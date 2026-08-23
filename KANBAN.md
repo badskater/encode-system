@@ -44,6 +44,15 @@ Mirror of the session task list. Move cards through columns as work lands.
   only on success + failure logging (regression-tested)
 - Plain-HTTP controller URL warning at agent start
 
+## Done (deploy prep + notifications)
+
+- First-node deploy runbook: Docs/md/FirstNodeDeploy.md (copy-paste steps:
+  controller, tool staging, inventory, credentials, smoke episode)
+- Docker fixes: state volume now covers the whole /data (DB persistence),
+  SPA served from /app/ui via ENCODE_UI_DIR, version ldflag ARG fixed
+- Discord notifications: ENCODE_DISCORD_WEBHOOK env; done/failed alerts with
+  series/episode/node/error/duration (5 unit tests + live E2E vs mock webhook)
+
 ## Done
 
 - Repo bootstrap + baseline docs

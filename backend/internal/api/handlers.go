@@ -157,6 +157,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	if err != nil {
 		s.Log.Error("render job failed", "job", job.ID, "err", err)
 		s.Store.FinishJob(ctx, job.ID, model.JobFailed, -1, "render failed: "+err.Error(), nil, "")
+		s.notifyJobFinished(ctx, job.ID, "controller")
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
@@ -252,7 +253,22 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		return
 	}
 	s.Log.Info("job finished", "job", jobID, "status", status, "node", node.Name)
+	s.notifyJobFinished(ctx, jobID, node.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
+}
+
+// notifyJobFinished fires the outcome alert for a job that just reached a
+// terminal state. The job is re-read so the alert carries the recorded error
+// and timestamps; a missing notifier (not configured) is a no-op.
+func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName string) {
+	if s.Notify == nil {
+		return
+	}
+	j, err := s.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return
+	}
+	s.Notify.JobFinished(ctx, j, nodeName)
 }
 
 // handleManifest returns the desired versions (agents compare and act).

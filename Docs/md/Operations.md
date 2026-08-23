@@ -30,6 +30,7 @@
 | Add a custom pipeline section | UI → Steps → New step template (PowerShell is syntax-checked), then add it to any flow. |
 | Share a flow | UI → Flows → Export JSON (embeds custom templates) / Import JSON. |
 | Register a node without copy-pasting tokens | UI → Nodes → Issue pairing code → `pairing_code` in the node's `agent.json`. |
+| Get job alerts in Discord | Set `ENCODE_DISCORD_WEBHOOK` (channel Incoming Webhook URL) in `.env`; done/failed alerts post automatically with series/episode/node/error. Empty = off. |
 | Push agent update | Upload new `encode-agent.exe`/`EncodeLib.ps1` to the controller's update store (they are SHA-256 hashed); manifest bump triggers staged rollout on idle nodes. Agents verify the checksum before installing. |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
 

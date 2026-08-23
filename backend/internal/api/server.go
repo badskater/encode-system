@@ -16,6 +16,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
 )
@@ -34,6 +35,7 @@ type Config struct {
 	RebootGracePeriod time.Duration // reboot attempt expires after this (default 10m)
 	StaleAfter        time.Duration // node offline after no heartbeat this long
 	DefaultFlowName   string        // flow used for auto-created jobs
+	DiscordWebhook    string        // optional job-outcome alerts (empty = off)
 }
 
 // Server bundles dependencies for all handlers.
@@ -42,6 +44,7 @@ type Server struct {
 	Update *update.Store
 	Log    *slog.Logger
 	Cfg    Config
+	Notify notify.Notifier
 }
 
 // New builds the server and seeds the default flow when absent.
@@ -58,7 +61,10 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if cfg.DefaultFlowName == "" {
 		cfg.DefaultFlowName = "default-1080"
 	}
-	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg}
+	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, Notify: notify.NewDiscord(cfg.DiscordWebhook, log)}
+	if cfg.DiscordWebhook != "" {
+		log.Info("discord notifications enabled")
+	}
 	if err := s.seedStepTemplates(); err != nil {
 		return nil, err
 	}

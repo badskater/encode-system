@@ -1,12 +1,39 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import FlowBuilder from './FlowBuilder';
-import type { Flow } from '../types';
+import type { Flow, StepTemplate } from '../types';
+
+// Templates fixture standing in for the API-provided catalog.
+function templatesFixture(): StepTemplate[] {
+  const mk = (key: string, label: string, params: { key: string; label: string; placeholder?: string }[] = []) => ({
+    id: 0,
+    key,
+    label,
+    description: `${label} step`,
+    params,
+    powershell: '',
+    builtin: true,
+    created_at: '',
+    updated_at: '',
+  });
+  return [
+    mk('source_rename', 'Rename source', [{ key: 'source_name', label: 'Source name', placeholder: 'src' }]),
+    mk('dgindex', 'DGIndexNV index'),
+    mk('audio', 'Audio (eac3to → Opus)', [
+      { key: 'track', label: 'Track index', placeholder: '2' },
+      { key: 'bitrate', label: 'Opus bitrate (kbps)', placeholder: '320' },
+    ]),
+    mk('encode', 'x265 encode', [{ key: 'x265_args', label: 'x265 arguments' }]),
+    mk('mux', 'MKV mux'),
+    mk('release_copy', 'Release copy'),
+    mk('keyframes', 'Keyframes'),
+  ];
+}
 
 describe('FlowBuilder', () => {
   it('adds steps from the palette in order', () => {
     const onSave = vi.fn();
-    render(<FlowBuilder initial={null} onSave={onSave} onCancel={() => {}} />);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
 
     fireEvent.click(screen.getByText('DGIndexNV index'));
     fireEvent.click(screen.getByText('Audio (eac3to → Opus)'));
@@ -20,7 +47,7 @@ describe('FlowBuilder', () => {
 
   it('strips empty params and calls onSave with ordered steps', async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
-    render(<FlowBuilder initial={null} onSave={onSave} onCancel={() => {}} />);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
 
     fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
       target: { value: 'my-flow' },
@@ -45,10 +72,11 @@ describe('FlowBuilder', () => {
         { type: 'dgindex' },
         { type: 'mux' },
       ],
+      is_default: false,
       created_at: '',
       updated_at: '',
     };
-    render(<FlowBuilder initial={flow} onSave={vi.fn()} onCancel={() => {}} />);
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
 
     // Move step 2 (mux) up.
     const upButtons = screen.getAllByTitle('Move up');
@@ -63,10 +91,11 @@ describe('FlowBuilder', () => {
       id: 1,
       name: 'x',
       steps: [{ type: 'dgindex' }, { type: 'mux' }],
+      is_default: false,
       created_at: '',
       updated_at: '',
     };
-    render(<FlowBuilder initial={flow} onSave={vi.fn()} onCancel={() => {}} />);
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
 
     fireEvent.click(screen.getAllByTitle('Remove')[0]);
     // Only one numbered step remains.
@@ -75,7 +104,9 @@ describe('FlowBuilder', () => {
   });
 
   it('disables save without name or steps', () => {
-    render(<FlowBuilder initial={null} onSave={vi.fn()} onCancel={() => {}} />);
+    render(
+      <FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />,
+    );
     expect(screen.getByText('Create flow')).toBeDisabled();
   });
 });

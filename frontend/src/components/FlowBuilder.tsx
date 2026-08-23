@@ -1,18 +1,36 @@
 import { useMemo, useState } from 'react';
-import type { Flow, Step, StepType } from '../types';
-import { STEP_CATALOG, stepMeta } from '../types';
+import type { Flow, Step, StepTemplate } from '../types';
 
 interface Props {
   initial: Flow | null;
+  templates: StepTemplate[];
   onSave: (name: string, steps: Step[]) => Promise<void>;
   onCancel: () => void;
+}
+
+// stepMeta resolves template metadata; unknown keys degrade to their raw key.
+function metaFor(templates: StepTemplate[], key: string) {
+  const t = templates.find((x) => x.key === key);
+  return (
+    t ?? {
+      id: 0,
+      key,
+      label: key,
+      description: 'unknown template',
+      params: [],
+      powershell: '',
+      builtin: false,
+      created_at: '',
+      updated_at: '',
+    }
+  );
 }
 
 // FlowBuilder is the visual editor: a palette of step templates on the right,
 // an ordered step list on the left with reorder/remove controls and per-step
 // parameter editing. Saving sends name + ordered steps to the controller,
 // which validates the flow renders before persisting.
-export default function FlowBuilder({ initial, onSave, onCancel }: Props) {
+export default function FlowBuilder({ initial, templates, onSave, onCancel }: Props) {
   const [name, setName] = useState(initial?.name ?? '');
   const [steps, setSteps] = useState<Step[]>(initial?.steps ?? []);
   const [saving, setSaving] = useState(false);
@@ -20,8 +38,8 @@ export default function FlowBuilder({ initial, onSave, onCancel }: Props) {
 
   const canSave = useMemo(() => name.trim() !== '' && steps.length > 0, [name, steps]);
 
-  function addStep(type: StepType) {
-    const meta = stepMeta(type);
+  function addStep(type: string) {
+    const meta = metaFor(templates, type);
     const params: Record<string, string> = {};
     for (const p of meta.params) params[p.key] = '';
     setSteps([...steps, { type, params }]);
@@ -89,7 +107,7 @@ export default function FlowBuilder({ initial, onSave, onCancel }: Props) {
             <p className="muted">No steps yet — add from the palette on the right.</p>
           )}
           {steps.map((s, i) => {
-            const meta = stepMeta(s.type);
+            const meta = metaFor(templates, s.type);
             return (
               <div className="step-card" key={i}>
                 <div className="step-num">{i + 1}</div>
@@ -135,9 +153,14 @@ export default function FlowBuilder({ initial, onSave, onCancel }: Props) {
 
         <div className="flow-palette">
           <h3>Add step</h3>
-          {STEP_CATALOG.map((meta) => (
-            <div key={meta.type} className="palette-step" onClick={() => addStep(meta.type)}>
+          {templates.map((meta) => (
+            <div
+              key={meta.key}
+              className="palette-step"
+              onClick={() => addStep(meta.key)}
+            >
               <strong>{meta.label}</strong>
+              {!meta.builtin && <span className="badge green">custom</span>}
               <div className="desc">{meta.description}</div>
             </div>
           ))}

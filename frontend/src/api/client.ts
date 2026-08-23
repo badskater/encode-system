@@ -1,7 +1,7 @@
 // Minimal fetch wrapper for the controller API. The admin bearer token is
 // supplied at runtime (prompt on first load, persisted to localStorage).
 
-import type { Flow, Job, JobStatus, Node, Settings } from '../types';
+import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, Series, Settings, StepTemplate } from '../types';
 
 const TOKEN_KEY = 'enc…oken';
 
@@ -61,4 +61,22 @@ export const api = {
   updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps'>>) =>
     request<Flow>('PUT', `/api/flows/${id}`, flow),
   deleteFlow: (id: number) => request<void>('DELETE', `/api/flows/${id}`),
+  setDefaultFlow: (id: number) => request<Flow>('POST', `/api/flows/${id}/default`),
+  exportFlow: (id: number) => request<FlowExport>('GET', `/api/flows/${id}/export`),
+  importFlow: (payload: FlowExport) => request<Flow>('POST', '/api/flows/import', payload),
+
+  series: () => request<Series[]>('GET', '/api/series'),
+  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean }) =>
+    request<Series>('PATCH', `/api/series/${id}`, body),
+
+  stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),
+  createStepTemplate: (t: Omit<StepTemplate, 'id' | 'builtin' | 'created_at' | 'updated_at'>) =>
+    request<StepTemplate>('POST', '/api/step-templates', t),
+  updateStepTemplate: (id: number, t: Partial<StepTemplate>) =>
+    request<StepTemplate>('PUT', `/api/step-templates/${id}`, t),
+  deleteStepTemplate: (id: number) => request<void>('DELETE', `/api/step-templates/${id}`),
+
+  pairingCodes: () => request<PairingCode[]>('GET', '/api/pairing'),
+  createPairingCode: (body: { name_hint?: string; ttl_hours?: number }) =>
+    request<{ pairing: PairingCode; code: string }>('POST', '/api/pairing', body),
 };

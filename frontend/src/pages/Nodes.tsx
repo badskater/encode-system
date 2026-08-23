@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api/client';
-import type { Node } from '../types';
+import type { Node, PairingCode } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { nodeBadge, timeAgo } from '../components/helpers';
 
@@ -8,8 +8,10 @@ import { nodeBadge, timeAgo } from '../components/helpers';
 // enable/disable for work, and force reboots.
 export default function NodesPage() {
   const { data: nodes, error } = usePolling<Node[]>(() => api.nodes(), 4000);
+  const { data: codes } = usePolling<PairingCode[]>(() => api.pairingCodes(), 10000);
   const [newName, setNewName] = useState('');
   const [issued, setIssued] = useState<{ name: string; token: string } | null>(null);
+  const [issuedPair, setIssuedPair] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   async function register() {
@@ -37,6 +39,16 @@ export default function NodesPage() {
   async function reboot(n: Node) {
     try {
       await api.rebootNode(n.id);
+      setActionError(null);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function issuePairingCode() {
+    try {
+      const res = await api.createPairingCode({ name_hint: newName.trim() || undefined, ttl_hours: 1 });
+      setIssuedPair(res.code);
       setActionError(null);
     } catch (e) {
       setActionError(String(e));
@@ -71,6 +83,55 @@ export default function NodesPage() {
               Dismiss
             </button>
           </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Or: one-shot pairing code</h3>
+        <p className="muted">
+          Prefer zero-touch bootstrap? Issue a pairing code (valid 1 hour) and put it in the
+          node's <code>agent.json</code> as <code>pairing_code</code> together with{' '}
+          <code>node_name</code>. The agent registers itself on first start and stores its own
+          credential — no manual token copy/paste.
+        </p>
+        <div className="toolbar">
+          <button className="btn primary" onClick={issuePairingCode}>
+            Issue pairing code
+          </button>
+        </div>
+        {issuedPair && (
+          <div className="card" style={{ background: '#0d1117' }}>
+            Copy this pairing code now — it is shown only once and can be used exactly once:
+            <pre>{issuedPair}</pre>
+            <pre>{`{
+  "controller_url": "https://controller:8080",
+  "node_name": "<this node>",
+  "pairing_code": "<paste code here>"
+}`}</pre>
+            <button className="btn" onClick={() => setIssuedPair(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+        {(codes ?? []).length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th>Active codes</th>
+                <th>Hint</th>
+                <th>Expires</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(codes ?? []).map((c) => (
+                <tr key={c.id}>
+                  <td className="muted">#{c.id}</td>
+                  <td>{c.name_hint || '—'}</td>
+                  <td className="muted">{timeAgo(c.expires_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
 

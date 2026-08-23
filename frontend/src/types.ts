@@ -12,7 +12,7 @@ export type StepType =
   | 'keyframes';
 
 export interface Step {
-  type: StepType;
+  type: string;
   params?: Record<string, string>;
 }
 
@@ -20,8 +20,50 @@ export interface Flow {
   id: number;
   name: string;
   steps: Step[];
+  is_default: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface Series {
+  id: number;
+  name: string;
+  flow_id: number; // 0 = default flow
+  enabled: boolean;
+  jobs?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ParamDef {
+  key: string;
+  label: string;
+  placeholder?: string;
+}
+
+export interface StepTemplate {
+  id: number;
+  key: string;
+  label: string;
+  description: string;
+  params: ParamDef[];
+  powershell: string;
+  builtin: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PairingCode {
+  id: number;
+  name_hint: string;
+  expires_at: string;
+  used_by?: number;
+  created_at: string;
+}
+
+export interface FlowExport {
+  flow: Flow;
+  templates: StepTemplate[];
 }
 
 export interface Node {
@@ -67,62 +109,5 @@ export interface Settings {
   release_root: string;
 }
 
-// Step metadata for the visual flow builder.
-export interface StepMeta {
-  type: StepType;
-  label: string;
-  description: string;
-  params: { key: string; label: string; placeholder?: string }[];
-}
-
-export const STEP_CATALOG: StepMeta[] = [
-  {
-    type: 'source_rename',
-    label: 'Rename source',
-    description: 'Rename the raw upload to src.<ext>',
-    params: [{ key: 'source_name', label: 'Source name', placeholder: 'src' }],
-  },
-  {
-    type: 'dgindex',
-    label: 'DGIndexNV index',
-    description: 'Build src.dgi from the source',
-    params: [],
-  },
-  {
-    type: 'audio',
-    label: 'Audio (eac3to → Opus)',
-    description: 'Demux track to WAV, encode Opus',
-    params: [
-      { key: 'track', label: 'Track index', placeholder: '2' },
-      { key: 'bitrate', label: 'Opus bitrate (kbps)', placeholder: '320' },
-    ],
-  },
-  {
-    type: 'encode',
-    label: 'x265 encode',
-    description: 'Encode the .avs/.vpy with the x265 fork',
-    params: [{ key: 'x265_args', label: 'x265 arguments' }],
-  },
-  {
-    type: 'mux',
-    label: 'MKV mux',
-    description: 'mkvmerge video + Opus audio',
-    params: [],
-  },
-  {
-    type: 'release_copy',
-    label: 'Release copy',
-    description: 'Copy MKV into [Group] Series - Raws [Tag]/',
-    params: [],
-  },
-  {
-    type: 'keyframes',
-    label: 'Keyframes',
-    description: 'ffmpeg → SCXvid keyframes file',
-    params: [],
-  },
-];
-
-export function stepMeta(type: StepType): StepMeta {
-  return STEP_CATALOG.find((s) => s.type === type)!;
-}
+// Step metadata for the builder now comes from the controller's step-template
+// registry (StepTemplate); the old hardcoded catalog was removed in phase 2.

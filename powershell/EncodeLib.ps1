@@ -57,8 +57,15 @@ function Invoke-Tool {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
+        # Windows PowerShell 5.1 wraps native stderr lines as ErrorRecords;
+        # stringifying via .Exception.Message keeps the original text and
+        # avoids 'RemoteException' noise in the job log.
         & $ExePath @Arguments 2>&1 | ForEach-Object {
-            Write-Output "[$Label] $_"
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                Write-Output ("[$Label] $($_.Exception.Message)")
+            } else {
+                Write-Output ("[$Label] $_")
+            }
         }
     } finally {
         $ErrorActionPreference = $prevEAP

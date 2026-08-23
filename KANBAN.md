@@ -10,8 +10,14 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## In progress
 
-- Phase 1: repo bootstrap + baseline docs
+- First real deploy to a Windows Server 2025 node (needs a physical node)
 
 ## Done
 
-(none yet)
+- Repo bootstrap + baseline docs
+- Backend: store, flow renderer, scanner, HTTP API dispatcher, agent
+- EncodeLib.ps1 Opus pipeline (eac3to → WAV → opusenc)
+- React SPA: dashboard, jobs, nodes, visual flow builder
+- Ansible: NFS client, C:\\bin toolchain, agent service
+- Docker controller image + compose with NFS volume mounts
+- Live E2E on Linux: scanner → job → agent → full pipeline → release folder → keyframes; reboot enforcement verified

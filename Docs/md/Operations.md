@@ -32,6 +32,6 @@
 
 - **NFS mount dropped on Windows node**: jobs fail at source read; remount play `ansible-playbook site.yml --tags nfs-client`.
 - **x265 fork crash on odd dimensions**: step fails with non-zero exit; inspect `run.log` for the x265 banner error; usually a filter-script issue (`.avs` crop values).
-- **opusenc missing**: audio step fails fast with "command not found" — Ansible `bin-tools` play fixes.
+- **opusenc missing**: audio step fails fast with "required tool not found" — Ansible `bin-tools` play fixes.
 - **Reboot during a job**: controller defers reboot instructions until the node reports idle; a crash-reboot mid-job leaves the job `running`-stale → operator retries.
 - **Two jobs on one node**: impossible by store constraint (unique active job per node), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api/client';
-import type { Job, JobStatus, Node } from '../types';
+import type { Flow, Job, JobStatus, Node } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { jobBadge, fmtTime } from '../components/helpers';
 
@@ -18,8 +18,19 @@ export default function JobsPage() {
     4000,
   );
   const { data: nodes } = usePolling<Node[]>(() => api.nodes(), 30000);
+  const { data: flows } = usePolling<Flow[]>(() => api.flows(), 30000);
 
   const nodeName = (id?: number) => nodes?.find((n) => n.id === id)?.name ?? '—';
+  const flowName = (id: number) => flows?.find((f) => f.id === id)?.name ?? `#${id}`;
+
+  async function changeFlow(id: number, flowId: number) {
+    try {
+      await api.patchJob(id, { flow_id: flowId });
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
 
   async function retry(id: number) {
     try {
@@ -63,6 +74,7 @@ export default function JobsPage() {
             <th>Ep</th>
             <th>Script</th>
             <th>Status</th>
+            <th>Flow</th>
             <th>Node</th>
             <th>Step</th>
             <th>Created</th>
@@ -81,6 +93,24 @@ export default function JobsPage() {
               <td>{j.episode}</td>
               <td className="muted">{j.script_type}</td>
               <td>{jobBadge(j.status)}</td>
+              <td>
+                {j.status === 'pending' && (flows ?? []).length > 0 ? (
+                  <select
+                    value={j.flow_id}
+                    onChange={(e) => changeFlow(j.id, Number(e.target.value))}
+                    title="Change the flow before this job starts"
+                  >
+                    {(flows ?? []).map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                        {f.is_default ? ' (default)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="muted">{j.flow_id ? flowName(j.flow_id) : '—'}</span>
+                )}
+              </td>
               <td className="muted">{j.node_id ? nodeName(j.node_id) : '—'}</td>
               <td className="muted">{j.step || '—'}</td>
               <td className="muted">{fmtTime(j.created_at)}</td>
@@ -100,7 +130,7 @@ export default function JobsPage() {
           ))}
           {(jobs ?? []).length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 No jobs {filter ? `with status ${filter}` : 'yet'}.
               </td>
             </tr>
@@ -114,8 +144,8 @@ export default function JobsPage() {
             Job #{selected.id} — {selected.series} Ep {selected.episode}
           </h3>
           <p className="muted">
-            dir: {selected.episode_dir} · flow id: {selected.flow_id} · exit code:{' '}
-            {selected.exit_code}
+            dir: {selected.episode_dir} · flow: {selected.flow_id ? flowName(selected.flow_id) : '—'} ·
+            exit code: {selected.exit_code}
           </p>
           {selected.error && <div className="error-box">{selected.error}</div>}
           {selected.log_tail && (

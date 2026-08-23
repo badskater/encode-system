@@ -4,7 +4,7 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## Backlog
 
-- UI button to change a pending job's flow (API exists: PATCH /api/jobs/{id})
+(empty)
 
 ## In progress
 
@@ -31,9 +31,18 @@ Mirror of the session task list. Move cards through columns as work lands.
   while a job runs, atomic pairing validation before node creation, import
   protection against template overwrite, bounded name-collision scan,
   keyframes freshness, counter-write error surfacing, empty-credential
-  re-pairing. Residual risks documented in the handoff: agent binary
-  swap-sidecar timing on locked exe (re-offered on next publish), TLS not enforced on
-  http:// controller URLs (homelab, reverse proxy recommended).
+  re-pairing. Both documented residual risks were later closed in code:
+  the swap sidecar now waits for process exit and retries the move with a
+  bounded loop (restart only on success; POSIX gets a direct rename path),
+  and the agent warns loudly when the controller URL is plain HTTP.
+
+## Done (backlog run)
+
+- UI flow changer: pending jobs show a flow dropdown in the Jobs table
+  (PATCH /api/jobs/{id} surfaced; locked once assigned/running)
+- Agent binary swap hardening: wait-for-exit + bounded move retry + restart
+  only on success + failure logging (regression-tested)
+- Plain-HTTP controller URL warning at agent start
 
 ## Done
 

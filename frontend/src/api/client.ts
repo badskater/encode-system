@@ -52,6 +52,8 @@ export const api = {
   job: (id: number) => request<Job>('GET', `/api/jobs/${id}`),
   retryJob: (id: number) => request<Job>('POST', `/api/jobs/${id}/retry`),
   cancelJob: (id: number) => request<void>('POST', `/api/jobs/${id}/cancel`),
+  patchJob: (id: number, body: { flow_id: number }) =>
+    request<Job>('PATCH', `/api/jobs/${id}`, body),
   createJob: (body: { series: string; episode_dir: string; script_type: string; flow_id?: number }) =>
     request<Job>('POST', '/api/jobs', body),
 

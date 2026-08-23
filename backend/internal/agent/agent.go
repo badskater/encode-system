@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,6 +182,9 @@ func (a *Agent) resetCounter() {
 // for in-flight job/update goroutines so no encode is orphaned mid-shutdown.
 func (a *Agent) Run(ctx context.Context) error {
 	a.Log.Info("agent starting", "node", a.Cfg.NodeName, "controller", a.Cfg.ControllerURL, "version", a.Version)
+	if strings.HasPrefix(a.Cfg.ControllerURL, "http://") {
+		a.Log.Warn("controller URL is plain HTTP — credentials and job scripts transit unencrypted; use HTTPS (reverse proxy) for anything beyond a trusted LAN")
+	}
 	if err := a.pairIfNeeded(ctx); err != nil {
 		return fmt.Errorf("agent cannot start without a credential: %w", err)
 	}
@@ -575,24 +579,67 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 			return
 		}
 		a.Log.Info("agent binary staged; will swap on restart", "staged", staged, "version", m.AgentVersion)
-		// Swap-and-restart: on Windows a running exe can't overwrite itself,
-		// so a cmd sidecar performs the move after we exit. The service manager
-		// then restarts us with the new binary.
-		script := fmt.Sprintf(`@echo off
-timeout /t 2 /nobreak >nul
-move /y "%s" "%s"
-net stop encode-agent && net start encode-agent
-`, staged, self)
-		batPath := filepath.Join(a.Cfg.DataDir, "swap-update.bat")
-		if err := os.WriteFile(batPath, []byte(script), 0o755); err != nil {
-			a.Log.Error("write swap script", "err", err)
-			return
+		if runtime.GOOS == "windows" {
+			a.launchWindowsSwap(staged, self)
+		} else {
+			// POSIX: the process can rename over its own running binary.
+			if err := os.Rename(staged, self); err != nil {
+				a.Log.Error("swap binary", "err", err)
+				return
+			}
+			a.Log.Info("binary swapped; exiting — supervisor (systemd etc.) restarts the new version")
+			a.Stop()
 		}
-		if err := exec.Command("cmd", "/c", "start", "/min", batPath).Start(); err != nil {
-			a.Log.Error("launch swap script", "err", err)
-			return
-		}
-		a.Log.Info("exiting for binary swap; service manager will restart")
-		a.Stop()
 	}
+}
+
+// launchWindowsSwap hands the swap to a cmd sidecar because a running Windows
+// exe cannot overwrite itself. The sidecar waits for THIS process to exit,
+// retries the move until the file lock clears, and restarts the service only
+// after a successful move — a failed move leaves the old agent running
+// unchanged (the manifest still advertises the new version, so the swap is
+// re-attempted on a later heartbeat), never a mismatched new-lib/old-agent.
+func (a *Agent) launchWindowsSwap(staged, self string) {
+	script := windowsSwapScript(filepath.Base(self), staged, self, a.Cfg.DataDir)
+	batPath := filepath.Join(a.Cfg.DataDir, "swap-update.bat")
+	if err := os.WriteFile(batPath, []byte(script), 0o755); err != nil {
+		a.Log.Error("write swap script", "err", err)
+		return
+	}
+	if err := exec.Command("cmd", "/c", "start", "/min", batPath).Start(); err != nil {
+		a.Log.Error("launch swap script", "err", err)
+		return
+	}
+	a.Log.Info("exiting for binary swap; service manager will restart")
+	a.Stop()
+}
+
+// windowsSwapScript renders the cmd sidecar that performs the binary swap.
+// Behavior contract: wait for the old process to exit, retry the move until
+// the lock clears (15 attempts), restart the service ONLY after a successful
+// move, and log to swap-update.log on exhaustion.
+func windowsSwapScript(exeName, staged, self, dataDir string) string {
+	return fmt.Sprintf(`@echo off
+setlocal
+rem Wait for the running agent process to exit so the file lock clears.
+:wait_exit
+timeout /t 1 /nobreak >nul
+tasklist /FI "IMAGENAME eq %s" 2>NUL | find /I "%s" >NUL
+if not errorlevel 1 goto wait_exit
+rem Retry the move: an antivirus or indexer may hold the file briefly.
+set /a tries=0
+:try_move
+move /y "%s" "%s" >nul 2>&1
+if not errorlevel 1 goto swapped
+set /a tries+=1
+if %%tries%% geq 15 (
+    echo swap failed after %%tries%% retries: %s >>"%s\swap-update.log"
+    exit /b 1
+)
+timeout /t 2 /nobreak >nul
+goto try_move
+:swapped
+net stop encode-agent >nul 2>&1
+net start encode-agent
+`, exeName, exeName, staged, self, staged, dataDir)
 }

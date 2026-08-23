@@ -94,11 +94,18 @@ Response:
 ## Runtime flows
 
 1. User drops `Ep 05/` with `src.m2ts` + `1080.vpy` into `scripts/<Series>/`.
-2. Scanner detects it next cycle → job `pending` with default flow (or UI-assigned).
+2. Scanner detects it next cycle (sources younger than 2 minutes are deferred, so mid-copy NFS uploads don't trigger jobs) → job `pending` with default flow (or UI-assigned).
 3. Node `enc-02` heartbeats idle → controller assigns job, response carries rendered script.
 4. Agent executes step by step; heartbeats carry progress; UI live-updates.
 5. Job completes → controller verifies output path exists on the share → `done`.
-6. After the node's 10th completed task, controller responds with `reboot`; agent defers until idle, reboots; node comes back with counter 0.
+6. After the node's 10th completed task, controller responds with `reboot`; the instruction is re-issued on every idle heartbeat until the node's counter drops (proof of reboot), so a missed packet self-heals. Agent defers until idle, reboots; node comes back with counter 0 and rejoins the pool.
+
+## Safety invariants enforced by the store/API
+
+- At most one active (assigned/running) job per node; `AssignJob` verifies rows-affected and node enabled-state before marking a node busy.
+- A node may only report progress/completion for jobs assigned to it.
+- Terminal jobs cannot regress via heartbeats; completion is idempotent.
+- The configured default flow is protected from deletion; flows with job history refuse deletion (FK).
 
 ## Security and observability
 

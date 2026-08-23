@@ -317,3 +317,77 @@ func TestUpdateAcceptsMatchingChecksum(t *testing.T) {
 		t.Fatalf("lib version = %d, want 3", a.LibVersion)
 	}
 }
+
+// Regression: an agent with only a pairing code exchanges it once, persists
+// the returned credential, and reuses the persisted file on later starts.
+func TestAgentPairingBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	var paired atomic.Int32
+	issuedAuth := nodeTok() // what the controller hands back
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/pair":
+			var req struct {
+				Code string `json:"code"`
+				Name string `json:"name"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			if req.Code != "abc123pairingcode" || req.Name != "enc-new" {
+				w.WriteHeader(401)
+				return
+			}
+			paired.Add(1)
+			json.NewEncoder(w).Encode(map[string]string{"token": issuedAuth})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer controller.Close()
+
+	cfg := Config{ControllerURL: controller.URL, NodeName: "enc-new", DataDir: dir}
+	cfg.PairingCode = "abc123pairingcode"
+	a, err := New(cfg, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.pairIfNeeded(context.Background()); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	if paired.Load() != 1 {
+		t.Fatalf("pair endpoint hits = %d", paired.Load())
+	}
+	if a.Cfg.Token != issuedAuth {
+		t.Fatal("agent must adopt the issued credential")
+	}
+
+	// Persisted file exists with 0600 perms.
+	info, err := os.Stat(filepath.Join(dir, "node.token"))
+	if err != nil {
+		t.Fatalf("credential not persisted: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("credential file perms = %v, want 0600", info.Mode().Perm())
+	}
+
+	// Second agent instance loads the persisted file and never pairs again.
+	cfg2 := Config{ControllerURL: controller.URL, NodeName: "enc-new", DataDir: dir}
+	cfg2.PairingCode = "abc123pairingcode"
+	b, err := New(cfg2, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.pairIfNeeded(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if paired.Load() != 1 {
+		t.Fatal("persisted credential must skip re-pairing")
+	}
+}
+
+// Regression: no token and no pairing code is a hard startup error.
+func TestAgentRefusesBootWithoutCredential(t *testing.T) {
+	cfg := Config{ControllerURL: "http://x", NodeName: "n", DataDir: t.TempDir()}
+	if _, err := New(cfg, "v", testLog()); err == nil {
+		t.Fatal("agent without token or pairing code must be rejected")
+	}
+}

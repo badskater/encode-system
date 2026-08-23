@@ -27,12 +27,16 @@ import (
 )
 
 // Config is the agent's runtime configuration (agent.json on disk).
+// Either Token is provided directly, or PairingCode is set for one-shot
+// self-registration with the controller (the resulting permanent token is
+// then persisted in data_dir and reused on every start).
 type Config struct {
 	ControllerURL  string `json:"controller_url"`
 	NodeName       string `json:"node_name"`
 	Token          string `json:"token"`
-	DataDir        string `json:"data_dir"` // e.g. C:\encode-agent
-	LibPath        string `json:"lib_path"` // EncodeLib.ps1 location
+	PairingCode    string `json:"pairing_code"` // one-shot bootstrap, consumed once
+	DataDir        string `json:"data_dir"`     // e.g. C:\encode-agent
+	LibPath        string `json:"lib_path"`     // EncodeLib.ps1 location
 	HeartbeatEvery int    `json:"heartbeat_seconds"`
 	PowerShell     string `json:"powershell"` // optional override; default finds powershell.exe
 }
@@ -54,10 +58,14 @@ type Agent struct {
 	stopCh   chan struct{}
 }
 
-// New builds an agent with sane defaults.
+// New builds an agent with sane defaults. A Token or a PairingCode must be
+// available; pairing is performed on first Run (or via bootstrap).
 func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
-	if cfg.ControllerURL == "" || cfg.Token == "" || cfg.NodeName == "" {
-		return nil, fmt.Errorf("controller_url, node_name and token are required")
+	if cfg.ControllerURL == "" || cfg.NodeName == "" {
+		return nil, fmt.Errorf("controller_url and node_name are required")
+	}
+	if cfg.Token == "" && cfg.PairingCode == "" {
+		return nil, fmt.Errorf("token or pairing_code is required")
 	}
 	if cfg.HeartbeatEvery <= 0 {
 		cfg.HeartbeatEvery = 15
@@ -98,6 +106,44 @@ func (a *Agent) TasksSinceBoot() int {
 // the agent resets it to zero after executing a reboot instruction.
 func (a *Agent) counterPath() string { return filepath.Join(a.Cfg.DataDir, "tasks_since_boot") }
 
+// tokenPath stores the permanent bearer credential obtained via pairing, so
+// the one-shot code never needs to survive on disk.
+func (a *Agent) tokenPath() string { return filepath.Join(a.Cfg.DataDir, "node.token") }
+
+// pairIfNeeded completes one-shot self-registration when no credential is
+// configured yet: a persisted token file wins; otherwise the pairing code is
+// exchanged for a permanent token at the controller. Idempotent across
+// restarts.
+func (a *Agent) pairIfNeeded(ctx context.Context) error {
+	if a.Cfg.Token != "" {
+		return nil
+	}
+	if b, err := os.ReadFile(a.tokenPath()); err == nil && len(b) > 0 {
+		a.Cfg.Token = strings.TrimSpace(string(b))
+		a.Log.Info("loaded persisted node credential")
+		return nil
+	}
+	if a.Cfg.PairingCode == "" {
+		return fmt.Errorf("no credential configured and no pairing code")
+	}
+	req := map[string]string{"code": a.Cfg.PairingCode, "name": a.Cfg.NodeName}
+	var resp struct {
+		Token string `json:"token"`
+	}
+	if err := a.postJSON(ctx, "/api/agent/pair", req, &resp); err != nil {
+		return fmt.Errorf("pairing failed: %w", err)
+	}
+	if resp.Token == "" {
+		return fmt.Errorf("pairing returned no credential")
+	}
+	if err := os.WriteFile(a.tokenPath(), []byte(resp.Token), 0o600); err != nil {
+		return fmt.Errorf("persist credential: %w", err)
+	}
+	a.Cfg.Token = resp.Token
+	a.Log.Info("node paired with controller", "node", a.Cfg.NodeName)
+	return nil
+}
+
 func (a *Agent) readCounter() int {
 	b, err := os.ReadFile(a.counterPath())
 	if err != nil {
@@ -127,6 +173,9 @@ func (a *Agent) resetCounter() {
 // for in-flight job/update goroutines so no encode is orphaned mid-shutdown.
 func (a *Agent) Run(ctx context.Context) error {
 	a.Log.Info("agent starting", "node", a.Cfg.NodeName, "controller", a.Cfg.ControllerURL, "version", a.Version)
+	if err := a.pairIfNeeded(ctx); err != nil {
+		return fmt.Errorf("agent cannot start without a credential: %w", err)
+	}
 	tick := time.NewTicker(time.Duration(a.Cfg.HeartbeatEvery) * time.Second)
 	defer tick.Stop()
 	defer a.wg.Wait()

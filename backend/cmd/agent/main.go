@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -66,12 +67,16 @@ func defaultConfigPath() string {
 }
 
 // loadConfig reads and validates the agent.json configuration file.
+// Windows tooling (PowerShell's Set-Content, Notepad, Ansible win_copy with
+// UTF-8 content) routinely writes a UTF-8 BOM, so strip it before parsing —
+// rejecting it would make agent.json painful to author on the node.
 func loadConfig(path string) (agent.Config, error) {
 	var cfg agent.Config
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, fmt.Errorf("read %s: %w (create it or pass -config)", path, err)
 	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}

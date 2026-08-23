@@ -42,14 +42,37 @@ function Invoke-Tool {
         [string] $Label = (Split-Path $ExePath -Leaf)
     )
     Write-Output "[$Label] starting: $ExePath $($Arguments -join ' ')"
-    & $ExePath @Arguments 2>&1 | ForEach-Object {
-        Write-Output "[$Label] $_"
+    # Windows PowerShell 5.1 wraps native stderr as ErrorRecords; under
+    # ErrorActionPreference=Stop that aborts on harmless progress output
+    # (x265 writes progress to stderr). Relax EAP for the native call and
+    # rely on the exit code for failure detection instead.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $ExePath @Arguments 2>&1 | ForEach-Object {
+            Write-Output "[$Label] $_"
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
     }
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         throw "$Label exited with code $code"
     }
     Write-Output "[$Label] finished (exit 0)"
+}
+
+# Assert-SafeName rejects values that could escape the intended directory or
+# break Windows filenames. Controller data is admin-authored, but this
+# boundary is where it meets the filesystem — defense in depth.
+function Assert-SafeName {
+    param(
+        [Parameter(Mandatory)] [string] $Value,
+        [Parameter(Mandatory)] [string] $What
+    )
+    if ($Value -match '[\\/:*?"<>|]' -or $Value.Contains('..') -or $Value.Trim() -eq '') {
+        throw "unsafe $What value: '$Value' (path separators, '..' or reserved characters are not allowed)"
+    }
 }
 
 # Find-SourceFile locates the episode's source media file. Prefers the
@@ -87,12 +110,18 @@ function Invoke-SourceRename {
             return
         }
     }
-    $raw = Get-ChildItem -LiteralPath $EpisodeDir -File |
-        Where-Object { $_.Extension -in @('.m2ts', '.ts', '.mkv', '.mp4') } |
-        Select-Object -First 1
-    if (-not $raw) {
+    $raws = @(Get-ChildItem -LiteralPath $EpisodeDir -File |
+        Where-Object { $_.Extension -in @('.m2ts', '.ts', '.mkv', '.mp4') })
+    if ($raws.Count -eq 0) {
         throw "no source media file to rename in $EpisodeDir"
     }
+    if ($raws.Count -gt 1) {
+        # Ambiguous uploads: picking one silently could canonicalize the
+        # wrong file. Require the operator to resolve the ambiguity.
+        $names = ($raws | ForEach-Object { $_.Name }) -join ', '
+        throw "multiple source candidates in $EpisodeDir ($names) - rename one to $SourceName manually"
+    }
+    $raw = $raws[0]
     $target = Join-Path $EpisodeDir ($SourceName + $raw.Extension)
     Rename-Item -LiteralPath $raw.FullName -NewName ($SourceName + $raw.Extension)
     Write-Output "renamed $($raw.Name) -> $(Split-Path $target -Leaf)"
@@ -113,10 +142,14 @@ function Invoke-DgIndex {
     $exe = Resolve-Tool $BinDir 'DGIndexNV.exe'
     $src = Find-SourceFile $EpisodeDir
     $dgi = Join-Path $EpisodeDir 'src.dgi'
-    if (Test-Path -LiteralPath $dgi) {
-        Write-Output "src.dgi already present, reusing"
+    if ((Test-Path -LiteralPath $dgi) -and ((Get-Item -LiteralPath $dgi).LastWriteTime -gt (Get-Item -LiteralPath $src).LastWriteTime)) {
+        Write-Output "src.dgi already present and newer than source, reusing"
         Write-Output "ENCODE_STEP dgindex 100"
         return
+    }
+    if (Test-Path -LiteralPath $dgi) {
+        Write-Output "src.dgi is stale (older than source), regenerating"
+        Remove-Item -LiteralPath $dgi -Force
     }
     Invoke-Tool -ExePath $exe -Arguments @('-i', $src, '-o', $dgi, '-h') -Label 'DGIndexNV'
     if (-not (Test-Path -LiteralPath $dgi)) {
@@ -147,10 +180,14 @@ function Invoke-AudioExtract {
     $wav = Join-Path $EpisodeDir 'audio.wav'
     $opus = Join-Path $EpisodeDir 'audio.opus'
 
-    if (Test-Path -LiteralPath $opus) {
-        Write-Output "audio.opus already present, reusing"
+    if ((Test-Path -LiteralPath $opus) -and ((Get-Item -LiteralPath $opus).LastWriteTime -gt (Get-Item -LiteralPath $src).LastWriteTime)) {
+        Write-Output "audio.opus already present and newer than source, reusing"
         Write-Output "ENCODE_STEP audio 100"
         return
+    }
+    if (Test-Path -LiteralPath $opus) {
+        Write-Output "audio.opus is stale (older than source), re-encoding"
+        Remove-Item -LiteralPath $opus -Force
     }
 
     # eac3to "src" 2: audio.wav -down16  → track 2, 16-bit WAV output.
@@ -181,6 +218,10 @@ function Invoke-AudioExtract {
 # Invoke-VideoEncode runs the x265_x64 fork on the episode's AviSynth or
 # VapourSynth script. Arguments come from the flow (x265_args param), which
 # defaults to the legacy proven parameter set.
+# EncodeHevcName is the shared encode-output contract between Invoke-VideoEncode
+# and Invoke-Mux; both steps must agree on the filename.
+$script:EncodeHevcName = '1080.hevc'
+
 function Invoke-VideoEncode {
     param(
         [Parameter(Mandatory)] [string] $BinDir,
@@ -194,12 +235,13 @@ function Invoke-VideoEncode {
     if (-not (Test-Path -LiteralPath $ScriptFile)) {
         throw "filter script not found: $ScriptFile"
     }
-    # The flow's arg string is trusted controller content (admin-authored),
-    # split on whitespace into argv. Input/output are appended last so they
-    # can never be overridden by flow params.
-    $args = @($X265Args -split '\s+' | Where-Object { $_ -ne '' })
-    $args += @('--input', $ScriptFile, '-o', $OutputFile)
-    Invoke-Tool -ExePath $x265 -Arguments $args -Label 'x265'
+    # The flow's arg string is trusted controller content (admin-authored).
+    # Note: $args is a PowerShell automatic variable — never assign to it.
+    # Quoted segments survive as single argv entries (quote-aware split).
+    # Input/output are appended last so flow params can never override them.
+    $x265ArgList = @([regex]::Matches($X265Args, '("([^"]*)"|\S+)') | ForEach-Object { $_.Value.Trim('"') })
+    $x265ArgList += @('--input', $ScriptFile, '-o', $OutputFile)
+    Invoke-Tool -ExePath $x265 -Arguments $x265ArgList -Label 'x265'
     if (-not (Test-Path -LiteralPath $OutputFile)) {
         throw "x265 finished but $OutputFile was not created"
     }
@@ -220,7 +262,7 @@ function Invoke-Mux {
     )
     Write-Output "ENCODE_STEP mux 0"
     $mkvmerge = Resolve-Tool $BinDir 'mkvmerge.exe'
-    $hevc = Join-Path $EpisodeDir '1080.hevc'
+    $hevc = Join-Path $EpisodeDir $script:EncodeHevcName
     $audio = Join-Path $EpisodeDir 'audio.opus'
     $out = Join-Path $EpisodeDir $OutputName
     foreach ($f in @($hevc, $audio)) {
@@ -258,6 +300,8 @@ function Invoke-ReleaseCopy {
         [Parameter(Mandatory)] [string] $OutputName
     )
     Write-Output "ENCODE_STEP release_copy 0"
+    Assert-SafeName -Value $ReleaseFolder -What "release folder"
+    Assert-SafeName -Value $OutputName -What "output name"
     $src = Join-Path $EpisodeDir $OutputName
     if (-not (Test-Path -LiteralPath $src)) { throw "finished MKV not found: $src" }
     $destDir = Join-Path $ReleaseDir $ReleaseFolder
@@ -266,8 +310,17 @@ function Invoke-ReleaseCopy {
         Write-Output "created release folder: $destDir"
     }
     $dest = Join-Path $destDir $OutputName
+    $existed = Test-Path -LiteralPath $dest
     Copy-Item -LiteralPath $src -Destination $dest -Force
-    Write-Output "copied to $dest"
+    if ($existed) {
+        Write-Output "OVERWROTE existing release: $dest"
+    } else {
+        Write-Output "copied to $dest"
+    }
+    # Post-copy integrity check: sizes must match over the NFS share.
+    if ((Get-Item -LiteralPath $src).Length -ne (Get-Item -LiteralPath $dest).Length) {
+        throw "release copy size mismatch: $dest"
+    }
     Write-Output "ENCODE_STEP release_copy 100"
 }
 
@@ -288,6 +341,9 @@ function Invoke-Keyframes {
         [Parameter(Mandatory)] [string] $OutputName
     )
     Write-Output "ENCODE_STEP keyframes 0"
+    Assert-SafeName -Value $Series -What "series"
+    Assert-SafeName -Value $Episode -What "episode"
+    Assert-SafeName -Value $ReleaseFolder -What "release folder"
     $ffmpeg = Resolve-Tool $BinDir 'ffmpeg.exe'
     $scxvid = Resolve-Tool $BinDir 'SCXvid.exe'
     $destDir = Join-Path $ReleaseDir $ReleaseFolder
@@ -301,10 +357,10 @@ function Invoke-Keyframes {
     if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkv" }
 
     Write-Output "[keyframes] ffmpeg -> y4m -> SCXvid"
-    # No cmd.exe pipe dependency: ffmpeg writes a downscaled y4m to a temp
-    # file, SCXvid reads it. Same output as the legacy pipe, and it works
-    # identically on Windows PowerShell and pwsh.
-    $y4m = Join-Path $destDir "$Series - $Episode.tmp.y4m"
+    # No cmd.exe pipe dependency: ffmpeg writes a downscaled y4m to a LOCAL
+    # temp file (not the NFS release share), SCXvid reads it. Same output as
+    # the legacy pipe, and it works identically on Windows PowerShell and pwsh.
+    $y4m = Join-Path ([System.IO.Path]::GetTempPath()) "encode-kf-$PID.y4m"
     try {
         Invoke-Tool -ExePath $ffmpeg -Arguments @(
             '-i', $mkv, '-f', 'yuv4mpegpipe', '-vf', 'scale=640:360',
@@ -312,7 +368,8 @@ function Invoke-Keyframes {
         ) -Label 'ffmpeg'
         Invoke-Tool -ExePath $scxvid -Arguments @($y4m, $kf) -Label 'SCXvid'
     } finally {
-        if (Test-Path -LiteralPath $y4m) { Remove-Item -LiteralPath $y4m -Force }
+        # Best-effort cleanup; a locked temp file must not fail the job.
+        try { if (Test-Path -LiteralPath $y4m) { Remove-Item -LiteralPath $y4m -Force } } catch { }
     }
     if (-not (Test-Path -LiteralPath $kf)) { throw "SCXvid finished but $kf was not created" }
     Write-Output "ENCODE_STEP keyframes 100"

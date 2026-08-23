@@ -7,6 +7,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,8 +48,8 @@ type Agent struct {
 
 	mu         sync.Mutex
 	currentJob *model.JobPayload
-	tasksDone  int // completed tasks since process start (~boot)
 
+	wg       sync.WaitGroup // tracks in-flight job/update goroutines for clean shutdown
 	stopOnce sync.Once
 	stopCh   chan struct{}
 }
@@ -70,9 +72,12 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 		cfg.LibPath = filepath.Join(cfg.DataDir, "EncodeLib.ps1")
 	}
 	return &Agent{
-		Cfg:     cfg,
-		Log:     log,
-		Client:  &http.Client{Timeout: 5 * time.Minute},
+		Cfg: cfg,
+		Log: log,
+		// No hard client Timeout: large payload downloads are governed by
+		// per-request contexts (heartbeat uses 30s, updates 30m). A fixed
+		// client-wide cap would contradict the download windows.
+		Client:  &http.Client{},
 		Version: version,
 		stopCh:  make(chan struct{}),
 	}, nil
@@ -86,7 +91,7 @@ func (a *Agent) Stop() { a.stopOnce.Do(func() { close(a.stopCh) }) }
 func (a *Agent) TasksSinceBoot() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.tasksDone + a.readCounter()
+	return a.readCounter()
 }
 
 // counterPath stores the per-boot task counter. The OS clears it implicitly:
@@ -102,20 +107,29 @@ func (a *Agent) readCounter() int {
 	return n
 }
 
+// bumpCounter/readCounter/resetCounter serialize on a.mu: the counter gates
+// the reboot safety limit, so a lost increment under concurrent reads would
+// defeat the mechanism.
 func (a *Agent) bumpCounter() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	n := a.readCounter() + 1
 	os.WriteFile(a.counterPath(), []byte(strconv.Itoa(n)), 0o644)
 }
 
 func (a *Agent) resetCounter() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	os.Remove(a.counterPath())
 }
 
-// Run drives the heartbeat loop until Stop or ctx cancellation.
+// Run drives the heartbeat loop until Stop or ctx cancellation, then waits
+// for in-flight job/update goroutines so no encode is orphaned mid-shutdown.
 func (a *Agent) Run(ctx context.Context) error {
 	a.Log.Info("agent starting", "node", a.Cfg.NodeName, "controller", a.Cfg.ControllerURL, "version", a.Version)
 	tick := time.NewTicker(time.Duration(a.Cfg.HeartbeatEvery) * time.Second)
 	defer tick.Stop()
+	defer a.wg.Wait()
 
 	// Heartbeat immediately on start, then on each tick.
 	for {
@@ -159,12 +173,24 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		if reply.Job == nil {
 			return fmt.Errorf("job instruction without payload")
 		}
-		go a.executeJob(reply.Job)
+		a.mu.Lock()
+		if a.currentJob != nil {
+			// Defense in depth: the controller enforces one job per node,
+			// but the agent must never run two encodes even if it receives
+			// a double dispatch (bug or stale instruction).
+			a.mu.Unlock()
+			a.Log.Warn("rejected job while busy", "new_job", reply.Job.ID, "running", a.currentJob.ID)
+			return nil
+		}
+		a.mu.Unlock()
+		a.wg.Add(1)
+		go func() { defer a.wg.Done(); a.executeJob(reply.Job) }()
 	case "reboot":
 		a.handleReboot(reply.RebootDelay)
 	case "update":
 		if reply.Update != nil {
-			go a.handleUpdate(*reply.Update)
+			a.wg.Add(1)
+			go func(m model.UpdateManifest) { defer a.wg.Done(); a.handleUpdate(m) }(*reply.Update)
 		}
 	case "none", "":
 	}
@@ -265,10 +291,20 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		}
 	}
 
-	// Collect output artifacts (best effort): the muxed MKV in the episode dir.
+	// Verify the expected mux artifact actually exists on success — an
+	// exit-0 encode that produced no file must not report a bogus output.
 	outputs := []string{}
-	if epDir, ok := job.Vars["episode_dir"]; ok && status == "done" {
-		outputs = append(outputs, epDir)
+	if status == "done" {
+		if epDir, ok := job.Vars["episode_dir"]; ok {
+			artifact := epDir
+			if name, ok2 := job.Vars["expected_output"]; ok2 && name != "" {
+				// The episode dir var is share-relative on Windows nodes; the
+				// agent runs the job from the rendered script which resolves
+				// $ScriptsDir internally, so report the relative artifact.
+				artifact = epDir + "/" + name
+			}
+			outputs = append(outputs, artifact)
+		}
 	}
 	a.completeJob(job.ID, status, exitCode, errMsg, outputs, tail)
 	a.bumpCounter()
@@ -367,29 +403,63 @@ func (a *Agent) handleReboot(delaySeconds int) {
 		delaySeconds = 30
 	}
 	a.Log.Warn("reboot instruction received", "delay_seconds", delaySeconds)
-	a.resetCounter()
 	// shutdown.exe exists on Windows Server; on non-Windows test hosts this
-	// fails harmlessly and is logged.
+	// fails harmlessly and is logged. The counter resets ONLY after the
+	// reboot command is accepted — resetting first would undercount when the
+	// command fails and defeat the task-limit safety mechanism.
 	cmd := exec.Command("shutdown", "/r", "/t", strconv.Itoa(delaySeconds), "/c", "encode-system: task limit reached")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		a.Log.Error("reboot command failed", "err", err, "output", strings.TrimSpace(string(out)))
 		return
 	}
+	a.resetCounter()
 	a.Log.Info("reboot scheduled", "delay_seconds", delaySeconds)
 }
 
+// maxUpdateBytes caps update payload downloads; anything larger is an error,
+// not something to buffer.
+const maxUpdateBytes = 256 << 20 // 256 MiB
+
+// sha256Bytes hashes a payload for manifest verification.
+func sha256Bytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// limitedBuffer buffers a download but fails past maxUpdateBytes so a
+// malicious or buggy controller cannot exhaust agent memory.
+type limitedBuffer struct {
+	buf bytes.Buffer
+}
+
+func (lb *limitedBuffer) Write(p []byte) (int, error) {
+	if int64(lb.buf.Len()+len(p)) > maxUpdateBytes {
+		return 0, fmt.Errorf("payload exceeds %d byte cap", maxUpdateBytes)
+	}
+	return lb.buf.Write(p)
+}
+
+func (lb *limitedBuffer) Bytes() []byte { return lb.buf.Bytes() }
+
 // handleUpdate compares the manifest and applies agent/lib updates.
-// The PowerShell lib swaps immediately (next job uses it); the binary stages
-// itself and restarts via a sidecar command.
+// Every payload is SHA-256 verified against the manifest before install: an
+// unverified binary would mean a compromised or MITM'd controller achieves
+// code execution on every node.
+// The PowerShell lib swaps while no job is running; the binary stages itself
+// and restarts via a sidecar command.
 func (a *Agent) handleUpdate(m model.UpdateManifest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	// Update EncodeLib.ps1 when the controller's version is newer.
 	if m.LibVersion > 0 && m.LibVersion != a.LibVersion {
-		var buf bytes.Buffer
+		var buf limitedBuffer
 		if err := a.getAuth(ctx, "/api/agent/download/lib", &buf); err != nil {
 			a.Log.Error("download lib failed", "err", err)
+			return
+		}
+		if got := sha256Bytes(buf.Bytes()); m.LibSHA256 != "" && got != m.LibSHA256 {
+			a.Log.Error("lib checksum mismatch, refusing install", "want", m.LibSHA256, "got", got)
 			return
 		}
 		tmp := a.Cfg.LibPath + ".new"
@@ -407,9 +477,13 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 
 	// Update the agent binary when the controller's version differs.
 	if m.AgentVersion != "" && m.AgentVersion != a.Version {
-		var buf bytes.Buffer
+		var buf limitedBuffer
 		if err := a.getAuth(ctx, "/api/agent/download/agent", &buf); err != nil {
 			a.Log.Error("download agent failed", "err", err)
+			return
+		}
+		if got := sha256Bytes(buf.Bytes()); m.AgentSHA256 != "" && got != m.AgentSHA256 {
+			a.Log.Error("agent checksum mismatch, refusing install", "want", m.AgentSHA256, "got", got)
 			return
 		}
 		self, err := os.Executable()

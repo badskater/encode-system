@@ -186,12 +186,19 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 	if err != nil {
 		return nil, err
 	}
+	episode := job.Episode
+	if episode == "" {
+		episode = flow.EpisodeNumber(job.EpisodeDir)
+	}
 	return &model.JobPayload{
 		ID:     job.ID,
 		Script: script,
 		Vars: map[string]string{
-			"series": job.Series, "episode": job.Episode,
+			"series": job.Series, "episode": episode,
 			"episode_dir": job.EpisodeDir, "script_type": job.ScriptType,
+			// Expected mux artifact so the agent can verify/report the real
+			// output file instead of the episode directory itself.
+			"expected_output": flow.OutputName(job.Series, episode, vars.Tag),
 		},
 		Flow: fl.Name,
 	}, nil

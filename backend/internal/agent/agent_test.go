@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -214,5 +217,103 @@ func TestHeartbeatLoopTalksToController(t *testing.T) {
 	<-done
 	if beats.Load() < 2 {
 		t.Fatalf("heartbeats = %d, want >= 2", beats.Load())
+	}
+}
+
+// Regression (adversarial review): bumpCounter/TasksSinceBoot are mutex-safe
+// under concurrent use — the counter gates the reboot safety limit.
+func TestCounterConcurrencySafe(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{ControllerURL: "http://x", NodeName: "n", DataDir: dir}
+	cfg.Token = nodeTok()
+	a, _ := New(cfg, "v", testLog())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); a.bumpCounter() }()
+	}
+	wg.Wait()
+	if got := a.TasksSinceBoot(); got != 50 {
+		t.Fatalf("counter = %d, want 50 (lost increments = racy RMW)", got)
+	}
+}
+
+// Regression: the reboot counter must NOT reset when the reboot command fails
+// (resetting first would defeat the task-limit mechanism on failure).
+func TestFailedRebootKeepsCounter(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{ControllerURL: "http://x", NodeName: "n", DataDir: dir}
+	cfg.Token = nodeTok()
+	a, _ := New(cfg, "v", testLog())
+	a.bumpCounter()
+	a.bumpCounter()
+
+	a.handleReboot(30) // shutdown not found on this host -> command fails
+
+	if got := a.TasksSinceBoot(); got != 2 {
+		t.Fatalf("counter after failed reboot = %d, want 2 (must not reset on failure)", got)
+	}
+}
+
+// Regression: update payloads with a checksum mismatch must be refused.
+func TestUpdateRefusesChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	// Serve a lib payload whose hash does NOT match the manifest.
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lib") {
+			w.Write([]byte("tampered lib content"))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer controller.Close()
+
+	cfg := Config{ControllerURL: controller.URL, NodeName: "n", DataDir: dir,
+		LibPath: filepath.Join(dir, "EncodeLib.ps1")}
+	cfg.Token = nodeTok()
+	os.WriteFile(cfg.LibPath, []byte("# original"), 0o644)
+	a, _ := New(cfg, "v", testLog())
+
+	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: strings.Repeat("0", 64)})
+
+	// The original lib must be untouched and the version not advanced.
+	if b, _ := os.ReadFile(cfg.LibPath); string(b) != "# original" {
+		t.Fatalf("lib replaced despite checksum mismatch: %s", b)
+	}
+	if a.LibVersion == 2 {
+		t.Fatal("lib version advanced despite refused install")
+	}
+}
+
+// Regression: matching checksum installs the payload.
+func TestUpdateAcceptsMatchingChecksum(t *testing.T) {
+	dir := t.TempDir()
+	payload := "new lib content"
+	sum := sha256.Sum256([]byte(payload))
+	wantHash := hex.EncodeToString(sum[:])
+
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lib") {
+			w.Write([]byte(payload))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer controller.Close()
+
+	cfg := Config{ControllerURL: controller.URL, NodeName: "n", DataDir: dir,
+		LibPath: filepath.Join(dir, "EncodeLib.ps1")}
+	cfg.Token = nodeTok()
+	os.WriteFile(cfg.LibPath, []byte("# original"), 0o644)
+	a, _ := New(cfg, "v", testLog())
+
+	a.handleUpdate(model.UpdateManifest{LibVersion: 3, LibSHA256: wantHash})
+
+	if b, _ := os.ReadFile(cfg.LibPath); string(b) != payload {
+		t.Fatalf("lib not installed with valid checksum: %s", b)
+	}
+	if a.LibVersion != 3 {
+		t.Fatalf("lib version = %d, want 3", a.LibVersion)
 	}
 }

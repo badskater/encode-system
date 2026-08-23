@@ -20,14 +20,14 @@ export function nodeBadge(status: NodeStatus, online: boolean) {
   return <span className={`badge ${cls}`}>{status}</span>;
 }
 
-export function fmtTime(iso?: string) {
+export function fmtTime(iso?: string | null) {
   if (!iso) return '—';
   const d = new Date(iso.endsWith('Z') || iso.includes('T') ? iso : iso + 'Z');
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString();
 }
 
-export function timeAgo(iso?: string) {
+export function timeAgo(iso?: string | null) {
   if (!iso) return 'never';
   const d = new Date(iso.endsWith('Z') || iso.includes('T') ? iso : iso + 'Z');
   if (Number.isNaN(d.getTime())) return iso;

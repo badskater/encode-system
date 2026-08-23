@@ -33,7 +33,7 @@ export interface Node {
   lib_version: number;
   tasks_since_boot: number;
   reboot_pending: boolean;
-  last_seen: string;
+  last_seen: string | null;
   last_error?: string;
   online?: boolean;
 }
@@ -54,8 +54,8 @@ export interface Job {
   log_tail?: string;
   outputs?: string[];
   created_at: string;
-  started_at?: string;
-  finished_at?: string;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface Settings {

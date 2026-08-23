@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 
+
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 
@@ -60,6 +61,15 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	if _, err := os.Stat(s.libPath()); err != nil {
 		return model.UpdateManifest{}, false
 	}
+	// Recompute hashes from what is actually on disk: if a payload was
+	// replaced or tampered with after publish, agents must receive the real
+	// hash, not a stale recorded one.
+	if h, err := fileSHA256(s.agentPath()); err == nil {
+		m.AgentSHA256 = h
+	}
+	if h, err := fileSHA256(s.libPath()); err == nil {
+		m.LibSHA256 = h
+	}
 	return m, true
 }
 
@@ -71,47 +81,57 @@ func (s *Store) Manifest() model.UpdateManifest {
 }
 
 // PublishAgent stores a new agent binary and bumps the manifest version.
+// The whole write-hash-rename-persist sequence runs under the lock so two
+// concurrent publishes cannot interleave on the same temp path.
 func (s *Store) PublishAgent(version string, r io.Reader) error {
-	tmp := s.agentPath() + ".tmp"
-	if err := writeFileHashing(tmp, r); err != nil {
-		return err
-	}
-	hash, err := fileSHA256(tmp)
-	if err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, s.agentPath()); err != nil {
-		return fmt.Errorf("install agent payload: %w", err)
-	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	hash, err := installPayload(s.agentPath(), r)
+	if err != nil {
+		return fmt.Errorf("publish agent: %w", err)
+	}
 	s.manifest.AgentVersion = version
 	s.manifest.AgentSHA256 = hash
-	m := s.manifest
-	s.mu.Unlock()
-	return s.persist(m)
+	return s.persistLocked()
 }
 
 // PublishLib stores a new EncodeLib.ps1 and bumps its version counter.
 func (s *Store) PublishLib(version int64, r io.Reader) error {
-	tmp := s.libPath() + ".tmp"
-	if err := writeFileHashing(tmp, r); err != nil {
-		return err
-	}
-	hash, err := fileSHA256(tmp)
-	if err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, s.libPath()); err != nil {
-		return fmt.Errorf("install lib payload: %w", err)
-	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	hash, err := installPayload(s.libPath(), r)
+	if err != nil {
+		return fmt.Errorf("publish lib: %w", err)
+	}
 	s.manifest.LibVersion = version
 	s.manifest.LibSHA256 = hash
-	m := s.manifest
-	s.mu.Unlock()
-	return s.persist(m)
+	return s.persistLocked()
+}
+
+// installPayload writes r to a unique temp file next to dest, hashes it, and
+// atomically renames it into place. The temp file is always cleaned up.
+func installPayload(dest string, r io.Reader) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(dest), filepath.Base(dest)+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp payload: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after successful rename
+	if _, err := io.Copy(tmp, r); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("write payload: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	hash, err := fileSHA256(tmpName)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return "", fmt.Errorf("install payload: %w", err)
+	}
+	return hash, nil
 }
 
 // AgentPayload opens the stored agent binary for serving.
@@ -145,10 +165,24 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (s *Store) persist(m model.UpdateManifest) error {
-	b, err := json.Marshal(m)
+// persistLocked writes manifest.json atomically (tmp + rename). Caller holds s.mu.
+func (s *Store) persistLocked() error {
+	b, err := json.Marshal(s.manifest)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.versionPath(), b, 0o644)
+	tmp, err := os.CreateTemp(s.dir, "manifest.json.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, s.versionPath())
 }

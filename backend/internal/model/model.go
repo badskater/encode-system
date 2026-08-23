@@ -70,6 +70,9 @@ type Node struct {
 	LibVersion     int64      `json:"lib_version"`
 	TasksSinceBoot int        `json:"tasks_since_boot"`
 	RebootPending  bool       `json:"reboot_pending"`
+	// RebootIssuedAtTasks snapshots the counter when the reboot instruction
+	// was issued. A heartbeat reporting fewer tasks proves the node rebooted.
+	RebootIssuedAtTasks int    `json:"-"`
 	LastSeen       *time.Time `json:"last_seen,omitempty"`
 	LastError      string     `json:"last_error,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
@@ -82,6 +85,7 @@ type Job struct {
 	Episode    string    `json:"episode"` // e.g. "01"
 	EpisodeDir string    `json:"episode_dir"` // path relative to scripts share, e.g. "Series Name/Ep 01"
 	ScriptType string    `json:"script_type"` // "avs" or "vpy"
+	ScriptFile string    `json:"script_file"` // detected filter script, e.g. "1080.vpy"
 	FlowID     int64     `json:"flow_id"`
 	Status     JobStatus `json:"status"`
 	NodeID     int64     `json:"node_id,omitempty"`

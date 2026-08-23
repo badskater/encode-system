@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // mkEp creates <root>/<series>/<ep>/ with the given files.
@@ -24,7 +25,7 @@ func TestScanFindsReadyEpisode(t *testing.T) {
 	root := t.TempDir()
 	mkEp(t, root, "Ookami-san", "Ep 01", "src.m2ts", "1080.vpy")
 
-	cands, err := Scan(root)
+	cands, _, err := Scan(root, 0)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -44,7 +45,7 @@ func TestScanSkipsFolderMissingScript(t *testing.T) {
 	root := t.TempDir()
 	mkEp(t, root, "S", "Ep 01", "src.m2ts") // no filter script yet (mid-copy)
 
-	cands, err := Scan(root)
+	cands, _, err := Scan(root, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +58,7 @@ func TestScanSkipsFolderMissingSource(t *testing.T) {
 	root := t.TempDir()
 	mkEp(t, root, "S", "Ep 01", "1080.avs") // script only, source not copied
 
-	cands, _ := Scan(root)
+	cands, _, _ := Scan(root, 0)
 	if len(cands) != 0 {
 		t.Fatalf("folder without source must be skipped: %+v", cands)
 	}
@@ -67,7 +68,7 @@ func TestScanPrefersCanonical1080Script(t *testing.T) {
 	root := t.TempDir()
 	mkEp(t, root, "S", "Ep 01", "src.mkv", "backup.avs", "1080.avs")
 
-	cands, _ := Scan(root)
+	cands, _, _ := Scan(root, 0)
 	if len(cands) != 1 {
 		t.Fatalf("want 1 candidate: %+v", cands)
 	}
@@ -81,7 +82,7 @@ func TestScanMultipleSeriesSorted(t *testing.T) {
 	mkEp(t, root, "Zebra", "Ep 02", "src.ts", "1080.vpy")
 	mkEp(t, root, "Alpha", "Ep 01", "src.m2ts", "1080.avs")
 
-	cands, _ := Scan(root)
+	cands, _, _ := Scan(root, 0)
 	if len(cands) != 2 {
 		t.Fatalf("want 2 candidates: %+v", cands)
 	}
@@ -98,7 +99,7 @@ func TestScanIgnoresTopLevelFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "stray.m2ts"), []byte("x"), 0o644)
 	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.vpy")
 
-	cands, _ := Scan(root)
+	cands, _, _ := Scan(root, 0)
 	if len(cands) != 1 {
 		t.Fatalf("top-level files must be ignored: %+v", cands)
 	}
@@ -106,7 +107,7 @@ func TestScanIgnoresTopLevelFiles(t *testing.T) {
 
 func TestScanEmptyRoot(t *testing.T) {
 	root := t.TempDir()
-	cands, err := Scan(root)
+	cands, _, err := Scan(root, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,85 @@ func TestScanEmptyRoot(t *testing.T) {
 }
 
 func TestScanMissingRootErrors(t *testing.T) {
-	if _, err := Scan(filepath.Join(t.TempDir(), "nope")); err == nil {
+	if _, _, err := Scan(filepath.Join(t.TempDir(), "nope"), 0); err == nil {
 		t.Fatal("expected error for missing root")
+	}
+}
+
+// Regression: a source modified within the stability window is deferred so
+// jobs are never created against a file still copying over NFS.
+func TestScanDefersUnstableSource(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.vpy") // mtime = now
+
+	cands, _, err := Scan(root, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("fresh source must be deferred: %+v", cands)
+	}
+
+	// Age the source beyond the window -> becomes ready.
+	past := time.Now().Add(-10 * time.Minute)
+	os.Chtimes(filepath.Join(root, "S", "Ep 01", "src.m2ts"), past, past)
+	cands, _, err = Scan(root, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("aged source must be ready: %+v", cands)
+	}
+}
+
+// Regression: a leftover mux output .mkv must not be mistaken for a source
+// when the real source is gone... but a lone .mkv is still accepted as a
+// fallback source (some workflows encode from MKV containers).
+func TestScanSourceSelectionPriority(t *testing.T) {
+	root := t.TempDir()
+	// Folder with both a real .m2ts source and a mux-output .mkv: the .m2ts
+	// must win as the source.
+	mkEp(t, root, "S", "Ep 01", "src.m2ts", "S - 01 [1080p].mkv", "1080.vpy")
+	cands, _, _ := Scan(root, 0)
+	if len(cands) != 1 || cands[0].SourceFile != "src.m2ts" {
+		t.Fatalf(".m2ts must outrank mux output .mkv: %+v", cands)
+	}
+
+	// Folder with only an .mkv and a script: accepted as fallback source.
+	mkEp(t, root, "S", "Ep 02", "source.mkv", "1080.vpy")
+	cands, _, _ = Scan(root, 0)
+	if len(cands) != 2 {
+		t.Fatalf("want 2 candidates: %+v", cands)
+	}
+}
+
+// Regression: 1080.vpy beats other scripts deterministically.
+func TestScanScriptPreference(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.avs", "1080.vpy", "extra.avs")
+	cands, _, _ := Scan(root, 0)
+	if len(cands) != 1 || cands[0].ScriptFile != "1080.vpy" || cands[0].ScriptType != "vpy" {
+		t.Fatalf("1080.vpy must win: %+v", cands)
+	}
+}
+
+// Regression: skipped/unreadable dirs are reported, not swallowed silently.
+func TestScanReportsSkippedDirs(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.vpy")
+	bad := filepath.Join(root, "Broken")
+	os.MkdirAll(filepath.Join(bad, "Ep 01"), 0o755)
+	os.Chmod(bad, 0o000)
+	t.Cleanup(func() { os.Chmod(bad, 0o755) })
+
+	cands, skipped, err := Scan(root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("good series must survive: %+v", cands)
+	}
+	if skipped == 0 {
+		t.Fatal("unreadable series dir must be counted as skipped")
 	}
 }

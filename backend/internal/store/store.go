@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   lib_version INTEGER NOT NULL DEFAULT 0,
   tasks_since_boot INTEGER NOT NULL DEFAULT 0,
   reboot_pending INTEGER NOT NULL DEFAULT 0,
+  reboot_issued_at_tasks INTEGER NOT NULL DEFAULT 0,
   last_seen TEXT,
   last_error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -95,7 +97,20 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// Schema v1 -> v1.1: add reboot_issued_at_tasks to databases created
+	// before this column existed. Tolerant of the already-migrated case.
+	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN reboot_issued_at_tasks INTEGER NOT NULL DEFAULT 0`); err != nil {
+		// duplicate column name => already migrated; anything else is fatal
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate nodes.reboot_issued_at_tasks: %w", err)
+		}
+	}
 	return nil
+}
+
+// isDuplicateColumnErr reports the SQLite "duplicate column" error shape.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column")
 }
 
 func parseTime(s string) time.Time {
@@ -156,14 +171,14 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
+  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
+  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
 
@@ -173,7 +188,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	var lastSeen sql.NullString
 	var createdAt string
 	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
-		&n.LibVersion, &n.TasksSinceBoot, &reboot, &lastSeen, &n.LastError, &createdAt)
+		&n.LibVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &lastSeen, &n.LastError, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +204,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, last_seen, last_error, created_at FROM nodes ORDER BY name`)
+  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, last_seen, last_error, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +216,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		var lastSeen sql.NullString
 		var createdAt string
 		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
-			&n.LibVersion, &n.TasksSinceBoot, &reboot, &lastSeen, &n.LastError, &createdAt); err != nil {
+			&n.LibVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &lastSeen, &n.LastError, &createdAt); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled == 1
@@ -218,16 +233,16 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 // UpdateNode persists mutable node fields after a heartbeat or UI action.
 func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
-  lib_version=?, tasks_since_boot=?, reboot_pending=?, last_seen=?, last_error=? WHERE id=?`,
+  lib_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, last_seen=?, last_error=? WHERE id=?`,
 		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.TasksSinceBoot,
-		boolToInt(n.RebootPending), fmtPtrTime(n.LastSeen), n.LastError, n.ID)
+		boolToInt(n.RebootPending), n.RebootIssuedAtTasks, fmtPtrTime(n.LastSeen), n.LastError, n.ID)
 	return err
 }
 
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
+  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
 
@@ -547,6 +562,18 @@ func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job,
 func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='idle' WHERE id=?`, nodeID)
 	return err
+}
+
+// CancelJob marks a pending/assigned job cancelled and returns rows affected.
+// Terminal and running jobs are refused so the lifecycle cannot regress.
+func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status='cancelled', finished_at=datetime('now') WHERE id=? AND status IN ('pending','assigned')`,
+		id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // RetryJob re-queues a failed/cancelled job as pending on no node. It returns

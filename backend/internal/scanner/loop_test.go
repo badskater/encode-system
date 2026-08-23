@@ -4,7 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
@@ -34,6 +37,11 @@ func TestScanOnceCreatesJobsForNewEpisodesOnly(t *testing.T) {
 	root := t.TempDir()
 	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.vpy")
 	mkEp(t, root, "S", "Ep 02", "src.m2ts", "1080.avs")
+	// Age sources past the stability gate so they count as ready.
+	past := time.Now().Add(-10 * time.Minute)
+	for _, ep := range []string{"Ep 01", "Ep 02"} {
+		os.Chtimes(filepath.Join(root, "S", ep, "src.m2ts"), past, past)
+	}
 
 	st := &fakeStore{
 		existing: map[string]bool{"S/Ep 01": true}, // Ep 01 already has a job
@@ -54,16 +62,26 @@ func TestScanOnceCreatesJobsForNewEpisodesOnly(t *testing.T) {
 	}
 }
 
-func TestEpTokenStripsPrefix(t *testing.T) {
-	cases := map[string]string{
-		"Ep 01": "01", "Ep 12": "12", "Ep01": "Ep01", "Finale": "Finale",
+// Episode extraction is unified on flow.EpisodeNumber (no second
+// implementation in the loop to drift out of sync).
+func TestLoopUsesFlowEpisodeNumber(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 03", "src.m2ts", "1080.vpy")
+	// Age the source past the stability gate.
+	past := time.Now().Add(-10 * time.Minute)
+	os.Chtimes(filepath.Join(root, "S", "Ep 03", "src.m2ts"), past, past)
+
+	st := &fakeStore{existing: map[string]bool{}, flow: &model.Flow{ID: 1, Name: "default-1080"}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	scanOnce(context.Background(), log, st, root, "default-1080")
+
+	if len(st.created) != 1 {
+		t.Fatalf("want 1 job, got %d", len(st.created))
 	}
-	for in, want := range cases {
-		if got := epToken(in); got != want {
-			t.Errorf("epToken(%q) = %q, want %q", in, got, want)
-		}
+	if st.created[0].Episode != "03" {
+		t.Errorf("episode = %q, want 03 via flow.EpisodeNumber", st.created[0].Episode)
 	}
-	if got := episodeFromDir("Series/Ep 03"); got != "03" {
-		t.Errorf("episodeFromDir = %q", got)
+	if st.created[0].ScriptFile != "1080.vpy" {
+		t.Errorf("script file not persisted on job: %+v", st.created[0])
 	}
 }

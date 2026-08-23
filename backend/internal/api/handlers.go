@@ -32,7 +32,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	}
 	ctx := r.Context()
 
-	// 1. Persist node state from the report.
+	// 1. Persist node state from the report. prevTasks is the counter from the
+	// previous heartbeat — the agent counter only ever increases within a
+	// boot, so a decrease proves the node came back from a reboot.
+	prevTasks := node.TasksSinceBoot
 	node.AgentVersion = hb.AgentVersion
 	node.LibVersion = hb.LibVersion
 	node.TasksSinceBoot = hb.TasksSinceBoot
@@ -43,11 +46,30 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	hasActiveJob := false
 	if hb.JobID > 0 {
 		if job, err := s.Store.GetJob(ctx, hb.JobID); err == nil && job != nil && !job.Status.Terminal() {
-			hasActiveJob = true
-			if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(hb.JobStatus), hb.Step, hb.StepProgress, hb.LogTail); err != nil {
-				s.Log.Warn("update job status", "err", err, "job", job.ID)
+			// Ownership check: a node may only report on its own job. Without
+			// this, one node could overwrite or terminate another node's job.
+			if job.NodeID != node.ID {
+				s.Log.Warn("heartbeat reported foreign job", "node", node.Name,
+					"job", job.ID, "owner", job.NodeID)
+			} else {
+				hasActiveJob = true
+				if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(hb.JobStatus), hb.Step, hb.StepProgress, hb.LogTail); err != nil {
+					s.Log.Warn("update job status", "err", err, "job", job.ID)
+				}
 			}
 		}
+	}
+
+	// Post-reboot recovery: the counter DECREASED since the last heartbeat,
+	// which only happens when the agent reset it while processing the reboot
+	// instruction (it never decreases within a boot). Clear the flag so the
+	// node rejoins the pool. While the flag is set and no decrease is seen,
+	// the reboot instruction keeps being re-issued below — a missed packet
+	// self-heals on the next heartbeat.
+	if node.RebootPending && !hasActiveJob && node.TasksSinceBoot < prevTasks {
+		node.RebootPending = false
+		s.Log.Info("node returned after reboot", "node", node.Name,
+			"tasks", node.TasksSinceBoot, "previous", prevTasks)
 	}
 	if hasActiveJob {
 		node.Status = model.NodeBusy
@@ -67,26 +89,37 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		return
 	}
 
-	// 2. Offer updates while idle.
+	// 2. Reboot enforcement comes BEFORE updates: a node at its task limit is
+	//    health-critical and must not be blocked behind an update the node
+	//    hasn't applied yet. The instruction is re-issued on every idle
+	//    heartbeat while the flag is set, so a missed packet self-heals.
+	if !hasActiveJob && node.TasksSinceBoot >= s.Cfg.TasksBeforeReboot {
+		if !node.RebootPending {
+			node.RebootPending = true
+			node.RebootIssuedAtTasks = node.TasksSinceBoot
+			node.Status = model.NodeReboot
+			if err := s.Store.UpdateNode(ctx, node); err != nil {
+				writeErr(w, http.StatusInternalServerError, "persist reboot flag")
+				return
+			}
+			s.Log.Info("node reached task limit, issuing reboot", "node", node.Name,
+				"tasks", node.TasksSinceBoot, "limit", s.Cfg.TasksBeforeReboot)
+		}
+		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "reboot", RebootDelay: 30})
+		return
+	}
+	if !hasActiveJob && node.RebootPending {
+		// Manual reboot or pending flag from a previous cycle: keep issuing.
+		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "reboot", RebootDelay: 30})
+		return
+	}
+
+	// 3. Offer updates while idle.
 	m := s.Update.Manifest()
 	needsAgent := m.AgentVersion != "" && m.AgentVersion != node.AgentVersion
 	needsLib := m.LibVersion > 0 && m.LibVersion != node.LibVersion
 	if !hasActiveJob && (needsAgent || needsLib) {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "update", Update: &m})
-		return
-	}
-
-	// 3. Enforce reboot-after-N-tasks when idle.
-	if !hasActiveJob && !node.RebootPending && node.TasksSinceBoot >= s.Cfg.TasksBeforeReboot {
-		node.RebootPending = true
-		node.Status = model.NodeReboot
-		if err := s.Store.UpdateNode(ctx, node); err != nil {
-			writeErr(w, http.StatusInternalServerError, "persist reboot flag")
-			return
-		}
-		s.Log.Info("node reached task limit, issuing reboot", "node", node.Name,
-			"tasks", node.TasksSinceBoot, "limit", s.Cfg.TasksBeforeReboot)
-		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "reboot", RebootDelay: 30})
 		return
 	}
 
@@ -178,6 +211,12 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		writeErr(w, http.StatusForbidden, "job belongs to another node")
 		return
 	}
+	// Idempotency: agents retry completions after timeouts; a job already in
+	// a terminal state is answered with the recorded status, not re-finished.
+	if job.Status.Terminal() {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already_recorded"})
+		return
+	}
 	status := model.JobDone
 	if rep.Status != "done" {
 		status = model.JobFailed
@@ -200,7 +239,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request, _ *model
 }
 
 // handleDownloadAgent streams the stored agent binary.
-func (s *Server) handleDownloadAgent(w http.ResponseWriter, _ *http.Request, _ *model.Node) {
+func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request, _ *model.Node) {
 	f, err := s.Update.AgentPayload()
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "no agent payload published")
@@ -208,11 +247,13 @@ func (s *Server) handleDownloadAgent(w http.ResponseWriter, _ *http.Request, _ *
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, nil, "encode-agent.exe", time.Time{}, f)
+	// Passing the request enables Range/If-Range so interrupted downloads
+	// can resume instead of restarting from byte zero.
+	http.ServeContent(w, r, "encode-agent.exe", time.Time{}, f)
 }
 
 // handleDownloadLib streams the stored EncodeLib.ps1.
-func (s *Server) handleDownloadLib(w http.ResponseWriter, _ *http.Request, _ *model.Node) {
+func (s *Server) handleDownloadLib(w http.ResponseWriter, r *http.Request, _ *model.Node) {
 	f, err := s.Update.LibPayload()
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "no lib payload published")
@@ -220,7 +261,7 @@ func (s *Server) handleDownloadLib(w http.ResponseWriter, _ *http.Request, _ *mo
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	http.ServeContent(w, nil, "EncodeLib.ps1", time.Time{}, f)
+	http.ServeContent(w, r, "EncodeLib.ps1", time.Time{}, f)
 }
 
 // ---------- UI handlers ----------
@@ -316,6 +357,7 @@ func (s *Server) handleRebootNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	node.RebootPending = true
+	node.RebootIssuedAtTasks = node.TasksSinceBoot
 	node.Status = model.NodeReboot
 	if err := s.Store.UpdateNode(r.Context(), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "update node")
@@ -433,11 +475,21 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
 	}
-	if job.Status != model.JobPending {
-		writeErr(w, http.StatusConflict, "only pending jobs can be cancelled")
+	switch job.Status {
+	case model.JobPending:
+		// Pending jobs cancel directly.
+	case model.JobAssigned:
+		// Assigned but not yet running: cancel and free the node. A late
+		// completion from the agent is absorbed by the idempotency guard.
+		if err := s.Store.ReleaseNode(r.Context(), job.NodeID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "release node")
+			return
+		}
+	default:
+		writeErr(w, http.StatusConflict, "only pending/assigned jobs can be cancelled (running jobs must finish)")
 		return
 	}
-	if err := s.Store.UpdateJobStatus(r.Context(), id, model.JobCancelled, "", 0, ""); err != nil {
+	if _, err := s.Store.CancelJob(r.Context(), id); err != nil {
 		writeErr(w, http.StatusInternalServerError, "cancel job")
 		return
 	}
@@ -465,6 +517,10 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name and at least one step required")
 		return
 	}
+	// Server-controlled fields never come from the client.
+	req.ID = 0
+	req.CreatedAt = time.Time{}
+	req.UpdatedAt = time.Time{}
 	// Validate the flow renders before persisting it.
 	dummy := &model.Job{ID: 0, Series: "Validate", Episode: "01", EpisodeDir: "Validate/Ep 01", ScriptType: "vpy"}
 	if _, err := flow.Render(&req, dummy, flow.Vars{}); err != nil {
@@ -514,11 +570,16 @@ func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, existing)
 }
 
-// handleDeleteFlow removes a flow.
+// handleDeleteFlow removes a flow. The configured default flow is protected:
+// deleting it would break scanner job creation and new-job fallback.
 func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad flow id")
+		return
+	}
+	if existing, err := s.Store.GetFlow(r.Context(), id); err == nil && existing.Name == s.Cfg.DefaultFlowName {
+		writeErr(w, http.StatusConflict, "the default flow cannot be deleted")
 		return
 	}
 	if err := s.Store.DeleteFlow(r.Context(), id); err != nil {

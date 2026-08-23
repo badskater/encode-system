@@ -351,3 +351,157 @@ func TestNodeRegistrationViaAPI(t *testing.T) {
 }
 
 func itoa(i int64) string { return strconv.FormatInt(i, 10) }
+
+// Regression (adversarial review): the reboot instruction must be RE-ISSUED on
+// every idle heartbeat while the flag is set — a missed packet must not brick
+// the node forever.
+func TestRebootReissuedWhilePending(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	n.RebootPending = true
+	n.Status = model.NodeReboot
+	e.server.Store.UpdateNode(ctx, n)
+
+	for i := 0; i < 3; i++ {
+		_, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 0, 0))
+		var reply model.HeartbeatReply
+		json.Unmarshal(body, &reply)
+		if reply.Instruction != "reboot" {
+			t.Fatalf("heartbeat %d: want reboot re-issue, got %q (%s)", i, reply.Instruction, body)
+		}
+	}
+}
+
+// Regression: manual reboot via UI reaches the agent on next heartbeat.
+func TestManualRebootReachesAgent(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	resp, _ := doJSON(t, "POST", ts.URL+"/api/nodes/"+itoa(e.node.ID)+"/reboot", adminTok, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("manual reboot api: %d", resp.StatusCode)
+	}
+	_, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 0, 0))
+	var reply model.HeartbeatReply
+	json.Unmarshal(body, &reply)
+	if reply.Instruction != "reboot" {
+		t.Fatalf("want reboot after manual request, got %q", reply.Instruction)
+	}
+}
+
+// Regression: after a real reboot the agent's counter resets to 0 and the
+// controller must clear the flag so the node rejoins the pool.
+func TestPostRebootRecoveryClearsFlag(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	n.RebootPending = true
+	n.Status = model.NodeReboot
+	n.TasksSinceBoot = 10 // counter at the moment the reboot was issued
+	e.server.Store.UpdateNode(ctx, n)
+
+	// Agent comes back with a fresh counter after the reboot.
+	_, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 0, 0))
+	var reply model.HeartbeatReply
+	json.Unmarshal(body, &reply)
+	if reply.Instruction == "reboot" {
+		t.Fatal("node with reset counter must not keep receiving reboot")
+	}
+	n2, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	if n2.RebootPending {
+		t.Fatal("RebootPending must be cleared after reboot recovery")
+	}
+}
+
+// Regression: a node cannot update another node's job via heartbeat.
+func TestHeartbeatRejectsForeignJobStatus(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	other, _ := e.server.Store.CreateNode(ctx, "enc-02", auth.HashToken("otherval"))
+	fl, _ := e.server.Store.FlowByName(ctx, "default-1080")
+	job, _ := e.server.Store.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: fl.ID})
+	e.server.Store.AssignJob(ctx, job.ID, other.ID)
+
+	hb := heartbeat("enc-01", 0, job.ID)
+	hb.JobStatus = "failed"
+	doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, hb)
+
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobAssigned {
+		t.Fatalf("foreign node overwrote job status: %+v", got)
+	}
+}
+
+// Regression: duplicate completion reports are absorbed, not re-applied.
+func TestJobCompleteIdempotent(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	fl, _ := e.server.Store.FlowByName(ctx, "default-1080")
+	job, _ := e.server.Store.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: fl.ID})
+	e.server.Store.AssignJob(ctx, job.ID, e.node.ID)
+
+	rep := map[string]any{"status": "done", "exit_code": 0}
+	resp1, _ := doJSON(t, "POST", ts.URL+"/api/agent/job/"+itoa(job.ID)+"/complete", e.token, rep)
+	if resp1.StatusCode != 200 {
+		t.Fatal(resp1.StatusCode)
+	}
+	// Simulate an agent retry after a timeout — now the job is terminal.
+	rep2 := map[string]any{"status": "failed", "exit_code": 9, "error": "retry"}
+	resp2, body2 := doJSON(t, "POST", ts.URL+"/api/agent/job/"+itoa(job.ID)+"/complete", e.token, rep2)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("idempotent retry should 200, got %d", resp2.StatusCode)
+	}
+	if !bytes.Contains(body2, []byte("already_recorded")) {
+		t.Fatalf("expected already_recorded marker: %s", body2)
+	}
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobDone {
+		t.Fatalf("retry must not flip done -> failed: %+v", got)
+	}
+}
+
+// Regression: cancelling an assigned job frees its node.
+func TestCancelAssignedJobReleasesNode(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	fl, _ := e.server.Store.FlowByName(ctx, "default-1080")
+	job, _ := e.server.Store.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: fl.ID})
+	e.server.Store.AssignJob(ctx, job.ID, e.node.ID)
+
+	resp, _ := doJSON(t, "POST", ts.URL+"/api/jobs/"+itoa(job.ID)+"/cancel", adminTok, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("cancel assigned: %d", resp.StatusCode)
+	}
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobCancelled {
+		t.Fatalf("job not cancelled: %+v", got)
+	}
+	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	if n.Status != model.NodeIdle {
+		t.Fatalf("node not released after cancel: %+v", n)
+	}
+}
+
+// Regression: the default flow cannot be deleted through the API.
+func TestDeleteDefaultFlowRefused(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	def, _ := e.server.Store.FlowByName(ctx, "default-1080")
+	resp, _ := doJSON(t, "DELETE", ts.URL+"/api/flows/"+itoa(def.ID), adminTok, nil)
+	if resp.StatusCode != 409 {
+		t.Fatalf("deleting default flow must be refused, got %d", resp.StatusCode)
+	}
+}

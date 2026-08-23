@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,12 +111,24 @@ func (s *Server) Routes() http.Handler {
 	return logRequests(s.Log, mux)
 }
 
-// logRequests emits one structured log line per request.
+// statusRecorder captures the response code for the access log.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// logRequests emits one structured log line per request with the status.
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Info("http", "method", r.Method, "path", r.URL.Path,
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Info("http", "method", r.Method, "path", r.URL.Path, "status", rec.status,
 			"dur_ms", time.Since(start).Milliseconds(), "remote", r.RemoteAddr)
 	})
 }
@@ -131,6 +144,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func decodeJSON(r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
@@ -142,11 +156,16 @@ type ctxKey string
 
 const nodeCtxKey ctxKey = "node"
 
-// bearer extracts the token from an Authorization: Bearer header.
+// maxBodyBytes caps request bodies so a malicious or broken client cannot
+// exhaust controller memory with oversized JSON.
+const maxBodyBytes = 1 << 20 // 1 MiB
+
+// bearer extracts the token from an Authorization header (case-insensitive
+// scheme per RFC 7235).
 func bearer(r *http.Request) string {
 	h := r.Header.Get("Authorization")
-	if v, ok := strings.CutPrefix(h, "Bearer "); ok {
-		return strings.TrimSpace(v)
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
 	}
 	return ""
 }
@@ -170,10 +189,11 @@ func (s *Server) withNodeAuth(h func(http.ResponseWriter, *http.Request, *model.
 	}
 }
 
-// withAdmin requires the UI admin token.
+// withAdmin requires the UI admin token (constant-time compare).
 func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.Cfg.AdminToken == "" || bearer(r) != s.Cfg.AdminToken {
+		if s.Cfg.AdminToken == "" ||
+			subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.Cfg.AdminToken)) != 1 {
 			writeErr(w, http.StatusUnauthorized, "invalid admin token")
 			return
 		}

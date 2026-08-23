@@ -129,6 +129,22 @@ func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 	return err
 }
 
+// SetSeriesFlow updates ONLY the flow selection — field-scoped SQL so a
+// concurrent enable/disable patch cannot be clobbered by a stale full-row
+// read-modify-write.
+func (s *Store) SetSeriesFlow(ctx context.Context, id, flowID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET flow_id=?, updated_at=datetime('now') WHERE id=?`, flowID, id)
+	return err
+}
+
+// SetSeriesEnabled updates ONLY the enabled flag (same rationale).
+func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET enabled=?, updated_at=datetime('now') WHERE id=?`, boolToInt(enabled), id)
+	return err
+}
+
 // ---------- Flows: default management ----------
 
 // DefaultFlow returns the flow marked default, or an error when none exists.

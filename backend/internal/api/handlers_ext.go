@@ -61,6 +61,8 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "series not found")
 		return
 	}
+	// Field-scoped updates: each field is written by its own SQL statement,
+	// so two concurrent PATCHes touching different fields cannot lose writes.
 	if req.FlowID != nil {
 		if *req.FlowID != 0 {
 			if _, err := s.Store.GetFlow(ctx, *req.FlowID); err != nil {
@@ -68,13 +70,20 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		sr.FlowID = *req.FlowID
+		if err := s.Store.SetSeriesFlow(ctx, id, *req.FlowID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series flow")
+			return
+		}
 	}
 	if req.Enabled != nil {
-		sr.Enabled = *req.Enabled
+		if err := s.Store.SetSeriesEnabled(ctx, id, *req.Enabled); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series enabled")
+			return
+		}
 	}
-	if err := s.Store.UpdateSeries(ctx, sr); err != nil {
-		writeErr(w, http.StatusInternalServerError, "update series")
+	sr, err = s.Store.GetSeries(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "series not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, sr)

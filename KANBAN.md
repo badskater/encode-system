@@ -25,6 +25,15 @@ Mirror of the session task list. Move cards through columns as work lands.
   scanner, update store, agent, and EncodeLib.ps1: all findings adjudicated —
   fixed with regression tests, or rejected with reason. Three rounds; live
   smoke re-run after each round.
+- Phase-2 review round: 33 findings. Fixed: renderer PowerShell-injection
+  hardening (sanitized identifiers, comment-safe values, duplicate-function
+  refusal, validation parity), mandatory update checksums, lib swap deferred
+  while a job runs, atomic pairing validation before node creation, import
+  protection against template overwrite, bounded name-collision scan,
+  keyframes freshness, counter-write error surfacing, empty-credential
+  re-pairing. Residual risks documented in the handoff: agent binary
+  swap-sidecar timing on locked exe (re-offered on next publish), TLS not enforced on
+  http:// controller URLs (homelab, reverse proxy recommended).
 
 ## Done
 

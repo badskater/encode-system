@@ -72,7 +72,10 @@ type Node struct {
 	RebootPending  bool       `json:"reboot_pending"`
 	// RebootIssuedAtTasks snapshots the counter when the reboot instruction
 	// was issued. A heartbeat reporting fewer tasks proves the node rebooted.
-	RebootIssuedAtTasks int    `json:"-"`
+	RebootIssuedAtTasks int `json:"-"`
+	// RebootIssuedAt records when the instruction was issued; after a grace
+	// period the flag expires so a node cannot be locked out forever.
+	RebootIssuedAt *time.Time `json:"-"`
 	LastSeen       *time.Time `json:"last_seen,omitempty"`
 	LastError      string     `json:"last_error,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`

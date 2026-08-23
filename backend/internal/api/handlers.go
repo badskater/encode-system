@@ -68,8 +68,21 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// self-heals on the next heartbeat.
 	if node.RebootPending && !hasActiveJob && node.TasksSinceBoot < prevTasks {
 		node.RebootPending = false
+		node.RebootIssuedAt = nil
 		s.Log.Info("node returned after reboot", "node", node.Name,
 			"tasks", node.TasksSinceBoot, "previous", prevTasks)
+	}
+
+	// Grace-period expiry: a reboot attempt older than the grace window is
+	// reset so the threshold logic below starts a fresh attempt (or frees the
+	// node if its counter already reset). This guarantees no node can be
+	// locked out forever by a stuck flag or a lost issue timestamp.
+	if node.RebootPending && !hasActiveJob &&
+		(node.RebootIssuedAt == nil || time.Since(*node.RebootIssuedAt) > s.Cfg.RebootGracePeriod) {
+		node.RebootPending = false
+		node.RebootIssuedAt = nil
+		s.Log.Warn("reboot attempt expired, resetting", "node", node.Name,
+			"tasks", node.TasksSinceBoot)
 	}
 	if hasActiveJob {
 		node.Status = model.NodeBusy
@@ -97,6 +110,8 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		if !node.RebootPending {
 			node.RebootPending = true
 			node.RebootIssuedAtTasks = node.TasksSinceBoot
+			issued := now
+			node.RebootIssuedAt = &issued
 			node.Status = model.NodeReboot
 			if err := s.Store.UpdateNode(ctx, node); err != nil {
 				writeErr(w, http.StatusInternalServerError, "persist reboot flag")
@@ -358,6 +373,8 @@ func (s *Server) handleRebootNode(w http.ResponseWriter, r *http.Request) {
 	}
 	node.RebootPending = true
 	node.RebootIssuedAtTasks = node.TasksSinceBoot
+	issued := time.Now().UTC()
+	node.RebootIssuedAt = &issued
 	node.Status = model.NodeReboot
 	if err := s.Store.UpdateNode(r.Context(), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "update node")

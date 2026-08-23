@@ -31,6 +31,7 @@ type Config struct {
 	Group             string        // release group tag
 	Tag               string        // quality tag, e.g. 1080p
 	TasksBeforeReboot int           // reboot threshold (default 10)
+	RebootGracePeriod time.Duration // reboot attempt expires after this (default 10m)
 	StaleAfter        time.Duration // node offline after no heartbeat this long
 	DefaultFlowName   string        // flow used for auto-created jobs
 }
@@ -47,6 +48,9 @@ type Server struct {
 func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Server, error) {
 	if cfg.TasksBeforeReboot <= 0 {
 		cfg.TasksBeforeReboot = 10
+	}
+	if cfg.RebootGracePeriod <= 0 {
+		cfg.RebootGracePeriod = 10 * time.Minute
 	}
 	if cfg.StaleAfter <= 0 {
 		cfg.StaleAfter = 45 * time.Second

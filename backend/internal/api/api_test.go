@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -363,6 +364,8 @@ func TestRebootReissuedWhilePending(t *testing.T) {
 	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
 	n.RebootPending = true
 	n.Status = model.NodeReboot
+	issued := time.Now().UTC()
+	n.RebootIssuedAt = &issued // fresh attempt: must keep re-issuing
 	e.server.Store.UpdateNode(ctx, n)
 
 	for i := 0; i < 3; i++ {
@@ -503,5 +506,66 @@ func TestDeleteDefaultFlowRefused(t *testing.T) {
 	resp, _ := doJSON(t, "DELETE", ts.URL+"/api/flows/"+itoa(def.ID), adminTok, nil)
 	if resp.StatusCode != 409 {
 		t.Fatalf("deleting default flow must be refused, got %d", resp.StatusCode)
+	}
+}
+
+// Regression (live smoke): a node with a reboot flag but NO issue timestamp
+// (e.g. flag set by an older controller version) must not be locked out
+// forever — the grace-period expiry resets the attempt and, with a reset
+// counter, the node rejoins the pool and receives pending jobs.
+func TestStaleRebootFlagExpiresAndNodeRejoins(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	n.RebootPending = true
+	n.Status = model.NodeReboot
+	n.TasksSinceBoot = 0 // agent already reset its counter
+	n.RebootIssuedAt = nil
+	e.server.Store.UpdateNode(ctx, n)
+
+	// A pending job must be pickable once the flag expires.
+	fl, _ := e.server.Store.FlowByName(ctx, "default-1080")
+	job, _ := e.server.Store.CreateJob(ctx, &model.Job{Series: "S", Episode: "03", EpisodeDir: "S/Ep 03", ScriptType: "vpy", FlowID: fl.ID})
+
+	_, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 0, 0))
+	var reply model.HeartbeatReply
+	json.Unmarshal(body, &reply)
+	if reply.Instruction != "job" {
+		t.Fatalf("want job after stale reboot flag expires, got %q (%s)", reply.Instruction, body)
+	}
+	if reply.Job.ID != job.ID {
+		t.Fatalf("wrong job: %+v", reply.Job)
+	}
+	n2, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	if n2.RebootPending {
+		t.Fatal("stale reboot flag must be cleared")
+	}
+}
+
+// Regression: reboot attempt timestamp persists and blocks expiry while fresh.
+func TestRebootFlagHeldWithinGracePeriod(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	n, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	n.RebootPending = true
+	n.Status = model.NodeReboot
+	n.TasksSinceBoot = 10
+	issued := time.Now().UTC()
+	n.RebootIssuedAt = &issued // fresh attempt — must NOT expire
+	e.server.Store.UpdateNode(ctx, n)
+
+	_, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 10, 0))
+	var reply model.HeartbeatReply
+	json.Unmarshal(body, &reply)
+	if reply.Instruction != "reboot" {
+		t.Fatalf("fresh reboot attempt must keep issuing reboot, got %q", reply.Instruction)
+	}
+	n2, _ := e.server.Store.GetNode(ctx, e.node.ID)
+	if !n2.RebootPending {
+		t.Fatal("fresh reboot flag must persist")
 	}
 }

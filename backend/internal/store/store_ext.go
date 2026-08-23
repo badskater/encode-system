@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -183,6 +184,9 @@ func scanFlowV2(row *sql.Row) (*model.Flow, error) {
 // UpsertStepTemplate inserts a template by key or updates it when present.
 // Builtin templates are created at boot; custom templates come from the UI.
 func (s *Store) UpsertStepTemplate(ctx context.Context, t *model.StepTemplate) (*model.StepTemplate, error) {
+	if t.Params == nil {
+		t.Params = []model.ParamDef{} // never persist "null" — schema default is '[]'
+	}
 	pb, err := json.Marshal(t.Params)
 	if err != nil {
 		return nil, fmt.Errorf("marshal params: %w", err)
@@ -337,6 +341,29 @@ func scanPairing(row *sql.Row) (*model.PairingCode, error) {
 	return &p, nil
 }
 
+// PeekPairingCode validates a code without consuming it: unknown/expired/
+// used codes are reported distinctly, and transient DB errors propagate as
+// such instead of being disguised as auth failures.
+func (s *Store) PeekPairingCode(ctx context.Context, codeHash string) (*model.PairingCode, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`,
+		codeHash)
+	p, err := scanPairing(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("unknown pairing code")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read pairing code: %w", err)
+	}
+	if p.UsedBy != 0 {
+		return nil, fmt.Errorf("pairing code already used")
+	}
+	if time.Now().UTC().After(p.ExpiresAt) {
+		return nil, fmt.Errorf("pairing code expired")
+	}
+	return p, nil
+}
+
 // ConsumePairingCode atomically marks a code used by nodeID. It fails when
 // the code is unknown, expired, or already consumed (one-shot semantics).
 func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID int64) (*model.PairingCode, error) {
@@ -351,8 +378,11 @@ func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID 
 	err = tx.QueryRowContext(ctx,
 		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`,
 		codeHash).Scan(&p.ID, &p.CodeHash, &p.NameHint, &expires, &p.UsedBy, &createdAt)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("unknown pairing code")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read pairing code: %w", err)
 	}
 	p.ExpiresAt = parseTime(expires)
 	p.CreatedAt = parseTime(createdAt)

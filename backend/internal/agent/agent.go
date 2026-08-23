@@ -118,10 +118,14 @@ func (a *Agent) pairIfNeeded(ctx context.Context) error {
 	if a.Cfg.Token != "" {
 		return nil
 	}
-	if b, err := os.ReadFile(a.tokenPath()); err == nil && len(b) > 0 {
-		a.Cfg.Token = strings.TrimSpace(string(b))
-		a.Log.Info("loaded persisted node credential")
-		return nil
+	if b, err := os.ReadFile(a.tokenPath()); err == nil {
+		if tok := strings.TrimSpace(string(b)); tok != "" {
+			a.Cfg.Token = tok
+			a.Log.Info("loaded persisted node credential")
+			return nil
+		}
+		// Empty/whitespace-only file: treat as absent and re-pair below.
+		a.Log.Warn("persisted credential is empty, re-pairing")
 	}
 	if a.Cfg.PairingCode == "" {
 		return fmt.Errorf("no credential configured and no pairing code")
@@ -160,7 +164,11 @@ func (a *Agent) bumpCounter() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	n := a.readCounter() + 1
-	os.WriteFile(a.counterPath(), []byte(strconv.Itoa(n)), 0o644)
+	if err := os.WriteFile(a.counterPath(), []byte(strconv.Itoa(n)), 0o644); err != nil {
+		// A failed write would silently undercount tasks and defeat the
+		// reboot-after-N limit — surface it loudly instead.
+		a.Log.Error("task counter write failed", "err", err, "count", n)
+	}
 }
 
 func (a *Agent) resetCounter() {
@@ -500,14 +508,30 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// Update EncodeLib.ps1 when the controller's version is newer.
+	// Update EncodeLib.ps1 when the controller's version is newer. The
+	// manifest MUST carry a checksum — an update without one is refused
+	// outright (skipping verification would let a compromised controller
+	// achieve code execution on every node).
 	if m.LibVersion > 0 && m.LibVersion != a.LibVersion {
+		if m.LibSHA256 == "" {
+			a.Log.Error("lib update refused: manifest has no checksum")
+			return
+		}
+		a.mu.Lock()
+		busy := a.currentJob != nil
+		a.mu.Unlock()
+		if busy {
+			// Never swap the library under a running job: the next idle
+			// heartbeat re-offers the update.
+			a.Log.Info("lib update deferred: job running")
+			return
+		}
 		var buf limitedBuffer
 		if err := a.getAuth(ctx, "/api/agent/download/lib", &buf); err != nil {
 			a.Log.Error("download lib failed", "err", err)
 			return
 		}
-		if got := sha256Bytes(buf.Bytes()); m.LibSHA256 != "" && got != m.LibSHA256 {
+		if got := sha256Bytes(buf.Bytes()); got != m.LibSHA256 {
 			a.Log.Error("lib checksum mismatch, refusing install", "want", m.LibSHA256, "got", got)
 			return
 		}
@@ -524,14 +548,19 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 		a.Log.Info("EncodeLib.ps1 updated", "version", m.LibVersion)
 	}
 
-	// Update the agent binary when the controller's version differs.
+	// Update the agent binary when the controller's version differs. Same
+	// mandatory-checksum rule as the lib.
 	if m.AgentVersion != "" && m.AgentVersion != a.Version {
+		if m.AgentSHA256 == "" {
+			a.Log.Error("agent update refused: manifest has no checksum")
+			return
+		}
 		var buf limitedBuffer
 		if err := a.getAuth(ctx, "/api/agent/download/agent", &buf); err != nil {
 			a.Log.Error("download agent failed", "err", err)
 			return
 		}
-		if got := sha256Bytes(buf.Bytes()); m.AgentSHA256 != "" && got != m.AgentSHA256 {
+		if got := sha256Bytes(buf.Bytes()); got != m.AgentSHA256 {
 			a.Log.Error("agent checksum mismatch, refusing install", "want", m.AgentSHA256, "got", got)
 			return
 		}

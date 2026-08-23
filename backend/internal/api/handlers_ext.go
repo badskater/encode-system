@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
@@ -89,7 +90,11 @@ func (s *Server) handleSetDefaultFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.SetDefaultFlow(r.Context(), id); err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+		if strings.Contains(err.Error(), "not found") {
+			writeErr(w, http.StatusNotFound, "flow not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "set default flow")
 		return
 	}
 	fl, err := s.Store.GetFlow(r.Context(), id)
@@ -136,8 +141,30 @@ func (s *Server) handleExportFlow(w http.ResponseWriter, r *http.Request) {
 			exp.Templates = append(exp.Templates, t)
 		}
 	}
-	w.Header().Set("Content-Disposition", `attachment; filename="flow-`+fl.Name+`.json"`)
+	// Sanitize the filename: user-controlled flow names must not inject
+	// quotes/CR/LF into the response header.
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+exportFileName(fl.Name)+".json\"")
 	writeJSON(w, http.StatusOK, exp)
+}
+
+// exportFileName restricts a flow name to filename-safe characters for the
+// Content-Disposition header.
+func exportFileName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "flow"
+	}
+	return b.String()
 }
 
 // handleImportFlow accepts a flowExport JSON. Behavior:
@@ -157,9 +184,20 @@ func (s *Server) handleImportFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Install embedded custom templates first so validation can see them.
+	// An import NEVER overwrites an existing template with different content:
+	// other flows may reference it, and template bodies execute on agents.
+	// Identical re-imports (same key + same script) pass through as no-ops.
 	for _, t := range exp.Templates {
 		t.ID = 0
 		t.Builtin = false // imported templates are never built-ins
+		if existing, err := s.Store.StepTemplateByKey(ctx, t.Key); err == nil {
+			if existing.PowerShell != t.PowerShell {
+				writeErr(w, http.StatusConflict,
+					"template "+t.Key+" already exists with different content; delete or rename before importing")
+				return
+			}
+			continue
+		}
 		if _, err := s.Store.UpsertStepTemplate(ctx, t); err != nil {
 			writeErr(w, http.StatusBadRequest, "import template "+t.Key+": "+err.Error())
 			return
@@ -175,13 +213,20 @@ func (s *Server) handleImportFlow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Pick a free name.
+	// Pick a free name (bounded attempts; a hostile import cannot force an
+	// unbounded lookup loop).
 	name := exp.Flow.Name
-	for i := 2; ; i++ {
+	picked := false
+	for i := 2; i <= 50; i++ {
 		if _, err := s.Store.FlowByName(ctx, name); err != nil {
+			picked = true
 			break
 		}
 		name = exp.Flow.Name + "-" + strconv.Itoa(i)
+	}
+	if !picked {
+		writeErr(w, http.StatusConflict, "too many name collisions during import")
+		return
 	}
 	exp.Flow.ID = 0
 	exp.Flow.Name = name

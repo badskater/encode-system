@@ -97,6 +97,12 @@ func (s *Server) handleUpdateStepTemplate(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Updates must still define a function — the renderer invokes whatever
+	// the template declares, and a function-less script would panic render.
+	if psFuncNameRe.FindStringSubmatch(req.PowerShell) == nil {
+		writeErr(w, http.StatusBadRequest, "powershell must define a function")
+		return
+	}
 	if msg, ok := s.parsePowerShell(req.PowerShell); !ok {
 		writeErr(w, http.StatusBadRequest, "powershell: "+msg)
 		return
@@ -117,12 +123,12 @@ func (s *Server) handleDeleteStepTemplate(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "bad template id")
 		return
 	}
+	if _, err := s.Store.GetStepTemplate(r.Context(), id); err != nil {
+		writeErr(w, http.StatusNotFound, "template not found")
+		return
+	}
 	if err := s.Store.DeleteStepTemplate(r.Context(), id); err != nil {
-		if strings.Contains(err.Error(), "built-in") || strings.Contains(err.Error(), "used by") {
-			writeErr(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeErr(w, http.StatusNotFound, err.Error())
+		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -267,6 +273,15 @@ func (s *Server) handleAgentPair(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
+	// Validate the code BEFORE creating any node: an invalid/expired code
+	// must not leave residue, and a transient DB error must not be
+	// misreported as an auth failure with a rolled-back node.
+	codeHash := auth.HashToken(req.Code)
+	if _, err := s.Store.PeekPairingCode(ctx, codeHash); err != nil {
+		writeErr(w, http.StatusUnauthorized, "pairing code rejected: "+err.Error())
+		return
+	}
+
 	nodeToken, err := auth.NewToken()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "generate token")
@@ -277,11 +292,14 @@ func (s *Server) handleAgentPair(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "node name already registered")
 		return
 	}
-	pc, err := s.Store.ConsumePairingCode(ctx, auth.HashToken(req.Code), node.ID)
+	pc, err := s.Store.ConsumePairingCode(ctx, codeHash, node.ID)
 	if err != nil {
-		// Roll back the node creation so a bad code leaves no residue.
-		s.Store.DeleteNode(ctx, node.ID)
-		writeErr(w, http.StatusUnauthorized, "pairing code rejected: "+err.Error())
+		// Extremely unlikely (code validated above); roll back and surface
+		// the real error rather than an auth failure.
+		if derr := s.Store.DeleteNode(ctx, node.ID); derr != nil {
+			s.Log.Error("rollback node after failed pairing", "err", derr, "node", req.Name)
+		}
+		writeErr(w, http.StatusConflict, "pairing failed: "+err.Error())
 		return
 	}
 	s.Log.Info("node paired", "node", req.Name, "pairing_id", pc.ID)

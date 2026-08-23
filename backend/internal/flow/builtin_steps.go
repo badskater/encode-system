@@ -46,6 +46,7 @@ func sourceRenameTemplate() *model.StepTemplate {
     )
     Write-Output "ENCODE_STEP source_rename 0"
     $sourceName = if ($Params.source_name) { $Params.source_name } else { 'src' }
+    Assert-SafeName -Value $sourceName -What "source name"
     foreach ($ext in @('.m2ts', '.ts', '.mkv', '.mp4')) {
         $target = Join-Path $Job.EpisodeDir ($sourceName + $ext)
         if (Test-Path -LiteralPath $target) {
@@ -126,7 +127,7 @@ func audioTemplate() *model.StepTemplate {
     $opusenc = Resolve-Tool $Job.BinDir 'opusenc.exe'
     $src = Find-SourceFile $Job.EpisodeDir
     $wav = $Job.AudioFile
-    $opus = Join-Path $Job.EpisodeDir 'audio.opus'
+    $opus = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
 
     if ((Test-Path -LiteralPath $opus) -and ((Get-Item -LiteralPath $opus).LastWriteTime -gt (Get-Item -LiteralPath $src).LastWriteTime)) {
         Write-Output "audio.opus already present and newer than source, reusing"
@@ -203,7 +204,7 @@ func muxTemplate() *model.StepTemplate {
     Write-Output "ENCODE_STEP mux 0"
     $mkvmerge = Resolve-Tool $Job.BinDir 'mkvmerge.exe'
     $hevc = $Job.HevcFile
-    $audio = Join-Path $Job.EpisodeDir 'audio.opus'
+    $audio = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
     $out = Join-Path $Job.EpisodeDir $Job.OutputName
     foreach ($f in @($hevc, $audio)) {
         if (-not (Test-Path -LiteralPath $f)) { throw "mux input missing: $f" }
@@ -286,12 +287,16 @@ func keyframesTemplate() *model.StepTemplate {
     $destDir = Join-Path $Job.ReleaseDir $Job.ReleaseFolder
     $mkv = Join-Path $destDir $Job.OutputName
     $kf = Join-Path $destDir "$($Job.Series) - $($Job.Episode) Keyframes.txt"
-    if (Test-Path -LiteralPath $kf) {
-        Write-Output "keyframes file exists, skipping"
+    if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkv" }
+    if ((Test-Path -LiteralPath $kf) -and ((Get-Item -LiteralPath $kf).LastWriteTime -gt (Get-Item -LiteralPath $mkv).LastWriteTime)) {
+        Write-Output "keyframes file exists and is newer than the MKV, skipping"
         Write-Output "ENCODE_STEP keyframes 100"
         return
     }
-    if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkv" }
+    if (Test-Path -LiteralPath $kf) {
+        Write-Output "keyframes file is stale (older than MKV), regenerating"
+        Remove-Item -LiteralPath $kf -Force
+    }
 
     Write-Output "[keyframes] ffmpeg -> y4m -> SCXvid"
     # Local temp file (not the NFS release share); best-effort cleanup.

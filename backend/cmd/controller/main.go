@@ -69,6 +69,7 @@ func main() {
 		Tag:               env("ENCODE_TAG", "1080p"),
 		DefaultFlowName:   env("ENCODE_DEFAULT_FLOW", "default-1080"),
 		TasksBeforeReboot: envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
+		DiscordWebhook:    env("ENCODE_DISCORD_WEBHOOK", ""),
 	}
 
 	srv, err := api.New(st, up, log, cfg)
@@ -85,8 +86,10 @@ func main() {
 	go scanner.RunLoop(ctx, log, st, cfg.ScriptsRoot, cfg.DefaultFlowName, interval)
 
 	// Serve UI static files (built frontend) if present, then the API.
+	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes
+	// the SPA into /app/ui, keeping it out of the persistent volume).
 	mux := http.NewServeMux()
-	uiDir := filepath.Join(*dataDir, "ui")
+	uiDir := env("ENCODE_UI_DIR", filepath.Join(*dataDir, "ui"))
 	if fi, err := os.Stat(uiDir); err == nil && fi.IsDir() {
 		spa := spaHandler(uiDir)
 		mux.Handle("/", spa)

@@ -1,11 +1,12 @@
 # Controller image: multi-stage build compiles the Go controller, then serves
 # it with the pre-built frontend (if present in frontend/dist at build time).
 FROM golang:1.25-alpine AS backend
+ARG AGENT_VERSION=dev
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 COPY backend/ ./
-RUN CGO_ENABLED=0 go build -ldflags "-X main.Version=${AGENT_VERSION:-dev}" \
+RUN CGO_ENABLED=0 go build -ldflags "-X main.Version=${AGENT_VERSION}" \
     -o /out/controller ./cmd/controller
 
 FROM node:22-alpine AS frontend
@@ -23,8 +24,10 @@ COPY --from=backend /out/controller /app/controller
 COPY --from=frontend /src/dist /app/ui
 COPY powershell/EncodeLib.ps1 /app/seed/EncodeLib.ps1
 
-# Data dir: SQLite db, update payloads, UI. NFS shares mount under /data.
+# Data dir: SQLite db + update payloads (persistent). The SPA is baked into
+# /app/ui and served via ENCODE_UI_DIR, so it stays out of the data volume.
 ENV ENCODE_DATA=/data
+ENV ENCODE_UI_DIR=/app/ui
 VOLUME /data
 EXPOSE 8080
 USER encode

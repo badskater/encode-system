@@ -9,6 +9,9 @@ frontend/node_modules/
 .env
 .env.*
 docker/.env
+# ...but example templates are committed (they contain no secrets)
+!*.example
+!**/*.example
 infra/ansible/inventory*
 infra/ansible/group_vars/secrets.yml
 infra/ansible/files/bin/

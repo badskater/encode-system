@@ -18,7 +18,16 @@ cp .env.example .env   # set ADMIN_TOKEN, NODE CIDR/allowed names if needed
 docker compose up -d
 ```
 
-Compose mounts the NFS shares into `/data/scripts` and `/data/release` (see `docker/docker-compose.yml`). Controller state lives in `/data/state` (SQLite DB + update payloads).
+Compose mounts the NFS shares into `/data/scripts` and `/data/release` (see
+`docker/docker-compose.yml`). Controller state lives in the persistent
+`encode-state` volume mounted over the whole `/data` dir (SQLite DB at
+`/data/encode.db` + update payloads); the share mounts are layered on top as
+sub-mounts. The SPA is baked into the image at `/app/ui` (served via
+`ENCODE_UI_DIR`), so it stays out of the data volume.
+
+**First deploy?** Follow `Docs/md/FirstNodeDeploy.md` — a copy-paste runbook
+covering controller setup, toolchain staging, inventory, credentials
+(manual token or pairing code), and smoke verification.
 
 First-boot env:
 
@@ -56,6 +65,8 @@ Node credentials — two options:
   itself on first start and stores its own credential.
 
 ## Post-deploy validation
+
+See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:
 
 1. UI at `http://<controller>:8080` loads the dashboard with admin token.
 2. `GET /api/health` returns `ok`.

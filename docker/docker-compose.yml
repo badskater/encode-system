@@ -27,9 +27,12 @@ services:
       ENCODE_GROUP: ${ENCODE_GROUP:-OldFartsSubs}
       ENCODE_TAG: ${ENCODE_TAG:-1080p}
       ENCODE_DEFAULT_FLOW: ${ENCODE_DEFAULT_FLOW:-default-1080}
+      ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
     volumes:
-      # Controller state (SQLite DB + update payloads). Keep this persistent.
-      - encode-state:/data/state
+      # Controller state (SQLite DB + update payloads) — the WHOLE /data dir
+      # is persistent. The NFS share mounts below are sub-mounts layered on
+      # top, so scripts/release stay on the unRAID exports.
+      - encode-state:/data
       # NFS shares. Compose mounts these as NFS volumes (see below); the
       # container reads/writes the same files the Windows agents see.
       - encode-scripts:/data/scripts

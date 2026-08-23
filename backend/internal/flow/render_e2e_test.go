@@ -51,6 +51,12 @@ echo "x265 stub done"`,
 prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && : > "$a"; prev="$a"; done
 echo "mkvmerge stub done"`,
+		"ffmpeg.exe": `#!/usr/bin/env bash
+args=("$@"); : > "${args[${#args[@]}-1]}"
+echo "ffmpeg stub done"`,
+		"SCXvid.exe": `#!/usr/bin/env bash
+args=("$@"); : > "${args[${#args[@]}-1]}"
+echo "SCXvid stub done"`,
 	}
 	for name, body := range stubs {
 		p := filepath.Join(binDir, name)
@@ -65,7 +71,8 @@ echo "mkvmerge stub done"`,
 	os.WriteFile(filepath.Join(epDir, "src.m2ts"), []byte("fake"), 0o644)
 	os.WriteFile(filepath.Join(epDir, "1080.vpy"), []byte("# stub vs script"), 0o644)
 
-	// Flow without the keyframes step (its cmd.exe pipe is Windows-only).
+	// Full default flow including keyframes — regression test for the
+	// cmd.exe-only pipe bug (keyframes now uses a temp y4m file).
 	f := &model.Flow{Name: "e2e", Steps: []model.Step{
 		{Type: model.StepSourceRename, Params: map[string]string{"source_name": "src"}},
 		{Type: model.StepDGIndex},
@@ -73,6 +80,7 @@ echo "mkvmerge stub done"`,
 		{Type: model.StepEncode},
 		{Type: model.StepMux},
 		{Type: model.StepReleaseCopy},
+		{Type: model.StepKeyframes},
 	}}
 	j := &model.Job{ID: 42, Series: "Test Series", Episode: "01",
 		EpisodeDir: "Test Series/Ep 01", ScriptType: "vpy"}
@@ -113,6 +121,7 @@ echo "mkvmerge stub done"`,
 		"ENCODE_STEP encode",
 		"ENCODE_STEP mux",
 		"ENCODE_STEP release_copy",
+		"ENCODE_STEP keyframes",
 		"ENCODE_JOB_DONE",
 	} {
 		if !strings.Contains(text, want) {
@@ -128,6 +137,7 @@ echo "mkvmerge stub done"`,
 		filepath.Join(epDir, "1080.hevc"),
 		filepath.Join(epDir, "Test Series - 01 [1080p].mkv"),
 		releaseMkv,
+		filepath.Join(releaseDir, "[OldFartsSubs] Test Series - Raws [1080p]", "Test Series - 01 Keyframes.txt"),
 	} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("expected artifact missing: %s", p)

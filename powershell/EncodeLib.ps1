@@ -301,12 +301,19 @@ function Invoke-Keyframes {
     if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkv" }
 
     Write-Output "[keyframes] ffmpeg -> y4m -> SCXvid"
-    # PowerShell pipes don't stream binary well; use cmd for the pipe like the
-    # legacy script did, quoting every path.
-    $cmd = '"{0}" -i "{1}" -f yuv4mpegpipe -vf scale=640:360 -pix_fmt yuv420p -vsync drop -loglevel quiet - | "{2}" "{3}"' -f
-        $ffmpeg, $mkv, $scxvid, $kf
-    cmd.exe /c $cmd 2>&1 | ForEach-Object { Write-Output "[keyframes] $_" }
-    if ($LASTEXITCODE -ne 0) { throw "keyframes pipeline exited with code $LASTEXITCODE" }
+    # No cmd.exe pipe dependency: ffmpeg writes a downscaled y4m to a temp
+    # file, SCXvid reads it. Same output as the legacy pipe, and it works
+    # identically on Windows PowerShell and pwsh.
+    $y4m = Join-Path $destDir "$Series - $Episode.tmp.y4m"
+    try {
+        Invoke-Tool -ExePath $ffmpeg -Arguments @(
+            '-i', $mkv, '-f', 'yuv4mpegpipe', '-vf', 'scale=640:360',
+            '-pix_fmt', 'yuv420p', '-vsync', 'drop', '-loglevel', 'quiet', $y4m
+        ) -Label 'ffmpeg'
+        Invoke-Tool -ExePath $scxvid -Arguments @($y4m, $kf) -Label 'SCXvid'
+    } finally {
+        if (Test-Path -LiteralPath $y4m) { Remove-Item -LiteralPath $y4m -Force }
+    }
     if (-not (Test-Path -LiteralPath $kf)) { throw "SCXvid finished but $kf was not created" }
     Write-Output "ENCODE_STEP keyframes 100"
 }

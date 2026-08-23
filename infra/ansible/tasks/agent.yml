@@ -5,7 +5,13 @@
 #   powershell/EncodeLib.ps1
 # Copy them into files/agent/ before running (gitignored staging dir).
 #
-# Node tokens come from group_vars/secrets.yml (never committed).
+# Node credentials come from group_vars/secrets.yml (never committed), in one
+# of two forms:
+#   encode_node_tokens:   { <inventory_hostname>: "<permanent agent token>" }
+#   encode_pairing_codes: { <inventory_hostname>: "<one-shot pairing code>" }
+# With a pairing code the agent registers itself on first start and persists
+# its own credential; the code itself is consumed (single-use) by the
+# controller, so nothing long-lived secret needs to stay on the node.
 ---
 - name: Ensure agent directory exists
   ansible.windows.win_file:
@@ -23,31 +29,48 @@
     src: "{{ playbook_dir }}/files/agent/EncodeLib.ps1"
     dest: "{{ encode_agent_dir }}\\EncodeLib.ps1"
 
-- name: Resolve this node's agent token
+- name: Resolve this node's credentials (token or pairing code)
   ansible.builtin.set_fact:
     node_token: "{{ encode_node_tokens[inventory_hostname] | default('') }}"
+    node_pairing_code: "{{ encode_pairing_codes[inventory_hostname] | default('') }}"
 
-- name: Fail when the node token is missing
+- name: Fail when neither credential is configured
   ansible.builtin.assert:
-    that: node_token | length > 0
+    that: (node_token | length > 0) or (node_pairing_code | length > 0)
     fail_msg: >-
-      No agent token for {{ inventory_hostname }}. Register the node with the
-      controller (UI or POST /api/nodes) and add the token to
-      group_vars/secrets.yml under encode_node_tokens.
+      No credential for {{ inventory_hostname }}. Either register the node with
+      the controller and add its token under encode_node_tokens, or issue a
+      pairing code (UI, Nodes page) and add it under encode_pairing_codes in
+      group_vars/secrets.yml.
     quiet: true
+
+# agent.json is assembled as a dict and dumped to JSON: the credential key is
+# 'token' when a permanent token exists, otherwise 'pairing_code' for the
+# one-shot bootstrap. The agent persists its own credential after pairing.
+- name: Build agent.json content
+  ansible.builtin.set_fact:
+    agent_config: >-
+      {{
+        ({'controller_url': encode_controller_url,
+          'node_name': encode_node_name | default(inventory_hostname),
+          'token': node_token,
+          'data_dir': encode_agent_dir,
+          'lib_path': encode_agent_dir ~ '\\EncodeLib.ps1',
+          'heartbeat_seconds': encode_heartbeat_seconds}
+         if node_token else
+         {'controller_url': encode_controller_url,
+          'node_name': encode_node_name | default(inventory_hostname),
+          'pairing_code': node_pairing_code,
+          'data_dir': encode_agent_dir,
+          'lib_path': encode_agent_dir ~ '\\EncodeLib.ps1',
+          'heartbeat_seconds': encode_heartbeat_seconds})
+      }}
+  no_log: true
 
 - name: Write agent.json configuration
   ansible.windows.win_copy:
     dest: "{{ encode_agent_dir }}\\agent.json"
-    content: |
-      {
-        "controller_url": "{{ encode_controller_url }}",
-        "node_name": "{{ encode_node_name | default(inventory_hostname) }}",
-        "token": "{{ node_token }}",
-        "data_dir": "{{ encode_agent_dir }}",
-        "lib_path": "{{ encode_agent_dir }}\\EncodeLib.ps1",
-        "heartbeat_seconds": {{ encode_heartbeat_seconds }}
-      }
+    content: "{{ agent_config | to_nice_json }}"
   no_log: true
 
 - name: Install encode-agent Windows service

@@ -1,0 +1,67 @@
+# tasks/agent.yml — install the encode-agent Windows service.
+#
+# The agent binary + EncodeLib.ps1 ship from this repo's build output:
+#   backend/bin/encode-agent.exe  (cross-compiled)
+#   powershell/EncodeLib.ps1
+# Copy them into files/agent/ before running (gitignored staging dir).
+#
+# Node tokens come from group_vars/secrets.yml (never committed).
+---
+- name: Ensure agent directory exists
+  ansible.windows.win_file:
+    path: "{{ encode_agent_dir }}"
+    state: directory
+
+- name: Copy agent binary
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/files/agent/encode-agent.exe"
+    dest: "{{ encode_agent_dir }}\\encode-agent.exe"
+  register: agent_binary
+
+- name: Copy EncodeLib.ps1
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/files/agent/EncodeLib.ps1"
+    dest: "{{ encode_agent_dir }}\\EncodeLib.ps1"
+
+- name: Resolve this node's agent token
+  ansible.builtin.set_fact:
+    node_token: "{{ encode_node_tokens[inventory_hostname] | default('') }}"
+
+- name: Fail when the node token is missing
+  ansible.builtin.assert:
+    that: node_token | length > 0
+    fail_msg: >-
+      No agent token for {{ inventory_hostname }}. Register the node with the
+      controller (UI or POST /api/nodes) and add the token to
+      group_vars/secrets.yml under encode_node_tokens.
+    quiet: true
+
+- name: Write agent.json configuration
+  ansible.windows.win_copy:
+    dest: "{{ encode_agent_dir }}\\agent.json"
+    content: |
+      {
+        "controller_url": "{{ encode_controller_url }}",
+        "node_name": "{{ encode_node_name | default(inventory_hostname) }}",
+        "token": "{{ node_token }}",
+        "data_dir": "{{ encode_agent_dir }}",
+        "lib_path": "{{ encode_agent_dir }}\\EncodeLib.ps1",
+        "heartbeat_seconds": {{ encode_heartbeat_seconds }}
+      }
+  no_log: true
+
+- name: Install encode-agent Windows service
+  ansible.windows.win_service:
+    name: encode-agent
+    display_name: "encode-system agent"
+    description: "Encode farm worker: heartbeats to the controller and runs encode jobs."
+    path: "{{ encode_agent_dir }}\\encode-agent.exe -config {{ encode_agent_dir }}\\agent.json"
+    start_mode: auto
+    state: started
+  register: agent_service
+
+- name: Restart service when the binary changed
+  ansible.windows.win_service:
+    name: encode-agent
+    state: restarted
+  when: agent_binary is changed

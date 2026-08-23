@@ -1,0 +1,45 @@
+# tasks/bin-tools.yml — deploy the encode toolchain into C:\bin.
+#
+# Binaries are staged locally in files/bin/ (gitignored; copy them there before
+# running): DGIndexNV.exe, x265_x64.exe, mkvmerge.exe, ffmpeg.exe, eac3to.exe,
+# opusenc.exe, SCXvid.exe.
+---
+- name: Ensure C:\bin exists
+  ansible.windows.win_file:
+    path: "{{ encode_bin_dir }}"
+    state: directory
+
+- name: Copy encode toolchain
+  ansible.windows.win_copy:
+    src: "{{ encode_bin_staging_dir }}\\{{ item }}"
+    dest: "{{ encode_bin_dir }}\\{{ item }}"
+  loop:
+    - DGIndexNV.exe
+    - x265_x64.exe
+    - mkvmerge.exe
+    - ffmpeg.exe
+    - eac3to.exe
+    - opusenc.exe
+    - SCXvid.exe
+
+- name: Verify all tools are present on the node
+  ansible.windows.win_stat:
+    path: "{{ encode_bin_dir }}\\{{ item }}"
+  loop:
+    - DGIndexNV.exe
+    - x265_x64.exe
+    - mkvmerge.exe
+    - ffmpeg.exe
+    - eac3to.exe
+    - opusenc.exe
+    - SCXvid.exe
+  register: tool_stats
+
+- name: Fail if any tool is missing after copy
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing tool on node: {{ item.item }}"
+    quiet: true
+  loop: "{{ tool_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"

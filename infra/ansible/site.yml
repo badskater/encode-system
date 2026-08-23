@@ -1,0 +1,26 @@
+# site.yml — deploys encode-system to Windows Server 2025 encode nodes.
+#
+# Order matters: NFS client first (shares), then bin tools, then the agent
+# service. All plays are idempotent — safe to re-run after playbook updates.
+#
+# Usage:
+#   cp inventory.example inventory.yml        # fill real hosts/credentials
+#   cp group_vars/secrets.yml.example group_vars/secrets.yml
+#   ansible-playbook -i inventory.yml site.yml
+---
+- name: Deploy encode-system to Windows encode nodes
+  hosts: encode_nodes
+  gather_facts: true
+
+  tasks:
+    - name: Include NFS client play
+      ansible.builtin.import_tasks: tasks/nfs-client.yml
+      tags: [nfs-client]
+
+    - name: Include bin tools play
+      ansible.builtin.import_tasks: tasks/bin-tools.yml
+      tags: [bin-tools]
+
+    - name: Include agent play
+      ansible.builtin.import_tasks: tasks/agent.yml
+      tags: [agent]

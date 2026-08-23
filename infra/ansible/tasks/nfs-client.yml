@@ -1,0 +1,62 @@
+# tasks/nfs-client.yml — enable the Windows NFS client and mount both shares.
+#
+# Windows Server 2025 ships the NFS client as a feature (Services for NFS).
+# NFS mounts do NOT survive reboot, so a startup scheduled task remounts them.
+---
+- name: Install NFS client feature (Services for NFS)
+  ansible.windows.win_feature:
+    name: NFS-Clnt
+    include_sub_features: true
+    state: present
+
+- name: Create mount point directories
+  ansible.windows.win_file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ encode_scripts_mount }}"
+    - "{{ encode_release_mount }}"
+
+- name: Create agent directory (holds remount script and agent state)
+  ansible.windows.win_file:
+    path: "{{ encode_agent_dir }}"
+    state: directory
+
+- name: Write NFS remount script (used at startup and first run)
+  ansible.windows.win_copy:
+    dest: "{{ encode_agent_dir }}\\remount-nfs.ps1"
+    content: |
+      # Remount encode-system NFS shares. Idempotent: skips already-mounted paths.
+      $mounts = @{
+        '{{ encode_nfs_scripts_export }}' = '{{ encode_scripts_mount }}'
+        '{{ encode_nfs_release_export }}' = '{{ encode_release_mount }}'
+      }
+      foreach ($export in $mounts.Keys) {
+        $target = $mounts[$export]
+        $already = Get-CimInstance Win32_MappedLogicalDisk | Where-Object { $_.DeviceID -eq $target }
+        if ($already) { Write-Output "already mounted: $target"; continue }
+        & mount.exe -o anon $export $target
+        if ($LASTEXITCODE -ne 0) { Write-Error "mount failed: $export -> $target"; exit 1 }
+        Write-Output "mounted: $export -> $target"
+      }
+
+- name: Mount NFS shares now
+  ansible.windows.win_shell: |
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{{ encode_agent_dir }}\remount-nfs.ps1"
+  register: mount_now
+  changed_when: "'mounted:' in mount_now.stdout"
+  failed_when: mount_now.rc != 0
+
+- name: Register startup task to remount NFS after reboot
+  ansible.windows.win_shell: |
+    $existing = Get-ScheduledTask -TaskName "encode-system-remount-nfs" -ErrorAction SilentlyContinue
+    if ($existing) { Write-Output "task exists"; exit 0 }
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+      -Argument "-NoProfile -ExecutionPolicy Bypass -File '{{ encode_agent_dir }}\remount-nfs.ps1'"
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName "encode-system-remount-nfs" `
+      -Action $action -Trigger $trigger -RunLevel Highest -User SYSTEM -Force
+    Write-Output "task registered"
+  register: startup_task
+  changed_when: "'task registered' in startup_task.stdout"
+  failed_when: startup_task.rc != 0

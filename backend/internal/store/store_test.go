@@ -124,6 +124,10 @@ func TestJobLifecycleAndRetry(t *testing.T) {
 	ctx := context.Background()
 	flow := seedFlow(t, s)
 
+	node, err := s.CreateNode(ctx, "lifecycle-node", "h")
+	if err != nil {
+		t.Fatal(err)
+	}
 	j, err := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "avs", FlowID: flow.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +141,9 @@ func TestJobLifecycleAndRetry(t *testing.T) {
 		t.Fatalf("episode dedupe failed: exists=%v err=%v", exists, err)
 	}
 
+	if err := s.AssignJob(ctx, j.ID, node.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.UpdateJobStatus(ctx, j.ID, model.JobRunning, "encode", 42.5, "tail"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,8 +167,8 @@ func TestJobLifecycleAndRetry(t *testing.T) {
 	}
 
 	// Retry re-queues the job as pending.
-	if err := s.RetryJob(ctx, j.ID); err != nil {
-		t.Fatal(err)
+	if n, err := s.RetryJob(ctx, j.ID); err != nil || n != 1 {
+		t.Fatalf("retry: n=%d err=%v", n, err)
 	}
 	got, err = s.GetJob(ctx, j.ID)
 	if err != nil {
@@ -233,6 +240,123 @@ func TestListJobsFilterByStatus(t *testing.T) {
 	// Newest first.
 	if all[0].Episode != "02" {
 		t.Fatalf("ordering wrong: %+v", all[0])
+	}
+}
+
+// Regression (adversarial review): AssignJob must error when the job is not
+// pending and must NOT mark the node busy — the old code committed a phantom
+// busy node with no job, breaking the one-job-per-node invariant.
+func TestAssignNonPendingJobLeavesNodeIdle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	node, _ := s.CreateNode(ctx, "n", "h")
+	j, _ := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+	s.FinishJob(ctx, j.ID, model.JobDone, 0, "", nil, "")
+
+	if err := s.AssignJob(ctx, j.ID, node.ID); err == nil {
+		t.Fatal("assigning a done job must error")
+	}
+	got, _ := s.GetNode(ctx, node.ID)
+	if got.Status != model.NodeIdle {
+		t.Fatalf("node must stay idle after refused assign, got %s", got.Status)
+	}
+	active, _ := s.ActiveJobForNode(ctx, node.ID)
+	if active != nil {
+		t.Fatalf("no active job expected: %+v", active)
+	}
+}
+
+// Regression: assigning to a disabled node must fail.
+func TestAssignToDisabledNodeFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	node, _ := s.CreateNode(ctx, "n", "h")
+	node.Enabled = false
+	s.UpdateNode(ctx, node)
+	j, _ := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+
+	if err := s.AssignJob(ctx, j.ID, node.ID); err == nil {
+		t.Fatal("assign to disabled node must error")
+	}
+	got, _ := s.GetJob(ctx, j.ID)
+	if got.Status != model.JobPending {
+		t.Fatalf("job must remain pending: %+v", got)
+	}
+}
+
+// Regression: deleting a flow with job history must be refused (FK).
+func TestDeleteFlowWithJobsRefused(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+
+	if err := s.DeleteFlow(ctx, flow.ID); err == nil {
+		t.Fatal("delete of referenced flow must error")
+	}
+	// Unreferenced flows still delete fine.
+	f2, _ := s.CreateFlow(ctx, &model.Flow{Name: "free", Steps: []model.Step{{Type: model.StepDGIndex}}})
+	if err := s.DeleteFlow(ctx, f2.ID); err != nil {
+		t.Fatalf("unreferenced flow delete failed: %v", err)
+	}
+}
+
+// Regression: UpdateJobStatus must not resurrect terminal jobs.
+func TestUpdateJobStatusIgnoresTerminalJobs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	j, _ := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+	s.FinishJob(ctx, j.ID, model.JobDone, 0, "", nil, "")
+
+	s.UpdateJobStatus(ctx, j.ID, model.JobRunning, "encode", 50, "stale")
+	got, _ := s.GetJob(ctx, j.ID)
+	if got.Status != model.JobDone {
+		t.Fatalf("terminal job resurrected: %+v", got)
+	}
+}
+
+// Regression: failed jobs must not report 100% progress.
+func TestFinishFailedJobKeepsProgress(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	node, _ := s.CreateNode(ctx, "n", "h")
+	j, _ := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+	if err := s.AssignJob(ctx, j.ID, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.UpdateJobStatus(ctx, j.ID, model.JobRunning, "encode", 37, "")
+	s.FinishJob(ctx, j.ID, model.JobFailed, 1, "crash", nil, "tail")
+
+	got, _ := s.GetJob(ctx, j.ID)
+	if got.Progress != 37 {
+		t.Fatalf("failed job progress = %v, want 37 (last known)", got.Progress)
+	}
+}
+
+// Regression: retry clears stale log/output and reports no-ops honestly.
+func TestRetryJobClearsStaleStateAndReportsNoop(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+	j, _ := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+	s.FinishJob(ctx, j.ID, model.JobFailed, 2, "boom", []string{"x.mkv"}, "old tail")
+
+	n, err := s.RetryJob(ctx, j.ID)
+	if err != nil || n != 1 {
+		t.Fatalf("retry: n=%d err=%v", n, err)
+	}
+	got, _ := s.GetJob(ctx, j.ID)
+	if got.LogTail != "" || len(got.Outputs) != 0 {
+		t.Fatalf("stale state survived retry: %+v", got)
+	}
+	// Retrying the now-pending job is a no-op and must say so.
+	n2, err := s.RetryJob(ctx, j.ID)
+	if err != nil || n2 != 0 {
+		t.Fatalf("no-op retry: n=%d err=%v", n2, err)
 	}
 }
 

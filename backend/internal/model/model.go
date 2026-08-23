@@ -70,7 +70,7 @@ type Node struct {
 	LibVersion     int64      `json:"lib_version"`
 	TasksSinceBoot int        `json:"tasks_since_boot"`
 	RebootPending  bool       `json:"reboot_pending"`
-	LastSeen       time.Time  `json:"last_seen"`
+	LastSeen       *time.Time `json:"last_seen,omitempty"`
 	LastError      string     `json:"last_error,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 }
@@ -90,10 +90,10 @@ type Job struct {
 	ExitCode   int       `json:"exit_code"`
 	Error      string    `json:"error,omitempty"`
 	LogTail    string    `json:"log_tail,omitempty"`
-	Outputs    []string  `json:"outputs,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Outputs    []string   `json:"outputs,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
 // Heartbeat is the periodic agent status report.

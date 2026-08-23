@@ -21,15 +21,14 @@ type Store struct {
 // Open opens (creating if needed) the SQLite database at path and applies
 // migrations. The pragmas keep SQLite safe for a single-writer controller.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// The _pragma query params apply to EVERY connection the pool opens,
+	// unlike a one-shot Exec PRAGMA which a replacement connection would lose.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // SQLite: single writer avoids lock contention
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set pragmas: %w", err)
-	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -41,7 +40,8 @@ func Open(path string) (*Store, error) {
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-// migrate applies the schema. Idempotent via IF NOT EXISTS / user_version check.
+// migrate applies the schema v1. Idempotent via IF NOT EXISTS. When the
+// schema changes, add an explicit versioned migration here.
 func (s *Store) migrate() error {
 	schema := `
 CREATE TABLE IF NOT EXISTS nodes (
@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_episode_dir ON jobs(episode_dir);
+CREATE INDEX IF NOT EXISTS idx_jobs_node_status ON jobs(node_id, status);
+CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -103,7 +105,7 @@ func parseTime(s string) time.Time {
 	t, err := time.Parse("2006-01-02 15:04:05", s)
 	if err != nil {
 		if t2, err2 := time.Parse(time.RFC3339Nano, s); err2 == nil {
-			return t2
+			return t2.UTC()
 		}
 		return time.Time{}
 	}
@@ -117,6 +119,24 @@ func fmtTime(t time.Time) any {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
+// ptrTime parses a stored timestamp into a *time.Time, nil when unset — keeps
+// unset timestamps out of API responses instead of emitting year-1 dates.
+func ptrTime(s string) *time.Time {
+	t := parseTime(s)
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// fmtPtrTime writes a nullable timestamp back to the store.
+func fmtPtrTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return fmtTime(*t)
+}
+
 // ---------- Nodes ----------
 
 // CreateNode registers a node with a bcrypt hash of its token.
@@ -126,7 +146,10 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 	if err != nil {
 		return nil, fmt.Errorf("create node: %w", err)
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("CreateNode: last insert id: %w", err)
+	}
 	return s.GetNode(ctx, id)
 }
 
@@ -157,7 +180,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	n.Enabled = enabled == 1
 	n.RebootPending = reboot == 1
 	if lastSeen.Valid {
-		n.LastSeen = parseTime(lastSeen.String)
+		n.LastSeen = ptrTime(lastSeen.String)
 	}
 	n.CreatedAt = parseTime(createdAt)
 	return &n, nil
@@ -184,7 +207,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		n.Enabled = enabled == 1
 		n.RebootPending = reboot == 1
 		if lastSeen.Valid {
-			n.LastSeen = parseTime(lastSeen.String)
+			n.LastSeen = ptrTime(lastSeen.String)
 		}
 		n.CreatedAt = parseTime(createdAt)
 		out = append(out, &n)
@@ -197,7 +220,7 @@ func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
   lib_version=?, tasks_since_boot=?, reboot_pending=?, last_seen=?, last_error=? WHERE id=?`,
 		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.TasksSinceBoot,
-		boolToInt(n.RebootPending), fmtTime(n.LastSeen), n.LastError, n.ID)
+		boolToInt(n.RebootPending), fmtPtrTime(n.LastSeen), n.LastError, n.ID)
 	return err
 }
 
@@ -227,7 +250,10 @@ func (s *Store) CreateFlow(ctx context.Context, f *model.Flow) (*model.Flow, err
 	if err != nil {
 		return nil, fmt.Errorf("create flow: %w", err)
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("CreateFlow: last insert id: %w", err)
+	}
 	return s.GetFlow(ctx, id)
 }
 
@@ -294,8 +320,17 @@ func (s *Store) UpdateFlow(ctx context.Context, f *model.Flow) error {
 	return err
 }
 
-// DeleteFlow removes a flow; jobs referencing it keep their flow_id (rendered script already delivered).
+// DeleteFlow removes a flow only when no job references it. The schema FK
+// (jobs.flow_id REFERENCES flows(id)) enforces this; refusing up front gives
+// an honest error instead of a constraint violation.
 func (s *Store) DeleteFlow(ctx context.Context, id int64) error {
+	var refs int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE flow_id = ?`, id).Scan(&refs); err != nil {
+		return err
+	}
+	if refs > 0 {
+		return fmt.Errorf("flow %d has %d job(s) referencing it", id, refs)
+	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM flows WHERE id = ?`, id)
 	return err
 }
@@ -311,7 +346,10 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("CreateJob: last insert id: %w", err)
+	}
 	return s.GetJob(ctx, id)
 }
 
@@ -337,12 +375,14 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 	}
 	j.CreatedAt = parseTime(createdAt)
 	j.Status = model.JobStatus(status)
-	_ = json.Unmarshal([]byte(outputsJSON), &j.Outputs)
+	if err := json.Unmarshal([]byte(outputsJSON), &j.Outputs); err != nil {
+		return nil, fmt.Errorf("job %d: outputs_json: %w", j.ID, err)
+	}
 	if started.Valid {
-		j.StartedAt = parseTime(started.String)
+		j.StartedAt = ptrTime(started.String)
 	}
 	if finished.Valid {
-		j.FinishedAt = parseTime(finished.String)
+		j.FinishedAt = ptrTime(finished.String)
 	}
 	return &j, nil
 }
@@ -393,12 +433,14 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	}
 	j.CreatedAt = parseTime(createdAt)
 	j.Status = model.JobStatus(status)
-	_ = json.Unmarshal([]byte(outputsJSON), &j.Outputs)
+	if err := json.Unmarshal([]byte(outputsJSON), &j.Outputs); err != nil {
+		return nil, fmt.Errorf("job %d: outputs_json: %w", j.ID, err)
+	}
 	if started.Valid {
-		j.StartedAt = parseTime(started.String)
+		j.StartedAt = ptrTime(started.String)
 	}
 	if finished.Valid {
-		j.FinishedAt = parseTime(finished.String)
+		j.FinishedAt = ptrTime(finished.String)
 	}
 	return &j, nil
 }
@@ -429,10 +471,28 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 		return fmt.Errorf("node %d already has an active job", nodeID)
 	}
 
-	if _, err := tx.ExecContext(ctx,
+	// The node must exist and be enabled; otherwise the job would be handed
+	// to a box that never runs it and the node row could be wrongly flipped.
+	var enabled int
+	if err := tx.QueryRowContext(ctx, `SELECT enabled FROM nodes WHERE id = ?`, nodeID).Scan(&enabled); err != nil {
+		return fmt.Errorf("assign to unknown node %d: %w", nodeID, err)
+	}
+	if enabled == 0 {
+		return fmt.Errorf("node %d is disabled", nodeID)
+	}
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET status='assigned', node_id=?, started_at=datetime('now') WHERE id=? AND status='pending'`,
-		nodeID, jobID); err != nil {
+		nodeID, jobID)
+	if err != nil {
 		return err
+	}
+	// RowsAffected must be 1: a job that is no longer pending (race, retry
+	// loop, bad id) matches zero rows, and marking the node busy anyway
+	// would strand it in busy state with no job — the exact invariant this
+	// function exists to protect.
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("job %d not pending (rows affected %d)", jobID, n)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET status='busy' WHERE id=?`, nodeID); err != nil {
 		return err
@@ -441,9 +501,11 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 }
 
 // UpdateJobStatus records progress from a heartbeat or completion report.
+// Only live jobs (assigned/running) are updatable — a stale heartbeat must
+// not resurrect a terminal job back into the queue.
 func (s *Store) UpdateJobStatus(ctx context.Context, id int64, status model.JobStatus, step string, progress float64, logTail string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, step=?, progress=?, log_tail=? WHERE id=?`,
+		`UPDATE jobs SET status=?, step=?, progress=?, log_tail=? WHERE id=? AND status IN ('assigned','running')`,
 		string(status), step, progress, logTail, id)
 	return err
 }
@@ -454,8 +516,14 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 		outputs = []string{}
 	}
 	b, _ := json.Marshal(outputs)
+	// progress=100 only for done jobs; a failed/cancelled job keeps its last
+	// progress so dashboards don't render failure as completion.
+	progress := ""
+	if status == model.JobDone {
+		progress = ", progress=100"
+	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now'), progress=100 WHERE id=?`,
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now')`+progress+` WHERE id=?`,
 		string(status), exitCode, errMsg, string(b), logTail, id)
 	return err
 }
@@ -481,12 +549,17 @@ func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
 	return err
 }
 
-// RetryJob re-queues a failed/cancelled job as pending on no node.
-func (s *Store) RetryJob(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', started_at=NULL, finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
+// RetryJob re-queues a failed/cancelled job as pending on no node. It returns
+// the number of rows re-queued (0 when the job is not retryable, e.g. still
+// running) so callers can distinguish success from a no-op.
+func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', started_at=NULL, finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
 		id)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CountFinishedTasksForNode counts terminal jobs completed by a node — used

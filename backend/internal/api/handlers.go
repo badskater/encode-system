@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
@@ -35,7 +36,8 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	node.AgentVersion = hb.AgentVersion
 	node.LibVersion = hb.LibVersion
 	node.TasksSinceBoot = hb.TasksSinceBoot
-	node.LastSeen = time.Now().UTC()
+	now := time.Now().UTC()
+	node.LastSeen = &now
 	node.LastError = ""
 
 	hasActiveJob := false
@@ -237,7 +239,7 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]nodeView, 0, len(nodes))
 	for _, n := range nodes {
-		online := !n.LastSeen.IsZero() && now.Sub(n.LastSeen) < s.Cfg.StaleAfter
+		online := n.LastSeen != nil && now.Sub(*n.LastSeen) < s.Cfg.StaleAfter
 		if !online {
 			n.Status = model.NodeOffline
 		}
@@ -402,8 +404,13 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad job id")
 		return
 	}
-	if err := s.Store.RetryJob(r.Context(), id); err != nil {
+	n, err := s.Store.RetryJob(r.Context(), id)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "retry job")
+		return
+	}
+	if n == 0 {
+		writeErr(w, http.StatusConflict, "job is not retryable (only failed/cancelled/done jobs can be retried)")
 		return
 	}
 	job, err := s.Store.GetJob(r.Context(), id)
@@ -515,6 +522,10 @@ func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.DeleteFlow(r.Context(), id); err != nil {
+		if strings.Contains(err.Error(), "referencing") {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "delete flow")
 		return
 	}

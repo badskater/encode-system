@@ -1,0 +1,30 @@
+# Build outputs
+backend/bin/
+frontend/dist/
+frontend/node_modules/
+*.exe
+*.dll
+
+# Local env / secrets (never commit)
+.env
+.env.*
+docker/.env
+infra/ansible/inventory*
+infra/ansible/group_vars/secrets.yml
+infra/ansible/files/bin/
+*.token
+
+# Data / state
+data/
+*.db
+*.sqlite
+
+# Editor/OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test/coverage artifacts
+coverage/
+*.log

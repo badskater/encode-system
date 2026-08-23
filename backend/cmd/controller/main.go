@@ -1,0 +1,139 @@
+// Command controller runs the encode-system control plane: share scanner,
+// job queue, agent API, and the web UI.
+package main
+
+import (
+	"context"
+	"flag"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/badskater/encode-system/backend/internal/api"
+	"github.com/badskater/encode-system/backend/internal/scanner"
+	"github.com/badskater/encode-system/backend/internal/store"
+	"github.com/badskater/encode-system/backend/internal/update"
+)
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func main() {
+	listen := flag.String("listen", env("ENCODE_LISTEN", ":8080"), "listen address")
+	dataDir := flag.String("data", env("ENCODE_DATA", "./data"), "data directory (db, updates, static ui)")
+	flag.Parse()
+
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(log)
+
+	adminToken := os.Getenv("ENCODE_ADMIN_TOKEN")
+	if adminToken == "" {
+		log.Error("ENCODE_ADMIN_TOKEN is required")
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		log.Error("create data dir", "err", err)
+		os.Exit(1)
+	}
+
+	st, err := store.Open(filepath.Join(*dataDir, "encode.db"))
+	if err != nil {
+		log.Error("open store", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	up, err := update.NewStore(filepath.Join(*dataDir, "updates"))
+	if err != nil {
+		log.Error("open update store", "err", err)
+		os.Exit(1)
+	}
+
+	cfg := api.Config{
+		AdminToken:        adminToken,
+		ScriptsRoot:       env("ENCODE_SCRIPTS_ROOT", filepath.Join(*dataDir, "scripts")),
+		ReleaseRoot:       env("ENCODE_RELEASE_ROOT", filepath.Join(*dataDir, "release")),
+		NodeBinDir:        env("ENCODE_NODE_BIN", `C:\bin`),
+		NodeScriptsDir:    env("ENCODE_NODE_SCRIPTS", `C:\Encodes\scripts`),
+		NodeReleaseDir:    env("ENCODE_NODE_RELEASE", `C:\Encodes\ReleaseFolders`),
+		Group:             env("ENCODE_GROUP", "OldFartsSubs"),
+		Tag:               env("ENCODE_TAG", "1080p"),
+		DefaultFlowName:   env("ENCODE_DEFAULT_FLOW", "default-1080"),
+		TasksBeforeReboot: envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
+	}
+
+	srv, err := api.New(st, up, log, cfg)
+	if err != nil {
+		log.Error("init api server", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Scanner loop: watch the scripts share for new episode folders.
+	interval := time.Duration(envInt("ENCODE_SCAN_INTERVAL", 30)) * time.Second
+	go scanner.RunLoop(ctx, log, st, cfg.ScriptsRoot, cfg.DefaultFlowName, interval)
+
+	// Serve UI static files (built frontend) if present, then the API.
+	mux := http.NewServeMux()
+	uiDir := filepath.Join(*dataDir, "ui")
+	if fi, err := os.Stat(uiDir); err == nil && fi.IsDir() {
+		spa := spaHandler(uiDir)
+		mux.Handle("/", spa)
+	}
+	mux.Handle("/api/", srv.Routes())
+
+	httpSrv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("controller starting", "listen", *listen, "data", *dataDir,
+		"scripts_root", cfg.ScriptsRoot, "scan_interval", interval.String())
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Error("http server", "err", err)
+		os.Exit(1)
+	}
+	log.Info("controller stopped")
+}
+
+// envInt parses an integer env var with a fallback.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// spaHandler serves static files, falling back to index.html for client routes.
+func spaHandler(dir string) http.Handler {
+	fs := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := filepath.Join(dir, filepath.Clean(r.URL.Path))
+		if _, err := os.Stat(p); err != nil {
+			r.URL.Path = "/" // SPA fallback
+		}
+		fs.ServeHTTP(w, r)
+	})
+}

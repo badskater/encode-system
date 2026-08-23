@@ -164,12 +164,16 @@ func (s *Server) parsePowerShell(script string) (string, bool) {
 	if err := os.WriteFile(p, []byte(script), 0o600); err != nil {
 		return "", true
 	}
-	checker := `
+	checkerPath := filepath.Join(dir, "checker.ps1")
+	checker := `$target = $args[0]
 $t = $null; $e = $null
-[System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$t, [ref]$e) | Out-Null
+[System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$t, [ref]$e) | Out-Null
 if ($e.Count) { $e | ForEach-Object { Write-Output $_.Message }; exit 1 }
 `
-	cmd := exec.Command(ps, "-NoProfile", "-Command", checker, p)
+	if err := os.WriteFile(checkerPath, []byte(checker), 0o600); err != nil {
+		return "", true
+	}
+	cmd := exec.Command(ps, "-NoProfile", "-File", checkerPath, p)
 	cmd.Env = append(os.Environ(), "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

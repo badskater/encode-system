@@ -485,6 +485,13 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	return &j, nil
 }
 
+// SetJobFlow changes the flow of a pending job (guarded by the caller).
+func (s *Store) SetJobFlow(ctx context.Context, id, flowID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET flow_id = ? WHERE id = ? AND status = 'pending'`, flowID, id)
+	return err
+}
+
 // JobExistsForEpisode reports whether any job (non-cancelled) already covers this episode dir.
 func (s *Store) JobExistsForEpisode(ctx context.Context, episodeDir string) (bool, error) {
 	var n int

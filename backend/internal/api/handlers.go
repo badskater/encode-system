@@ -499,6 +499,48 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// handlePatchJob changes a pending job's flow before it starts. Assigned or
+// running jobs refuse the change — their script is already on (or bound for)
+// a node, so swapping flows mid-flight would be meaningless.
+func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad job id")
+		return
+	}
+	var req struct {
+		FlowID *int64 `json:"flow_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.FlowID == nil {
+		writeErr(w, http.StatusBadRequest, "flow_id required")
+		return
+	}
+	ctx := r.Context()
+	job, err := s.Store.GetJob(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if job.Status != model.JobPending {
+		writeErr(w, http.StatusConflict, "only pending jobs can change flow")
+		return
+	}
+	if _, err := s.Store.GetFlow(ctx, *req.FlowID); err != nil {
+		writeErr(w, http.StatusBadRequest, "flow not found")
+		return
+	}
+	if err := s.Store.SetJobFlow(ctx, id, *req.FlowID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "update job flow")
+		return
+	}
+	job, err = s.Store.GetJob(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
 // handleCancelJob cancels a pending job.
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)

@@ -4,13 +4,20 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## Backlog
 
-- Agent self-registration token bootstrap UX (one-shot pairing code)
-- Flow templates: import/export as JSON
-- Per-series default flow selection rules
+- UI button to change a pending job's flow (API exists: PATCH /api/jobs/{id})
 
 ## In progress
 
 - First real deploy to a Windows Server 2025 node (needs a physical node)
+
+## Done (phase 2)
+
+- One-shot pairing codes: issue in UI, agent self-registers and persists its credential
+- Per-series flow selection + series pause (scanner-driven registry)
+- Step templates: every flow section owns its PowerShell; custom steps in the UI,
+  syntax-checked, linked into the rendered final flow
+- Flow JSON export/import (embeds custom templates); multiple saved flows with one default
+- Live E2E: 2 nodes, 2 series, per-series flows, custom step executed in pwsh, pairing bootstrap
 
 ## Review status
 

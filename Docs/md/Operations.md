@@ -24,7 +24,12 @@
 | Pause a node | UI → Nodes → toggle enabled. No new jobs assigned; running job finishes. |
 | Force reboot a node | UI → Nodes → "Reboot now" (issues reboot instruction on next heartbeat). |
 | Retry a failed job | UI → Jobs → Retry (re-queues as pending). |
-| Change a job's flow before it starts | UI → Jobs → edit flow while job is `pending`. |
+| Change a job's flow before it starts | `PATCH /api/jobs/{id}` while the job is `pending` (UI support tracked in KANBAN). |
+| Pick the flow a series encodes with | UI → Series → per-series flow selector (0 = default flow). |
+| Pause one series | UI → Series → toggle (scanner stops queueing it; other series keep running). |
+| Add a custom pipeline section | UI → Steps → New step template (PowerShell is syntax-checked), then add it to any flow. |
+| Share a flow | UI → Flows → Export JSON (embeds custom templates) / Import JSON. |
+| Register a node without copy-pasting tokens | UI → Nodes → Issue pairing code → `pairing_code` in the node's `agent.json`. |
 | Push agent update | Upload new `encode-agent.exe`/`EncodeLib.ps1` to the controller's update store (they are SHA-256 hashed); manifest bump triggers staged rollout on idle nodes. Agents verify the checksum before installing. |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
 

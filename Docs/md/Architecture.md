@@ -43,9 +43,29 @@
 - Reboot: on `reboot` instruction with no running job, schedules `shutdown /r /t 30` and reports; counter resets naturally on next boot.
 - Auto-update: on `update` instruction, downloads new `encode-agent.exe` + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary on next service restart (self-replace via sidecar restart command).
 
-### PowerShell layer (`powershell/EncodeLib.ps1`)
+### Step templates — every flow section owns its PowerShell
 
-Functions (each = one flow step):
+Phase-2 architecture: a flow is an ordered list of references to **step
+templates**, and each template carries its own PowerShell function. At render
+time the controller **links** every referenced function into the final job
+script and calls it with a shared `$Job` context object plus the step's
+`$Params` — so a saved flow is always self-contained and custom steps need no
+node-side install.
+
+- **Built-in templates** (seeded at boot, editable, not deletable):
+  `source_rename`, `dgindex`, `audio`, `encode`, `mux`, `release_copy`,
+  `keyframes`.
+- **Custom templates**: created in the UI (key + params + PowerShell),
+  syntax-checked by the controller when pwsh is available, validated to
+  define a function; they appear in the flow builder palette automatically.
+- **Function contract**: `param([Parameter(Mandatory=$true)] [pscustomobject] $Job,
+  [pscustomobject] $Params)`; helpers come from EncodeLib.ps1 (Resolve-Tool,
+  Invoke-Tool, Find-SourceFile, Assert-SafeName); progress via
+  `ENCODE_STEP <key> <pct>` lines.
+
+`powershell/EncodeLib.ps1` is the shared helper library only:
+
+Functions:
 
 - `Invoke-SourceRename` — rename the raw source to `src.<ext>` (legacy `rename *.m2ts src.m2ts`).
 - `Invoke-DgIndex` — `DGIndexNV.exe -i src -o src.dgi -h`.
@@ -56,6 +76,40 @@ Functions (each = one flow step):
 - `Invoke-Keyframes` — `ffmpeg` writes a downscaled temp y4m, `SCXvid` reads it into the keyframes file; skipped if it already exists.
 
 All steps write structured progress lines (`ENCODE_STEP <name> <pct>`) that the agent parses into heartbeat progress.
+
+## Node registration
+
+Two paths:
+
+1. **Manual**: admin creates the node in the UI, copies the one-time agent
+   token into `agent.json` (`token` field).
+2. **Pairing (one-shot code)**: admin issues a pairing code in the UI
+   (1-hour TTL); the node ships only `node_name` + `pairing_code` in
+   `agent.json`. On first start the agent calls the unauthenticated
+   `POST /api/agent/pair`, which consumes the code, creates the node, and
+   returns a permanent token the agent persists at `data_dir/node.token`
+   (0600). Later starts reuse the persisted credential; the code itself is
+   single-use and hash-only on the server.
+
+## Series registry
+
+The scanner auto-registers every series folder it sees. Each series has:
+
+- **flow selection** — an explicit flow, or 0 to inherit the flagged default flow;
+- **enabled flag** — a paused series is skipped by the scanner (no new jobs),
+  without affecting other series.
+
+Jobs carry the flow fixed at creation time; operators can change a *pending*
+job's flow via `PATCH /api/jobs/{id}` before it starts. Episodes distribute
+across all enabled idle nodes naturally (one job per node).
+
+## Flows: multiple sequences, one default
+
+Any number of flows can be saved; exactly one carries `is_default`
+(atomic swap). Resolution order for new jobs: series flow → default flow →
+configured default name. Flows export/import as JSON; the export embeds any
+custom step templates the flow uses (built-ins resolve at the destination),
+and import refuses flows referencing unknown templates.
 
 ## Contracts
 

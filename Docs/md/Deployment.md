@@ -45,7 +45,15 @@ Playbook order in `site.yml`:
 2. `bin-tools.yml` — create `C:\bin`, copy encode binaries from `files/bin/` staging.
 3. `agent.yml` — create `C:\encode-agent` dir, install `encode-agent.exe` + `EncodeLib.ps1`, register the Windows service, write `agent.json` config (controller URL + node token).
 
-Node token: generate with `controller nodetoken <node-name>` on the controller host, paste into `group_vars/secrets.yml` (never commit).
+Node credentials — two options:
+
+- **Manual token**: register the node in the UI (Nodes page), copy the
+  one-time token into `encode_node_tokens` in `group_vars/secrets.yml`
+  (never commit).
+- **Pairing code** (zero-touch): issue a pairing code in the UI (valid 1
+  hour), and put `pairing_code` + `node_name` into the node's `agent.json`
+  instead of a token (Ansible template supports both). The agent registers
+  itself on first start and stores its own credential.
 
 ## Post-deploy validation
 

@@ -12,6 +12,13 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 - First real deploy to a Windows Server 2025 node (needs a physical node)
 
+## Review status
+
+- Adversarial review (GLM-5.2 + DeepSeek-v4) over backend, flow renderer,
+  scanner, update store, agent, and EncodeLib.ps1: all findings adjudicated —
+  fixed with regression tests, or rejected with reason. Three rounds; live
+  smoke re-run after each round.
+
 ## Done
 
 - Repo bootstrap + baseline docs

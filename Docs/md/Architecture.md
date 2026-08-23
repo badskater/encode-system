@@ -98,7 +98,7 @@ Response:
 3. Node `enc-02` heartbeats idle → controller assigns job, response carries rendered script.
 4. Agent executes step by step; heartbeats carry progress; UI live-updates.
 5. Job completes → controller verifies output path exists on the share → `done`.
-6. After the node's 10th completed task, controller responds with `reboot`; the instruction is re-issued on every idle heartbeat until the node's counter drops (proof of reboot), so a missed packet self-heals. Agent defers until idle, reboots; node comes back with counter 0 and rejoins the pool.
+6. After the node's 10th completed task, controller responds with `reboot`; the instruction is re-issued on every idle heartbeat until the node's counter drops (proof of reboot), so a missed packet self-heals. Agent defers until idle, reboots; node comes back with counter 0 and rejoins the pool. A reboot attempt expires after a 10-minute grace period so no node can be locked out by a stuck flag.
 
 ## Safety invariants enforced by the store/API
 
@@ -109,7 +109,8 @@ Response:
 
 ## Security and observability
 
-- Agent tokens: random per-node tokens issued at node registration, stored hashed. UI admin token from env. TLS optional behind reverse proxy.
+- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). UI admin token from env, constant-time compare. TLS optional behind reverse proxy.
+- Auto-update payloads (agent binary + EncodeLib.ps1) are SHA-256 verified by the agent against the manifest before install; downloads are size-capped. Request bodies are capped at 1 MiB.
 - Structured JSON logs (`slog`) with `job_id` / `node` fields on both sides; agent log tails retained per job for post-mortem.
 
 ## Open decisions

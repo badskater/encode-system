@@ -25,7 +25,7 @@
 | Force reboot a node | UI → Nodes → "Reboot now" (issues reboot instruction on next heartbeat). |
 | Retry a failed job | UI → Jobs → Retry (re-queues as pending). |
 | Change a job's flow before it starts | UI → Jobs → edit flow while job is `pending`. |
-| Push agent update | UI → Updates → upload new `encode-agent.exe`/`EncodeLib.ps1`; manifest bump triggers staged rollout on idle nodes. |
+| Push agent update | Upload new `encode-agent.exe`/`EncodeLib.ps1` to the controller's update store (they are SHA-256 hashed); manifest bump triggers staged rollout on idle nodes. Agents verify the checksum before installing. |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
 
 ## Known failure modes
@@ -34,4 +34,5 @@
 - **x265 fork crash on odd dimensions**: step fails with non-zero exit; inspect `run.log` for the x265 banner error; usually a filter-script issue (`.avs` crop values).
 - **opusenc missing**: audio step fails fast with "required tool not found" — Ansible `bin-tools` play fixes.
 - **Reboot during a job**: controller defers reboot instructions until the node reports idle; a crash-reboot mid-job leaves the job `running`-stale → operator retries.
+- **Node stuck in reboot_pending**: attempts expire after a 10-minute grace period and the node rejoins automatically; check the agent log (`C:\encode-agent\agent.log`) if the node never actually reboots (permissions, pending reboot).
 - **Two jobs on one node**: impossible by store constraint (unique active job per node), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.

@@ -1,0 +1,176 @@
+:root {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: 200px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sidebar h1 { font-size: 15px; margin: 0 0 16px; color: var(--accent); }
+
+.sidebar button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.sidebar button:hover { background: #21262d; color: var(--text); }
+.sidebar button.active { background: #21262d; color: var(--accent); }
+
+.main { flex: 1; padding: 24px; overflow-x: auto; }
+.main h2 { margin-top: 0; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.badge.green { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+.badge.red { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+.badge.yellow { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
+.badge.blue { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+.badge.gray { background: #21262d; color: var(--muted); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.btn {
+  background: #21262d;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: #238636; border-color: #2ea043; }
+.btn.danger { background: #da3633; border-color: #f85149; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+input, select {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.progress-track {
+  background: #21262d;
+  border-radius: 4px;
+  height: 8px;
+  width: 120px;
+  overflow: hidden;
+}
+.progress-fill { background: var(--accent); height: 100%; }
+
+.error-box {
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid var(--red);
+  color: var(--red);
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.muted { color: var(--muted); }
+pre {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+  font-size: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* Flow builder */
+.flow-canvas { display: flex; gap: 24px; }
+.flow-steps { flex: 2; display: flex; flex-direction: column; gap: 8px; }
+.flow-palette { flex: 1; }
+
+.step-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.step-card .step-body { flex: 1; }
+.step-card .step-num { color: var(--muted); font-weight: 700; font-size: 13px; min-width: 20px; }
+.step-card .step-actions { display: flex; flex-direction: column; gap: 4px; }
+.step-card .step-actions button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+}
+.step-card .step-actions button:hover { color: var(--text); }
+
+.step-params { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.step-params label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.step-params input { width: 100%; }
+
+.palette-step {
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.palette-step:hover { border-color: var(--accent); }
+.palette-step .desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+.toolbar input { flex: 1; }

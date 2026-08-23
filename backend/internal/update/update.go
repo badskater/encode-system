@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sync"
 
-
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 

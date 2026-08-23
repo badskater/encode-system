@@ -15,6 +15,10 @@ import (
 type JobCreator interface {
 	JobExistsForEpisode(ctx context.Context, episodeDir string) (bool, error)
 	CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
+	// Series registry: auto-register on first sight, honor flow selection.
+	UpsertSeriesByName(ctx context.Context, name string) (*model.Series, error)
+	GetFlow(ctx context.Context, id int64) (*model.Flow, error)
+	DefaultFlow(ctx context.Context) (*model.Flow, error)
 	FlowByName(ctx context.Context, name string) (*model.Flow, error)
 }
 
@@ -41,7 +45,9 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, root, default
 	}
 }
 
-// scanOnce performs a single scan + job creation pass.
+// scanOnce performs a single scan + job creation pass. Series are
+// auto-registered on first sight; disabled series are skipped; each series'
+// flow selection wins over the default flow.
 func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaultFlow string) {
 	cands, skipped, err := Scan(root, SourceStableFor)
 	if err != nil {
@@ -51,18 +57,26 @@ func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaul
 	if skipped > 0 {
 		log.Warn("scan skipped unreadable dirs", "count", skipped, "root", root)
 	}
-	fl, err := st.FlowByName(ctx, defaultFlow)
-	if err != nil {
-		log.Warn("default flow missing", "flow", defaultFlow, "err", err)
-		return
-	}
 	for _, c := range cands {
+		sr, err := st.UpsertSeriesByName(ctx, c.Series)
+		if err != nil {
+			log.Warn("series registration failed", "series", c.Series, "err", err)
+			continue
+		}
+		if !sr.Enabled {
+			continue // operator paused this series; folder stays unprocessed
+		}
 		exists, err := st.JobExistsForEpisode(ctx, c.EpisodeDir)
 		if err != nil {
 			log.Warn("dedupe check failed", "episode_dir", c.EpisodeDir, "err", err)
 			continue
 		}
 		if exists {
+			continue
+		}
+		fl, err := resolveSeriesFlow(ctx, st, sr, defaultFlow)
+		if err != nil {
+			log.Warn("flow resolution failed", "series", c.Series, "err", err)
 			continue
 		}
 		job, err := st.CreateJob(ctx, &model.Job{
@@ -78,6 +92,20 @@ func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaul
 			continue
 		}
 		log.Info("job created from scan", "job", job.ID, "episode_dir", c.EpisodeDir,
-			"script", c.ScriptFile, "flow", defaultFlow)
+			"script", c.ScriptFile, "flow", fl.Name)
 	}
+}
+
+// resolveSeriesFlow picks the series' explicit flow, else the flagged default
+// flow, else the configured default name.
+func resolveSeriesFlow(ctx context.Context, st JobCreator, sr *model.Series, defaultName string) (*model.Flow, error) {
+	if sr.FlowID > 0 {
+		if fl, err := st.GetFlow(ctx, sr.FlowID); err == nil {
+			return fl, nil
+		}
+	}
+	if fl, err := st.DefaultFlow(ctx); err == nil {
+		return fl, nil
+	}
+	return st.FlowByName(ctx, defaultName)
 }

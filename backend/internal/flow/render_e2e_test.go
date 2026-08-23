@@ -88,7 +88,7 @@ echo "SCXvid stub done"`,
 	script, err := Render(f, j, Vars{
 		BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: releaseDir,
 		Group: "OldFartsSubs", Tag: "1080p",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

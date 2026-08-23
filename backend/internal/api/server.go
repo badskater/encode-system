@@ -59,24 +59,51 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 		cfg.DefaultFlowName = "default-1080"
 	}
 	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg}
+	if err := s.seedStepTemplates(); err != nil {
+		return nil, err
+	}
 	if err := s.seedDefaultFlow(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// seedDefaultFlow installs the standard 1080p flow on first boot.
+// seedStepTemplates installs the built-in pipeline sections (idempotent
+// upserts keyed by template key).
+func (s *Server) seedStepTemplates() error {
+	ctx := ctxBg()
+	for _, t := range flow.BuiltinStepTemplates() {
+		if _, err := s.Store.UpsertStepTemplate(ctx, t); err != nil {
+			return fmt.Errorf("seed step template %s: %w", t.Key, err)
+		}
+	}
+	return nil
+}
+
+// seedDefaultFlow installs the standard 1080p flow on first boot and ensures
+// exactly one flow carries the default flag. When no flow is default yet
+// (fresh installs and databases created before the flag existed), the
+// configured default flow takes the flag.
 func (s *Server) seedDefaultFlow() error {
 	ctx := ctxBg()
-	if _, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err == nil {
-		return nil // already present
+	if _, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err != nil {
+		def := flow.DefaultFlow()
+		def.Name = s.Cfg.DefaultFlowName
+		if _, err := s.Store.CreateFlow(ctx, def); err != nil {
+			return fmt.Errorf("seed default flow: %w", err)
+		}
+		s.Log.Info("seeded default flow", "name", def.Name, "steps", len(def.Steps))
 	}
-	def := flow.DefaultFlow()
-	def.Name = s.Cfg.DefaultFlowName
-	if _, err := s.Store.CreateFlow(ctx, def); err != nil {
-		return fmt.Errorf("seed default flow: %w", err)
+	if _, err := s.Store.DefaultFlow(ctx); err != nil {
+		fl, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName)
+		if err != nil {
+			return fmt.Errorf("resolve default flow: %w", err)
+		}
+		if err := s.Store.SetDefaultFlow(ctx, fl.ID); err != nil {
+			return fmt.Errorf("mark default flow: %w", err)
+		}
+		s.Log.Info("marked default flow", "flow", fl.Name)
 	}
-	s.Log.Info("seeded default flow", "name", def.Name, "steps", len(def.Steps))
 	return nil
 }
 
@@ -109,6 +136,21 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/flows", s.withAdmin(s.handleCreateFlow))
 	mux.HandleFunc("PUT /api/flows/{id}", s.withAdmin(s.handleUpdateFlow))
 	mux.HandleFunc("DELETE /api/flows/{id}", s.withAdmin(s.handleDeleteFlow))
+	mux.HandleFunc("POST /api/flows/{id}/default", s.withAdmin(s.handleSetDefaultFlow))
+	mux.HandleFunc("GET /api/flows/{id}/export", s.withAdmin(s.handleExportFlow))
+	mux.HandleFunc("POST /api/flows/import", s.withAdmin(s.handleImportFlow))
+
+	mux.HandleFunc("GET /api/series", s.withAdmin(s.handleListSeries))
+	mux.HandleFunc("PATCH /api/series/{id}", s.withAdmin(s.handlePatchSeries))
+
+	mux.HandleFunc("GET /api/step-templates", s.withAdmin(s.handleListStepTemplates))
+	mux.HandleFunc("POST /api/step-templates", s.withAdmin(s.handleCreateStepTemplate))
+	mux.HandleFunc("PUT /api/step-templates/{id}", s.withAdmin(s.handleUpdateStepTemplate))
+	mux.HandleFunc("DELETE /api/step-templates/{id}", s.withAdmin(s.handleDeleteStepTemplate))
+
+	mux.HandleFunc("GET /api/pairing", s.withAdmin(s.handleListPairingCodes))
+	mux.HandleFunc("POST /api/pairing", s.withAdmin(s.handleCreatePairingCode))
+	mux.HandleFunc("POST /api/agent/pair", s.handleAgentPair)
 
 	mux.HandleFunc("GET /api/settings", s.withAdmin(s.handleGetSettings))
 
@@ -209,6 +251,14 @@ func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// storeResolver resolves step templates from the store so rendered jobs link
+// the exact PowerShell saved in the database (custom steps included).
+func (s *Server) storeResolver() flow.TemplateResolver {
+	return func(key string) (*model.StepTemplate, error) {
+		return s.Store.StepTemplateByKey(ctxBg(), key)
+	}
 }
 
 // nodeFromCtx retrieves the authenticated node.

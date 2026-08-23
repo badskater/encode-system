@@ -1,0 +1,398 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/badskater/encode-system/backend/internal/model"
+)
+
+// migrateExt applies the phase-2 schema: flows.is_default, series,
+// step_templates, pairing_codes. Tolerant of databases created by the
+// original schema (ALTERs) and of fresh databases (CREATE TABLE).
+func (s *Store) migrateExt() error {
+	schema := `
+CREATE TABLE IF NOT EXISTS series (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  flow_id INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS step_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  params_json TEXT NOT NULL DEFAULT '[]',
+  powershell TEXT NOT NULL,
+  builtin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pairing_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash TEXT NOT NULL UNIQUE,
+  name_hint TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL,
+  used_by INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`
+	if _, err := s.db.Exec(schema); err != nil {
+		return fmt.Errorf("migrate ext schema: %w", err)
+	}
+	// flows.is_default for databases created before phase 2.
+	if _, err := s.db.Exec(`ALTER TABLE flows ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate flows.is_default: %w", err)
+		}
+	}
+	return nil
+}
+
+// ---------- Series ----------
+
+// UpsertSeriesByName returns the series row for name, creating it enabled
+// with no flow override when first seen. Existing rows are returned as-is.
+func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Series, error) {
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO series (name) VALUES (?)`, name); err != nil {
+		return nil, fmt.Errorf("upsert series: %w", err)
+	}
+	return s.SeriesByName(ctx, name)
+}
+
+// SeriesByName loads a series by exact folder name.
+func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series WHERE name = ?`, name)
+	return scanSeries(row)
+}
+
+// GetSeries loads a series by ID.
+func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series WHERE id = ?`, id)
+	return scanSeries(row)
+}
+
+func scanSeries(row *sql.Row) (*model.Series, error) {
+	var sr model.Series
+	var enabled int
+	var createdAt, updatedAt string
+	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &enabled, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	sr.Enabled = enabled == 1
+	sr.CreatedAt = parseTime(createdAt)
+	sr.UpdatedAt = parseTime(updatedAt)
+	return &sr, nil
+}
+
+// ListSeries returns all series ordered by name.
+func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Series
+	for rows.Next() {
+		var sr model.Series
+		var enabled int
+		var createdAt, updatedAt string
+		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &enabled, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		sr.Enabled = enabled == 1
+		sr.CreatedAt = parseTime(createdAt)
+		sr.UpdatedAt = parseTime(updatedAt)
+		out = append(out, &sr)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSeries persists flow selection and enabled state.
+func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET flow_id=?, enabled=?, updated_at=datetime('now') WHERE id=?`,
+		sr.FlowID, boolToInt(sr.Enabled), sr.ID)
+	return err
+}
+
+// ---------- Flows: default management ----------
+
+// DefaultFlow returns the flow marked default, or an error when none exists.
+func (s *Store) DefaultFlow(ctx context.Context) (*model.Flow, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE is_default = 1 LIMIT 1`)
+	return scanFlowV2(row)
+}
+
+// SetDefaultFlow marks one flow default and clears all others, atomically.
+func (s *Store) SetDefaultFlow(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM flows WHERE id = ?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return fmt.Errorf("flow %d not found", id)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE flows SET is_default = 0`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE flows SET is_default = 1 WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// scanFlowV2 reads a flow row including is_default.
+func scanFlowV2(row *sql.Row) (*model.Flow, error) {
+	var f model.Flow
+	var stepsJSON string
+	var isDefault int
+	var createdAt, updatedAt string
+	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
+		return nil, fmt.Errorf("unmarshal steps: %w", err)
+	}
+	f.IsDefault = isDefault == 1
+	f.CreatedAt = parseTime(createdAt)
+	f.UpdatedAt = parseTime(updatedAt)
+	return &f, nil
+}
+
+// ---------- Step templates ----------
+
+// UpsertStepTemplate inserts a template by key or updates it when present.
+// Builtin templates are created at boot; custom templates come from the UI.
+func (s *Store) UpsertStepTemplate(ctx context.Context, t *model.StepTemplate) (*model.StepTemplate, error) {
+	pb, err := json.Marshal(t.Params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal params: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO step_templates (key, label, description, params_json, powershell, builtin)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET label=excluded.label, description=excluded.description,
+       params_json=excluded.params_json, powershell=excluded.powershell, updated_at=datetime('now')`,
+		t.Key, t.Label, t.Description, string(pb), t.PowerShell, boolToInt(t.Builtin)); err != nil {
+		return nil, fmt.Errorf("upsert step template: %w", err)
+	}
+	return s.StepTemplateByKey(ctx, t.Key)
+}
+
+// StepTemplateByKey loads a template by unique key.
+func (s *Store) StepTemplateByKey(ctx context.Context, key string) (*model.StepTemplate, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
+     FROM step_templates WHERE key = ?`, key)
+	return scanTemplate(row)
+}
+
+// GetStepTemplate loads a template by ID.
+func (s *Store) GetStepTemplate(ctx context.Context, id int64) (*model.StepTemplate, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
+     FROM step_templates WHERE id = ?`, id)
+	return scanTemplate(row)
+}
+
+func scanTemplate(row *sql.Row) (*model.StepTemplate, error) {
+	var t model.StepTemplate
+	var paramsJSON string
+	var builtin int
+	var createdAt, updatedAt string
+	if err := row.Scan(&t.ID, &t.Key, &t.Label, &t.Description, &paramsJSON, &t.PowerShell,
+		&builtin, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(paramsJSON), &t.Params); err != nil {
+		return nil, fmt.Errorf("unmarshal params: %w", err)
+	}
+	t.Builtin = builtin == 1
+	t.CreatedAt = parseTime(createdAt)
+	t.UpdatedAt = parseTime(updatedAt)
+	return &t, nil
+}
+
+// ListStepTemplates returns all templates ordered by key.
+func (s *Store) ListStepTemplates(ctx context.Context) ([]*model.StepTemplate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
+     FROM step_templates ORDER BY key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.StepTemplate
+	for rows.Next() {
+		var t model.StepTemplate
+		var paramsJSON string
+		var builtin int
+		var createdAt, updatedAt string
+		if err := rows.Scan(&t.ID, &t.Key, &t.Label, &t.Description, &paramsJSON, &t.PowerShell,
+			&builtin, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(paramsJSON), &t.Params); err != nil {
+			return nil, err
+		}
+		t.Builtin = builtin == 1
+		t.CreatedAt = parseTime(createdAt)
+		t.UpdatedAt = parseTime(updatedAt)
+		out = append(out, &t)
+	}
+	return out, rows.Err()
+}
+
+// DeleteStepTemplate removes a custom template. Built-ins and templates
+// referenced by flows are refused.
+func (s *Store) DeleteStepTemplate(ctx context.Context, id int64) error {
+	t, err := s.GetStepTemplate(ctx, id)
+	if err != nil {
+		return fmt.Errorf("template %d: %w", id, err)
+	}
+	if t.Builtin {
+		return fmt.Errorf("built-in template %q cannot be deleted", t.Key)
+	}
+	refs, err := s.flowRefsTemplate(ctx, t.Key)
+	if err != nil {
+		return err
+	}
+	if refs > 0 {
+		return fmt.Errorf("template %q is used by %d flow(s)", t.Key, refs)
+	}
+	_, err = s.db.ExecContext(ctx, `DELETE FROM step_templates WHERE id = ?`, id)
+	return err
+}
+
+// flowRefsTemplate counts flows whose step list references the template key.
+func (s *Store) flowRefsTemplate(ctx context.Context, key string) (int, error) {
+	flows, err := s.ListFlows(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, f := range flows {
+		for _, st := range f.Steps {
+			if st.TemplateKey() == key {
+				n++
+				break
+			}
+		}
+	}
+	return n, nil
+}
+
+// ---------- Pairing codes ----------
+
+// CreatePairingCode stores a hashed one-shot code expiring after ttl.
+func (s *Store) CreatePairingCode(ctx context.Context, codeHash, nameHint string, ttl time.Duration) (*model.PairingCode, error) {
+	exp := time.Now().UTC().Add(ttl)
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO pairing_codes (code_hash, name_hint, expires_at) VALUES (?, ?, ?)`,
+		codeHash, nameHint, fmtTime(exp))
+	if err != nil {
+		return nil, fmt.Errorf("create pairing code: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return s.GetPairingCode(ctx, id)
+}
+
+// GetPairingCode loads one code by ID.
+func (s *Store) GetPairingCode(ctx context.Context, id int64) (*model.PairingCode, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE id = ?`, id)
+	return scanPairing(row)
+}
+
+func scanPairing(row *sql.Row) (*model.PairingCode, error) {
+	var p model.PairingCode
+	var expires, createdAt string
+	if err := row.Scan(&p.ID, &p.CodeHash, &p.NameHint, &expires, &p.UsedBy, &createdAt); err != nil {
+		return nil, err
+	}
+	p.ExpiresAt = parseTime(expires)
+	p.CreatedAt = parseTime(createdAt)
+	return &p, nil
+}
+
+// ConsumePairingCode atomically marks a code used by nodeID. It fails when
+// the code is unknown, expired, or already consumed (one-shot semantics).
+func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID int64) (*model.PairingCode, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var p model.PairingCode
+	var expires, createdAt string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`,
+		codeHash).Scan(&p.ID, &p.CodeHash, &p.NameHint, &expires, &p.UsedBy, &createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("unknown pairing code")
+	}
+	p.ExpiresAt = parseTime(expires)
+	p.CreatedAt = parseTime(createdAt)
+
+	if p.UsedBy != 0 {
+		return nil, fmt.Errorf("pairing code already used")
+	}
+	if time.Now().UTC().After(p.ExpiresAt) {
+		return nil, fmt.Errorf("pairing code expired")
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE pairing_codes SET used_by = ? WHERE id = ?`, nodeID, p.ID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	p.UsedBy = nodeID
+	return &p, nil
+}
+
+// ListPairingCodes returns active (unused, unexpired) codes for the UI.
+func (s *Store) ListPairingCodes(ctx context.Context) ([]*model.PairingCode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes
+     WHERE used_by = 0 AND expires_at > ? ORDER BY id DESC`, fmtTime(time.Now().UTC()))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.PairingCode
+	for rows.Next() {
+		var p model.PairingCode
+		var expires, createdAt string
+		if err := rows.Scan(&p.ID, &p.CodeHash, &p.NameHint, &expires, &p.UsedBy, &createdAt); err != nil {
+			return nil, err
+		}
+		p.ExpiresAt = parseTime(expires)
+		p.CreatedAt = parseTime(createdAt)
+		out = append(out, &p)
+	}
+	return out, rows.Err()
+}

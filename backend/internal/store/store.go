@@ -98,6 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	if err := s.migrateExt(); err != nil {
+		return err
+	}
 	// Schema v1 -> v1.1: add reboot_issued_at_tasks to databases created
 	// before this column existed. Tolerant of the already-migrated case.
 	for _, alt := range []string{
@@ -251,6 +254,12 @@ func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	return err
 }
 
+// DeleteNode removes a node row (used to roll back failed pairing).
+func (s *Store) DeleteNode(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
+	return err
+}
+
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
@@ -286,26 +295,28 @@ func (s *Store) CreateFlow(ctx context.Context, f *model.Flow) (*model.Flow, err
 
 // GetFlow loads a flow by ID.
 func (s *Store) GetFlow(ctx context.Context, id int64) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, created_at, updated_at FROM flows WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE id = ?`, id)
 	return scanFlow(row)
 }
 
 // FlowByName loads a flow by unique name.
 func (s *Store) FlowByName(ctx context.Context, name string) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, created_at, updated_at FROM flows WHERE name = ?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE name = ?`, name)
 	return scanFlow(row)
 }
 
 func scanFlow(row *sql.Row) (*model.Flow, error) {
 	var f model.Flow
 	var stepsJSON string
+	var isDefault int
 	var createdAt, updatedAt string
-	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
 		return nil, fmt.Errorf("unmarshal steps: %w", err)
 	}
+	f.IsDefault = isDefault == 1
 	f.CreatedAt = parseTime(createdAt)
 	f.UpdatedAt = parseTime(updatedAt)
 	return &f, nil
@@ -313,7 +324,7 @@ func scanFlow(row *sql.Row) (*model.Flow, error) {
 
 // ListFlows returns all flows ordered by name.
 func (s *Store) ListFlows(ctx context.Context) ([]*model.Flow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, steps_json, created_at, updated_at FROM flows ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -322,13 +333,15 @@ func (s *Store) ListFlows(ctx context.Context) ([]*model.Flow, error) {
 	for rows.Next() {
 		var f model.Flow
 		var stepsJSON string
+		var isDefault int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&f.ID, &f.Name, &stepsJSON, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
 			return nil, err
 		}
+		f.IsDefault = isDefault == 1
 		f.CreatedAt = parseTime(createdAt)
 		f.UpdatedAt = parseTime(updatedAt)
 		out = append(out, &f)

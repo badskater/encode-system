@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -17,6 +18,8 @@ type fakeStore struct {
 	existing map[string]bool
 	flow     *model.Flow
 	created  []*model.Job
+	series   map[string]*model.Series
+	disabled map[string]bool // series name -> disabled
 }
 
 func (f *fakeStore) JobExistsForEpisode(_ context.Context, dir string) (bool, error) {
@@ -30,6 +33,30 @@ func (f *fakeStore) CreateJob(_ context.Context, j *model.Job) (*model.Job, erro
 }
 
 func (f *fakeStore) FlowByName(_ context.Context, _ string) (*model.Flow, error) {
+	return f.flow, nil
+}
+
+func (f *fakeStore) UpsertSeriesByName(_ context.Context, name string) (*model.Series, error) {
+	if f.series == nil {
+		f.series = map[string]*model.Series{}
+	}
+	if _, ok := f.series[name]; !ok {
+		f.series[name] = &model.Series{Name: name, Enabled: !f.disabled[name]}
+	}
+	return f.series[name], nil
+}
+
+func (f *fakeStore) GetFlow(_ context.Context, id int64) (*model.Flow, error) {
+	if f.flow != nil && f.flow.ID == id {
+		return f.flow, nil
+	}
+	return nil, fmt.Errorf("flow %d not found", id)
+}
+
+func (f *fakeStore) DefaultFlow(_ context.Context) (*model.Flow, error) {
+	if f.flow == nil {
+		return nil, fmt.Errorf("no default flow")
+	}
 	return f.flow, nil
 }
 

@@ -44,17 +44,24 @@ const (
 	StepKeyframes    StepType = "keyframes"
 )
 
-// Step is one entry in a flow: a step template plus its parameters.
+// Step is one entry in a flow: a reference to a step template (by key)
+// plus its parameters. Type mirrors the template key and stays for
+// backward compatibility with the built-in step constants.
 type Step struct {
 	Type   StepType          `json:"type"`
 	Params map[string]string `json:"params,omitempty"`
 }
 
+// TemplateKey returns the step's template reference (defaults to its type).
+func (s Step) TemplateKey() string { return string(s.Type) }
+
 // Flow is a named, ordered list of steps rendered into a job script.
+// Exactly one flow may be the default (used when a series has no flow set).
 type Flow struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Steps     []Step    `json:"steps"`
+	IsDefault bool      `json:"is_default"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -83,24 +90,68 @@ type Node struct {
 
 // Job is one episode encode assignment.
 type Job struct {
-	ID         int64     `json:"id"`
-	Series     string    `json:"series"`
-	Episode    string    `json:"episode"` // e.g. "01"
-	EpisodeDir string    `json:"episode_dir"` // path relative to scripts share, e.g. "Series Name/Ep 01"
-	ScriptType string    `json:"script_type"` // "avs" or "vpy"
-	ScriptFile string    `json:"script_file"` // detected filter script, e.g. "1080.vpy"
-	FlowID     int64     `json:"flow_id"`
-	Status     JobStatus `json:"status"`
-	NodeID     int64     `json:"node_id,omitempty"`
-	Step       string    `json:"step,omitempty"`
-	Progress   float64   `json:"progress,omitempty"`
-	ExitCode   int       `json:"exit_code"`
-	Error      string    `json:"error,omitempty"`
-	LogTail    string    `json:"log_tail,omitempty"`
+	ID         int64      `json:"id"`
+	Series     string     `json:"series"`
+	Episode    string     `json:"episode"`     // e.g. "01"
+	EpisodeDir string     `json:"episode_dir"` // path relative to scripts share, e.g. "Series Name/Ep 01"
+	ScriptType string     `json:"script_type"` // "avs" or "vpy"
+	ScriptFile string     `json:"script_file"` // detected filter script, e.g. "1080.vpy"
+	FlowID     int64      `json:"flow_id"`
+	Status     JobStatus  `json:"status"`
+	NodeID     int64      `json:"node_id,omitempty"`
+	Step       string     `json:"step,omitempty"`
+	Progress   float64    `json:"progress,omitempty"`
+	ExitCode   int        `json:"exit_code"`
+	Error      string     `json:"error,omitempty"`
+	LogTail    string     `json:"log_tail,omitempty"`
 	Outputs    []string   `json:"outputs,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+}
+
+// Series is a registered show/folder on the scripts share with its own flow
+// assignment and enable state. Episodes of a series may run on any enabled
+// node (the queue distributes one job per idle node automatically).
+type Series struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`    // matches the share folder name exactly
+	FlowID    int64     `json:"flow_id"` // 0 = use the default flow
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// StepTemplate is one controllable pipeline section: metadata plus its own
+// PowerShell function. Built-ins mirror EncodeLib.ps1; custom templates add
+// new steps the renderer embeds into the final flow script.
+type StepTemplate struct {
+	ID          int64      `json:"id"`
+	Key         string     `json:"key"` // unique, e.g. "dgindex" or "my_cleanup"
+	Label       string     `json:"label"`
+	Description string     `json:"description"`
+	Params      []ParamDef `json:"params"`
+	PowerShell  string     `json:"powershell"` // full function source
+	Builtin     bool       `json:"builtin"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// ParamDef declares one editable parameter of a step template.
+type ParamDef struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Placeholder string `json:"placeholder,omitempty"`
+}
+
+// PairingCode is a one-shot code an agent presents to register itself.
+type PairingCode struct {
+	ID        int64     `json:"id"`
+	CodeHash  string    `json:"-"`
+	NameHint  string    `json:"name_hint"`
+	ExpiresAt time.Time `json:"expires_at"`
+	UsedBy    int64     `json:"used_by,omitempty"` // node id once consumed
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Heartbeat is the periodic agent status report.

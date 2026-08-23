@@ -182,7 +182,7 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 		Group:      s.Cfg.Group,
 		Tag:        s.Cfg.Tag,
 	}
-	script, err := flow.Render(fl, job, vars)
+	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +423,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	fl, err := s.resolveFlow(ctx, req.FlowID)
+	fl, err := s.resolveFlow(ctx, req.FlowID, req.Series)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "flow: "+err.Error())
 		return
@@ -440,10 +440,22 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, job)
 }
 
-// resolveFlow picks the flow by ID, falling back to the default flow name.
-func (s *Server) resolveFlow(ctx context.Context, id int64) (*model.Flow, error) {
+// resolveFlow picks the flow by ID; with no explicit ID it honors the
+// series' flow selection, then the flagged default flow, then the configured
+// default name.
+func (s *Server) resolveFlow(ctx context.Context, id int64, seriesName string) (*model.Flow, error) {
 	if id > 0 {
 		return s.Store.GetFlow(ctx, id)
+	}
+	if seriesName != "" {
+		if sr, err := s.Store.SeriesByName(ctx, seriesName); err == nil && sr.FlowID > 0 {
+			if fl, err := s.Store.GetFlow(ctx, sr.FlowID); err == nil {
+				return fl, nil
+			}
+		}
+	}
+	if fl, err := s.Store.DefaultFlow(ctx); err == nil {
+		return fl, nil
 	}
 	return s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName)
 }
@@ -545,10 +557,9 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 	req.ID = 0
 	req.CreatedAt = time.Time{}
 	req.UpdatedAt = time.Time{}
-	// Validate the flow renders before persisting it.
-	dummy := &model.Job{ID: 0, Series: "Validate", Episode: "01", EpisodeDir: "Validate/Ep 01", ScriptType: "vpy"}
-	if _, err := flow.Render(&req, dummy, flow.Vars{}); err != nil {
-		writeErr(w, http.StatusBadRequest, "flow does not render: "+err.Error())
+	// Validate every step resolves before persisting the flow.
+	if err := flow.ValidateForRender(&req, s.storeResolver()); err != nil {
+		writeErr(w, http.StatusBadRequest, "flow invalid: "+err.Error())
 		return
 	}
 	fl, err := s.Store.CreateFlow(r.Context(), &req)
@@ -582,9 +593,8 @@ func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
 	if len(req.Steps) > 0 {
 		existing.Steps = req.Steps
 	}
-	dummy := &model.Job{ID: 0, Series: "Validate", Episode: "01", EpisodeDir: "Validate/Ep 01", ScriptType: "vpy"}
-	if _, err := flow.Render(existing, dummy, flow.Vars{}); err != nil {
-		writeErr(w, http.StatusBadRequest, "flow does not render: "+err.Error())
+	if err := flow.ValidateForRender(existing, s.storeResolver()); err != nil {
+		writeErr(w, http.StatusBadRequest, "flow invalid: "+err.Error())
 		return
 	}
 	if err := s.Store.UpdateFlow(r.Context(), existing); err != nil {

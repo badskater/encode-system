@@ -16,7 +16,7 @@ func TestRenderDefaultFlowProducesAllSteps(t *testing.T) {
 	j := &model.Job{ID: 7, Series: "Ookami-san to Shichinin no Nakama-tachi", Episode: "01",
 		EpisodeDir: "Ookami-san to Shichinin no Nakama-tachi/Ep 01", ScriptType: "vpy", FlowID: 1}
 
-	script, err := Render(f, j, testVars())
+	script, err := Render(f, j, testVars(), nil)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestRenderEscapesSingleQuotes(t *testing.T) {
 	j := &model.Job{ID: 1, Series: "L'Arc ~en~ Ciel", Episode: "02",
 		EpisodeDir: "L'Arc ~en~ Ciel/Ep 02", ScriptType: "avs"}
 
-	script, err := Render(f, j, testVars())
+	script, err := Render(f, j, testVars(), nil)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -67,14 +67,14 @@ func TestRenderEscapesSingleQuotes(t *testing.T) {
 func TestRenderRejectsUnknownStep(t *testing.T) {
 	f := &model.Flow{Name: "bad", Steps: []model.Step{{Type: "teleport"}}}
 	j := &model.Job{ID: 1, Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy"}
-	if _, err := Render(f, j, testVars()); err == nil {
+	if _, err := Render(f, j, testVars(), nil); err == nil {
 		t.Fatal("expected error for unknown step type")
 	}
 }
 
 func TestRenderRejectsEmptyFlow(t *testing.T) {
 	j := &model.Job{ID: 1, Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy"}
-	if _, err := Render(&model.Flow{Name: "empty"}, j, testVars()); err == nil {
+	if _, err := Render(&model.Flow{Name: "empty"}, j, testVars(), nil); err == nil {
 		t.Fatal("expected error for empty flow")
 	}
 }
@@ -99,12 +99,12 @@ func TestAudioStepParamsPropagate(t *testing.T) {
 		{Type: model.StepAudio, Params: map[string]string{"track": "3", "bitrate": "192"}},
 	}}
 	j := &model.Job{ID: 2, Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy"}
-	script, err := Render(f, j, testVars())
+	script, err := Render(f, j, testVars(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(script, "-TrackIndex '3'") || !strings.Contains(script, "-Bitrate '192'") {
-		t.Errorf("audio params missing:\n%s", script)
+	if !strings.Contains(script, "track = '3'") || !strings.Contains(script, "bitrate = '192'") {
+		t.Errorf("audio params missing from step params literal:\n%s", script)
 	}
 }
 
@@ -114,7 +114,7 @@ func TestStepOrderPreserved(t *testing.T) {
 		{Type: model.StepEncode},
 	}}
 	j := &model.Job{ID: 3, Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy"}
-	script, err := Render(f, j, testVars())
+	script, err := Render(f, j, testVars(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

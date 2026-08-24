@@ -14,6 +14,8 @@ docker/.env
 !**/*.example
 infra/ansible/inventory*
 infra/ansible/group_vars/secrets.yml
+infra/ansible/group_vars/all/secrets.yml
+infra/ansible/files/
 infra/ansible/files/bin/
 *.token
 

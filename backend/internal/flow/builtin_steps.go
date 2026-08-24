@@ -299,14 +299,35 @@ func keyframesTemplate() *model.StepTemplate {
     }
 
     Write-Output "[keyframes] ffmpeg -> y4m -> SCXvid"
-    # Local temp file (not the NFS release share); best-effort cleanup.
+    # SCXvid's documented contract (verified on a real node): the output log
+    # file is its ONLY argument and the y4m arrives on STDIN. ffmpeg writes a
+    # temp y4m, then a .NET process pipes it into SCXvid - cross-platform
+    # (works on PS 5.1 nodes and pwsh alike, no cmd.exe dependency).
     $y4m = Join-Path ([System.IO.Path]::GetTempPath()) "encode-kf-$PID.y4m"
     try {
         Invoke-Tool -ExePath $ffmpeg -Arguments @(
             '-i', $mkv, '-f', 'yuv4mpegpipe', '-vf', 'scale=640:360',
             '-pix_fmt', 'yuv420p', '-vsync', 'drop', '-loglevel', 'quiet', $y4m
         ) -Label 'ffmpeg'
-        Invoke-Tool -ExePath $scxvid -Arguments @($y4m, $kf) -Label 'SCXvid'
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $scxvid
+        $psi.Arguments = '"' + $kf + '"'
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $src = [System.IO.File]::OpenRead($y4m)
+        try { $src.CopyTo($proc.StandardInput.BaseStream) } finally { $src.Close() }
+        $proc.StandardInput.Close()
+        $proc.WaitForExit()
+        foreach ($line in (($outTask.Result + [Environment]::NewLine + $errTask.Result) -split [Environment]::NewLine)) {
+            if ($line.Trim()) { Write-Output "[SCXvid] $($line.Trim())" }
+        }
+        if ($proc.ExitCode -ne 0) { throw "SCXvid exited with code $($proc.ExitCode)" }
     } finally {
         try { if (Test-Path -LiteralPath $y4m) { Remove-Item -LiteralPath $y4m -Force } } catch { }
     }

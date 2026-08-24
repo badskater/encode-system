@@ -329,7 +329,12 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		return
 	}
 	scriptPath := filepath.Join(jobDir, "job.ps1")
-	if err := os.WriteFile(scriptPath, []byte(job.Script), 0o644); err != nil {
+	// Windows PowerShell 5.1 reads .ps1 files WITHOUT a BOM as ANSI and
+	// mangles any non-ASCII content — with anime series names that is a
+	// data-corruption bug, not a cosmetic one. Always write UTF-8 with BOM;
+	// pwsh (7+) and PS 5.1 both honor it identically.
+	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(job.Script)...)
+	if err := os.WriteFile(scriptPath, scriptBytes, 0o644); err != nil {
 		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "")
 		return
 	}

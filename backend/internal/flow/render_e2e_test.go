@@ -55,7 +55,9 @@ echo "mkvmerge stub done"`,
 args=("$@"); : > "${args[${#args[@]}-1]}"
 echo "ffmpeg stub done"`,
 		"SCXvid.exe": `#!/usr/bin/env bash
-args=("$@"); : > "${args[${#args[@]}-1]}"
+# real contract: scxvid {output_log_file} < {input y4m on stdin}
+cat > /dev/null
+: > "$1"
 echo "SCXvid stub done"`,
 	}
 	for name, body := range stubs {

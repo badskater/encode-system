@@ -8,8 +8,18 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## In progress
 
-- GPU-path validation on a real Nvidia node (test VM has no GPU: DGIndexNV/
-  KNLMeansCL/x265-fork all untestable there; CPU pipeline fully validated)
+- GPU-path validation on a real Nvidia node (test VM has no GPU: DGIndexNV
+  and KNLMeansCL/OpenCL filters untestable there)
+
+## Done (real x265 fork validated — after VM vCPU change to i9-13900HX)
+
+- Patman/JPSDR x265 fork runs with the FULL legacy argument set (aq-mode 5,
+  aq-strength-edge, aq-bias-strength-edge etc.) reading .avs via AviSynth+
+  3.7.5: 120 frames encoded, muxed, released, keyframed -> job done exit 0
+- Node env fix found: AviSynth+ plugins64 contained two 32-bit DLLs
+  (dfttest.dll, libfftw3f-3.dll) that abort the 64-bit loader; real nodes
+  need the 64-bit builds (dfttest backs TTempSmooth in the filter chain)
+- Agent credential + task counter survived a full VM reboot (persistence OK)
 
 ## Done (first real Windows Server 2025 deploy — 172.24.92.219)
 

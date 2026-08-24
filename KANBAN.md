@@ -8,7 +8,25 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## In progress
 
-- First real deploy to a Windows Server 2025 node (needs a physical node)
+- GPU-path validation on a real Nvidia node (test VM has no GPU: DGIndexNV/
+  KNLMeansCL/x265-fork all untestable there; CPU pipeline fully validated)
+
+## Done (first real Windows Server 2025 deploy — 172.24.92.219)
+
+- Full stack live on WS2025 Datacenter + PowerShell 5.1.26100: controller +
+  agent binaries, pairing self-registration, scanner, series registry,
+  per-series flow selection, custom step template created via API and executed
+- Real tools ran: eac3to (AC3->WAV), opusenc (deployed, Opus @ 262 kbit/s),
+  mkvmerge, ffmpeg libx265 (cpu-test flow), release copy
+- Four real bugs found and fixed (all committed with tests):
+  1. agent.json loader choked on UTF-8 BOM (PS Set-Content default)
+  2. rendered job.ps1 written without BOM -> PS 5.1 ANSI mojibake of
+     non-ASCII content (anime series names)
+  3. Invoke-Tool logged 'RemoteException' noise for native stderr (PS 5.1
+     ErrorRecord wrapping)
+  4. SCXvid invocation contract wrong: it reads y4m on STDIN and takes the
+     output log as its only arg (verified against the real binary's usage
+     text; step rewritten cross-platform with .NET process piping)
 
 ## Done (phase 2)
 

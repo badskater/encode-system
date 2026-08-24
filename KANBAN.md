@@ -11,6 +11,23 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (change-password system — no password in .env)
+
+- POST /api/auth/password: verifies current password (wrong attempts count
+  against the login throttle), min 10 chars, must differ, bcrypt rehash,
+  revokes all OTHER sessions of the user (performing session survives).
+- UI: Change password dialog in the sidebar (client-side policy validation,
+  server errors surfaced, success screen advising .env cleanup). 5 component
+  tests + 8 backend tests (policy, throttle, revocation, session survival).
+- Recovery hatch: ENCODE_ADMIN_FORCE_PASSWORD=1 makes startup overwrite the
+  stored admin hash from ENCODE_ADMIN_PASSWORD once (warn-logged); without
+  the flag env never touches an existing account. Tested.
+- Compose: ENCODE_ADMIN_PASSWORD now optional (`:-` instead of `:?`).
+- Live-verified on the Docker host: rotated the real admin password through
+  the endpoint (old 401, new works), removed the password line from the
+  host's .env, recreated the container — login now runs purely off the DB
+  hash; nodes/jobs/templates all intact.
+
 ## Done (FileFlows-style plugins + fully editable steps)
 
 - Three plugin steps shipped as built-ins (FileFlows-inspired, Tier-1 picks):

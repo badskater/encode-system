@@ -11,6 +11,25 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (FileFlows-style plugins + fully editable steps)
+
+- Three plugin steps shipped as built-ins (FileFlows-inspired, Tier-1 picks):
+  media_probe (MediaInfo JSON -> container/video/audio report incl. suggested
+  eac3to track index), audio_branch (lossy/lossless-aware Opus bitrate
+  budgeting), crc32_rename (streaming CRC32 -> [ABC1234D] release naming,
+  propagates $Job.OutputName so release_copy/keyframes follow).
+- x265 encode step now has structured Opus-style fields (preset, crf, aq_mode,
+  aq_strength(+edge), psy_rd/rdoq, rd, ctu, no_sao/b_pyramid/open_gop bools);
+  blank field = documented default; x265_args remains as raw override.
+- Step scripts are FULLY UI-editable and PERSIST ACROSS RESTARTS: boot
+  seeding switched to insert-if-absent; POST /api/step-templates/{id}/reset
+  restores factory defaults; live-verified on the Docker host (edit survived
+  a container restart).
+- Flow builder: typed widgets (checkbox for bool, number inputs), defaults
+  prefilled on add; Steps page edits param type + default columns.
+- Tests: 6 new API tests (edit survival, reset, plugin seeding), 1 pwsh E2E
+  running all three plugin steps with a MediaInfo JSON stub; all gates green.
+
 ## Done (multi-node fleet)
 
 - Second Windows node added by cloning the test VM (172.24.92.229). Clone

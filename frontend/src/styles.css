@@ -174,3 +174,17 @@ pre {
 
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
 .toolbar input { flex: 1; }
+
+/* Modal dialogs (e.g. change password) */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  z-index: 50;
+}
+.modal-backdrop .modal { width: 100%; margin: 0; }
+.modal-backdrop .modal h3 { margin-top: 0; }

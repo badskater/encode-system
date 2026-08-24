@@ -48,6 +48,20 @@ sliding expiry; wrong passwords lock the login endpoint for 30s after 5
 failures. The dashboard loads; the scanner registers series as folders
 appear on the share.
 
+**Right after first login:** open *Change password* in the sidebar, set your
+own password, then delete `ENCODE_ADMIN_PASSWORD` from the compose `.env`
+and recreate the container. The account hash in the state volume is the only
+credential from then on — nothing sensitive remains in the environment.
+
+**Lost password recovery:** there is no reset mechanism other than the
+database itself, so if you lose the rotated password, use the one-time
+recovery hatch: set `ENCODE_ADMIN_FORCE_PASSWORD=1` alongside
+`ENCODE_ADMIN_PASSWORD=<temporary>` in `.env`, recreate the container
+(startup logs a warning that the hash was force-reset), log in with the
+temporary password, rotate to a real one via the UI, then delete both env
+lines and recreate again. Without the force flag an existing account is
+never touched by environment values.
+
 Layout inside the container (for reference):
 
 - `/data` — persistent state volume: `encode.db` (SQLite), agent/lib update payloads

@@ -34,7 +34,8 @@ First-boot env:
 | Var | Meaning |
 | --- | --- |
 | `ENCODE_ADMIN_USER` | Management-plane login username (default `admin`). |
-| `ENCODE_ADMIN_PASSWORD` | Initial password — used only on the boot that creates the account. Leave empty to auto-generate (logged once). |
+| `ENCODE_ADMIN_PASSWORD` | Initial password — used only on the boot that creates the account. Leave empty to auto-generate (logged once). Rotate later via UI → *Change password*, then delete this line from `.env`. |
+| `ENCODE_ADMIN_FORCE_PASSWORD` | Lost-password recovery hatch. With `=1` set, `ENCODE_ADMIN_PASSWORD` overwrites the stored admin hash once (logged as a warning). Rotate via UI immediately after and remove both vars. |
 | `ENCODE_DATA` | Data dir (default `/data`). |
 | `ENCODE_SCAN_INTERVAL` | Seconds between share scans (default `30`). |
 | `ENCODE_TASKS_BEFORE_REBOOT` | Default `10`. |

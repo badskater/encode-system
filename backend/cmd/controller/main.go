@@ -83,8 +83,9 @@ func main() {
 	}
 
 	cfg := api.Config{
-		AdminUsername:     adminUser,
-		AdminPassword:     adminPass,
+		AdminUsername:      adminUser,
+		AdminPassword:      adminPass,
+		ForceAdminPassword: os.Getenv("ENCODE_ADMIN_FORCE_PASSWORD") == "1",
 		ScriptsRoot:       env("ENCODE_SCRIPTS_ROOT", filepath.Join(*dataDir, "scripts")),
 		ReleaseRoot:       env("ENCODE_RELEASE_ROOT", filepath.Join(*dataDir, "release")),
 		NodeBinDir:        env("ENCODE_NODE_BIN", `C:\bin`),

@@ -6,6 +6,7 @@ import FlowsPage from './pages/Flows';
 import SeriesPage from './pages/Series';
 import StepsPage from './pages/Steps';
 import TokenGate from './components/TokenGate';
+import ChangePasswordDialog from './components/ChangePasswordDialog';
 import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './api/client';
 
 type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps';
@@ -23,6 +24,7 @@ export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
   const [authed, setAuthed] = useState<boolean | null>(() => (hasToken() ? null : false));
   const [who, setWho] = useState('');
+  const [showChangePassword, setShowChangePassword] = useState(false);
 
   // If a session token is stored, validate it against the server before
   // showing anything. 401 drops straight back to the login form.
@@ -87,6 +89,9 @@ export default function App() {
         ))}
         <div style={{ marginTop: 'auto', paddingTop: 16 }}>
           {who && <div className="muted" style={{ marginBottom: 6 }}>{who}</div>}
+          <button onClick={() => setShowChangePassword(true)} style={{ marginBottom: 6 }}>
+            Change password
+          </button>
           <button onClick={logout}>Log out</button>
         </div>
       </aside>
@@ -98,6 +103,7 @@ export default function App() {
         {page === 'flows' && <FlowsPage />}
         {page === 'steps' && <StepsPage />}
       </main>
+      {showChangePassword && <ChangePasswordDialog onClose={() => setShowChangePassword(false)} />}
     </div>
   );
 }

@@ -23,8 +23,9 @@ import (
 
 // Config carries runtime settings injected into handlers.
 type Config struct {
-	AdminUsername     string        // management-plane admin account (seeded at startup)
-	AdminPassword     string        // initial password for the admin account (only used when the account doesn't exist)
+	AdminUsername        string        // management-plane admin account (seeded at startup)
+	AdminPassword        string        // initial password for the admin account (only used when the account doesn't exist)
+	ForceAdminPassword   bool          // recovery hatch: overwrite the stored admin hash with AdminPassword on this boot
 	ScriptsRoot       string        // controller-side scripts share mount
 	ReleaseRoot       string        // controller-side release share mount
 	NodeBinDir        string        // tools dir on nodes, e.g. C:\bin
@@ -92,6 +93,20 @@ func (s *Server) seedAdminUser() error {
 		return err
 	}
 	if existing != nil {
+		// Recovery hatch only: with the explicit force flag set, overwrite
+		// the stored hash so an operator who lost the password can get back
+		// in, then rotate from the UI and remove the env again. Without the
+		// flag an existing account is never touched by env values.
+		if s.Cfg.ForceAdminPassword && s.Cfg.AdminPassword != "" {
+			hash, err := bcrypt.GenerateFromPassword([]byte(s.Cfg.AdminPassword), bcrypt.DefaultCost)
+			if err != nil {
+				return err
+			}
+			if err := s.Store.UpdateUserPassword(ctxBg(), existing.ID, string(hash)); err != nil {
+				return err
+			}
+			s.Log.Warn("admin password force-reset from environment (recovery hatch) — rotate it from the UI and unset the env", "username", username)
+		}
 		return nil // already provisioned
 	}
 	if s.Cfg.AdminPassword == "" {
@@ -167,6 +182,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/logout", s.withAdmin(s.handleLogout))
 	mux.HandleFunc("GET /api/auth/me", s.withAdmin(s.handleMe))
+	mux.HandleFunc("POST /api/auth/password", s.withAdmin(s.handleChangePassword))
 
 	// UI endpoints — session auth.
 	mux.HandleFunc("GET /api/nodes", s.withAdmin(s.handleListNodes))

@@ -92,6 +92,11 @@ export const api = {
     }),
   logout: () => request<void>('POST', '/api/auth/logout'),
   me: () => request<{ username: string; expires_at: string }>('GET', '/api/auth/me'),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<{ status: string }>('POST', '/api/auth/password', {
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
 
   nodes: () => request<Node[]>('GET', '/api/nodes'),
   createNode: (name: string) =>

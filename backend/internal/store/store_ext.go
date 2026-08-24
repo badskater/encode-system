@@ -586,3 +586,18 @@ func (s *Store) PruneSessions(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at <= datetime('now')")
 	return err
 }
+
+// UpdateUserPassword replaces a user's bcrypt hash.
+func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHash string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, userID)
+	return err
+}
+
+// DeleteUserSessions revokes every session of a user except the one
+// identified by keepTokenHash (the session performing the action). Used on
+// password change so stale or stolen sessions die immediately.
+func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keepTokenHash string) error {
+	_, err := s.db.ExecContext(ctx,
+		"DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", userID, keepTokenHash)
+	return err
+}

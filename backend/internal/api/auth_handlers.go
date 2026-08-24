@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -137,6 +138,76 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"username":   sess.Username,
 		"expires_at": sess.ExpiresAt,
 	})
+}
+
+// ---------- Password management ----------
+
+// minPasswordLen is the floor for user-chosen passwords. Deliberately modest:
+// this is a single-admin management plane on a trusted LAN, and the login
+// endpoint already throttles brute force.
+const minPasswordLen = 10
+
+type changePasswordRequest struct {
+	Current string `json:"current_password"`
+	New     string `json:"new_password"`
+}
+
+// handleChangePassword lets the logged-in admin rotate their password without
+// touching the controller's environment. Requires the CURRENT password,
+// enforces a minimum length, and revokes every other session so stale or
+// stolen tokens die immediately. The env-supplied password (if any) becomes
+// irrelevant once the account exists — the hash in the database is the only
+// source of truth.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	sess := sessionFromCtx(r)
+	var req changePasswordRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Current == "" || req.New == "" {
+		writeErr(w, http.StatusBadRequest, "current_password and new_password are required")
+		return
+	}
+	if len(req.New) < minPasswordLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("new password must be at least %d characters", minPasswordLen))
+		return
+	}
+	if req.New == req.Current {
+		writeErr(w, http.StatusBadRequest, "new password must differ from the current one")
+		return
+	}
+
+	user, err := s.Store.UserByUsername(r.Context(), sess.Username)
+	if err != nil || user == nil {
+		writeErr(w, http.StatusInternalServerError, "user lookup failed")
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Current)) != nil {
+		s.throttle.fail() // wrong current password participates in the lockout
+		s.Log.Warn("password change rejected: wrong current password", "username", user.Username)
+		writeErr(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.New), bcrypt.DefaultCost)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "hash new password")
+		return
+	}
+	if err := s.Store.UpdateUserPassword(r.Context(), user.ID, string(hash)); err != nil {
+		writeErr(w, http.StatusInternalServerError, "update password")
+		return
+	}
+	// Revoke all OTHER sessions (the caller keeps theirs).
+	present := bearer(r)
+	if present != "" {
+		if err := s.Store.DeleteUserSessions(r.Context(), user.ID, auth.HashToken(present)); err != nil {
+			s.Log.Warn("revoke sessions after password change", "err", err)
+		}
+	}
+	s.Log.Info("admin password changed", "username", user.Username)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
 }
 
 // ---------- Middleware ----------

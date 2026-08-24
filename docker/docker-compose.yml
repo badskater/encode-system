@@ -19,7 +19,11 @@ services:
       - "${ENCODE_PORT:-8080}:8080"
     environment:
       ENCODE_ADMIN_USER: ${ENCODE_ADMIN_USER:-admin}
-      ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:?set in .env (first boot only)}
+      # Initial admin password — used ONLY on the boot that creates the
+      # account. Leave empty to auto-generate one (logged once at startup).
+      # After first boot the account hash lives in the database; rotate it
+      # from the UI (Change password) and delete this line from .env.
+      ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:-}
       ENCODE_DATA: /data
       ENCODE_SCRIPTS_ROOT: /data/scripts
       ENCODE_RELEASE_ROOT: /data/release

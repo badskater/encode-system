@@ -53,7 +53,7 @@ for a in "$@"; do [ "$prev" = "-o" ] && : > "$a"; prev="$a"; done
 echo "x265 stub done"`,
 		"mkvmerge.exe": `#!/usr/bin/env bash
 prev=""
-for a in "$@"; do [ "$prev" = "-o" ] && : > "$a"; prev="$a"; done
+for a in "$@"; do [ "$prev" = "-o" ] && printf '123456789' > "$a"; prev="$a"; done
 echo "mkvmerge stub done"`,
 	}
 	for name, body := range stubs {
@@ -112,6 +112,15 @@ echo "mkvmerge stub done"`,
 		"[probe] AUDIO #1 -> eac3to track 2",
 		"ENCODE_STEP audio_branch",
 		"[branch] track 2 : AC-3 -> Opus @ 192 kbps",
+		// Structured encode assembly: defaults applied for omitted params,
+		// including the bool flags (regression for the dropped-flag bug).
+		"[x265] args:",
+		"--preset slow",
+		"--crf 15",
+		"--aq-mode 5",
+		"--no-sao",
+		"--b-pyramid",
+		"--open-gop",
 		"ENCODE_STEP crc32_rename",
 		"ENCODE_JOB_DONE",
 	} {
@@ -120,7 +129,8 @@ echo "mkvmerge stub done"`,
 		}
 	}
 
-	// crc32_rename must have appended an 8-hex checksum tag to the release MKV.
+	// crc32_rename must have appended the CANONICAL CRC32 of the stub MKV
+	// content ("123456789" -> CBF43926), proving the checksum path end to end.
 	relDir := filepath.Join(releaseDir, "[OldFartsSubs] Plugin Series - Raws [1080p]")
 	entries, err := os.ReadDir(relDir)
 	if err != nil {
@@ -128,11 +138,11 @@ echo "mkvmerge stub done"`,
 	}
 	foundChecksummed := false
 	for _, e := range entries {
-		if strings.Contains(e.Name(), "[00000000]") {
+		if strings.Contains(e.Name(), "[CBF43926]") {
 			foundChecksummed = true
 		}
 	}
 	if !foundChecksummed {
-		t.Errorf("no checksummed release MKV found in %s (entries: %v)", relDir, entries)
+		t.Errorf("no [CBF43926] release MKV found in %s (entries: %v)", relDir, entries)
 	}
 }

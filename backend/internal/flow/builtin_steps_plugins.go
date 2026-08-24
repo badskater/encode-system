@@ -33,7 +33,9 @@ func mediaProbeTemplate() *model.StepTemplate {
     Write-Output "[probe] analyzing $src"
     $raw = & $mi --Output=JSON $src
     if ($LASTEXITCODE -ne 0) { throw "MediaInfo exited with code $LASTEXITCODE" }
-    $info = $raw | ConvertFrom-Json
+    # Join before parsing: PS 5.1 pipes native output line-by-line and would
+    # parse each line as separate JSON; joining works on 5.1 and pwsh alike.
+    $info = ([string]::Join([char]10, $raw)) | ConvertFrom-Json
     $tracks = @($info.media.track)
     $general = $tracks | Where-Object { $_.'@type' -eq 'General' } | Select-Object -First 1
     $video = $tracks | Where-Object { $_.'@type' -eq 'Video' } | Select-Object -First 1
@@ -112,10 +114,14 @@ func audioBranchTemplate() *model.StepTemplate {
 
     # Identify the selected track's codec via MediaInfo to pick the budget.
     $codec = ''
+    $profile = ''
+    $hiRes = $false
     $trackKbps = 0
     try {
 ` + mediainfoResolverPS + `
-        $info = (& $mi --Output=JSON $src) | ConvertFrom-Json
+        $rawMi = & $mi --Output=JSON $src
+        if ($LASTEXITCODE -ne 0) { throw "MediaInfo exited with code $LASTEXITCODE" }
+        $info = ([string]::Join([char]10, $rawMi)) | ConvertFrom-Json
         $audios = @($info.media.track | Where-Object { $_.'@type' -eq 'Audio' })
         $audioPos = [int]$track - 2  # eac3to track 2 = first audio stream
         if ($audioPos -lt 0 -or $audioPos -ge $audios.Count) {
@@ -123,6 +129,11 @@ func audioBranchTemplate() *model.StepTemplate {
         }
         $sel = $audios[$audioPos]
         $codec = [string]$sel.Format
+        if ($sel.PSObject.Properties['Format_Profile']) { $profile = [string]$sel.Format_Profile }
+        # DTS-HD Master Audio reports Format 'DTS' with profile 'MA / Core' -
+        # the profile, not the codec family, decides lossy vs lossless here.
+        # Set-StrictMode throws on missing properties, hence the guard above.
+        $hiRes = ($profile -ne '') -and ($profile -match 'Master Audio|HRA|\bMA\b')
         if ($sel.BitRate) { $trackKbps = [math]::Round([double]$sel.BitRate / 1000) }
     } catch {
         Write-Output "[branch] MediaInfo unavailable/failed ($($_.Exception.Message)); falling back to the lossless budget"
@@ -132,8 +143,12 @@ func audioBranchTemplate() *model.StepTemplate {
     $why = "lossless or unknown codec"
     if ($codec -ne '') {
         $isLossy = $false
-        foreach ($c in ($lossyCodecs -split ',')) {
-            if ($c.Trim() -and ($codec -like "*$($c.Trim())*")) { $isLossy = $true; break }
+        if (-not $hiRes) {
+            foreach ($c in ($lossyCodecs -split ',')) {
+                if ($c.Trim() -and ($codec -like "*$($c.Trim())*")) { $isLossy = $true; break }
+            }
+        } else {
+            Write-Output "[branch] profile '$profile' marks this track lossless despite codec family"
         }
         if ($isLossy) {
             if ($threshold -gt 0 -and $trackKbps -ge $threshold) {
@@ -194,31 +209,40 @@ func crc32RenameTemplate() *model.StepTemplate {
     }
 
     # Streaming CRC32 (standard reflected polynomial, same as fansub tooling).
-    $table = New-Object uint32[] 256
-    for ($i = 0; $i -lt 256; $i++) {
-        $c = [uint32]$i
-        for ($k = 0; $k -lt 8; $k++) {
-            if ($c -band 1) { $c = 0xEDB88320 -bxor ($c -shr 1) } else { $c = $c -shr 1 }
+    # Compiled via Add-Type for native speed: a byte-wise PowerShell loop over
+    # a multi-GB release would take tens of minutes, this runs in seconds.
+    if (-not ('EncodeCrc32' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public static class EncodeCrc32 {
+    private static readonly uint[] Table = new uint[256];
+    static EncodeCrc32() {
+        for (uint i = 0; i < 256; i++) {
+            uint c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            Table[i] = c;
         }
-        $table[$i] = $c
     }
-    $crc = [uint32]::MaxValue
-    $fs = [System.IO.File]::OpenRead($mkv)
-    $buf = New-Object byte[] 65536
-    try {
-        while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
-            for ($j = 0; $j -lt $n; $j++) {
-                $crc = $table[($crc -bxor $buf[$j]) -band 0xFF] -bxor ($crc -shr 8)
-            }
+    public static uint Compute(string path) {
+        uint crc = 0xFFFFFFFFu;
+        using (var fs = File.OpenRead(path)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+                for (int j = 0; j < n; j++)
+                    crc = Table[(crc ^ buf[j]) & 0xFF] ^ (crc >> 8);
         }
-    } finally {
-        $fs.Close()
+        return crc ^ 0xFFFFFFFFu;
     }
-    $hex = '{0:X8}' -f ($crc -bxor [uint32]::MaxValue)
+}
+'@
+    }
+    $hex = '{0:X8}' -f ([EncodeCrc32]::Compute($mkv))
     if (-not $uppercase) { $hex = $hex.ToLower() }
 
     $newName = "$base [$hex]$ext"
-    $newPath = Join-Path $Job.EpisodeDir $newName
     Rename-Item -LiteralPath $mkv -NewName $newName
     # Propagate to the shared job context so release_copy / keyframes pick up
     # the checksummed name automatically.

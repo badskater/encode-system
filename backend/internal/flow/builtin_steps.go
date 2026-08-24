@@ -231,9 +231,13 @@ func encodeTemplate() *model.StepTemplate {
             '--rect', '--amp', '--weightb', '--tskip', '--rskip', '0',
             '--no-strong-intra-smoothing'
         )
-        if ($Params.no_sao -eq 'true') { $argList += @('--no-sao', '--no-sao-non-deblock') }
-        if ($Params.b_pyramid -eq 'true') { $argList += '--b-pyramid' }
-        if ($Params.open_gop -eq 'true') { $argList += '--open-gop' }
+        # Bools: blank means "use the declared default" - and these three
+        # default to true, so only an explicit 'false' turns them off.
+        # (Omitted params reach the script as empty strings, so -eq 'true'
+        # would have silently DROPPED the flags on the default flow.)
+        if ($Params.no_sao -ne 'false') { $argList += @('--no-sao', '--no-sao-non-deblock') }
+        if ($Params.b_pyramid -ne 'false') { $argList += '--b-pyramid' }
+        if ($Params.open_gop -ne 'false') { $argList += '--open-gop' }
     }
     # Input/output always appended last so flow params can never override them.
     $argList += @('--input', $Job.ScriptFile, '-o', $Job.HevcFile)

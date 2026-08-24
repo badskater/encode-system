@@ -1,13 +1,13 @@
 import { useState } from 'react';
 import { api } from '../api/client';
-import type { StepTemplate } from '../types';
+import type { ParamType, StepTemplate } from '../types';
 import { usePolling } from '../hooks/usePolling';
 
 // StepsPage manages step templates: each pipeline section owns its PowerShell
 // here. Built-ins are editable (their script is admin-owned) but not
 // deletable/renamable; custom templates can be created, edited, and deleted.
 export default function StepsPage() {
-  const { data: templates, error } = usePolling<StepTemplate[]>(() => api.stepTemplates(), 30000);
+  const { data: templates, error, refresh } = usePolling<StepTemplate[]>(() => api.stepTemplates(), 30000);
   const [editing, setEditing] = useState<StepTemplate | null>(null);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -33,6 +33,7 @@ export default function StepsPage() {
       setEditing(null);
       setCreating(false);
       setActionError(null);
+      refresh();
     } catch (e) {
       setActionError(String(e instanceof Error ? e.message : e));
     }
@@ -42,6 +43,7 @@ export default function StepsPage() {
     try {
       await api.deleteStepTemplate(t.id);
       setActionError(null);
+      refresh();
     } catch (e) {
       setActionError(String(e instanceof Error ? e.message : e));
     }
@@ -50,8 +52,13 @@ export default function StepsPage() {
   async function reset(t: StepTemplate) {
     if (!confirm(`Reset "${t.label}" to the factory script? Your edits to this step will be replaced.`)) return;
     try {
+      // The API returns the restored template, but we re-fetch the whole
+      // list so the table and any open editor both show the factory state —
+      // otherwise a stale pre-reset row could be re-opened and re-saved,
+      // silently undoing the reset.
       await api.resetStepTemplate(t.id);
       setActionError(null);
+      refresh();
     } catch (e) {
       setActionError(String(e instanceof Error ? e.message : e));
     }
@@ -239,7 +246,12 @@ function TemplateEditor({
             <select
               value={p.type ?? 'text'}
               onChange={(e) =>
-                setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)) })
+                setT({
+                  ...t,
+                  params: t.params.map((x, j) =>
+                    j === i ? { ...x, type: e.target.value as ParamType } : x,
+                  ),
+                })
               }
             >
               <option value="text">text</option>
@@ -251,6 +263,13 @@ function TemplateEditor({
               value={p.default ?? ''}
               onChange={(e) =>
                 setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, default: e.target.value } : x)) })
+              }
+            />
+            <input
+              placeholder="input placeholder (hint)"
+              value={p.placeholder ?? ''}
+              onChange={(e) =>
+                setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, placeholder: e.target.value } : x)) })
               }
             />
             <button className="btn" onClick={() => setT({ ...t, params: t.params.filter((_, j) => j !== i) })}>

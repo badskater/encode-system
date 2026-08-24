@@ -130,6 +130,8 @@ export const api = {
   updateStepTemplate: (id: number, t: Partial<StepTemplate>) =>
     request<StepTemplate>('PUT', `/api/step-templates/${id}`, t),
   deleteStepTemplate: (id: number) => request<void>('DELETE', `/api/step-templates/${id}`),
+  resetStepTemplate: (id: number) =>
+    request<StepTemplate>('POST', `/api/step-templates/${id}/reset`),
 
   pairingCodes: () => request<PairingCode[]>('GET', '/api/pairing'),
   createPairingCode: (body: { name_hint?: string; ttl_hours?: number }) =>

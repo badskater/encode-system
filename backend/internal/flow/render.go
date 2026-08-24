@@ -65,7 +65,7 @@ func DefaultFlow() *model.Flow {
 			{Type: model.StepSourceRename, Params: map[string]string{"source_name": "src"}},
 			{Type: model.StepDGIndex},
 			{Type: model.StepAudio, Params: map[string]string{"track": "2", "bitrate": "320"}},
-			{Type: model.StepEncode, Params: map[string]string{"x265_args": DefaultX265Args}},
+			{Type: model.StepEncode, Params: map[string]string{}},
 			{Type: model.StepMux},
 			{Type: model.StepReleaseCopy},
 			{Type: model.StepKeyframes},

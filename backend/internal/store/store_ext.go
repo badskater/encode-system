@@ -197,8 +197,31 @@ func scanFlowV2(row *sql.Row) (*model.Flow, error) {
 
 // ---------- Step templates ----------
 
+// InsertStepTemplateIfAbsent creates a template only when its key is not yet
+// in the store. Boot seeding uses this so edits made through the UI survive
+// controller restarts (re-seeding only adds brand-new templates).
+func (s *Store) InsertStepTemplateIfAbsent(ctx context.Context, t *model.StepTemplate) (*model.StepTemplate, error) {
+	if t.Params == nil {
+		t.Params = []model.ParamDef{}
+	}
+	pb, err := json.Marshal(t.Params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal params: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO step_templates (key, label, description, params_json, powershell, builtin)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(key) DO NOTHING`,
+		t.Key, t.Label, t.Description, string(pb), t.PowerShell, boolToInt(t.Builtin))
+	if err != nil {
+		return nil, fmt.Errorf("insert step template: %w", err)
+	}
+	return s.StepTemplateByKey(ctx, t.Key)
+}
+
 // UpsertStepTemplate inserts a template by key or updates it when present.
-// Builtin templates are created at boot; custom templates come from the UI.
+// Used by the UI for edits and custom templates; boot seeding uses
+// InsertStepTemplateIfAbsent instead to preserve those edits.
 func (s *Store) UpsertStepTemplate(ctx context.Context, t *model.StepTemplate) (*model.StepTemplate, error) {
 	if t.Params == nil {
 		t.Params = []model.ParamDef{} // never persist "null" — schema default is '[]'

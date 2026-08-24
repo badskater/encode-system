@@ -47,6 +47,16 @@ export default function StepsPage() {
     }
   }
 
+  async function reset(t: StepTemplate) {
+    if (!confirm(`Reset "${t.label}" to the factory script? Your edits to this step will be replaced.`)) return;
+    try {
+      await api.resetStepTemplate(t.id);
+      setActionError(null);
+    } catch (e) {
+      setActionError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   if (creating || editing) {
     return (
       <TemplateEditor
@@ -69,8 +79,10 @@ export default function StepsPage() {
       <p className="muted">
         Every flow section is backed by its own PowerShell function. When a flow
         runs, the controller links each referenced function into the final job
-        script. Built-ins ship with the controller; create custom steps to extend
-        pipelines (they appear in the flow builder automatically).
+        script. Built-ins ship with the controller and <strong>your edits persist
+        across restarts</strong> — use <em>Reset</em> to restore the factory
+        script. Create custom steps to extend pipelines (they appear in the flow
+        builder automatically).
       </p>
 
       <div className="toolbar">
@@ -106,6 +118,11 @@ export default function StepsPage() {
                 <button className="btn" onClick={() => setEditing(t)}>
                   Edit
                 </button>{' '}
+                {t.builtin && (
+                  <button className="btn" title="Restore the factory script and defaults (your edits are replaced)" onClick={() => reset(t)}>
+                    Reset
+                  </button>
+                )}{' '}
                 {!t.builtin && (
                   <button className="btn danger" onClick={() => remove(t)}>
                     Delete
@@ -199,7 +216,9 @@ function TemplateEditor({
         <h3 style={{ marginTop: 0 }}>Parameters</h3>
         <p className="muted">
           Values are edited per-flow in the builder and reach your function as{' '}
-          <code>$Params.&lt;key&gt;</code>.
+          <code>$Params.&lt;key&gt;</code>. The <em>type</em> picks the builder
+          widget (checkbox for bool); the <em>default</em> documents what your
+          script applies when the flow leaves the field blank.
         </p>
         {t.params.map((p, i) => (
           <div className="toolbar" key={i}>
@@ -217,14 +236,21 @@ function TemplateEditor({
                 setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)) })
               }
             />
-            <input
-              placeholder="placeholder / default hint"
-              value={p.placeholder ?? ''}
+            <select
+              value={p.type ?? 'text'}
               onChange={(e) =>
-                setT({
-                  ...t,
-                  params: t.params.map((x, j) => (j === i ? { ...x, placeholder: e.target.value } : x)),
-                })
+                setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)) })
+              }
+            >
+              <option value="text">text</option>
+              <option value="number">number</option>
+              <option value="bool">bool (checkbox)</option>
+            </select>
+            <input
+              placeholder="default value"
+              value={p.default ?? ''}
+              onChange={(e) =>
+                setT({ ...t, params: t.params.map((x, j) => (j === i ? { ...x, default: e.target.value } : x)) })
               }
             />
             <button className="btn" onClick={() => setT({ ...t, params: t.params.filter((_, j) => j !== i) })}>

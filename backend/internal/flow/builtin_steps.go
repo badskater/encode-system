@@ -21,10 +21,13 @@ const (
 func BuiltinStepTemplates() []*model.StepTemplate {
 	return []*model.StepTemplate{
 		sourceRenameTemplate(),
+		mediaProbeTemplate(),
 		dgindexTemplate(),
 		audioTemplate(),
+		audioBranchTemplate(),
 		encodeTemplate(),
 		muxTemplate(),
+		crc32RenameTemplate(),
 		releaseCopyTemplate(),
 		keyframesTemplate(),
 	}
@@ -160,10 +163,22 @@ func encodeTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "encode",
 		Label:       "x265 encode",
-		Description: "Encode the .avs/.vpy with the x265 fork and the flow's argument set.",
+		Description: "Encode the .avs/.vpy with the x265 fork. Tune the named fields, or set x265_args to override everything.",
 		Builtin:     true,
 		Params: []model.ParamDef{
-			{Key: "x265_args", Label: "x265 arguments"},
+			{Key: "preset", Label: "Preset", Default: "slow"},
+			{Key: "crf", Label: "CRF (quality)", Type: "number", Default: "15"},
+			{Key: "aq_mode", Label: "AQ mode", Type: "number", Default: "5"},
+			{Key: "aq_strength", Label: "AQ strength", Type: "number", Default: "0.80"},
+			{Key: "aq_strength_edge", Label: "AQ strength (edge)", Type: "number", Default: "0.90"},
+			{Key: "psy_rd", Label: "Psy RD", Type: "number", Default: "2.0"},
+			{Key: "psy_rdoq", Label: "Psy RDOQ", Type: "number", Default: "2.0"},
+			{Key: "rd", Label: "RD level", Type: "number", Default: "6"},
+			{Key: "ctu", Label: "CTU size", Type: "number", Default: "32"},
+			{Key: "no_sao", Label: "Disable SAO", Type: "bool", Default: "true"},
+			{Key: "b_pyramid", Label: "B-pyramid", Type: "bool", Default: "true"},
+			{Key: "open_gop", Label: "Open GOP", Type: "bool", Default: "true"},
+			{Key: "x265_args", Label: "Raw x265 arguments (overrides everything above; blank = use the fields)"},
 		},
 		PowerShell: `function Invoke-VideoEncode {
     param(
@@ -175,12 +190,55 @@ func encodeTemplate() *model.StepTemplate {
     if (-not (Test-Path -LiteralPath $Job.ScriptFile)) {
         throw "filter script not found: $($Job.ScriptFile)"
     }
-    $argString = if ($Params.x265_args) { $Params.x265_args } else { $Job.DefaultX265Args }
-    # Quote-aware argv split; input/output appended last so flow params can
-    # never override them. Note: $args is a PS automatic variable - never use it.
-    $x265ArgList = @([regex]::Matches($argString, '("([^"]*)"|\S+)') | ForEach-Object { $_.Value.Trim('"') })
-    $x265ArgList += @('--input', $Job.ScriptFile, '-o', $Job.HevcFile)
-    Invoke-Tool -ExePath $x265 -Arguments $x265ArgList -Label 'x265'
+    # Two modes: (a) x265_args set -> use that raw argument string verbatim
+    # (power users, legacy flows). (b) empty -> assemble from the named
+    # fields, each falling back to its documented default when blank.
+    $argList = @()
+    $raw = if ($Params.x265_args) { $Params.x265_args } else { '' }
+    if ($raw.Trim() -ne '') {
+        $argList = @([regex]::Matches($raw, '("[^"]*"|\S+)') | ForEach-Object { $_.Value.Trim('"') })
+    } else {
+        $preset = if ($Params.preset) { $Params.preset } else { 'slow' }
+        $crf = if ($Params.crf) { $Params.crf } else { '15' }
+        $aqMode = if ($Params.aq_mode) { $Params.aq_mode } else { '5' }
+        $aqStrength = if ($Params.aq_strength) { $Params.aq_strength } else { '0.80' }
+        $aqStrengthEdge = if ($Params.aq_strength_edge) { $Params.aq_strength_edge } else { '0.90' }
+        $psyRd = if ($Params.psy_rd) { $Params.psy_rd } else { '2.0' }
+        $psyRdoq = if ($Params.psy_rdoq) { $Params.psy_rdoq } else { '2.0' }
+        $rd = if ($Params.rd) { $Params.rd } else { '6' }
+        $ctu = if ($Params.ctu) { $Params.ctu } else { '32' }
+        # Full legacy argument set (JPSDR/Patman fork flags included); the
+        # structured fields substitute their values, everything else is the
+        # proven baseline verbatim.
+        $argList = @(
+            '--frame-threads', '1', '--lookahead-slices', '8',
+            '--input-depth', '10', '--output-depth', '10',
+            '--videoformat', 'ntsc', '--range', 'limited',
+            '--colorprim', 'bt709', '--transfer', 'bt709', '--colormatrix', 'bt709',
+            '--allow-non-conformance',
+            '--preset', $preset, '--crf', $crf,
+            '--deblock=-2:-2', '--min-keyint', '23', '--keyint', '240',
+            '--ref', '6', '--bframes', '12', '--b-adapt', '2', '--b-intra', '--fades',
+            '--aq-mode', $aqMode, '--aq-strength', $aqStrength,
+            '--aq-strength-edge', $aqStrengthEdge,
+            '--aq-bias-strength', '0.95', '--aq-bias-strength-edge', '1.00',
+            '--subme', '7', '--me', 'star', '--merange', '24',
+            '--qcomp', '0.82', '--rc-lookahead', '160',
+            '--rd', $rd, '--rdoq-level', '2', '--psy-rd', $psyRd, '--psy-rdoq', $psyRdoq,
+            '--cbqpoffs', '-2', '--crqpoffs', '-2', '--qpstep', '2',
+            '--ctu', $ctu, '--max-tu-size', '16',
+            '--tu-intra-depth', '2', '--tu-inter-depth', '2',
+            '--rect', '--amp', '--weightb', '--tskip', '--rskip', '0',
+            '--no-strong-intra-smoothing'
+        )
+        if ($Params.no_sao -eq 'true') { $argList += @('--no-sao', '--no-sao-non-deblock') }
+        if ($Params.b_pyramid -eq 'true') { $argList += '--b-pyramid' }
+        if ($Params.open_gop -eq 'true') { $argList += '--open-gop' }
+    }
+    # Input/output always appended last so flow params can never override them.
+    $argList += @('--input', $Job.ScriptFile, '-o', $Job.HevcFile)
+    Write-Output "[x265] args: $($argList -join ' ')"
+    Invoke-Tool -ExePath $x265 -Arguments $argList -Label 'x265'
     if (-not (Test-Path -LiteralPath $Job.HevcFile)) {
         throw "x265 finished but $($Job.HevcFile) was not created"
     }

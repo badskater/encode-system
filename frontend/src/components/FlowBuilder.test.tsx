@@ -109,4 +109,35 @@ describe('FlowBuilder', () => {
     );
     expect(screen.getByText('Create flow')).toBeDisabled();
   });
+
+  it('prefills declared defaults when adding a step', () => {
+    const withDefaults: StepTemplate[] = [
+      {
+        id: 0,
+        key: 'encode',
+        label: 'x265 encode',
+        description: '',
+        params: [
+          { key: 'preset', label: 'Preset', default: 'slow' },
+          { key: 'crf', label: 'CRF (quality)', default: '15', type: 'number' },
+          { key: 'no_sao', label: 'Disable SAO', default: 'true', type: 'bool' },
+        ],
+        powershell: '',
+        builtin: true,
+        created_at: '',
+        updated_at: '',
+      },
+    ];
+    render(<FlowBuilder initial={null} templates={withDefaults} onSave={vi.fn()} onCancel={() => {}} />);
+
+    fireEvent.click(screen.getByText('x265 encode'));
+
+    // Text/number inputs prefilled with the declared defaults.
+    expect((screen.getByDisplayValue('slow') as HTMLInputElement).value).toBe('slow');
+    expect((screen.getByDisplayValue('15') as HTMLInputElement).value).toBe('15');
+    // Bool renders as a checked checkbox.
+    const cb = screen.getByLabelText('Disable SAO') as HTMLInputElement;
+    expect(cb.type).toBe('checkbox');
+    expect(cb.checked).toBe(true);
+  });
 });

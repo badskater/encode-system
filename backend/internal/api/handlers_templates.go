@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
+	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 
@@ -112,6 +113,49 @@ func (s *Server) handleUpdateStepTemplate(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusInternalServerError, "update template: "+err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// handleResetStepTemplate restores a built-in template to its factory
+// definition from the compiled binary. Only built-ins may be reset; custom
+// templates have no factory source. This is the deliberate counterpart to
+// boot seeding preserving UI edits: edits survive restarts, and a reset is
+// always an explicit user action.
+func (s *Server) handleResetStepTemplate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad template id")
+		return
+	}
+	existing, err := s.Store.GetStepTemplate(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "template not found")
+		return
+	}
+	if !existing.Builtin {
+		writeErr(w, http.StatusConflict, "only built-in templates can be reset to factory defaults")
+		return
+	}
+	var factory *model.StepTemplate
+	for _, t := range flow.BuiltinStepTemplates() {
+		if t.Key == existing.Key {
+			factory = t
+			break
+		}
+	}
+	if factory == nil {
+		writeErr(w, http.StatusNotFound, "no factory definition for "+existing.Key)
+		return
+	}
+	factory.ID = existing.ID
+	factory.Key = existing.Key
+	factory.Builtin = true
+	updated, err := s.Store.UpsertStepTemplate(r.Context(), factory)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "reset template: "+err.Error())
+		return
+	}
+	s.Log.Info("step template reset to factory defaults", "key", updated.Key)
 	writeJSON(w, http.StatusOK, updated)
 }
 

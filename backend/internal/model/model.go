@@ -156,11 +156,15 @@ type StepTemplate struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
-// ParamDef declares one editable parameter of a step template.
+// ParamDef declares one editable parameter of a step template. Type drives
+// the flow-builder widget ("text" default, "bool", "number"); Default is the
+// runtime value when a flow omits the param (the script applies it).
 type ParamDef struct {
 	Key         string `json:"key"`
 	Label       string `json:"label"`
 	Placeholder string `json:"placeholder,omitempty"`
+	Default     string `json:"default,omitempty"`
+	Type        string `json:"type,omitempty"`
 }
 
 // PairingCode is a one-shot code an agent presents to register itself.

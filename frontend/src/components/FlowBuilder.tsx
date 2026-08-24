@@ -41,7 +41,9 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
   function addStep(type: string) {
     const meta = metaFor(templates, type);
     const params: Record<string, string> = {};
-    for (const p of meta.params) params[p.key] = '';
+    // Prefill from the template's declared defaults so the current values are
+    // visible and editable in the builder (blank = script-side default).
+    for (const p of meta.params) params[p.key] = p.default ?? '';
     setSteps([...steps, { type, params }]);
   }
 
@@ -68,7 +70,8 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
     setSaving(true);
     setError(null);
     try {
-      // Strip empty params so the backend applies step defaults.
+      // Strip empty params so the backend applies step defaults; keep
+      // explicit values (including booleans) so the flow stays self-documenting.
       const cleaned = steps.map((s) => ({
         type: s.type,
         params: Object.fromEntries(
@@ -118,16 +121,28 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
                   </div>
                   {meta.params.length > 0 && (
                     <div className="step-params">
-                      {meta.params.map((p) => (
-                        <label key={p.key}>
-                          {p.label}
-                          <input
-                            value={s.params?.[p.key] ?? ''}
-                            placeholder={p.placeholder ?? 'default'}
-                            onChange={(e) => setParam(i, p.key, e.target.value)}
-                          />
-                        </label>
-                      ))}
+                      {meta.params.map((p) =>
+                        p.type === 'bool' ? (
+                          <label key={p.key} className="param-bool">
+                            <input
+                              type="checkbox"
+                              checked={(s.params?.[p.key] ?? p.default ?? 'false') === 'true'}
+                              onChange={(e) => setParam(i, p.key, e.target.checked ? 'true' : 'false')}
+                            />
+                            {p.label}
+                          </label>
+                        ) : (
+                          <label key={p.key}>
+                            {p.label}
+                            <input
+                              type={p.type === 'number' ? 'number' : 'text'}
+                              value={s.params?.[p.key] ?? ''}
+                              placeholder={p.default ?? p.placeholder ?? 'default'}
+                              onChange={(e) => setParam(i, p.key, e.target.value)}
+                            />
+                          </label>
+                        ),
+                      )}
                     </div>
                   )}
                 </div>

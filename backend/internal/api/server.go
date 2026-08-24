@@ -108,12 +108,15 @@ func (s *Server) seedAdminUser() error {
 	return nil
 }
 
-// seedStepTemplates installs the built-in pipeline sections (idempotent
-// upserts keyed by template key).
+// seedStepTemplates installs the built-in pipeline sections on first boot.
+// Existing templates are NEVER overwritten: UI edits to a built-in step
+// persist across restarts. New built-ins added in a release appear on the
+// next boot; a deliberate restore is available via
+// POST /api/step-templates/{id}/reset.
 func (s *Server) seedStepTemplates() error {
 	ctx := ctxBg()
 	for _, t := range flow.BuiltinStepTemplates() {
-		if _, err := s.Store.UpsertStepTemplate(ctx, t); err != nil {
+		if _, err := s.Store.InsertStepTemplateIfAbsent(ctx, t); err != nil {
 			return fmt.Errorf("seed step template %s: %w", t.Key, err)
 		}
 	}
@@ -193,6 +196,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/step-templates", s.withAdmin(s.handleCreateStepTemplate))
 	mux.HandleFunc("PUT /api/step-templates/{id}", s.withAdmin(s.handleUpdateStepTemplate))
 	mux.HandleFunc("DELETE /api/step-templates/{id}", s.withAdmin(s.handleDeleteStepTemplate))
+	mux.HandleFunc("POST /api/step-templates/{id}/reset", s.withAdmin(s.handleResetStepTemplate))
 
 	mux.HandleFunc("GET /api/pairing", s.withAdmin(s.handleListPairingCodes))
 	mux.HandleFunc("POST /api/pairing", s.withAdmin(s.handleCreatePairingCode))

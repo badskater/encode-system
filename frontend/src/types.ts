@@ -39,6 +39,10 @@ export interface ParamDef {
   key: string;
   label: string;
   placeholder?: string;
+  /** Runtime default applied by the step script when the flow omits the value. */
+  default?: string;
+  /** Widget type in the flow builder: 'text' (default), 'number', 'bool'. */
+  type?: string;
 }
 
 export interface StepTemplate {

@@ -8,8 +8,19 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## In progress
 
-- GPU-path validation on a real Nvidia node (test VM has no GPU: DGIndexNV
+- GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
+
+## Done (multi-node fleet)
+
+- Second Windows node added by cloning the test VM (172.24.92.229). Clone
+  hazard handled: the clone inherited node 1's persisted credential +
+  scheduled tasks — wiped `C:\encode-agent-dist\{agent.json,node.token}`,
+  deleted inherited tasks, then paired fresh as `enc-test-docker-2`.
+  Agent restarts survive via an `/sc onstart` scheduled task.
+- True 2-node distribution validated against the Docker-host controller:
+  two episodes seeded, one job per worker (`enc-test-docker`,
+  `enc-test-docker-2`), both done exit 0, release MKVs verified on each node.
 
 ## Done (Docker-host deployment — distributed topology validated)
 

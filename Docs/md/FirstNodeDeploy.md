@@ -189,6 +189,21 @@ automatically (one job per node at a time). Use the **Series** page to give
 individual series their own flow; **Flows** to create more sequences and mark
 the default.
 
+> **Cloned-VM hazard.** If you add a node by cloning a VM that already ran an
+> agent, the clone inherits node 1's identity (persisted credential +
+> scheduled tasks) and would heartbeat as the SAME node. After cloning, wipe
+> the inherited state before first start:
+>
+> ```powershell
+> Remove-Item C:\encode-agent\agent.json, C:\encode-agent\node.token -Force -ErrorAction SilentlyContinue
+> Remove-Item C:\encode-agent-dist\agent.json, C:\encode-agent-dist\node.token -Force -ErrorAction SilentlyContinue
+> schtasks /delete /tn EncodeAgent /f; schtasks /delete /tn EncodeAgentDist /f
+> ```
+>
+> Then pair the clone fresh (issue a pairing code and point `agent.json` at
+> it). Verified live: a clone of the test node was cleaned and paired as a
+> distinct second worker, and jobs distributed across both.
+
 ## Rollback & recovery
 
 - **Controller:** `docker compose down` never touches the state volume; the

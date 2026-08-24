@@ -442,3 +442,124 @@ func (s *Store) ListPairingCodes(ctx context.Context) ([]*model.PairingCode, err
 	}
 	return out, rows.Err()
 }
+
+// ---------- Users & sessions (management-plane login) ----------
+
+func (s *Store) migrateAuth(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS users (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	username TEXT NOT NULL UNIQUE,
+	password_hash TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT 'admin',
+	created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+	token_hash TEXT PRIMARY KEY,
+	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+`)
+	return err
+}
+
+// CreateUser inserts a user with a pre-hashed (bcrypt) password.
+func (s *Store) CreateUser(ctx context.Context, username, passwordHash, role string) (*model.User, error) {
+	res, err := s.db.ExecContext(ctx,
+		"INSERT INTO users(username, password_hash, role, created_at) VALUES (?, ?, ?, datetime('now'))",
+		username, passwordHash, role)
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &model.User{ID: id, Username: username, Role: role, PasswordHash: passwordHash}, nil
+}
+
+// UserByUsername loads one account (nil when absent).
+func (s *Store) UserByUsername(ctx context.Context, username string) (*model.User, error) {
+	var u model.User
+	var created sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT id, username, password_hash, role, created_at FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.CreatedAt = ptrTime(created.String)
+	return &u, nil
+}
+
+// Users lists accounts (no hashes).
+func (s *Store) Users(ctx context.Context) ([]*model.User, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, username, role, created_at FROM users ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*model.User{}
+	for rows.Next() {
+		var u model.User
+		var created sql.NullString
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &created); err != nil {
+			return nil, err
+		}
+		u.CreatedAt = ptrTime(created.String)
+		out = append(out, &u)
+	}
+	return out, rows.Err()
+}
+
+// CreateSession stores a hashed session token with its expiry.
+func (s *Store) CreateSession(ctx context.Context, tokenHash string, userID int64, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		"INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, datetime('now'), ?)",
+		tokenHash, userID, fmtTime(expiresAt))
+	return err
+}
+
+// SessionByTokenHash loads an UNEXPIRED session joined with its user.
+func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (*model.Session, error) {
+	var sess model.Session
+	var created, expires sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+SELECT s.token_hash, s.user_id, u.username, s.created_at, s.expires_at
+FROM sessions s JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = ? AND s.expires_at > datetime('now')`, tokenHash).
+		Scan(&sess.TokenHash, &sess.UserID, &sess.Username, &created, &expires)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sess.CreatedAt = ptrTime(created.String)
+	sess.ExpiresAt = ptrTime(expires.String)
+	return &sess, nil
+}
+
+// SlideSession extends an active session's expiry.
+func (s *Store) SlideSession(ctx context.Context, tokenHash string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+		fmtTime(expiresAt), tokenHash)
+	return err
+}
+
+// DeleteSession revokes one session (logout).
+func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token_hash = ?", tokenHash)
+	return err
+}
+
+// PruneSessions removes expired sessions.
+func (s *Store) PruneSessions(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at <= datetime('now')")
+	return err
+}

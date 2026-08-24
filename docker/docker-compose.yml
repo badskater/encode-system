@@ -18,7 +18,8 @@ services:
     ports:
       - "${ENCODE_PORT:-8080}:8080"
     environment:
-      ENCODE_ADMIN_TOKEN: ${ENCODE_ADMIN_TOKEN:?set in .env}
+      ENCODE_ADMIN_USER: ${ENCODE_ADMIN_USER:-admin}
+      ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:?set in .env (first boot only)}
       ENCODE_DATA: /data
       ENCODE_SCRIPTS_ROOT: /data/scripts
       ENCODE_RELEASE_ROOT: /data/release

@@ -17,7 +17,11 @@ import (
 	"github.com/badskater/encode-system/backend/internal/update"
 )
 
-const adminTok = "admin-test-token"
+// adminPassword seeds the test admin account; adminTok holds a minted session
+// token for it (refreshed by every newTestEnv).
+const adminPassword = "test-admin-password"
+
+var adminTok string
 
 // testEnv wires a Server backed by temp-dir state for httptest runs.
 type testEnv struct {
@@ -42,7 +46,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 
 	cfg := Config{
-		AdminToken: adminTok, ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
+		AdminUsername: "admin", AdminPassword: adminPassword,
+		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
 		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
 		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
 	}
@@ -60,6 +65,20 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Mint a management session for the seeded admin so withAdmin passes.
+	u, err := st.UserByUsername(ctxBg(), "admin")
+	if err != nil || u == nil {
+		t.Fatal("admin user not seeded")
+	}
+	sessTok, err := auth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctxBg(), auth.HashToken(sessTok), u.ID, time.Now().UTC().Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	adminTok = sessTok
 
 	ts := httptest.NewServer(s.Routes())
 	t.Cleanup(ts.Close)

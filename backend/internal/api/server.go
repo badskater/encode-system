@@ -4,7 +4,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
+	"golang.org/x/crypto/bcrypt"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
@@ -23,7 +23,8 @@ import (
 
 // Config carries runtime settings injected into handlers.
 type Config struct {
-	AdminToken        string        // UI/API admin bearer token
+	AdminUsername     string        // management-plane admin account (seeded at startup)
+	AdminPassword     string        // initial password for the admin account (only used when the account doesn't exist)
 	ScriptsRoot       string        // controller-side scripts share mount
 	ReleaseRoot       string        // controller-side release share mount
 	NodeBinDir        string        // tools dir on nodes, e.g. C:\bin
@@ -40,11 +41,12 @@ type Config struct {
 
 // Server bundles dependencies for all handlers.
 type Server struct {
-	Store  *store.Store
-	Update *update.Store
-	Log    *slog.Logger
-	Cfg    Config
-	Notify notify.Notifier
+	Store    *store.Store
+	Update   *update.Store
+	Log      *slog.Logger
+	Cfg      Config
+	Notify   notify.Notifier
+	throttle *loginThrottle
 }
 
 // New builds the server and seeds the default flow when absent.
@@ -61,7 +63,7 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if cfg.DefaultFlowName == "" {
 		cfg.DefaultFlowName = "default-1080"
 	}
-	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, Notify: notify.NewDiscord(cfg.DiscordWebhook, log)}
+	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, Notify: notify.NewDiscord(cfg.DiscordWebhook, log), throttle: &loginThrottle{}}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled")
 	}
@@ -71,7 +73,39 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if err := s.seedDefaultFlow(); err != nil {
 		return nil, err
 	}
+	if err := s.seedAdminUser(); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// seedAdminUser ensures the management-plane admin account exists. On first
+// boot the password comes from Config (ENCODE_ADMIN_PASSWORD); on later boots
+// an existing account is left untouched — passwords rotate through the API.
+func (s *Server) seedAdminUser() error {
+	username := s.Cfg.AdminUsername
+	if username == "" {
+		username = "admin"
+	}
+	existing, err := s.Store.UserByUsername(ctxBg(), username)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return nil // already provisioned
+	}
+	if s.Cfg.AdminPassword == "" {
+		return fmt.Errorf("admin user %q does not exist and no password was configured", username)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(s.Cfg.AdminPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	if _, err := s.Store.CreateUser(ctxBg(), username, string(hash), "admin"); err != nil {
+		return err
+	}
+	s.Log.Info("management admin account created", "username", username)
+	return nil
 }
 
 // seedStepTemplates installs the built-in pipeline sections (idempotent
@@ -126,7 +160,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/agent/download/agent", s.withNodeAuth(s.handleDownloadAgent))
 	mux.HandleFunc("GET /api/agent/download/lib", s.withNodeAuth(s.handleDownloadLib))
 
-	// UI endpoints — admin token auth.
+	// Authentication — no session required to log in.
+	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/auth/logout", s.withAdmin(s.handleLogout))
+	mux.HandleFunc("GET /api/auth/me", s.withAdmin(s.handleMe))
+
+	// UI endpoints — session auth.
 	mux.HandleFunc("GET /api/nodes", s.withAdmin(s.handleListNodes))
 	mux.HandleFunc("POST /api/nodes", s.withAdmin(s.handleCreateNode))
 	mux.HandleFunc("PATCH /api/nodes/{id}", s.withAdmin(s.handlePatchNode))
@@ -242,17 +281,7 @@ func (s *Server) withNodeAuth(h func(http.ResponseWriter, *http.Request, *model.
 	}
 }
 
-// withAdmin requires the UI admin token (constant-time compare).
-func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.Cfg.AdminToken == "" ||
-			subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.Cfg.AdminToken)) != 1 {
-			writeErr(w, http.StatusUnauthorized, "invalid admin token")
-			return
-		}
-		h(w, r)
-	}
-}
+// withAdmin lives in auth_handlers.go (session-based authentication).
 
 // ---------- Health ----------
 

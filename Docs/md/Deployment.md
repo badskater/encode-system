@@ -33,7 +33,8 @@ First-boot env:
 
 | Var | Meaning |
 | --- | --- |
-| `ENCODE_ADMIN_TOKEN` | UI/API admin token (required). |
+| `ENCODE_ADMIN_USER` | Management-plane login username (default `admin`). |
+| `ENCODE_ADMIN_PASSWORD` | Initial password — used only on the boot that creates the account. Leave empty to auto-generate (logged once). |
 | `ENCODE_DATA` | Data dir (default `/data`). |
 | `ENCODE_SCAN_INTERVAL` | Seconds between share scans (default `30`). |
 | `ENCODE_TASKS_BEFORE_REBOOT` | Default `10`. |
@@ -68,7 +69,7 @@ Node credentials — two options:
 
 See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:
 
-1. UI at `http://<controller>:8080` loads the dashboard with admin token.
+1. UI at `http://<controller>:8080` shows the sign-in form; log in with the admin account (password from `ENCODE_ADMIN_PASSWORD` or the generated one in the startup logs).
 2. `GET /api/health` returns `ok`.
 3. Register a node (or run the agent in foreground: `encode-agent.exe -foreground`), see it appear as `idle` within one heartbeat interval.
 4. Create a test episode folder with a tiny source + `1080.avs`, watch job go `pending → assigned → running → done`.

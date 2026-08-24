@@ -33,7 +33,7 @@
 - **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`). Exactly one active job per node enforced in the store.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained PowerShell script. The generated script calls functions from `EncodeLib.ps1`.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
-- **UI API** under `/api/*` for the SPA: nodes, jobs, flows, scanner config, settings. Single-admin token auth (env-supplied).
+- **UI API** under `/api/*` for the SPA: nodes, jobs, flows, scanner config, settings. Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle).
 
 ### Agent (`backend/cmd/agent` → `encode-agent.exe`)
 
@@ -163,7 +163,7 @@ Response:
 
 ## Security and observability
 
-- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). UI admin token from env, constant-time compare. TLS optional behind reverse proxy.
+- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). Management plane: session tokens issued at login, stored SHA-256-hashed at rest, sliding 24h expiry. TLS optional behind reverse proxy.
 - Auto-update payloads (agent binary + EncodeLib.ps1) are SHA-256 verified by the agent against the manifest before install; downloads are size-capped. Request bodies are capped at 1 MiB.
 - Structured JSON logs (`slog`) with `job_id` / `node` fields on both sides; agent log tails retained per job for post-mortem.
 

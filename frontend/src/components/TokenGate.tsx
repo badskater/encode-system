@@ -1,39 +1,67 @@
 import { useState } from 'react';
-import { setToken } from '../api/client';
+import { api, setToken, setCurrentUser } from '../api/client';
 
-// TokenGate prompts once for the controller admin token and stores it locally.
+// LoginGate collects a username/password and exchanges them for a session
+// via POST /api/auth/login. Replaces the old static admin-token prompt.
 export default function TokenGate({ onDone }: { onDone: () => void }) {
-  const [value, setValue] = useState('');
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  function submit() {
-    const t = value.trim();
-    if (!t) {
-      setError('Token is required.');
+  async function submit() {
+    if (!username.trim() || !password) {
+      setError('Username and password are required.');
       return;
     }
-    setToken(t);
-    onDone();
+    setBusy(true);
+    setError('');
+    try {
+      const sess = await api.login(username.trim(), password);
+      setToken(sess.token);
+      setCurrentUser(sess.username);
+      onDone();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'login failed');
+      setBusy(false);
+    }
   }
 
   return (
     <div className="main" style={{ maxWidth: 420, margin: '10vh auto' }}>
       <div className="card">
-        <h2>Controller access</h2>
+        <h2>Sign in</h2>
         <p className="muted">
-          Enter the admin token configured on the controller (ENCODE_ADMIN_TOKEN).
+          Management-plane login. The admin account is created on the
+          controller&apos;s first startup (see ENCODE_ADMIN_USER /
+          ENCODE_ADMIN_PASSWORD).
         </p>
         {error && <div className="error-box">{error}</div>}
+        <label htmlFor="login-user" style={{ display: 'block', marginBottom: 4 }}>
+          Username
+        </label>
         <input
+          id="login-user"
+          style={{ width: '100%', marginBottom: 12 }}
+          autoComplete="username"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <label htmlFor="login-pass" style={{ display: 'block', marginBottom: 4 }}>
+          Password
+        </label>
+        <input
+          id="login-pass"
           style={{ width: '100%', marginBottom: 12 }}
           type="password"
-          placeholder="admin token"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
+          autoComplete="current-password"
+          placeholder="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && submit()}
         />
-        <button className="btn primary" onClick={submit}>
-          Connect
+        <button className="btn primary" onClick={submit} disabled={busy}>
+          {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </div>
     </div>

@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -34,11 +36,13 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
 
-	adminToken := os.Getenv("ENCODE_ADMIN_TOKEN")
-	if adminToken == "" {
-		log.Error("ENCODE_ADMIN_TOKEN is required")
-		os.Exit(1)
-	}
+	// Management-plane admin account. Username defaults to "admin". The
+	// password comes from ENCODE_ADMIN_PASSWORD, but ONLY on the boot that
+	// creates the account — existing accounts keep their stored bcrypt hash
+	// and the env value is ignored. With no env password at all, a random
+	// one is generated and logged exactly once (same boot as creation).
+	adminUser := env("ENCODE_ADMIN_USER", "admin")
+	adminPass := os.Getenv("ENCODE_ADMIN_PASSWORD")
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		log.Error("create data dir", "err", err)
@@ -58,8 +62,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Decide whether THIS boot will create the account; that is the only
+	// situation where a generated password must be surfaced.
+	adminExists := true
+	if u, err := st.UserByUsername(context.Background(), adminUser); err != nil {
+		log.Error("admin user lookup", "err", err)
+		os.Exit(1)
+	} else {
+		adminExists = u != nil
+	}
+	generatedPass := ""
+	if !adminExists && adminPass == "" {
+		b := make([]byte, 12)
+		if _, err := rand.Read(b); err != nil {
+			log.Error("generate admin password", "err", err)
+			os.Exit(1)
+		}
+		generatedPass = hex.EncodeToString(b)
+		adminPass = generatedPass
+	}
+
 	cfg := api.Config{
-		AdminToken:        adminToken,
+		AdminUsername:     adminUser,
+		AdminPassword:     adminPass,
 		ScriptsRoot:       env("ENCODE_SCRIPTS_ROOT", filepath.Join(*dataDir, "scripts")),
 		ReleaseRoot:       env("ENCODE_RELEASE_ROOT", filepath.Join(*dataDir, "release")),
 		NodeBinDir:        env("ENCODE_NODE_BIN", `C:\bin`),
@@ -76,6 +101,11 @@ func main() {
 	if err != nil {
 		log.Error("init api server", "err", err)
 		os.Exit(1)
+	}
+	if generatedPass != "" {
+		// One-time disclosure, same boot as the account creation.
+		log.Warn("GENERATED admin password (shown once; set ENCODE_ADMIN_PASSWORD to pin your own)",
+			"username", adminUser, "password", generatedPass)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

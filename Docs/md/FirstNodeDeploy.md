@@ -22,7 +22,8 @@ cp .env.example .env
 Edit `.env`:
 
 ```bash
-ENCODE_ADMIN_TOKEN=*** rand -hex 24)   # generate, paste, store in your password manager
+ENCODE_ADMIN_USER=admin
+ENCODE_ADMIN_PASSWORD=<choose a strong password — used only on first boot>
 NFS_SERVER=<ip-or-hostname of the unRAID exporting the shares>
 ENCODE_PORT=8080
 ```
@@ -40,8 +41,12 @@ Verify:
 curl http://localhost:8080/api/health          # -> {"status":"ok"}
 ```
 
-Open `http://<controller-ip>:8080` and log in with the admin token. The
-dashboard loads; the scanner registers series as folders appear on the share.
+Open `http://<controller-ip>:8080` and sign in with the admin account
+(username `admin` by default, password from ENCODE_ADMIN_PASSWORD or the
+one-time generated password in the startup logs). Sessions last 24h with
+sliding expiry; wrong passwords lock the login endpoint for 30s after 5
+failures. The dashboard loads; the scanner registers series as folders
+appear on the share.
 
 Layout inside the container (for reference):
 
@@ -66,8 +71,13 @@ cp ../../backend/bin/encode-agent.exe ../../powershell/EncodeLib.ps1 files/agent
 
 ```bash
 cp inventory.example inventory.yml
-cp group_vars/secrets.yml.example group_vars/secrets.yml
+mkdir -p group_vars/all
+cp group_vars/secrets.yml.example group_vars/all/secrets.yml
 ```
+
+> Secrets live in `group_vars/all/` (a directory) because Ansible only
+> auto-loads group_vars files matching host/group names — `secrets.yml`
+> directly under `group_vars/` would be ignored.
 
 `inventory.yml` — one entry per Windows node, using the hostname the node
 should register as:
@@ -85,7 +95,7 @@ all:
           ansible_winrm_server_cert_validation: ignore
 ```
 
-`group_vars/secrets.yml`:
+`group_vars/all/secrets.yml`:
 
 ```yaml
 ansible_user: Administrator
@@ -116,7 +126,7 @@ inventory to `ansible_connection: ssh`.
 **Option A — pairing code (recommended, zero-touch):**
 
 1. UI → **Nodes** → *Issue pairing code* (valid 1 hour). Copy it.
-2. In `group_vars/secrets.yml`:
+2. In `group_vars/all/secrets.yml`:
 
    ```yaml
    encode_pairing_codes:
@@ -129,7 +139,7 @@ the code is consumed and never needed again.
 **Option B — manual token:**
 
 1. UI → **Nodes** → register `enc-01` → copy the shown token (shown once).
-2. In `group_vars/secrets.yml`:
+2. In `group_vars/all/secrets.yml`:
 
    ```yaml
    encode_node_tokens:

@@ -101,6 +101,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	if err := s.migrateExt(); err != nil {
 		return err
 	}
+	if err := s.migrateAuth(context.Background()); err != nil {
+		return err
+	}
 	// Schema v1 -> v1.1: add reboot_issued_at_tasks to databases created
 	// before this column existed. Tolerant of the already-migrated case.
 	for _, alt := range []string{

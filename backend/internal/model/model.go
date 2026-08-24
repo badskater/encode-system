@@ -66,6 +66,25 @@ type Flow struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// User is a management-plane account (login-based, replaces the static
+// admin bearer token).
+type User struct {
+	ID           int64      `json:"id"`
+	Username     string     `json:"username"`
+	Role         string     `json:"role"` // "admin"
+	PasswordHash string     `json:"-"`    // never serialized
+	CreatedAt    *time.Time `json:"created_at,omitempty"`
+}
+
+// Session is an issued management session (token stored hashed at rest).
+type Session struct {
+	TokenHash string     `json:"-"`
+	UserID    int64      `json:"user_id"`
+	Username  string     `json:"username"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+}
+
 // Node is one Windows encode machine.
 type Node struct {
 	ID             int64      `json:"id"`

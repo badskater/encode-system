@@ -1,0 +1,19 @@
+# Runtime-only image for hosts that receive a pre-built bundle (controller
+# binary + built frontend). Used for offline/fast deploys where building Go
+# and Node inside the image is undesirable — e.g. deploying from a machine
+# with no Docker, straight over SFTP.
+#
+# Bundle layout next to this file:
+#   controller       (CGO_ENABLED=0 GOOS=linux build of cmd/controller)
+#   ui/              (frontend/dist)
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY controller /app/controller
+COPY ui /app/ui
+RUN chmod +x /app/controller && mkdir -p /data
+ENV ENCODE_DATA=/data \
+    ENCODE_UI_DIR=/app/ui
+EXPOSE 8080
+ENTRYPOINT ["/app/controller"]

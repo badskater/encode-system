@@ -11,6 +11,26 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VM has no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Docker-host deployment — distributed topology validated)
+
+- Controller deployed to the Docker host (172.24.92.232, Debian 13, Docker
+  29.7.2) as a slim runtime container: `/opt/encode-system`
+  (`docker/Dockerfile.runtime` pattern — pre-built binary + SPA, no build
+  deps), health + SPA on :8080, state in a named volume.
+- True distributed E2E passed: agent `enc-test-docker` self-paired over the
+  LAN to the Docker controller; job dispatched Docker-host -> Windows node;
+  full pipeline completed with real tools — eac3to->opusenc Opus (348 kbit/s),
+  Patman x265 fork encoding YV12 .avs via AviSynth+ 3.7.5 (AVX2), mkvmerge
+  mux, release copy, SCXvid keyframes. Job done, exit 0; release artifacts
+  verified on the node.
+- Path mapping: controller env `ENCODE_NODE_SCRIPTS/RELEASE/BIN` must point
+  at each node's local dirs when there's no shared NFS (set for the test).
+- Fixture/E2E pitfalls logged: eac3to rejects mono AC3 (use stereo); the
+  audio step `track` param is the 1-based track index (e.g. 2), not `1.0`;
+  fixture .avs must be YUV (`pixel_type="YV12"`) or the fork refuses the
+  colorspace; PS 5.1 `ConvertTo-Json` decorates strings — read files with
+  `[IO.File]::ReadAllText()` before posting JSON.
+
 ## Done (real x265 fork validated — after VM vCPU change to i9-13900HX)
 
 - Patman/JPSDR x265 fork runs with the FULL legacy argument set (aq-mode 5,

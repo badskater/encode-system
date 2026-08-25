@@ -397,6 +397,32 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, node)
 }
 
+// handleDeleteNode removes a node registration (used before re-provisioning
+// a host whose name is already registered — pairing fails on name collision).
+// Busy nodes cannot be deleted: their job would be orphaned mid-encode.
+func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad node id")
+		return
+	}
+	node, err := s.Store.GetNode(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "node not found")
+		return
+	}
+	if node.Status == model.NodeBusy {
+		writeErr(w, http.StatusConflict, "cannot delete a busy node")
+		return
+	}
+	if err := s.Store.DeleteNode(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete node")
+		return
+	}
+	s.Log.Info("node deleted", "node", node.Name, "id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleRebootNode flags a node for reboot on its next idle heartbeat.
 func (s *Server) handleRebootNode(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)

@@ -62,6 +62,28 @@ func TestProvisionRunLogNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteNode(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	// The harness registers one node (e.node). Idle nodes can be deleted.
+	resp, _ := doJSON(t, "DELETE", ts.URL+"/api/nodes/999", adminTok, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing node: want 404, got %d", resp.StatusCode)
+	}
+
+	resp, body := doJSON(t, "DELETE", ts.URL+"/api/nodes/"+itoa(e.node.ID), adminTok, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete idle node: want 204, got %d (%s)", resp.StatusCode, body)
+	}
+
+	// Second delete: gone.
+	resp, _ = doJSON(t, "DELETE", ts.URL+"/api/nodes/"+itoa(e.node.ID), adminTok, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted node: want 404, got %d", resp.StatusCode)
+	}
+}
+
 func TestSettingsControllerURLValidation(t *testing.T) {
 	e := newTestEnv(t)
 	ts := e.serve(t)

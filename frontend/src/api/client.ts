@@ -170,6 +170,7 @@ export const api = {
   setNodeEnabled: (id: number, enabled: boolean) =>
     request<Node>('PATCH', `/api/nodes/${id}`, { enabled }),
   rebootNode: (id: number) => request<Node>('POST', `/api/nodes/${id}/reboot`),
+  deleteNode: (id: number) => request<void>('DELETE', `/api/nodes/${id}`),
 
   jobs: (status?: JobStatus) =>
     request<Job[]>('GET', `/api/jobs${status ? `?status=${status}` : ''}`),

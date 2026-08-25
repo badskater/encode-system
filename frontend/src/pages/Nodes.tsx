@@ -45,6 +45,16 @@ export default function NodesPage() {
     }
   }
 
+  async function remove(n: Node) {
+    if (!confirm(`Delete node "${n.name}"? Its registration is removed (re-provision it to re-add). The host itself is untouched.`)) return;
+    try {
+      await api.deleteNode(n.id);
+      setActionError(null);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
+    }
+  }
+
   async function issuePairingCode() {
     try {
       const res = await api.createPairingCode({ name_hint: newName.trim() || undefined, ttl_hours: 1 });
@@ -167,6 +177,9 @@ export default function NodesPage() {
               <td>
                 <button className="btn" onClick={() => reboot(n)}>
                   Reboot
+                </button>{' '}
+                <button className="btn danger" onClick={() => remove(n)}>
+                  Delete
                 </button>
               </td>
             </tr>

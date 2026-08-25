@@ -1,5 +1,8 @@
 # Build outputs
 backend/bin/
+backend/controller
+backend/controller.exe
+backend/encode-agent.exe
 frontend/dist/
 frontend/node_modules/
 *.exe

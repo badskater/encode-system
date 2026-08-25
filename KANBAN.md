@@ -4,12 +4,44 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## Backlog
 
-(empty)
+- DoVi RPU passthrough: hdr_probe detects Dolby Vision today and signals
+  HDR10; full Profile 8.1 RPU extraction/injection needs dovi_tool + ffmpeg
+  in C:\bin as a new step (operator to confirm dovi_tool availability)
+- HDR10/4K pipeline validation on a real source + real encode (test VMs have
+  no HDR material; MediaInfo stubs cover the logic, not the pixels)
 
 ## In progress
 
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
+
+## Done (HDR/4K pipeline, language-aware audio, series scaffolding)
+
+- Create Series system: UI Series page → Create series dialog (name, episode
+  count, tag, flow) → POST /api/series scaffolds the scripts-share episode
+  folders (`<ScriptsRoot>/<Name>/Ep 01…Ep NN`, empty by design) AND the
+  release folder (`[Group] <Name> - Raws [Tag]` on the release share),
+  registers the series row. Idempotent extend (re-run with a higher count);
+  Windows-reserved-char + traversal validation before any mkdir; 3-digit
+  episode padding for 100+ episode shows.
+- Audio auto-select by language: new `audio_lang` step — MediaInfo language
+  priority list (default jpn,eng), falls back to track 1 with a loud warning,
+  eac3to → WAV → opusenc as usual, writes audio.json; mux template upgraded
+  to read audio.json and set the mkvmerge track language (byte-for-byte
+  guarded factory upgrade chain V1→V3, V2→V3 — user edits survive).
+- HDR/DoVi: new `hdr_probe` step — MediaInfo transfer/primaries/MaxCLL/DV
+  detection → hdr.json; DoVi detected and signaled as HDR10 (RPU passthrough
+  tracked in backlog).
+- 4K step: scanner now recognizes 2160.avs/2160.vpy (outranks 1080 scripts,
+  vpy wins at equal resolution); new `encode_4k` template (CTU 64 defaults,
+  structured fields) reads hdr.json and switches to bt2020/PQ signaling.
+- Per-series tag override: series.tag column + UI Tag column; renderer uses
+  it for output names and release folders (e.g. 4K re-encodes of 1080p shows).
+- Tests: scanner 4K priority, 7 create-series API tests, tag override →
+  rendered script, helper unit tests, 5 dialog component tests, and two pwsh
+  E2Es running hdr_probe/audio_lang/encode_4k/mux end to end (jpn selected
+  over earlier eng stream; bt2020/PQ flags emitted; audio.json/hdr.json
+  sidecars verified).
 
 ## Done (controller-driven provisioning)
 

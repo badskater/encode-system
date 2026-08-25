@@ -27,6 +27,10 @@
 | Change a job's flow before it starts | `PATCH /api/jobs/{id}` while the job is `pending` (UI support tracked in KANBAN). |
 | Pick the flow a series encodes with | UI → Series → per-series flow selector (0 = default flow). |
 | Pause one series | UI → Series → toggle (scanner stops queueing it; other series keep running). |
+| Scaffold a new series' folders | UI → Series → **Create series** (name, episode count, optional tag + flow): builds `Ep 01…NN` on the scripts share and the `[Group] … - Raws [Tag]` release folder. Re-run with a higher count to extend. |
+| Override a series' quality tag | UI → Series → Tag column (click to edit; blank = global tag from Settings). |
+| Encode a 4K/HDR series | Flow builder: use `hdr_probe` → `encode_4k` (reads hdr.json, bt2020/PQ for HDR10); author `2160.avs/.vpy` in the episode folder (outranks 1080 scripts). |
+| Auto-select the audio track by language | Flow builder: use the `audio_lang` step (language priority, default `jpn,eng`); the mux step tags the track from audio.json. |
 | Add a custom pipeline section | UI → Steps → New step template (PowerShell is syntax-checked), then add it to any flow. |
 | Share a flow | UI → Flows → Export JSON (embeds custom templates) / Import JSON. |
 | Register a node without copy-pasting tokens | UI → Nodes → Issue pairing code → `pairing_code` in the node's `agent.json`. |

@@ -29,7 +29,7 @@
 
 ### Controller (`backend/cmd/controller`)
 
-- **Scanner** polls the mounted `scripts/` share; an episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script (`1080.avs` or `1080.vpy`). Ready-and-unseen folders become jobs.
+- **Scanner** polls the mounted `scripts/` share; an episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs.
 - **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`). Exactly one active job per node enforced in the store.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained PowerShell script. The generated script calls functions from `EncodeLib.ps1`.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
@@ -53,8 +53,21 @@ script and calls it with a shared `$Job` context object plus the step's
 node-side install.
 
 - **Built-in templates** (seeded at boot, editable, not deletable):
-  `source_rename`, `dgindex`, `audio`, `encode`, `mux`, `release_copy`,
-  `keyframes`.
+  `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
+  `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
+  `crc32_rename`, `release_copy`, `keyframes`.
+- **HDR/4K chain**: `hdr_probe` writes `hdr.json` (HDR10/HLG/DoVi detection
+  from MediaInfo); `encode_4k` (2160p x265, CTU 64 defaults) reads it and
+  switches color signaling to bt2020 + PQ/HLG for HDR sources. DoVi is
+  detected and signaled as HDR10 today; full RPU passthrough (dovi_tool) is
+  a future step.
+- **Language-aware audio**: `audio_lang` selects the audio track by a
+  MediaInfo language priority list (default `jpn,eng`, falls back to the
+  first track with a loud warning), then runs eac3to → WAV → opusenc and
+  records the pick in `audio.json`; the mux template (V3 factory) reads
+  `audio.json` and sets the mkvmerge track language instead of hardcoding
+  `jpn`. The mux upgrade is byte-for-byte guarded (V1 → V3 and V2 → V3), so
+  user-edited mux scripts survive.
 - **Custom templates**: created in the UI (key + params + PowerShell),
   syntax-checked by the controller when pwsh is available, validated to
   define a function; they appear in the flow builder palette automatically.
@@ -96,12 +109,32 @@ Two paths:
 The scanner auto-registers every series folder it sees. Each series has:
 
 - **flow selection** — an explicit flow, or 0 to inherit the flagged default flow;
+- **tag override** — a per-series quality tag (e.g. `2160p`); blank inherits
+  the global settings tag. The renderer uses it for output names
+  (`<Series> - <Ep> [<Tag>].mkv`) and the release folder
+  (`[<Group>] <Series> - Raws [<Tag>]`);
 - **enabled flag** — a paused series is skipped by the scanner (no new jobs),
   without affecting other series.
 
 Jobs carry the flow fixed at creation time; operators can change a *pending*
 job's flow via `PATCH /api/jobs/{id}` before it starts. Episodes distribute
 across all enabled idle nodes naturally (one job per node).
+
+### Create series (scaffolding)
+
+`POST /api/series` (UI: Series page → **Create series**) builds the full
+folder structure up front:
+
+- scripts share: `<ScriptsRoot>/<Name>/Ep 01 … Ep NN` (empty — sources +
+  filter scripts are dropped in by hand; the scanner only queues episodes
+  that have both);
+- release share: `<ReleaseRoot>/[<Group>] <Name> - Raws [<Tag>]` — the
+  release_copy destination.
+
+Idempotent: re-running adds missing episode folders (extend a series by
+raising the count), never duplicates. Names are validated against the
+Windows-reserved characters before any filesystem touch; episode folders pad
+to three digits for 100+ episode shows (`Ep 001`).
 
 ## Flows: multiple sequences, one default
 

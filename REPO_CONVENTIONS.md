@@ -22,11 +22,23 @@ Distributed anime encoding farm. Terminology used everywhere:
 
 ## Encoding specifics
 
-- Audio pipeline: `eac3to` → 16-bit WAV → `opusenc` → `.opus`. No FLAC anywhere in new code.
-- Video pipeline: `DGIndexNV` → `.dgi`, then `x265_x64` (the fork with `--aq-strength-edge` etc.) reading the `.avs`/`.vpy` directly, 10-bit in/out.
-- Mux: `mkvmerge` with the standard track language/default flags from the legacy batch script.
+- Audio pipeline: `eac3to` → 16-bit WAV → `opusenc` → `.opus`. No FLAC
+  anywhere in new code. Track selection: fixed index (`audio`/`audio_branch`)
+  or MediaInfo language priority (`audio_lang`, default `jpn,eng`); the mux
+  step reads the `audio.json` sidecar for the track language.
+- Video pipeline: `DGIndexNV` → `.dgi`, then `x265_x64` (the fork with
+  `--aq-strength-edge` etc.) reading the `.avs`/`.vpy` directly, 10-bit
+  in/out. 4K uses `encode_4k` (CTU 64) with `2160.avs`/`2160.vpy` scripts;
+  HDR sources get bt2020/PQ signaling via the `hdr.json` sidecar written by
+  `hdr_probe` (DoVi detected, signaled as HDR10 today).
+- Mux: `mkvmerge` with the standard track language/default flags from the
+  legacy batch script; audio language comes from `audio.json` when present.
 - Keyframes: `ffmpeg` → y4m pipe → `SCXvid` → `<Series> - NN Keyframes.txt`, only when the flow includes the keyframes step.
-- Binaries live in `C:\bin` on nodes (moved from `E:\Encodes\bin`). Encode working dirs: `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` — both NFS shares mounted by the Windows NFS client.
+- Binaries live in `C:\bin` on nodes (moved from `E:\Encodes\bin`). Encode
+  working dirs: `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` — both
+  NFS shares mounted by the Windows NFS client. Series folders are created
+  via `POST /api/series` (UI: Series → Create series): `Ep 01…NN` on the
+  scripts share + `[Group] <Name> - Raws [Tag]` on the release share.
 
 ## Conventions
 

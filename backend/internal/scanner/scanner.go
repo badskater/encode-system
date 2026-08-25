@@ -88,8 +88,10 @@ func sortedDirs(fsys fs.FS, dir string) ([]string, error) {
 // inspectEpisode checks one episode folder for source + filter script.
 // Source selection prefers raw container extensions (.m2ts/.ts/.mp4) over
 // .mkv so a leftover mux OUTPUT ("Series - 01 [1080p].mkv") never
-// masquerades as a source. The canonical "1080.vpy" wins over other filter
-// scripts, then "1080.avs", for a deterministic pick.
+// masquerades as a source. Filter script priority (deterministic pick):
+// 2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy, so an
+// explicitly-authored 4K script wins over a legacy 1080 one, and VapourSynth
+// wins over AviSynth at the same resolution.
 func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (Candidate, bool, error) {
 	dir := path.Join(series, ep)
 	entries, err := fs.ReadDir(fsys, dir)
@@ -113,9 +115,13 @@ func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (
 			continue
 		}
 		switch {
-		case strings.HasPrefix(name, "1080.vpy"):
+		case strings.HasPrefix(name, "2160.vpy"):
 			script = name
-		case strings.HasPrefix(name, "1080.avs") && !strings.HasPrefix(script, "1080.vpy"):
+		case strings.HasPrefix(name, "2160.avs") && !strings.HasPrefix(script, "2160.vpy"):
+			script = name
+		case strings.HasPrefix(name, "1080.vpy") && !strings.HasPrefix(script, "2160"):
+			script = name
+		case strings.HasPrefix(name, "1080.avs") && !strings.HasPrefix(script, "2160") && !strings.HasPrefix(script, "1080.vpy"):
 			script = name
 		case script == "":
 			script = name

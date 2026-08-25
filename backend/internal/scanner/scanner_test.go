@@ -179,6 +179,32 @@ func TestScanScriptPreference(t *testing.T) {
 	}
 }
 
+// 4K support: 2160 scripts are recognized and outrank 1080 ones; within the
+// same resolution VapourSynth wins over AviSynth.
+func TestScanScriptPreference2160(t *testing.T) {
+	root := t.TempDir()
+	// 2160.vpy present alongside everything else -> wins outright.
+	mkEp(t, root, "S", "Ep 01", "src.m2ts", "1080.vpy", "1080.avs", "2160.avs", "2160.vpy")
+	cands, _, _ := Scan(root, 0)
+	if len(cands) != 1 || cands[0].ScriptFile != "2160.vpy" || cands[0].ScriptType != "vpy" {
+		t.Fatalf("2160.vpy must win: %+v", cands)
+	}
+
+	// 2160.avs with 1080 candidates -> the 4K script wins.
+	mkEp(t, root, "S", "Ep 02", "src.m2ts", "1080.vpy", "2160.avs")
+	cands, _, _ = Scan(root, 0)
+	if len(cands) != 2 || cands[1].ScriptFile != "2160.avs" || cands[1].ScriptType != "avs" {
+		t.Fatalf("2160.avs must win over 1080.vpy: %+v", cands)
+	}
+
+	// No 2160 script -> legacy behavior (1080.vpy wins).
+	mkEp(t, root, "S", "Ep 03", "src.m2ts", "1080.vpy", "1080.avs")
+	cands, _, _ = Scan(root, 0)
+	if len(cands) != 3 || cands[2].ScriptFile != "1080.vpy" {
+		t.Fatalf("1080.vpy must stay the 1080 pick: %+v", cands)
+	}
+}
+
 // Regression: skipped/unreadable dirs are reported, not swallowed silently.
 func TestScanReportsSkippedDirs(t *testing.T) {
 	root := t.TempDir()

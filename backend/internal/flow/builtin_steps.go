@@ -26,10 +26,13 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		sourceRenameTemplate(),
 		mediaProbeTemplate(),
 		dgindexTemplate(),
+		hdrProbeTemplate(),
 		audioTemplate(),
 		audioBranchTemplate(),
+		audioLangTemplate(),
 		flacAudioTemplate(),
 		encodeTemplate(),
+		encode4kTemplate(),
 		muxTemplate(),
 		crc32RenameTemplate(),
 		releaseCopyTemplate(),
@@ -346,14 +349,10 @@ const MuxFactoryV1 = `function Invoke-Mux {
     Write-Output "ENCODE_STEP mux 100"
 }`
 
-func muxTemplate() *model.StepTemplate {
-	return &model.StepTemplate{
-		Key:         "mux",
-		Label:       "MKV mux",
-		Description: "mkvmerge video + the produced audio track (audio.flac preferred when both exist, newest wins) with the standard track flags.",
-		Builtin:     true,
-		Params:      []model.ParamDef{},
-		PowerShell: `function Invoke-Mux {
+// MuxFactoryV2 is the FLAC-aware factory mux (audio.flac/audio.opus
+// selection, newest wins). Boot upgrades V1 installs to it, then continues
+// to V3 (language-aware) with the same byte-for-byte guard.
+const MuxFactoryV2 = `function Invoke-Mux {
     param(
         [Parameter(Mandatory=$true)] [pscustomobject] $Job,
         [pscustomobject] $Params
@@ -395,6 +394,87 @@ func muxTemplate() *model.StepTemplate {
         '-d', '0', '-A', '-S', '-T', '--no-global-tags', '--no-chapters',
         '(', $hevc, ')',
         '--language', '0:jpn', '--track-name', '0:Audio', '--forced-track', '0:no',
+        '-a', '0', '-D', '-S', '-T', '--no-global-tags', '--no-chapters',
+        '(', $audio, ')',
+        '--track-order', '0:0,1:0'
+    )
+    Invoke-Tool -ExePath $mkvmerge -Arguments $arguments -Label 'mkvmerge'
+    if (-not (Test-Path -LiteralPath $out)) {
+        throw "mkvmerge finished but $out was not created"
+    }
+    Write-Output "ENCODE_STEP mux 100"
+}`
+
+func muxTemplate() *model.StepTemplate {
+	return &model.StepTemplate{
+		Key:         "mux",
+		Label:       "MKV mux",
+		Description: "mkvmerge video + the produced audio track (audio.flac preferred when both exist, newest wins) with the standard track flags. Reads audio.json when present so language-aware audio steps set the track language.",
+		Builtin:     true,
+		Params:      []model.ParamDef{},
+		PowerShell: `function Invoke-Mux {
+    param(
+        [Parameter(Mandatory=$true)] [pscustomobject] $Job,
+        [pscustomobject] $Params
+    )
+    Write-Output "ENCODE_STEP mux 0"
+    $mkvmerge = Resolve-Tool $Job.BinDir 'mkvmerge.exe'
+    $hevc = $Job.HevcFile
+    # Audio selection: the flow decides the codec by running an audio step
+    # (opus or flac); mux consumes whichever final exists. When BOTH exist
+    # (a flow switched between codecs), the newest one wins — muxing the
+    # leftover stale track would silently ship yesterday's audio. Ties go
+    # to FLAC (lossless).
+    $opus = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
+    $flac = Join-Path $Job.EpisodeDir 'audio.flac'  # AudioFlacName contract
+    $opusExists = Test-Path -LiteralPath $opus
+    $flacExists = Test-Path -LiteralPath $flac
+    if ($opusExists -and $flacExists) {
+        if ((Get-Item -LiteralPath $flac).LastWriteTime -ge (Get-Item -LiteralPath $opus).LastWriteTime) {
+            $audio = $flac
+        } else {
+            $audio = $opus
+        }
+    } elseif ($flacExists) {
+        $audio = $flac
+    } elseif ($opusExists) {
+        $audio = $opus
+    } else {
+        throw "no audio track found in $($Job.EpisodeDir) (expected audio.flac or audio.opus — check the flow has an audio step)"
+    }
+    Write-Output "muxing audio track: $(Split-Path $audio -Leaf)"
+
+    # Track language: language-aware audio steps (audio_lang) record their
+    # pick in audio.json; use it, else keep the legacy jpn default. The code
+    # is validated to a strict alphabet before it reaches mkvmerge — an
+    # unexpected value falls back to jpn instead of failing mid-mux.
+    $audioLang = 'jpn'
+    $audioJson = Join-Path $Job.EpisodeDir 'audio.json'
+    if (Test-Path -LiteralPath $audioJson) {
+        try {
+            $sel = [System.IO.File]::ReadAllText($audioJson) | ConvertFrom-Json
+            if ($sel.language -match '^[a-z]{2,3}$') {
+                $audioLang = $sel.language
+                Write-Output "audio track language from audio.json: $audioLang"
+            } else {
+                Write-Output "audio.json language '$($sel.language)' is not a valid code; using jpn"
+            }
+        } catch {
+            Write-Output "audio.json unreadable ($($_.Exception.Message)); using jpn"
+        }
+    }
+
+    $out = Join-Path $Job.EpisodeDir $Job.OutputName
+    foreach ($f in @($hevc, $audio)) {
+        if (-not (Test-Path -LiteralPath $f)) { throw "mux input missing: $f" }
+    }
+    $arguments = @(
+        '-o', $out, '--quiet',
+        '--language', '0:jpn', '--track-name', '0:Video',
+        '--default-track', '0:yes', '--forced-track', '0:no',
+        '-d', '0', '-A', '-S', '-T', '--no-global-tags', '--no-chapters',
+        '(', $hevc, ')',
+        '--language', "0:$audioLang", '--track-name', '0:Audio', '--forced-track', '0:no',
         '-a', '0', '-D', '-S', '-T', '--no-global-tags', '--no-chapters',
         '(', $audio, ')',
         '--track-order', '0:0,1:0'

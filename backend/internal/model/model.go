@@ -119,7 +119,11 @@ type Settings struct {
 	TasksBeforeReboot   int    `json:"tasks_before_reboot"`
 	Group               string `json:"group"`
 	Tag                 string `json:"tag"`
-	UpdatedAt           *time.Time `json:"updated_at,omitempty"`
+	// DiscordWebhook is the live-editable Discord webhook used by both the
+	// job-outcome alerts and the discord_notify flow step (as the fallback
+	// when a flow omits its own webhook param). Empty = notifications off.
+	DiscordWebhook string     `json:"discord_webhook"`
+	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
 }
 
 // Session is an issued management session (token stored hashed at rest).

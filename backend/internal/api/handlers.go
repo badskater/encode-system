@@ -10,6 +10,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 )
 
 // ctxBg returns a background context for startup seeding operations.
@@ -204,7 +205,7 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 		ReleaseDir:     st.NodeReleaseDir,
 		Group:          st.Group,
 		Tag:            tag,
-		DiscordWebhook: s.Cfg.DiscordWebhook,
+		DiscordWebhook: s.discordWebhook(ctx),
 	}
 	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {
@@ -282,16 +283,24 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 
 // notifyJobFinished fires the outcome alert for a job that just reached a
 // terminal state. The job is re-read so the alert carries the recorded error
-// and timestamps; a missing notifier (not configured) is a no-op.
+// and timestamps. The notifier is resolved from the LIVE settings on every
+// call (Settings-page webhook edits take effect immediately, no restart);
+// an empty webhook is a no-op.
 func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName string) {
-	if s.Notify == nil {
-		return
-	}
 	j, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return
 	}
-	s.Notify.JobFinished(ctx, j, nodeName)
+	notify.NewDiscord(s.discordWebhook(ctx), s.Log).JobFinished(ctx, j, nodeName)
+}
+
+// discordWebhook returns the effective Discord webhook. The persisted
+// settings row is authoritative once it exists — including a blank value,
+// which lets the operator turn notifications OFF without editing env. With
+// no saved row, the env default the controller booted with applies.
+// currentSettings implements exactly that merge.
+func (s *Server) discordWebhook(ctx context.Context) string {
+	return s.currentSettings(ctx).DiscordWebhook
 }
 
 // handleManifest returns the desired versions (agents compare and act).

@@ -30,6 +30,11 @@ type Nop struct{}
 // JobFinished does nothing.
 func (Nop) JobFinished(context.Context, *model.Job, string) {}
 
+// sharedHTTP backs every Discord notifier. Notifiers may be built per call
+// (the webhook is a live setting), so the client must not be per-instance —
+// each call would otherwise allocate a fresh transport.
+var sharedHTTP = &http.Client{Timeout: 10 * time.Second}
+
 // Discord posts alerts to a webhook URL. Messages are plain-text embeds;
 // Discord accepts a JSON body of {"content": "..."}.
 type Discord struct {
@@ -45,8 +50,8 @@ func NewDiscord(webhookURL string, log *slog.Logger) Notifier {
 		return Nop{}
 	}
 	return &Discord{
-		WebhookURL: webhookURL,
-		HTTP:       &http.Client{Timeout: 10 * time.Second},
+		WebhookURL: strings.TrimSpace(webhookURL),
+		HTTP:       sharedHTTP,
 		Log:        log,
 	}
 }

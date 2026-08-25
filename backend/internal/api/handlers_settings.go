@@ -26,6 +26,7 @@ func (s *Server) defaultsSettings() *model.Settings {
 		TasksBeforeReboot:   s.Cfg.TasksBeforeReboot,
 		Group:               s.Cfg.Group,
 		Tag:                 s.Cfg.Tag,
+		DiscordWebhook:      s.Cfg.DiscordWebhook,
 	}
 }
 
@@ -106,6 +107,22 @@ func validateSettings(st *model.Settings) error {
 	}
 	if st.Tag == "" {
 		return errSettings("tag is required")
+	}
+	// Discord webhook: optional (blank = notifications off). When set it must
+	// look like a Discord webhook URL (loopback allowed for local mock
+	// testing) — mirroring the discord_notify step's own guard so a typo or
+	// an exfiltration target is caught at save time, not mid-job.
+	st.DiscordWebhook = strings.TrimSpace(st.DiscordWebhook)
+	if st.DiscordWebhook != "" {
+		discordish := strings.HasPrefix(st.DiscordWebhook, "https://discord.com/api/webhooks/") ||
+			strings.HasPrefix(st.DiscordWebhook, "https://discordapp.com/api/webhooks/")
+		loopback := strings.HasPrefix(st.DiscordWebhook, "http://localhost") ||
+			strings.HasPrefix(st.DiscordWebhook, "https://localhost") ||
+			strings.HasPrefix(st.DiscordWebhook, "http://127.0.0.1") ||
+			strings.HasPrefix(st.DiscordWebhook, "https://127.0.0.1")
+		if !discordish && !loopback {
+			return errSettings("discord_webhook must be a Discord webhook URL (https://discord.com/api/webhooks/...) or blank")
+		}
 	}
 	// Controller URL (what nodes dial): required for provisioning, must be
 	// an absolute http(s) URL. Empty is tolerated until someone provisions.

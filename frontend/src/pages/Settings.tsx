@@ -283,6 +283,29 @@ export default function SettingsPage() {
       </div>
 
       <div className="card">
+        <h3 style={{ marginTop: 0 }}>Discord notifications</h3>
+        <p className="muted">
+          One webhook, two uses: the controller posts job-outcome alerts
+          (done/failed) to it, and the <code>discord_notify</code> flow step
+          falls back to it when a flow doesn't set its own webhook. Changes
+          apply immediately — no restart. Leave blank to turn notifications
+          off (overrides the controller's environment webhook).
+        </p>
+        {field(
+          'Webhook URL',
+          'https://discord.com/api/webhooks/… — validated on save.',
+          'discord_webhook',
+          'https://discord.com/api/webhooks/…',
+        )}
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
+        {settings.updated_at && (
+          <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      <div className="card">
         <h3 style={{ marginTop: 0 }}>Push to nodes</h3>
         <p className="muted">
           Publish a payload here and every enabled node adopts it on its next

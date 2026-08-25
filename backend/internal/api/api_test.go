@@ -50,6 +50,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
 		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
 		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
+		DiscordWebhook: "https://discord.com/api/webhooks/env/default",
 	}
 	s, err := New(st, up, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
 	if err != nil {

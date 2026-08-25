@@ -16,7 +16,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
-	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -48,7 +47,6 @@ type Server struct {
 	Update    *update.Store
 	Log       *slog.Logger
 	Cfg       Config
-	Notify    notify.Notifier
 	Provision *provision.Engine // node provisioning (nil = unavailable)
 	throttle  *loginThrottle
 }
@@ -70,9 +68,9 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if cfg.DefaultFlowName == "" {
 		cfg.DefaultFlowName = "default-1080"
 	}
-	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, Notify: notify.NewDiscord(cfg.DiscordWebhook, log), throttle: &loginThrottle{}}
+	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{}}
 	if cfg.DiscordWebhook != "" {
-		log.Info("discord notifications enabled")
+		log.Info("discord notifications enabled (default; override via Settings page)")
 	}
 	if err := s.seedStepTemplates(); err != nil {
 		return nil, err

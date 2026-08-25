@@ -71,6 +71,7 @@ export interface Settings {
   tasks_before_reboot: number;
   group: string;
   tag: string;
+  discord_webhook: string; // blank = Discord notifications off
   updated_at?: string;
 }
 

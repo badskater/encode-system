@@ -13,6 +13,20 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (live Discord webhook in Settings)
+
+- Discord webhook is now a live Settings-page field (Settings → Discord
+  notifications): edits apply immediately — no restart — to both the
+  job-outcome alerts (notify package, resolved per alert) and the
+  discord_notify step's fallback (injected into $Job at render time). The
+  static boot-time Notifier was replaced by per-call resolution off the
+  settings row; env ENCODE_DISCORD_WEBHOOK seeds the default, and a saved
+  blank value turns notifications OFF even when the env var is set.
+- URL validation on save (discord.com/discordapp.com webhooks or loopback),
+  mirroring the step's exfil guard. 3 new API tests (validation matrix,
+  resolution precedence incl. blank-disables, env→live propagation into
+  rendered job scripts) + full suite green.
+
 ## Done (Discord notification flow step)
 
 - New discord_notify step: posts an episode-progress message to a Discord

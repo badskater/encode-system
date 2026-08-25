@@ -85,20 +85,20 @@ func main() {
 	}
 
 	cfg := api.Config{
-		AdminUsername:      adminUser,
-		AdminPassword:      adminPass,
-		ForceAdminPassword: os.Getenv("ENCODE_ADMIN_FORCE_PASSWORD") == "1",
-		ScriptsRoot:       env("ENCODE_SCRIPTS_ROOT", filepath.Join(*dataDir, "scripts")),
-		ReleaseRoot:       env("ENCODE_RELEASE_ROOT", filepath.Join(*dataDir, "release")),
-		NodeBinDir:        env("ENCODE_NODE_BIN", `C:\bin`),
-		NodeScriptsDir:    env("ENCODE_NODE_SCRIPTS", `C:\Encodes\scripts`),
-		NodeReleaseDir:    env("ENCODE_NODE_RELEASE", `C:\Encodes\ReleaseFolders`),
-		Group:             env("ENCODE_GROUP", "OldFartsSubs"),
-		Tag:               env("ENCODE_TAG", "1080p"),
-		DefaultFlowName:   env("ENCODE_DEFAULT_FLOW", "default-1080"),
+		AdminUsername:       adminUser,
+		AdminPassword:       adminPass,
+		ForceAdminPassword:  os.Getenv("ENCODE_ADMIN_FORCE_PASSWORD") == "1",
+		ScriptsRoot:         env("ENCODE_SCRIPTS_ROOT", filepath.Join(*dataDir, "scripts")),
+		ReleaseRoot:         env("ENCODE_RELEASE_ROOT", filepath.Join(*dataDir, "release")),
+		NodeBinDir:          env("ENCODE_NODE_BIN", `C:\bin`),
+		NodeScriptsDir:      env("ENCODE_NODE_SCRIPTS", `C:\Encodes\scripts`),
+		NodeReleaseDir:      env("ENCODE_NODE_RELEASE", `C:\Encodes\ReleaseFolders`),
+		Group:               env("ENCODE_GROUP", "OldFartsSubs"),
+		Tag:                 env("ENCODE_TAG", "1080p"),
+		DefaultFlowName:     env("ENCODE_DEFAULT_FLOW", "default-1080"),
 		TasksBeforeReboot:   envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
 		ScanIntervalSeconds: envInt("ENCODE_SCAN_INTERVAL", 30),
-		DiscordWebhook:    env("ENCODE_DISCORD_WEBHOOK", ""),
+		DiscordWebhook:      env("ENCODE_DISCORD_WEBHOOK", ""),
 	}
 
 	srv, err := api.New(st, up, log, cfg)

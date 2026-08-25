@@ -41,9 +41,9 @@ func (s *Store) agentPath() string { return filepath.Join(s.dir, "encode-agent.e
 
 // Dir returns the payload directory (used by the provisioner to stage
 // published artifacts for ansible win_copy).
-func (s *Store) Dir() string { return s.dir }
-func (s *Store) libPath() string   { return filepath.Join(s.dir, "EncodeLib.ps1") }
-func (s *Store) binPath() string   { return filepath.Join(s.dir, "bin-package.zip") }
+func (s *Store) Dir() string     { return s.dir }
+func (s *Store) libPath() string { return filepath.Join(s.dir, "EncodeLib.ps1") }
+func (s *Store) binPath() string { return filepath.Join(s.dir, "bin-package.zip") }
 func (s *Store) versionPath() string {
 	return filepath.Join(s.dir, "manifest.json")
 }

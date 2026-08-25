@@ -78,8 +78,6 @@ func DefaultFlow() *model.Flow {
 	}
 }
 
-
-
 // psQuote renders a PowerShell single-quoted string literal, escaping embedded
 // single quotes by doubling them. All rendered values pass through here, which
 // keeps generated scripts injection-safe for arbitrary series names.
@@ -302,4 +300,3 @@ func ValidateForRender(f *model.Flow, resolve TemplateResolver) error {
 	}
 	return nil
 }
-

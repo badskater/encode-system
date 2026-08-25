@@ -13,26 +13,26 @@ import (
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
-	"golang.org/x/crypto/bcrypt"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Config carries runtime settings injected into handlers.
 type Config struct {
-	AdminUsername        string        // management-plane admin account (seeded at startup)
-	AdminPassword        string        // initial password for the admin account (only used when the account doesn't exist)
-	ForceAdminPassword   bool          // recovery hatch: overwrite the stored admin hash with AdminPassword on this boot
-	ScriptsRoot       string        // controller-side scripts share mount
-	ReleaseRoot       string        // controller-side release share mount
-	NodeBinDir        string        // tools dir on nodes, e.g. C:\bin
-	NodeScriptsDir    string        // scripts mount on nodes, e.g. C:\Encodes\scripts
-	NodeReleaseDir    string        // release mount on nodes
-	Group             string        // release group tag
-	Tag               string        // quality tag, e.g. 1080p
+	AdminUsername       string        // management-plane admin account (seeded at startup)
+	AdminPassword       string        // initial password for the admin account (only used when the account doesn't exist)
+	ForceAdminPassword  bool          // recovery hatch: overwrite the stored admin hash with AdminPassword on this boot
+	ScriptsRoot         string        // controller-side scripts share mount
+	ReleaseRoot         string        // controller-side release share mount
+	NodeBinDir          string        // tools dir on nodes, e.g. C:\bin
+	NodeScriptsDir      string        // scripts mount on nodes, e.g. C:\Encodes\scripts
+	NodeReleaseDir      string        // release mount on nodes
+	Group               string        // release group tag
+	Tag                 string        // quality tag, e.g. 1080p
 	TasksBeforeReboot   int           // reboot threshold (default 10)
 	ScanIntervalSeconds int           // scanner cadence (default 30)
 	RebootGracePeriod   time.Duration // reboot attempt expires after this (default 10m)

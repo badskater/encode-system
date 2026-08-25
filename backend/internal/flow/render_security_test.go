@@ -103,8 +103,8 @@ func TestValidateRejectsFunctionlessTemplate(t *testing.T) {
 // in comment lines.
 func TestRenderStripsNewlinesFromComments(t *testing.T) {
 	tpl := &model.StepTemplate{
-		Key:   "n_step",
-		Label: "Nice\nInvoke-EvilCmd",
+		Key:        "n_step",
+		Label:      "Nice\nInvoke-EvilCmd",
 		PowerShell: "function Invoke-N {\n    param($Job,$Params)\n}",
 	}
 	resolve := func(key string) (*model.StepTemplate, error) { return tpl, nil }

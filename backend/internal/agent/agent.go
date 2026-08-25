@@ -512,8 +512,8 @@ func (a *Agent) handleReboot(delaySeconds int) {
 // error, not something to buffer. Bin packages use maxBinDownloadBytes
 // instead (the controller caps bin uploads at 1 GiB — a node that refused
 // anything over 256 MiB could never sync a legitimately large tools folder).
-const maxUpdateBytes = 256 << 20      // 256 MiB
-const maxBinDownloadBytes = 1 << 30   // 1 GiB (matches the publish cap)
+const maxUpdateBytes = 256 << 20    // 256 MiB
+const maxBinDownloadBytes = 1 << 30 // 1 GiB (matches the publish cap)
 
 // sha256Bytes hashes a payload for manifest verification.
 func sha256Bytes(b []byte) string {

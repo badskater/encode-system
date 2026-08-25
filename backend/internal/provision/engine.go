@@ -28,12 +28,12 @@ import (
 
 // Request is one provisioning attempt (validated before execution).
 type Request struct {
-	Host         string
-	Port         int
-	Scheme       string // http | https
-	WinRMUser    string
+	Host          string
+	Port          int
+	Scheme        string // http | https
+	WinRMUser     string
 	WinRMPassword string
-	NodeName     string
+	NodeName      string
 	// Options.
 	InstallToolchain bool // MediaInfo, AviSynth+, Python, VapourSynth
 	MountNFS         bool // NFS client + share mounts (needs settings.NFSServer)

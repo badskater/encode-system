@@ -80,18 +80,18 @@ type User struct {
 // Windows node. The WinRM password is NEVER stored: it lives only in the
 // temporary vars file for the duration of the run.
 type ProvisionRun struct {
-	ID            int64      `json:"id"`
-	Host          string     `json:"host"`      // WinRM target (ip or hostname)
-	Port          int        `json:"port"`      // WinRM port (default 5985)
-	Scheme        string     `json:"scheme"`    // http | https
-	WinRMUser     string     `json:"winrm_user"`
-	NodeName      string     `json:"node_name"` // desired agent/node name
-	Status        string     `json:"status"`    // queued|running|success|failed
-	OptionsJSON   string     `json:"-"`              // run options snapshot (no secrets)
-	Log           string     `json:"log,omitempty"`  // full ansible output (single-run GET only)
-	Error         string     `json:"error,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	ID          int64      `json:"id"`
+	Host        string     `json:"host"`   // WinRM target (ip or hostname)
+	Port        int        `json:"port"`   // WinRM port (default 5985)
+	Scheme      string     `json:"scheme"` // http | https
+	WinRMUser   string     `json:"winrm_user"`
+	NodeName    string     `json:"node_name"`     // desired agent/node name
+	Status      string     `json:"status"`        // queued|running|success|failed
+	OptionsJSON string     `json:"-"`             // run options snapshot (no secrets)
+	Log         string     `json:"log,omitempty"` // full ansible output (single-run GET only)
+	Error       string     `json:"error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
 }
 
 // Settings is the operator-editable runtime configuration (NFS shares,
@@ -100,20 +100,20 @@ type ProvisionRun struct {
 type Settings struct {
 	// Controller URL as seen by the NODES (provisioned agents connect here;
 	// the container's own hostname is usually meaningless outside Docker).
-	ControllerURL   string `json:"controller_url"`
+	ControllerURL string `json:"controller_url"`
 	// NFS share description (informational + deployment guidance: the
 	// actual mounts are compose volumes on the Docker host).
-	NFSServer       string `json:"nfs_server"`
-	ScriptsShare    string `json:"scripts_share"`    // export path, e.g. /mnt/user/scripts
-	ReleaseShare    string `json:"release_share"`    // export path, e.g. /mnt/user/ReleaseFolders
+	NFSServer    string `json:"nfs_server"`
+	ScriptsShare string `json:"scripts_share"` // export path, e.g. /mnt/user/scripts
+	ReleaseShare string `json:"release_share"` // export path, e.g. /mnt/user/ReleaseFolders
 	// Controller-side roots (where the shares are mounted in the container).
-	ScriptsRoot     string `json:"scripts_root"`
-	ReleaseRoot     string `json:"release_root"`
+	ScriptsRoot string `json:"scripts_root"`
+	ReleaseRoot string `json:"release_root"`
 	// Remote path mapping: node-side locations used when rendering job
 	// scripts ($Job.BinDir / ScriptsDir / ReleaseDir).
-	NodeBinDir      string `json:"node_bin_dir"`
-	NodeScriptsDir  string `json:"node_scripts_dir"`
-	NodeReleaseDir  string `json:"node_release_dir"`
+	NodeBinDir     string `json:"node_bin_dir"`
+	NodeScriptsDir string `json:"node_scripts_dir"`
+	NodeReleaseDir string `json:"node_release_dir"`
 	// Behavior.
 	ScanIntervalSeconds int    `json:"scan_interval_seconds"`
 	TasksBeforeReboot   int    `json:"tasks_before_reboot"`

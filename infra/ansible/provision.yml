@@ -63,7 +63,7 @@
           ansible.windows.win_shell: |
             powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{{ encode_agent_dir }}\remount-nfs.ps1"
           register: mount_now
-          changed_when: "'mounted:' in mount_now.stdout"
+          changed_when: "'mounted:' in mount_now.stdout and 'already mounted:' not in mount_now.stdout"
           failed_when: mount_now.rc != 0
 
         - name: Register startup task to remount NFS after reboot
@@ -106,6 +106,7 @@
         - name: Extract MediaInfo
           when: not mediainfo_stat.stat.exists
           ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Stop'
             Expand-Archive -LiteralPath "{{ encode_agent_dir }}\installers\MediaInfo_CLI.zip" `
               -DestinationPath "{{ encode_agent_dir }}\installers\MediaInfo_CLI" -Force
           register: mi_extract
@@ -217,8 +218,8 @@
         - name: Extract bin package over tools dir
           when: bin_upload is changed
           ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Stop'
             Expand-Archive -LiteralPath "{{ encode_agent_dir }}\bin-package.zip" -DestinationPath "{{ encode_bin_dir }}" -Force
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             (Get-ChildItem "{{ encode_bin_dir }}" -Recurse -File | Measure-Object).Count
           register: bin_extract
           changed_when: true
@@ -248,16 +249,20 @@
         # Build as a dict and serialize with to_nice_json: inline templating
         # would inject raw backslashes from the path vars and produce invalid
         # JSON escapes (e.g. \e in "C:\encode-agent").
+        # lib_path is only populated when EncodeLib.ps1 was actually
+        # deployed: pointing the agent at a file that was never copied makes
+        # every job render fail with a confusing load error.
         - name: Build agent.json content
           ansible.builtin.set_fact:
-            agent_config:
-              controller_url: "{{ encode_controller_url }}"
-              node_name: "{{ encode_node_name }}"
-              pairing_code: "{{ encode_pairing_code }}"
-              data_dir: "{{ encode_agent_dir }}"
-              bin_dir: "{{ encode_bin_dir }}"
-              lib_path: "{{ encode_agent_dir }}\\EncodeLib.ps1"
-              heartbeat_seconds: "{{ encode_heartbeat_seconds | int }}"
+            agent_config: >-
+              {{ {
+                'controller_url': encode_controller_url,
+                'node_name': encode_node_name,
+                'pairing_code': encode_pairing_code,
+                'data_dir': encode_agent_dir,
+                'bin_dir': encode_bin_dir,
+                'heartbeat_seconds': encode_heartbeat_seconds | int,
+              } | combine({'lib_path': encode_agent_dir ~ '\EncodeLib.ps1'} if (encode_has_lib | bool) else {}) }}
           no_log: true
 
         - name: Write agent.json (pairing bootstrap)
@@ -298,3 +303,16 @@
           delay: 10
           until: pair_check.rc == 0
           changed_when: false
+
+        # Hygiene: the one-shot pairing code has served its purpose — strip
+        # it from agent.json so credential material doesn't sit on disk.
+        # (The agent keeps its own permanent token in node.token.)
+        - name: Remove pairing code from agent.json
+          ansible.windows.win_shell: |
+            $p = "{{ encode_agent_dir }}\agent.json"
+            $j = Get-Content $p -Raw | ConvertFrom-Json
+            if ($j.PSObject.Properties['pairing_code']) {
+              $j.PSObject.Properties.Remove('pairing_code')
+              $j | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
+            }
+          changed_when: true

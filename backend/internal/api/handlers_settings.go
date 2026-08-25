@@ -108,7 +108,8 @@ func validateSettings(st *model.Settings) error {
 	}
 	// Controller URL (what nodes dial): required for provisioning, must be
 	// an absolute http(s) URL. Empty is tolerated until someone provisions.
-	if cu := strings.TrimSpace(st.ControllerURL); cu != "" {
+	st.ControllerURL = strings.TrimSpace(st.ControllerURL)
+	if cu := st.ControllerURL; cu != "" {
 		if !strings.HasPrefix(cu, "http://") && !strings.HasPrefix(cu, "https://") {
 			return errSettings("controller_url must start with http:// or https://")
 		}

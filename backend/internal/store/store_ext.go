@@ -183,9 +183,29 @@ func (s *Store) SetProvisionRunStatus(ctx context.Context, id int64, status, err
 	return err
 }
 
+// DeleteNodeIfNotBusy removes a node only if it is not busy, atomically.
+// Returns rows affected: 0 means the node is busy (or gone) — the caller
+// must not proceed, otherwise a job dispatched between check and delete
+// would be orphaned mid-encode (the TOCTOU the old check-then-act had).
+func (s *Store) DeleteNodeIfNotBusy(ctx context.Context, id int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND status != 'busy'`, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // AppendProvisionRunLog atomically appends output to the run's log column.
 // SQLite's || concat handles the append; the UI tails via GetProvisionRun.
-func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error {
+// When capBytes > 0 the persisted log is bounded to the last capBytes bytes
+// (substr with a negative offset keeps the tail — where the failure is) so a
+// long run cannot grow the row without limit.
+func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk string, capBytes int) error {
+	if capBytes > 0 {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE provision_runs SET log = substr(log || ?, -?) WHERE id = ?`, chunk, capBytes, id)
+		return err
+	}
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE provision_runs SET log = log || ? WHERE id = ?`, chunk, id)
 	return err

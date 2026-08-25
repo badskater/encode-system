@@ -411,12 +411,16 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "node not found")
 		return
 	}
-	if node.Status == model.NodeBusy {
-		writeErr(w, http.StatusConflict, "cannot delete a busy node")
+	// Atomic busy-guard: between the GetNode above and this delete, a job
+	// could dispatch and flip the node to busy — the conditional DELETE
+	// closes that window instead of orphaning an in-flight encode.
+	n, err := s.Store.DeleteNodeIfNotBusy(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete node")
 		return
 	}
-	if err := s.Store.DeleteNode(r.Context(), id); err != nil {
-		writeErr(w, http.StatusInternalServerError, "delete node")
+	if n == 0 {
+		writeErr(w, http.StatusConflict, "cannot delete a busy node")
 		return
 	}
 	s.Log.Info("node deleted", "node", node.Name, "id", id)

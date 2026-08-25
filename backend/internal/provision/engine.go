@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,7 @@ type Store interface {
 	GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error)
 	ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error)
 	SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error
-	AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error
+	AppendProvisionRunLog(ctx context.Context, id int64, chunk string, capBytes int) error
 }
 
 // Payloads stages the agent artifacts for ansible win_copy: agent binary,
@@ -73,8 +74,7 @@ type Engine struct {
 	AnsibleBin   string // ansible-playbook executable (default: PATH lookup)
 	LogCap       int    // max bytes of ansible output kept per run
 
-	mu      sync.Mutex // serializes runs
-	running bool
+	mu sync.Mutex // serializes runs
 }
 
 // ReconcileStaleRuns marks any run left in queued/running state as failed.
@@ -82,20 +82,36 @@ type Engine struct {
 // process (crash, restart, redeploy) and will never finish — without this
 // they would show as "running" forever.
 func (e *Engine) ReconcileStaleRuns(ctx context.Context) error {
+	// Crash hygiene first: a controller that died mid-run leaves
+	// /tmp/provision-*/ behind, and its vars.yml still holds the WinRM
+	// password. Runs never survive a process restart (nothing resumes
+	// them), so every such dir is by definition stale — sweep them all.
+	entries, err := os.ReadDir(os.TempDir())
+	if err == nil {
+		for _, en := range entries {
+			if strings.HasPrefix(en.Name(), "provision-") {
+				_ = os.RemoveAll(filepath.Join(os.TempDir(), en.Name()))
+			}
+		}
+	}
+
 	runs, err := e.Store.ListProvisionRuns(ctx)
 	if err != nil {
 		return err
 	}
+	var firstErr error
 	for _, r := range runs {
 		if r.Status == "queued" || r.Status == "running" {
+			// Use a generous cap: these appends go through the same
+			// bounded-append path as live output.
 			_ = e.Store.AppendProvisionRunLog(ctx, r.ID,
-				"\n[controller] controller restarted while this run was active; marking failed\n")
-			if err := e.Store.SetProvisionRunStatus(ctx, r.ID, "failed", "interrupted by controller restart", true); err != nil {
-				return err
+				"\n[controller] controller restarted while this run was active; marking failed\n", e.logCap())
+			if err := e.Store.SetProvisionRunStatus(ctx, r.ID, "failed", "interrupted by controller restart", true); err != nil && firstErr == nil {
+				firstErr = err // keep going: one bad row must not freeze the rest
 			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 const (
@@ -108,6 +124,10 @@ const (
 // (IPv6), no whitespace or shell metacharacters. Args are passed as argv
 // (never through a shell), but validation keeps errors loud and early.
 var hostRe = regexp.MustCompile(`^[A-Za-z0-9._:\[\]-]+$`)
+
+// nodeNameRe is the allow-list for provisioned node names (also the name a
+// node registers under). Compiled once, not per Validate call.
+var nodeNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // Validate checks the request shape before any resources are allocated.
 func (r *Request) Validate() error {
@@ -136,7 +156,7 @@ func (r *Request) Validate() error {
 	if r.NodeName == "" {
 		return fmt.Errorf("node_name is required")
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(r.NodeName) {
+	if !nodeNameRe.MatchString(r.NodeName) {
 		return fmt.Errorf("node_name %q contains invalid characters", r.NodeName)
 	}
 	return nil
@@ -167,23 +187,27 @@ func (e *Engine) Start(ctx context.Context, req Request) (*model.ProvisionRun, e
 
 // run executes one provisioning attempt end to end.
 func (e *Engine) run(id int64, req Request) {
-	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
-	defer cancel()
-
 	// Serialize runs: queue behind any in-flight run.
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Timeout starts only once this run owns the stage: a queued run must
+	// not burn its 45-minute budget waiting on the mutex (which would turn
+	// into a spurious "provisioning timed out" the moment it starts).
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
 
 	bg := context.Background()
 	_ = e.Store.SetProvisionRunStatus(bg, id, "running", "", false)
 
 	err := e.execute(ctx, bg, id, req)
+	capB := e.logCap()
 	if err != nil {
-		_ = e.Store.AppendProvisionRunLog(bg, id, "\n[controller] FAILED: "+err.Error()+"\n")
+		_ = e.Store.AppendProvisionRunLog(bg, id, "\n[controller] FAILED: "+err.Error()+"\n", capB)
 		_ = e.Store.SetProvisionRunStatus(bg, id, "failed", err.Error(), true)
 		return
 	}
-	_ = e.Store.AppendProvisionRunLog(bg, id, "\n[controller] SUCCESS: node provisioned\n")
+	_ = e.Store.AppendProvisionRunLog(bg, id, "\n[controller] SUCCESS: node provisioned\n", capB)
 	_ = e.Store.SetProvisionRunStatus(bg, id, "success", "", true)
 }
 
@@ -264,7 +288,7 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	// starts, so an empty final log is never ambiguous (it means ansible
 	// produced nothing, not that the plumbing dropped it).
 	_ = e.Store.AppendProvisionRunLog(bg, id,
-		"[controller] launching ansible-playbook ("+ansibleBin+")\n")
+		"[controller] launching ansible-playbook ("+ansibleBin+")\n", e.logCap())
 	cmd := exec.CommandContext(ctx, ansibleBin,
 		"-i", filepath.Join(dir, "inventory.yml"),
 		"-e", "@"+filepath.Join(dir, "vars.yml"),
@@ -276,7 +300,10 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 		// win_copy transfers can make tasks long.
 		"ANSIBLE_TIMEOUT=120",
 	)
-	return streamCommand(ctx, bg, e.Store, id, cmd, e.logCap())
+	// Defense in depth: ansible at verbosity or a task echoing vars could
+	// reflect secrets into the output; scrub them before they reach the DB.
+	redact := []string{req.WinRMPassword, code}
+	return streamCommand(ctx, bg, e.Store, id, cmd, e.logCap(), redact)
 }
 
 func (e *Engine) logCap() int {
@@ -295,7 +322,7 @@ func (e *Engine) logCap() int {
 // side reaches EOF when the child exits. Stderr is merged into the same
 // pipe — ansible reports fatal errors on stderr, so discarding it (as a
 // naive StdoutPipe setup does) would leave runs dying silently.
-func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, capBytes int) error {
+func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, capBytes int, redact []string) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create pipe: %w", err)
@@ -311,38 +338,62 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 	// Parent's write end must close so EOF depends only on the child.
 	pw.Close()
 
+	// Single-flusher design: the scanner goroutine (this one) and the ticker
+	// goroutine both produce output, but ONLY the flusher goroutine ever
+	// talks to the store — appends stay ordered and nothing races the final
+	// flush. Chunks are delivered on a channel; a failed append is re-queued
+	// in place (strings.Builder by value is never copied — that panics).
 	var (
 		mu  sync.Mutex
 		buf strings.Builder
 	)
-	flush := func() {
+	flushCh := make(chan string, 64)
+	flusherDone := make(chan struct{})
+	go func() {
+		defer close(flusherDone)
+		for chunk := range flushCh {
+			if chunk == "" {
+				continue
+			}
+			for _, secret := range redact {
+				if secret != "" {
+					chunk = strings.ReplaceAll(chunk, secret, "[REDACTED]")
+				}
+			}
+			if err := st.AppendProvisionRunLog(bg, id, chunk, capBytes); err != nil {
+				// Transient DB failure: re-queue ahead of whatever arrived
+				// since, then the next chunk retries it.
+				mu.Lock()
+				merged := chunk + buf.String()
+				buf.Reset()
+				buf.WriteString(merged)
+				mu.Unlock()
+			}
+		}
+	}()
+
+	drainBuf := func() {
 		mu.Lock()
 		chunk := buf.String()
 		buf.Reset()
 		mu.Unlock()
 		if chunk != "" {
-			if err := st.AppendProvisionRunLog(bg, id, chunk); err != nil {
-				// Re-queue the chunk so a transient DB error cannot lose
-				// output; the next flush retries it (ahead of newer lines).
-				mu.Lock()
-				rebuf := &strings.Builder{}
-				rebuf.WriteString(chunk)
-				rebuf.WriteString(buf.String())
-				buf = *rebuf
-				mu.Unlock()
-			}
+			flushCh <- chunk
 		}
 	}
-	done := make(chan struct{})
+
+	tickerStop := make(chan struct{})
+	tickerDone := make(chan struct{})
 	go func() {
+		defer close(tickerDone)
 		tick := time.NewTicker(logFlushInterval)
 		defer tick.Stop()
 		for {
 			select {
-			case <-done:
+			case <-tickerStop:
 				return
 			case <-tick.C:
-				flush()
+				drainBuf()
 			}
 		}
 	}()
@@ -352,8 +403,9 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 	for scanner.Scan() {
 		line := scanner.Text() + "\n"
 		mu.Lock()
-		// capBytes bounds the per-run log size: drop the oldest lines when
-		// the cap is exceeded (keep the tail — that is where the failure is).
+		// capBytes bounds the in-memory buffer; the persisted column is
+		// bounded by the same cap inside AppendProvisionRunLog (tail kept —
+		// that is where the failure is).
 		if buf.Len()+len(line) > capBytes {
 			excess := buf.Len() + len(line) - capBytes
 			s := buf.String()
@@ -367,9 +419,21 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		buf.WriteString(line)
 		mu.Unlock()
 	}
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		// Oversized line or read error: do NOT abandon the pipe — drain the
+		// rest so the child never blocks writing into a full buffer.
+		mu.Lock()
+		buf.WriteString("\n[controller] WARNING: log capture truncated (" + scanErr.Error() + ")\n")
+		mu.Unlock()
+		go func() { _, _ = io.Copy(io.Discard, pr) }()
+	}
 	pr.Close()
-	close(done)
-	flush()
+	close(tickerStop)
+	<-tickerDone // ticker fully stopped before the final flush
+	drainBuf()   // final flush goes through the same ordered path
+	close(flushCh)
+	<-flusherDone
 
 	waitErr := cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -426,9 +490,13 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 
 // yamlQuote single-quotes a scalar, escaping embedded single quotes. Keeps
 // arbitrary settings values (paths with backslashes, etc.) YAML-safe without
-// a full marshaler dependency.
+// a full marshaler dependency. CR/LF/NUL are stripped: a newline inside a
+// single-quoted YAML scalar silently folds (mangling a password) or breaks
+// parsing entirely.
 func yamlQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	s = strings.ReplaceAll(s, "'", "''")
+	s = strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
+	return "'" + s + "'"
 }
 
 func firstNonEmpty(a, b string) string {

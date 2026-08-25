@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -35,7 +36,7 @@ func TestProvisionRunLogAppendPersists(t *testing.T) {
 	}
 
 	// Append and read back.
-	if err := st.AppendProvisionRunLog(ctx, pr.ID, "MARKER-1\n"); err != nil {
+	if err := st.AppendProvisionRunLog(ctx, pr.ID, "MARKER-1\n", 0); err != nil {
 		t.Fatal("append:", err)
 	}
 	got, err := st.GetProvisionRun(ctx, pr.ID)
@@ -45,5 +46,26 @@ func TestProvisionRunLogAppendPersists(t *testing.T) {
 	t.Logf("log after append = %q", got.Log)
 	if got.Log != "MARKER-1\n" {
 		t.Fatalf("append did not persist: got %q", got.Log)
+	}
+
+	// Cap enforcement: the persisted log must stay bounded (tail kept).
+	long := ""
+	for i := 0; i < 100; i++ {
+		long += "0123456789" // 1 KB total
+	}
+	for i := 0; i < 10; i++ { // push 10 KB through a 2 KB cap
+		if err := st.AppendProvisionRunLog(ctx, pr.ID, long, 2048); err != nil {
+			t.Fatal("capped append:", err)
+		}
+	}
+	got, err = st.GetProvisionRun(ctx, pr.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Log) > 2048 {
+		t.Fatalf("persisted log exceeds cap: %d bytes", len(got.Log))
+	}
+	if !strings.HasSuffix(got.Log, "9") {
+		t.Fatalf("cap must keep the TAIL, got suffix %q", got.Log[len(got.Log)-4:])
 	}
 }

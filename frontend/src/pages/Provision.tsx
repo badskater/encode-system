@@ -46,28 +46,47 @@ export default function ProvisionPage() {
     return () => clearInterval(t);
   }, []);
 
-  // Poll the open run's log while it is active.
+  // Track whether the user is scrolled to the bottom of the log; only
+  // auto-follow when they are (so scrolling up to read earlier lines isn't
+  // yanked back down on every poll).
+  const stickToBottomRef = useRef(true);
+  function onLogScroll() {
+    const el = logRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
+
+  // Poll the open run's log while it is active. Stops once the run reaches a
+  // terminal status (success/failed) instead of hammering the controller
+  // forever while the log panel stays open.
   useEffect(() => {
     if (openRunId === null) return;
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const poll = async () => {
       try {
         const run = await api.provisionRun(openRunId);
         if (cancelled) return;
         setOpenRun(run);
-        // Auto-scroll the log to the bottom on every update.
-        requestAnimationFrame(() => {
-          if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-        });
+        if (stickToBottomRef.current) {
+          requestAnimationFrame(() => {
+            if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+          });
+        }
+        // Terminal: stop polling. (The run list still refreshes on its own
+        // 5s interval, so the status badge stays current.)
+        if (run.status === 'success' || run.status === 'failed') {
+          if (timer) clearInterval(timer);
+        }
       } catch {
         /* transient: keep polling */
       }
     };
     poll();
-    const t = setInterval(poll, 2500);
+    timer = setInterval(poll, 2500);
     return () => {
       cancelled = true;
-      clearInterval(t);
+      if (timer) clearInterval(timer);
     };
   }, [openRunId]);
 
@@ -227,6 +246,7 @@ export default function ProvisionPage() {
           </h3>
           <pre
             ref={logRef}
+            onScroll={onLogScroll}
             style={{
               maxHeight: 420,
               overflow: 'auto',

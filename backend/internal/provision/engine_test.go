@@ -133,11 +133,14 @@ func (f *fakeProvStore) ListProvisionRuns(ctx context.Context) ([]*model.Provisi
 func (f *fakeProvStore) SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error {
 	return nil
 }
-func (f *fakeProvStore) AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error {
+func (f *fakeProvStore) AppendProvisionRunLog(ctx context.Context, id int64, chunk string, capBytes int) error {
 	if f.logs == nil {
 		f.logs = map[int64]string{}
 	}
 	f.logs[id] += chunk
+	if capBytes > 0 && len(f.logs[id]) > capBytes {
+		f.logs[id] = f.logs[id][len(f.logs[id])-capBytes:]
+	}
 	return nil
 }
 
@@ -150,7 +153,7 @@ func TestStreamCommandTerminatesAfterChildExit(t *testing.T) {
 	cmd := exec.Command("sh", "-c", "echo hello; echo world >&2; echo done")
 	done := make(chan error, 1)
 	go func() {
-		done <- streamCommand(context.Background(), context.Background(), st, 1, cmd, 1024*1024)
+		done <- streamCommand(context.Background(), context.Background(), st, 1, cmd, 1024*1024, nil)
 	}()
 	select {
 	case err := <-done:

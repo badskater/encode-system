@@ -76,6 +76,26 @@ See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:
 4. Create a test episode folder with a tiny source + `1080.avs`, watch job go `pending → assigned → running → done`.
 5. Check `ReleaseFolders` receives the output per the naming pattern.
 
+## CI/CD (GitHub Actions)
+
+Two workflows in `.github/workflows/`:
+
+- **CI** (`ci.yml`) — on every push/PR to `main`: runs the AGENTS.md command
+  map. Backend: `gofmt -l` (must be clean), `go vet`, `go test ./...`
+  (includes the pwsh-rendered-script E2E tests — PowerShell 7 ships on the
+  runner), and cross-builds `controller` (linux) + `encode-agent.exe`
+  (windows). Frontend: `eslint`, `tsc --noEmit`, `vitest`, `vite build`.
+- **Release** (`release.yml`) — on a version tag (`git tag v1.4.0 && git push
+  origin v1.4.0`): builds the deploy bundle exactly like the manual deploys —
+  controller + agent binaries with `-X main.Version`, the built SPA, the
+  provision playbook, plus `SHA256SUMS` — and publishes them as a GitHub
+  release. The Docker host sits on a private LAN that GitHub runners cannot
+  reach, so deployment stays an explicit operator step: download the release
+  assets (or pull the repo on the host) and `docker compose build && up -d`.
+
+The SQLite driver is pure Go (`modernc.org/sqlite`), so CI needs no system
+libraries.
+
 ## Rollback
 
 - Controller: pin image tag in compose; `docker compose pull && up -d` forward, restore previous tag to roll back. SQLite DB is a single file — snapshot before upgrades.

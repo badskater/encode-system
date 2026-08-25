@@ -13,6 +13,23 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (CI/CD on GitHub Actions)
+
+- Repo went public → security pre-flight first: 4 agent core dumps (~376 MB,
+  containing process memory incl. a credential fragment) were committed and
+  got untracked + gitignored; full-tree secret scan otherwise clean (test
+  fixture creds only).
+- CI workflow (.github/workflows/ci.yml): the AGENTS.md command map — backend
+  gofmt/vet/test (pwsh E2E tests run on the runner) + cross-build
+  (linux controller, windows agent); frontend eslint/tsc/vitest/vite build.
+  Concurrency cancellation per branch.
+- Release workflow (release.yml): version tags build the deploy bundle
+  (controller + encode-agent.exe with main.Version, SPA, provision playbook,
+  SHA256SUMS) and publish a GitHub release. Deployment to the Docker host
+  stays operator-driven (private LAN, unreachable from runners).
+- gofmt drift on 8 pre-existing files cleaned so the format gate passes.
+- Docs: Deployment.md CI/CD section.
+
 ## Done (live Discord webhook in Settings)
 
 - Discord webhook is now a live Settings-page field (Settings → Discord

@@ -36,6 +36,11 @@
             - "{{ encode_scripts_mount }}"
             - "{{ encode_release_mount }}"
 
+        - name: Ensure agent directory exists (remount script home)
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}"
+            state: directory
+
         - name: Write NFS remount script
           ansible.windows.win_copy:
             dest: "{{ encode_agent_dir }}\\remount-nfs.ps1"
@@ -53,11 +58,6 @@
                 if ($LASTEXITCODE -ne 0) { Write-Error "mount failed: $export -> $target"; exit 1 }
                 Write-Output "mounted: $export -> $target"
               }
-
-        - name: Ensure agent directory exists (remount script home)
-          ansible.windows.win_file:
-            path: "{{ encode_agent_dir }}"
-            state: directory
 
         - name: Mount NFS shares now
           ansible.windows.win_shell: |

@@ -226,10 +226,14 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 		return err
 	}
 
-	// 4. Run ansible-playbook, streaming output into the run log.
-	playbook := filepath.Join(e.PlaybookDir, "provision.yml")
-	if _, err := os.Stat(playbook); err != nil {
+	// 4. Copy the playbook INTO the run dir: it resolves staged payloads via
+	//    {{ playbook_dir }}/files/..., so it must sit next to them.
+	srcPlaybook := filepath.Join(e.PlaybookDir, "provision.yml")
+	playbook := filepath.Join(dir, "provision.yml")
+	if b, err := os.ReadFile(srcPlaybook); err != nil {
 		return fmt.Errorf("playbook missing: %w", err)
+	} else if err := os.WriteFile(playbook, b, 0o600); err != nil {
+		return err
 	}
 	ansibleBin := e.AnsibleBin
 	if ansibleBin == "" {

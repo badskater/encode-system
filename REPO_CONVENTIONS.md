@@ -30,7 +30,9 @@ Distributed anime encoding farm. Terminology used everywhere:
   `--aq-strength-edge` etc.) reading the `.avs`/`.vpy` directly, 10-bit
   in/out. 4K uses `encode_4k` (CTU 64) with `2160.avs`/`2160.vpy` scripts;
   HDR sources get bt2020/PQ signaling via the `hdr.json` sidecar written by
-  `hdr_probe` (DoVi detected, signaled as HDR10 today).
+  the separate `hdr_probe` step (fork-exact spellings: `smpte2084`,
+  `bt2020nc`). Dolby Vision: `dovi_tool extract-rpu` on the source, x265
+  profile 8.1 with `--dolby-vision-rpu` (needs dovi_tool.exe in C:\bin).
 - Mux: `mkvmerge` with the standard track language/default flags from the
   legacy batch script; audio language comes from `audio.json` when present.
 - Keyframes: `ffmpeg` → y4m pipe → `SCXvid` → `<Series> - NN Keyframes.txt`, only when the flow includes the keyframes step.

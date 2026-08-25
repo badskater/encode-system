@@ -115,11 +115,14 @@ echo "mkvmerge stub done"`,
 		// stream even though English came first in the file.
 		"ENCODE_STEP audio_lang",
 		"selected audio #2 (language 'jpn')",
-		// encode_4k switched to bt2020/PQ signaling from hdr.json.
+		// encode_4k switched to bt2020/PQ signaling from hdr.json — with the
+		// fork's EXACT spellings (smpte2084/bt2020nc; verified on a real node
+		// that this build rejects smpte-st2084 and bt2020 as colormatrix).
 		"ENCODE_STEP encode_4k",
 		"hdr.json reports HDR10 -> bt2020/PQ signaling",
 		"--colorprim bt2020",
-		"--transfer smpte-st2084",
+		"--transfer smpte2084",
+		"--colormatrix bt2020nc",
 		"--ctu 64",
 		// mux read the recorded language.
 		"audio track language from audio.json: jpn",
@@ -154,6 +157,131 @@ echo "mkvmerge stub done"`,
 	}
 	if !strings.Contains(string(hdrJSON), `"hdr":"HDR10"`) {
 		t.Errorf("hdr.json wrong: %s", hdrJSON)
+	}
+}
+
+// TestEncode4kDoviPipelineExecutesInPowerShell: a Dolby Vision source
+// (hdr.json: dovi=true) drives encode_4k to extract the RPU with dovi_tool
+// and encode profile 8.1 with the fork's full DoVi flag set. The second run
+// covers the fallback: extraction fails -> HDR10 signaling, job completes.
+func TestEncode4kDoviPipelineExecutesInPowerShell(t *testing.T) {
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh not installed; skipping PowerShell integration test")
+	}
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	scriptsDir := filepath.Join(root, "scripts")
+	releaseDir := filepath.Join(root, "release")
+	for _, d := range []string{binDir, scriptsDir, releaseDir} {
+		os.MkdirAll(d, 0o755)
+	}
+	stubs := map[string]string{
+		// MediaInfo stub: PQ transfer + Dolby Vision markers -> hdr_probe
+		// reports HDR10 + dovi=true.
+		"MediaInfo.exe": `#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "media": {
+    "track": [
+      { "@type": "General", "Format": "Matroska" },
+      { "@type": "Video", "Format": "HEVC", "Width": 3840, "Height": 2160, "BitDepth": 10, "transfer_characteristics": "PQ", "colour_primaries": "BT.2020", "HDR_Format/String": "Dolby Vision 1.0, Profile 8.1" },
+      { "@type": "Audio", "Format": "AC-3", "Channel(s)": 2, "SamplingRate": 48000, "Language/String3": "jpn" }
+    ]
+  }
+}
+JSON`,
+		// dovi_tool stub: extract-rpu writes a non-empty RPU file at the -o path.
+		"dovi_tool.exe": `#!/usr/bin/env bash
+prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && printf 'FAKERPUDATA' > "$a"; prev="$a"; done
+echo "dovi_tool stub done"`,
+		"x265_x64.exe": `#!/usr/bin/env bash
+prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && : > "$a"; prev="$a"; done
+echo "x265 stub done"`,
+	}
+	for name, body := range stubs {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(ep string, flowName string) string {
+		epDir := filepath.Join(scriptsDir, "DoVi Series", ep)
+		os.MkdirAll(epDir, 0o755)
+		os.WriteFile(filepath.Join(epDir, "src.mkv"), []byte("fake"), 0o644)
+		os.WriteFile(filepath.Join(epDir, "2160.vpy"), []byte("# stub"), 0o644)
+		f := &model.Flow{Name: flowName, Steps: []model.Step{
+			{Type: model.StepType("hdr_probe")},
+			{Type: model.StepType("encode_4k")},
+		}}
+		j := &model.Job{ID: 200, Series: "DoVi Series", Episode: "01",
+			EpisodeDir: "DoVi Series/" + ep, ScriptType: "vpy", ScriptFile: "2160.vpy"}
+		script, err := Render(f, j, Vars{
+			BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: releaseDir,
+			Group: "OldFartsSubs", Tag: "2160p",
+		}, nil)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		scriptPath := filepath.Join(root, ep+".ps1")
+		if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		libPath, _ := filepath.Abs("../../../powershell/EncodeLib.ps1")
+		cmd := exec.Command(pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", libPath)
+		cmd.Env = append(os.Environ(), "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("dovi flow failed under pwsh: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+
+	// Run 1: RPU extraction succeeds -> full profile 8.1 flag set.
+	text := run("Ep 01", "dovi-full")
+	t.Logf("run 1:\n%s", text)
+	for _, want := range []string{
+		"Dolby Vision detected",
+		"extracting Dolby Vision RPU from source",
+		"bt2020/PQ + profile 8.1 with source RPU",
+		"--dolby-vision-profile 8.1",
+		"--dolby-vision-rpu",
+		"--master-display G(13250,34500)",
+		"--vbv-maxrate 10000",
+		"--transfer smpte2084",
+		"--colormatrix bt2020nc",
+		"ENCODE_JOB_DONE",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("run 1 output missing %q", want)
+		}
+	}
+	// rpu.bin must exist and be non-empty (the reuse contract for retries).
+	rpuInfo, err := os.Stat(filepath.Join(scriptsDir, "DoVi Series", "Ep 01", "rpu.bin"))
+	if err != nil || rpuInfo.Size() == 0 {
+		t.Fatalf("rpu.bin missing or empty: %v", err)
+	}
+
+	// Run 2: extraction fails -> HDR10 fallback, job still completes.
+	// Break the dovi_tool stub for this run.
+	os.WriteFile(filepath.Join(binDir, "dovi_tool.exe"),
+		[]byte("#!/usr/bin/env bash\necho 'Error: No RPU was found in input file' >&2\nexit 1\n"), 0o755)
+	text2 := run("Ep 02", "dovi-fallback")
+	t.Logf("run 2:\n%s", text2)
+	for _, want := range []string{
+		"WARNING: RPU extraction failed",
+		"falling back to HDR10 signaling",
+		"--transfer smpte2084",
+		"ENCODE_JOB_DONE",
+	} {
+		if !strings.Contains(text2, want) {
+			t.Errorf("run 2 output missing %q", want)
+		}
+	}
+	if strings.Contains(text2, "--dolby-vision-profile") {
+		t.Error("fallback must not carry Dolby Vision flags")
 	}
 }
 

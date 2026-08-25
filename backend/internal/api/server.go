@@ -166,6 +166,14 @@ func (s *Server) seedStepTemplates() error {
 	} else if upgraded {
 		s.Log.Info("upgraded mux step template to the language-aware factory version (from V2)")
 	}
+	// Guarded encode_4k upgrade: V1 (HDR10/HLG signaling only) -> current
+	// factory version (Dolby Vision RPU support + corrected color spellings).
+	// Same byte-for-byte guard: user-edited encode_4k scripts stay in effect.
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "encode_4k", flow.Encode4kFactoryV1, flow.Encode4kTemplate()); err != nil {
+		return fmt.Errorf("upgrade encode_4k template: %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded encode_4k step template to the Dolby Vision factory version")
+	}
 	return nil
 }
 

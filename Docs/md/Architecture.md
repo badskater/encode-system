@@ -56,11 +56,16 @@ node-side install.
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
   `crc32_rename`, `release_copy`, `keyframes`.
-- **HDR/4K chain**: `hdr_probe` writes `hdr.json` (HDR10/HLG/DoVi detection
-  from MediaInfo); `encode_4k` (2160p x265, CTU 64 defaults) reads it and
-  switches color signaling to bt2020 + PQ/HLG for HDR sources. DoVi is
-  detected and signaled as HDR10 today; full RPU passthrough (dovi_tool) is
-  a future step.
+- **HDR/4K chain**: `hdr_probe` (a separate flow step) writes `hdr.json`
+  (HDR10/HLG/DoVi detection from MediaInfo); `encode_4k` (2160p x265, CTU 64
+  defaults) consumes the sidecar — it never probes the source itself.
+  HDR10/HLG switch the color signaling to bt2020 + PQ/HLG (fork-exact
+  spellings: `smpte2084`, `bt2020nc`). Dolby Vision: dovi_tool extracts the
+  source RPU (reuse-cached in `rpu.bin`) and x265 encodes profile 8.1 with
+  the RPU embedded per frame (`--dolby-vision-rpu`, verified closed-loop on a
+  real node) plus the mandatory VBV + mastering-display flags; extraction
+  failures fall back to HDR10 signaling. Guarded factory upgrade
+  (Encode4kFactoryV1 → current) keeps user-edited scripts in effect.
 - **Language-aware audio**: `audio_lang` selects the audio track by a
   MediaInfo language priority list (default `jpn,eng`, falls back to the
   first track with a loud warning), then runs eac3to → WAV → opusenc and

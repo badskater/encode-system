@@ -4,16 +4,29 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## Backlog
 
-- DoVi RPU passthrough: hdr_probe detects Dolby Vision today and signals
-  HDR10; full Profile 8.1 RPU extraction/injection needs dovi_tool + ffmpeg
-  in C:\bin as a new step (operator to confirm dovi_tool availability)
-- HDR10/4K pipeline validation on a real source + real encode (test VMs have
-  no HDR material; MediaInfo stubs cover the logic, not the pixels)
+- HDR10/4K pipeline validation on a real HDR source + real encode (test VMs
+  have no HDR material; MediaInfo stubs + dovi_tool roundtrip on 219 cover
+  the logic, not full-resolution pixels)
 
 ## In progress
 
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
+
+## Done (Dolby Vision RPU in encode_4k)
+
+- encode_4k consumes hdr.json from the separate hdr_probe step (no probing
+  inside the encode). DoVi path verified closed-loop on node 219's real fork:
+  dovi_tool extract-rpu → x265 --dolby-vision-profile 8.1 --dolby-vision-rpu
+  (RPU roundtrips out of the encoded stream; no mux-side inject needed) +
+  the mandatory --vbv-maxrate/--vbv-bufsize/--master-display/--max-cll set.
+- Fork correctness found live: this build accepts smpte2084/bt2020nc and
+  REJECTS smpte-st2084/bt2020-as-colormatrix — HDR10/HLG signaling fixed
+  everywhere. Extraction failures fall back to HDR10 signaling with a loud
+  warning; rpu.bin is reuse-cached across job retries.
+- Guarded factory upgrade Encode4kFactoryV1 → current (byte-for-byte guard,
+  user edits survive) + regression test that the guard is live. New pwsh E2E
+  covers both the full DoVi path and the fallback.
 
 ## Done (HDR/4K pipeline, language-aware audio, series scaffolding)
 

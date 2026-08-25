@@ -30,6 +30,21 @@ Mirror of the session task list. Move cards through columns as work lands.
 - Node deletion endpoint (busy-guarded) so hosts can be re-provisioned after
   name collisions; UI delete button on the Nodes page.
 - Live-verified: provisioning enc-test-docker-2 end-to-end from the browser.
+- Adversarial review round (engine/api/fe, GLM+DeepSeek): HIGH fixed —
+  strings.Builder copied by value in the flush retry path would panic on the
+  exact transient DB failure it was meant to survive. MEDIUMs fixed: single-
+  flusher log pipeline (ordered appends, credential redaction, scanner
+  errors surfaced), persisted log column capped in SQLite, 45-min timeout
+  starts only after the serialization lock, busy-node delete made atomic
+  (conditional DELETE), controller URL trimmed before save, stale staging
+  dirs swept at startup (crash-leaked vars.yml holds the WinRM password),
+  pinned ansible-core 2.21.3 / pywinrm 0.5.0 / ansible.windows 3.7.0,
+  playbook fixes ('mounted:' idempotency, Expand-Archive error handling,
+  lib_path only when deployed, pairing code stripped after pairing), UI
+  polling stops at terminal status and autoscroll respects manual scroll.
+- Rejected findings: verbose-flag secret echo (verbosity never raised +
+  redaction added), pairing code in agent.json as HIGH (bounded one-shot +
+  now stripped), React password-in-memory (standard form behavior).
 
 ## Done (Settings page + WebUI fleet push)
 

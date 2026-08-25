@@ -130,6 +130,7 @@ func (f *fakeProvStore) GetProvisionRun(ctx context.Context, id int64) (*model.P
 func (f *fakeProvStore) ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error) {
 	return nil, nil
 }
+func (f *fakeProvStore) PruneProvisionRuns(ctx context.Context, keep int) error { return nil }
 func (f *fakeProvStore) SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error {
 	return nil
 }

@@ -183,6 +183,17 @@ func (s *Store) SetProvisionRunStatus(ctx context.Context, id int64, status, err
 	return err
 }
 
+// PruneProvisionRuns keeps only the most recent keep rows. Each row carries
+// a full run log, so the table must not grow without bound across the
+// controller's lifetime. Finished runs are pruned first (never a live one).
+func (s *Store) PruneProvisionRuns(ctx context.Context, keep int) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM provision_runs
+		WHERE id NOT IN (SELECT id FROM provision_runs ORDER BY id DESC LIMIT ?)
+		  AND status IN ('success', 'failed')`, keep)
+	return err
+}
+
 // DeleteNodeIfNotBusy removes a node only if it is not busy, atomically.
 // Returns rows affected: 0 means the node is busy (or gone) — the caller
 // must not proceed, otherwise a job dispatched between check and delete

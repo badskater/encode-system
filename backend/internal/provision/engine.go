@@ -46,6 +46,7 @@ type Store interface {
 	CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error)
 	GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error)
 	ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error)
+	PruneProvisionRuns(ctx context.Context, keep int) error
 	SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error
 	AppendProvisionRunLog(ctx context.Context, id int64, chunk string, capBytes int) error
 }
@@ -182,6 +183,9 @@ func (e *Engine) Start(ctx context.Context, req Request) (*model.ProvisionRun, e
 		return nil, err
 	}
 	go e.run(pr.ID, req)
+	// Retention: prune old finished runs so the runs table (each row holds a
+	// full log) does not grow without bound. Best-effort, never fatal.
+	_ = e.Store.PruneProvisionRuns(ctx, 50)
 	return pr, nil
 }
 

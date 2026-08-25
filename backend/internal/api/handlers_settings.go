@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -110,8 +111,9 @@ func validateSettings(st *model.Settings) error {
 	// an absolute http(s) URL. Empty is tolerated until someone provisions.
 	st.ControllerURL = strings.TrimSpace(st.ControllerURL)
 	if cu := st.ControllerURL; cu != "" {
-		if !strings.HasPrefix(cu, "http://") && !strings.HasPrefix(cu, "https://") {
-			return errSettings("controller_url must start with http:// or https://")
+		u, err := url.Parse(cu)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return errSettings("controller_url must be a full http(s) URL (e.g. http://172.24.92.232:8080)")
 		}
 	}
 	// Node paths must be absolute Windows paths (drive letter or UNC);

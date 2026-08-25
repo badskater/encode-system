@@ -207,7 +207,7 @@ func (s *Server) seedStepTemplates() error {
 // existing flow (factory or user-edited) is never touched.
 func (s *Server) seedDefaultFlow() error {
 	ctx := ctxBg()
-	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow()} {
+	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow(), flow.Default4kCPUFlow()} {
 		if _, err := s.Store.FlowByName(ctx, seed.Name); err != nil {
 			if _, err := s.Store.CreateFlow(ctx, seed); err != nil {
 				return fmt.Errorf("seed flow %q: %w", seed.Name, err)

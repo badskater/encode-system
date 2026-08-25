@@ -333,8 +333,8 @@ func TestUIFlowCRUDViaAPI(t *testing.T) {
 	}
 	var flows []model.Flow
 	json.Unmarshal(body3, &flows)
-	if len(flows) != 3 {
-		t.Fatalf("want 3 flows (2 seeded + 1 created), got %d", len(flows))
+	if len(flows) != 4 {
+		t.Fatalf("want 4 flows (3 seeded + 1 created), got %d", len(flows))
 	}
 }
 

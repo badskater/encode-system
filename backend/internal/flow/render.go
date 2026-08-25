@@ -99,6 +99,25 @@ func Default4kFlow() *model.Flow {
 	}
 }
 
+// Default4kCPUFlow is the CPU-only sibling of default-4k: it drops the
+// dgindex step (DGIndexNV needs an Nvidia GPU) and otherwise mirrors the 4K
+// chain. The episode's 2160.avs/.vpy opens the source through a CPU filter
+// (e.g. L-SMASH/FFMS2 on the mkv) instead of a dgi index.
+func Default4kCPUFlow() *model.Flow {
+	return &model.Flow{
+		Name: "default-4k-cpu",
+		Steps: []model.Step{
+			{Type: model.StepSourceRename, Params: map[string]string{"source_name": "src"}},
+			{Type: model.StepType("hdr_probe")},
+			{Type: model.StepType("audio_lang"), Params: map[string]string{"languages": "jpn,eng", "bitrate": "320"}},
+			{Type: model.StepType("encode_4k")},
+			{Type: model.StepMux},
+			{Type: model.StepReleaseCopy},
+			{Type: model.StepKeyframes},
+		},
+	}
+}
+
 // psQuote renders a PowerShell single-quoted string literal, escaping embedded
 // single quotes by doubling them. All rendered values pass through here, which
 // keeps generated scripts injection-safe for arbitrary series names.

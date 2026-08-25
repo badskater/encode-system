@@ -146,3 +146,26 @@ func TestDefault4kFlowStepsResolve(t *testing.T) {
 		}
 	}
 }
+
+// TestDefault4kCPUFlowStepsResolve: same contract for the CPU-only 4K flow.
+func TestDefault4kCPUFlowStepsResolve(t *testing.T) {
+	have := map[string]bool{}
+	for _, tpl := range BuiltinStepTemplates() {
+		have[tpl.Key] = true
+	}
+	fl := Default4kCPUFlow()
+	if fl.Name != "default-4k-cpu" {
+		t.Fatalf("name = %q", fl.Name)
+	}
+	if len(fl.Steps) != 7 {
+		t.Fatalf("want 7 steps (no dgindex), got %d", len(fl.Steps))
+	}
+	for _, st := range fl.Steps {
+		if st.TemplateKey() == "dgindex" {
+			t.Fatal("CPU flow must not contain the GPU dgindex step")
+		}
+		if !have[st.TemplateKey()] {
+			t.Errorf("step %s has no builtin template", st.TemplateKey())
+		}
+	}
+}

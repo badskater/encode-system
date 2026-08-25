@@ -88,7 +88,17 @@ async function publishUpload(path: string, version: string, file: File): Promise
     body: form,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error ?? `${res.status}: publish failed`);
+  if (!res.ok) {
+    // A 401 here means the SESSION expired (unlike changePassword, where a
+    // 401 means the wrong current password) — bounce to login exactly like
+    // the request() wrapper does for every other endpoint.
+    if (res.status === 401) {
+      clearToken();
+      expiredHook?.();
+      throw new Error('401: session expired — log in again');
+    }
+    throw new Error(data.error ?? `${res.status}: publish failed`);
+  }
   return data as UpdateManifest;
 }
 

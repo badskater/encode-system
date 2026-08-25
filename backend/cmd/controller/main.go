@@ -124,7 +124,9 @@ func main() {
 			if st2.ScriptsRoot != "" {
 				root = st2.ScriptsRoot
 			}
-			if st2.ScanIntervalSeconds >= 5 {
+			// Mirror validateSettings' bounds so a hand-edited DB row cannot
+			// push the cadence outside [5s, 1h] even if it bypassed the API.
+			if st2.ScanIntervalSeconds >= 5 && st2.ScanIntervalSeconds <= 3600 {
 				interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
 			}
 		}

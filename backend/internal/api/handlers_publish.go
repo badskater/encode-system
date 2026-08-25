@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/badskater/encode-system/backend/internal/agent"
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 
@@ -46,6 +48,12 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Update.PublishAgent(version, f); err != nil {
+		// The store enforces the version rule under its lock; a collision is
+		// a client error, not a server fault.
+		if strings.Contains(err.Error(), "already published") {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "publish agent")
 		return
 	}
@@ -66,11 +74,6 @@ func (s *Server) handlePublishLib(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "version must be a positive integer")
 		return
 	}
-	if cur := s.Update.Manifest(); version <= cur.LibVersion {
-		writeErr(w, http.StatusConflict,
-			fmt.Sprintf("version must exceed the current lib version (%d)", cur.LibVersion))
-		return
-	}
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "file field is required")
@@ -81,7 +84,13 @@ func (s *Server) handlePublishLib(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "lib payload too large")
 		return
 	}
+	// Strict-increase is enforced inside the store under its lock (a
+	// pre-check here would race concurrent publishes).
 	if err := s.Update.PublishLib(version, f); err != nil {
+		if strings.Contains(err.Error(), "must exceed") {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "publish lib")
 		return
 	}
@@ -105,11 +114,6 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "version must be a positive integer")
 		return
 	}
-	if cur := s.Update.Manifest(); version <= cur.BinVersion {
-		writeErr(w, http.StatusConflict,
-			fmt.Sprintf("version must exceed the current bin version (%d)", cur.BinVersion))
-		return
-	}
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "file field is required")
@@ -128,11 +132,15 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "read upload: "+err.Error())
 		return
 	}
-	if err := validateBinZip(bytes.NewReader(body.Bytes()), int64(body.Len())); err != nil {
+	if err := validateBinZip(body.Bytes()); err != nil {
 		writeErr(w, http.StatusBadRequest, "bin package rejected: "+err.Error())
 		return
 	}
 	if err := s.Update.PublishBin(version, bytes.NewReader(body.Bytes())); err != nil {
+		if strings.Contains(err.Error(), "must exceed") {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "publish bin")
 		return
 	}
@@ -141,17 +149,12 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateBinZip checks the uploaded package: must be a readable zip, every
-// entry must be a plain relative path (zip-slip guard), no symlinks, sane
-// total entry count and size. Rejecting here protects every node that would
-// otherwise extract it.
-func validateBinZip(r io.Reader, size int64) error {
-	// Read the whole zip into memory for central-directory parsing. The 1 GiB
-	// cap above bounds this; typical tool folders are tens of MB.
-	b := &bytes.Buffer{}
-	if _, err := io.Copy(b, r); err != nil {
-		return fmt.Errorf("read upload: %w", err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(b.Bytes()), int64(b.Len()))
+// entry must be a plain relative path (zip-slip guard: absolute, UNC, and
+// drive-letter paths rejected), no symlinks, sane entry count. Rejecting
+// here protects every node that would otherwise extract it. Takes the raw
+// bytes once — the caller's buffer is reused, no second copy.
+func validateBinZip(data []byte) error {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return fmt.Errorf("not a valid zip archive: %w", err)
 	}
@@ -162,34 +165,14 @@ func validateBinZip(r io.Reader, size int64) error {
 		return fmt.Errorf("too many entries (%d)", len(zr.File))
 	}
 	for _, zf := range zr.File {
-		name := zf.Name
-		if name == "" {
-			return fmt.Errorf("entry with empty name")
-		}
-		if name[0] == '/' || name[0] == '\\' {
-			return fmt.Errorf("absolute path in zip: %q", name)
-		}
 		if zf.FileInfo().Mode()&0o170000 == 0o120000 { // symlink
-			return fmt.Errorf("symlink entry not allowed: %q", name)
+			return fmt.Errorf("symlink entry not allowed: %q", zf.Name)
 		}
-		if containsPathTraversal(name) {
-			return fmt.Errorf("path traversal in entry %q", name)
+		if err := agent.SafeRelPath(strings.ReplaceAll(zf.Name, `\`, "/")); err != nil {
+			return fmt.Errorf("entry %q: %w", zf.Name, err)
 		}
 	}
 	return nil
-}
-
-// containsPathTraversal flags ../ segments in any separator style.
-func containsPathTraversal(name string) bool {
-	seps := []string{`../`, `..\`}
-	for _, sep := range seps {
-		for i := 0; i+len(sep) <= len(name); i++ {
-			if name[i:i+len(sep)] == sep {
-				return true
-			}
-		}
-	}
-	return len(name) >= 2 && name[len(name)-2:] == ".."
 }
 
 // handleDownloadBin streams the stored bin-package zip to a node.

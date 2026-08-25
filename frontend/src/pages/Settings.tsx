@@ -1,7 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Settings, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
+
+// clampInt coerces a possibly-NaN/out-of-range number input into [lo, hi].
+function clampInt(v: number, lo: number, hi: number): number {
+  if (!Number.isFinite(v)) return lo;
+  return Math.min(hi, Math.max(lo, Math.round(v)));
+}
 
 // SettingsPage edits the fleet's runtime configuration from the UI:
 //  - NFS shares (documentation-grade: which exports, where they mount)
@@ -25,15 +31,36 @@ export default function SettingsPage() {
   const [binVersion, setBinVersion] = useState('');
   const [binFile, setBinFile] = useState<File | null>(null);
   const [publishing, setPublishing] = useState('');
+  // Refs to the file inputs: a successful publish clears the STATE but the
+  // uncontrolled <input type=file> would still show the picked file name —
+  // reset its value too so the UI matches reality.
+  const agentFileRef = useRef<HTMLInputElement>(null);
+  const libFileRef = useRef<HTMLInputElement>(null);
+  const binFileRef = useRef<HTMLInputElement>(null);
 
   async function load() {
+    // Settings and the manifest are INDEPENDENT resources: a manifest fetch
+    // failure (e.g. nothing published yet) must not make the settings form
+    // unusable.
     try {
-      const [st, m] = await Promise.all([api.settings(), api.manifest()]);
-      setSettings(st);
-      setManifest(m);
+      setSettings(await api.settings());
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+    try {
+      setManifest(await api.manifest());
+    } catch {
+      // Manifest unavailable: publishing UI degrades gracefully.
+      setManifest(null);
+    }
+  }
+
+  async function refreshManifest() {
+    try {
+      setManifest(await api.manifest());
+    } catch {
+      /* non-fatal */
     }
   }
 
@@ -60,7 +87,15 @@ export default function SettingsPage() {
     setError(null);
     setNotice(null);
     try {
-      const saved = await api.saveSettings(settings);
+      // Number inputs can yield NaN (cleared field) or bypass their min/max
+      // attrs (Save is a button, not a form submit) — clamp server-bound
+      // values to the documented ranges instead of persisting zeros.
+      const toSave = {
+        ...settings,
+        scan_interval_seconds: clampInt(settings.scan_interval_seconds, 5, 3600),
+        tasks_before_reboot: clampInt(settings.tasks_before_reboot, 1, 1000),
+      };
+      const saved = await api.saveSettings(toSave);
       setSettings(saved);
       setNotice('Settings saved. Scanner and new jobs pick them up on the next cycle — no restart needed.');
     } catch (e) {
@@ -80,19 +115,24 @@ export default function SettingsPage() {
         await api.publishAgent(agentVersion.trim(), agentFile);
         setAgentFile(null);
         setAgentVersion('');
+        if (agentFileRef.current) agentFileRef.current.value = '';
       } else if (kind === 'lib') {
         if (!libFile || !/^\d+$/.test(libVersion)) throw new Error('lib needs a numeric version + file');
         await api.publishLib(Number(libVersion), libFile);
         setLibFile(null);
         setLibVersion('');
+        if (libFileRef.current) libFileRef.current.value = '';
       } else {
         if (!binFile || !/^\d+$/.test(binVersion)) throw new Error('bin needs a numeric version + file');
         await api.publishBin(Number(binVersion), binFile);
         setBinFile(null);
         setBinVersion('');
+        if (binFileRef.current) binFileRef.current.value = '';
       }
       setNotice(`${kind} published — idle nodes adopt it on their next heartbeat.`);
-      await load();
+      // Refresh the manifest readout only — reloading settings here would
+      // silently discard any unsaved edits in the form above.
+      await refreshManifest();
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
     } finally {
@@ -214,7 +254,7 @@ export default function SettingsPage() {
             <span style={{ display: 'block', marginBottom: 2 }}>Agent version</span>
             <input style={{ width: '100%' }} value={agentVersion} onChange={(e) => setAgentVersion(e.target.value)} placeholder="e.g. 0.8.0" />
           </label>
-          <input type="file" accept=".exe" onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)} />
+          <input ref={agentFileRef} type="file" accept=".exe" onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)} />
           <button className="btn primary" disabled={publishing !== '' || !agentFile || !agentVersion.trim()} onClick={() => publish('agent')}>
             {publishing === 'agent' ? 'Publishing…' : 'Publish agent'}
           </button>
@@ -225,7 +265,7 @@ export default function SettingsPage() {
             <span style={{ display: 'block', marginBottom: 2 }}>EncodeLib version (must exceed {manifest?.lib_version ?? 0})</span>
             <input style={{ width: '100%' }} value={libVersion} onChange={(e) => setLibVersion(e.target.value)} placeholder="e.g. 3" />
           </label>
-          <input type="file" accept=".ps1" onChange={(e) => setLibFile(e.target.files?.[0] ?? null)} />
+          <input ref={libFileRef} type="file" accept=".ps1" onChange={(e) => setLibFile(e.target.files?.[0] ?? null)} />
           <button className="btn primary" disabled={publishing !== '' || !libFile || !libVersion} onClick={() => publish('lib')}>
             {publishing === 'lib' ? 'Publishing…' : 'Publish EncodeLib'}
           </button>
@@ -236,7 +276,7 @@ export default function SettingsPage() {
             <span style={{ display: 'block', marginBottom: 2 }}>Bin package version (must exceed {manifest?.bin_version ?? 0})</span>
             <input style={{ width: '100%' }} value={binVersion} onChange={(e) => setBinVersion(e.target.value)} placeholder="e.g. 1" />
           </label>
-          <input type="file" accept=".zip" onChange={(e) => setBinFile(e.target.files?.[0] ?? null)} />
+          <input ref={binFileRef} type="file" accept=".zip" onChange={(e) => setBinFile(e.target.files?.[0] ?? null)} />
           <button className="btn primary" disabled={publishing !== '' || !binFile || !binVersion} onClick={() => publish('bin')}>
             {publishing === 'bin' ? 'Publishing…' : 'Publish bin package'}
           </button>

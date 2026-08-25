@@ -55,6 +55,7 @@ type Agent struct {
 
 	mu         sync.Mutex
 	currentJob *model.JobPayload
+	syncing    bool // update sync in progress: job assignment must wait
 
 	wg       sync.WaitGroup // tracks in-flight job/update goroutines for clean shutdown
 	stopOnce sync.Once
@@ -232,13 +233,16 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) heartbeat(ctx context.Context) error {
 	a.mu.Lock()
 	job := a.currentJob
+	libVer, binVer := a.LibVersion, a.BinVersion
+	syncing := a.syncing
 	a.mu.Unlock()
 
 	hb := model.Heartbeat{
 		Node:           a.Cfg.NodeName,
 		AgentVersion:   a.Version,
-		LibVersion:     a.LibVersion,
-		BinVersion:     a.BinVersion,
+		LibVersion:     libVer,
+		BinVersion:     binVer,
+		Syncing:        syncing, // update in flight -> controller holds jobs back
 		TasksSinceBoot: a.TasksSinceBoot(),
 	}
 	if job != nil {
@@ -504,9 +508,12 @@ func (a *Agent) handleReboot(delaySeconds int) {
 	a.Log.Info("reboot scheduled", "delay_seconds", delaySeconds)
 }
 
-// maxUpdateBytes caps update payload downloads; anything larger is an error,
-// not something to buffer.
-const maxUpdateBytes = 256 << 20 // 256 MiB
+// maxUpdateBytes caps agent/lib payload downloads; anything larger is an
+// error, not something to buffer. Bin packages use maxBinDownloadBytes
+// instead (the controller caps bin uploads at 1 GiB — a node that refused
+// anything over 256 MiB could never sync a legitimately large tools folder).
+const maxUpdateBytes = 256 << 20      // 256 MiB
+const maxBinDownloadBytes = 1 << 30   // 1 GiB (matches the publish cap)
 
 // sha256Bytes hashes a payload for manifest verification.
 func sha256Bytes(b []byte) string {
@@ -514,155 +521,197 @@ func sha256Bytes(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// limitedBuffer buffers a download but fails past maxUpdateBytes so a
-// malicious or buggy controller cannot exhaust agent memory.
+// limitedBuffer buffers a download but fails past its cap so a malicious or
+// buggy controller cannot exhaust agent memory.
 type limitedBuffer struct {
 	buf bytes.Buffer
+	cap int64
 }
 
 func (lb *limitedBuffer) Write(p []byte) (int, error) {
-	if int64(lb.buf.Len()+len(p)) > maxUpdateBytes {
-		return 0, fmt.Errorf("payload exceeds %d byte cap", maxUpdateBytes)
+	if lb.cap <= 0 {
+		lb.cap = maxUpdateBytes
+	}
+	if int64(lb.buf.Len()+len(p)) > lb.cap {
+		return 0, fmt.Errorf("payload exceeds %d byte cap", lb.cap)
 	}
 	return lb.buf.Write(p)
 }
 
 func (lb *limitedBuffer) Bytes() []byte { return lb.buf.Bytes() }
 
-// handleUpdate compares the manifest and applies agent/lib updates.
+// handleUpdate compares the manifest and applies lib/bin/agent updates.
 // Every payload is SHA-256 verified against the manifest before install: an
 // unverified binary would mean a compromised or MITM'd controller achieves
 // code execution on every node.
-// The PowerShell lib swaps while no job is running; the binary stages itself
-// and restarts via a sidecar command.
+//
+// The three sync steps are INDEPENDENT: a failure in one (bad checksum,
+// download error, extract error) logs and moves on — it must never block the
+// others. In particular a broken bin package must not strand the node on an
+// old agent binary (agent self-update runs regardless).
+//
+// Extraction happens with a.syncing set, which the controller sees on the
+// next heartbeat as busy — no job lands mid-swap.
 func (a *Agent) handleUpdate(m model.UpdateManifest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// Update EncodeLib.ps1 when the controller's version is newer. The
-	// manifest MUST carry a checksum — an update without one is refused
-	// outright (skipping verification would let a compromised controller
-	// achieve code execution on every node).
-	if m.LibVersion > 0 && m.LibVersion != a.LibVersion {
-		if m.LibSHA256 == "" {
-			a.Log.Error("lib update refused: manifest has no checksum")
-			return
-		}
+	a.mu.Lock()
+	a.syncing = true
+	a.mu.Unlock()
+	defer func() {
 		a.mu.Lock()
-		busy := a.currentJob != nil
+		a.syncing = false
 		a.mu.Unlock()
-		if busy {
-			// Never swap the library under a running job: the next idle
-			// heartbeat re-offers the update.
-			a.Log.Info("lib update deferred: job running")
-			return
-		}
-		var buf limitedBuffer
-		if err := a.getAuth(ctx, "/api/agent/download/lib", &buf); err != nil {
-			a.Log.Error("download lib failed", "err", err)
-			return
-		}
-		if got := sha256Bytes(buf.Bytes()); got != m.LibSHA256 {
-			a.Log.Error("lib checksum mismatch, refusing install", "want", m.LibSHA256, "got", got)
-			return
-		}
-		tmp := a.Cfg.LibPath + ".new"
-		if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
-			a.Log.Error("write lib failed", "err", err)
-			return
-		}
-		if err := os.Rename(tmp, a.Cfg.LibPath); err != nil {
-			a.Log.Error("swap lib failed", "err", err)
-			return
-		}
-		a.LibVersion = m.LibVersion
-		a.Log.Info("EncodeLib.ps1 updated", "version", m.LibVersion)
-	}
+	}()
 
-	// Sync the tools folder when the controller's bin package differs. Same
-	// mandatory-checksum rule; extracted over Cfg.BinDir only while idle so a
-	// running encode never sees a half-swapped toolchain.
-	if m.BinVersion > 0 && m.BinVersion != a.BinVersion {
-		if m.BinSHA256 == "" {
-			a.Log.Error("bin sync refused: manifest has no checksum")
-			return
-		}
-		a.mu.Lock()
-		busy := a.currentJob != nil
-		a.mu.Unlock()
-		if busy {
-			a.Log.Info("bin sync deferred: job running")
-			return
-		}
-		var buf limitedBuffer
-		if err := a.getAuth(ctx, "/api/agent/download/bin", &buf); err != nil {
-			a.Log.Error("download bin package failed", "err", err)
-			return
-		}
-		if got := sha256Bytes(buf.Bytes()); got != m.BinSHA256 {
-			a.Log.Error("bin checksum mismatch, refusing install", "want", m.BinSHA256, "got", got)
-			return
-		}
-		if err := extractBinZip(buf.Bytes(), a.Cfg.BinDir); err != nil {
-			a.Log.Error("extract bin package failed", "err", err, "dir", a.Cfg.BinDir)
-			return
-		}
-		a.BinVersion = m.BinVersion
-		if err := a.saveBinVersion(); err != nil {
-			a.Log.Warn("persist bin version failed", "err", err)
-		}
-		a.Log.Info("bin folder synced", "version", m.BinVersion, "dir", a.Cfg.BinDir)
-	}
+	a.syncLib(ctx, m)
+	a.syncBin(ctx, m)
+	a.syncAgent(ctx, m)
+}
 
-	// Update the agent binary when the controller's version differs. Same
-	// mandatory-checksum rule as the lib.
-	if m.AgentVersion != "" && m.AgentVersion != a.Version {
-		if m.AgentSHA256 == "" {
-			a.Log.Error("agent update refused: manifest has no checksum")
+// busy reports whether a job is currently running (updates must wait).
+func (a *Agent) busy() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.currentJob != nil
+}
+
+// syncLib updates EncodeLib.ps1 when the controller's version is newer. The
+// manifest MUST carry a checksum — an update without one is refused outright.
+func (a *Agent) syncLib(ctx context.Context, m model.UpdateManifest) {
+	if m.LibVersion <= 0 || m.LibVersion == a.LibVersion {
+		return
+	}
+	if m.LibSHA256 == "" {
+		a.Log.Error("lib update refused: manifest has no checksum")
+		return
+	}
+	if a.busy() {
+		// Never swap the library under a running job: the next idle
+		// heartbeat re-offers the update.
+		a.Log.Info("lib update deferred: job running")
+		return
+	}
+	var buf limitedBuffer
+	if err := a.getAuth(ctx, "/api/agent/download/lib", &buf); err != nil {
+		a.Log.Error("download lib failed", "err", err)
+		return
+	}
+	if got := sha256Bytes(buf.Bytes()); got != m.LibSHA256 {
+		a.Log.Error("lib checksum mismatch, refusing install", "want", m.LibSHA256, "got", got)
+		return
+	}
+	tmp := a.Cfg.LibPath + ".new"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		a.Log.Error("write lib failed", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, a.Cfg.LibPath); err != nil {
+		a.Log.Error("swap lib failed", "err", err)
+		return
+	}
+	a.mu.Lock()
+	a.LibVersion = m.LibVersion
+	a.mu.Unlock()
+	a.Log.Info("EncodeLib.ps1 updated", "version", m.LibVersion)
+}
+
+// syncBin extracts the tools-folder zip over Cfg.BinDir when the controller's
+// version differs. Same mandatory-checksum rule. The version is bumped ONLY
+// after a fully successful extraction — a locked or failing file leaves the
+// version old, so the next heartbeat re-syncs the whole package and retries
+// the file (no half-applied state is ever reported as complete).
+func (a *Agent) syncBin(ctx context.Context, m model.UpdateManifest) {
+	if m.BinVersion <= 0 || m.BinVersion == a.BinVersion {
+		return
+	}
+	if m.BinSHA256 == "" {
+		a.Log.Error("bin sync refused: manifest has no checksum")
+		return
+	}
+	if a.busy() {
+		a.Log.Info("bin sync deferred: job running")
+		return
+	}
+	var buf limitedBuffer
+	buf.cap = maxBinDownloadBytes
+	if err := a.getAuth(ctx, "/api/agent/download/bin", &buf); err != nil {
+		a.Log.Error("download bin package failed", "err", err)
+		return
+	}
+	if got := sha256Bytes(buf.Bytes()); got != m.BinSHA256 {
+		a.Log.Error("bin checksum mismatch, refusing install", "want", m.BinSHA256, "got", got)
+		return
+	}
+	if err := extractBinZip(buf.Bytes(), a.Cfg.BinDir); err != nil {
+		a.Log.Error("extract bin package failed; version NOT bumped, will retry on next heartbeat",
+			"err", err, "dir", a.Cfg.BinDir)
+		return
+	}
+	a.mu.Lock()
+	a.BinVersion = m.BinVersion
+	a.mu.Unlock()
+	if err := a.saveBinVersion(); err != nil {
+		a.Log.Warn("persist bin version failed", "err", err)
+	}
+	a.Log.Info("bin folder synced", "version", m.BinVersion, "dir", a.Cfg.BinDir)
+}
+
+// syncAgent updates the agent binary when the controller's version differs.
+// Same mandatory-checksum rule. On Windows the running exe cannot overwrite
+// itself, so the binary is staged and a cmd sidecar performs the swap after
+// this process exits (then relaunches it); POSIX renames in place and exits
+// for its supervisor.
+func (a *Agent) syncAgent(ctx context.Context, m model.UpdateManifest) {
+	if m.AgentVersion == "" || m.AgentVersion == a.Version {
+		return
+	}
+	if m.AgentSHA256 == "" {
+		a.Log.Error("agent update refused: manifest has no checksum")
+		return
+	}
+	var buf limitedBuffer
+	if err := a.getAuth(ctx, "/api/agent/download/agent", &buf); err != nil {
+		a.Log.Error("download agent failed", "err", err)
+		return
+	}
+	if got := sha256Bytes(buf.Bytes()); got != m.AgentSHA256 {
+		a.Log.Error("agent checksum mismatch, refusing install", "want", m.AgentSHA256, "got", got)
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		a.Log.Error("resolve self path", "err", err)
+		return
+	}
+	staged := self + ".new"
+	if err := os.WriteFile(staged, buf.Bytes(), 0o755); err != nil {
+		a.Log.Error("stage agent binary", "err", err)
+		return
+	}
+	a.Log.Info("agent binary staged; will swap on restart", "staged", staged, "version", m.AgentVersion)
+	if runtime.GOOS == "windows" {
+		a.launchWindowsSwap(staged, self)
+	} else {
+		// POSIX: the process can rename over its own running binary.
+		if err := os.Rename(staged, self); err != nil {
+			a.Log.Error("swap binary", "err", err)
 			return
 		}
-		var buf limitedBuffer
-		if err := a.getAuth(ctx, "/api/agent/download/agent", &buf); err != nil {
-			a.Log.Error("download agent failed", "err", err)
-			return
-		}
-		if got := sha256Bytes(buf.Bytes()); got != m.AgentSHA256 {
-			a.Log.Error("agent checksum mismatch, refusing install", "want", m.AgentSHA256, "got", got)
-			return
-		}
-		self, err := os.Executable()
-		if err != nil {
-			a.Log.Error("resolve self path", "err", err)
-			return
-		}
-		staged := self + ".new"
-		if err := os.WriteFile(staged, buf.Bytes(), 0o755); err != nil {
-			a.Log.Error("stage agent binary", "err", err)
-			return
-		}
-		a.Log.Info("agent binary staged; will swap on restart", "staged", staged, "version", m.AgentVersion)
-		if runtime.GOOS == "windows" {
-			a.launchWindowsSwap(staged, self)
-		} else {
-			// POSIX: the process can rename over its own running binary.
-			if err := os.Rename(staged, self); err != nil {
-				a.Log.Error("swap binary", "err", err)
-				return
-			}
-			a.Log.Info("binary swapped; exiting — supervisor (systemd etc.) restarts the new version")
-			a.Stop()
-		}
+		a.Log.Info("binary swapped; exiting — supervisor (systemd etc.) restarts the new version")
+		a.Stop()
 	}
 }
 
 // launchWindowsSwap hands the swap to a cmd sidecar because a running Windows
 // exe cannot overwrite itself. The sidecar waits for THIS process to exit,
-// retries the move until the file lock clears, and restarts the service only
+// retries the move until the file lock clears, and restarts the agent only
 // after a successful move — a failed move leaves the old agent running
 // unchanged (the manifest still advertises the new version, so the swap is
 // re-attempted on a later heartbeat), never a mismatched new-lib/old-agent.
 func (a *Agent) launchWindowsSwap(staged, self string) {
-	script := windowsSwapScript(filepath.Base(self), staged, self, a.Cfg.DataDir)
+	script := windowsSwapScript(filepath.Base(self), staged, self, a.Cfg.DataDir, relaunchCommand(self))
 	batPath := filepath.Join(a.Cfg.DataDir, "swap-update.bat")
 	if err := os.WriteFile(batPath, []byte(script), 0o755); err != nil {
 		a.Log.Error("write swap script", "err", err)
@@ -678,9 +727,13 @@ func (a *Agent) launchWindowsSwap(staged, self string) {
 
 // windowsSwapScript renders the cmd sidecar that performs the binary swap.
 // Behavior contract: wait for the old process to exit, retry the move until
-// the lock clears (15 attempts), restart the service ONLY after a successful
-// move, and log to swap-update.log on exhaustion.
-func windowsSwapScript(exeName, staged, self, dataDir string) string {
+// the lock clears (15 attempts), restart the agent ONLY after a successful
+// move, and log to swap-update.log on exhaustion. Restart strategy: if a
+// Windows SERVICE named encode-agent exists, let the service manager restart
+// it (net stop/start); otherwise — bare exe or scheduled-task deployments,
+// which have no service — relaunch the binary directly with its original
+// arguments so the swap never leaves the node without an agent.
+func windowsSwapScript(exeName, staged, self, dataDir, relaunch string) string {
 	return fmt.Sprintf(`@echo off
 setlocal
 rem Wait for the running agent process to exit so the file lock clears.
@@ -701,7 +754,24 @@ if %%tries%% geq 15 (
 timeout /t 2 /nobreak >nul
 goto try_move
 :swapped
+rem Prefer the service manager when the agent runs as a Windows service.
+sc query encode-agent >nul 2>&1
+if errorlevel 1 goto relaunch
 net stop encode-agent >nul 2>&1
 net start encode-agent
-`, exeName, exeName, staged, self, staged, dataDir)
+exit /b 0
+:relaunch
+rem Task/bare deployments: restart the new binary directly.
+start "" %s
+`, exeName, exeName, staged, self, staged, dataDir, relaunch)
+}
+
+// relaunchCommand quotes the agent path and its original arguments so the
+// swap sidecar can restart a non-service deployment after the binary swap.
+func relaunchCommand(self string) string {
+	parts := []string{`"` + self + `"`}
+	for _, arg := range os.Args[1:] {
+		parts = append(parts, `"`+arg+`"`)
+	}
+	return strings.Join(parts, " ")
 }

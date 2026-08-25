@@ -209,6 +209,7 @@ type Heartbeat struct {
 	AgentVersion   string  `json:"agent_version"`
 	LibVersion     int64   `json:"lib_version"`
 	BinVersion     int64   `json:"bin_version"` // bin package version on disk (0 = none)
+	Syncing        bool    `json:"syncing"`     // update sync in flight: treat node as busy
 	TasksSinceBoot int     `json:"tasks_since_boot"`
 	JobID          int64   `json:"job_id,omitempty"`
 	JobStatus      string  `json:"job_status,omitempty"`

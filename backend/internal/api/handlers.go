@@ -44,7 +44,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	node.LastSeen = &now
 	node.LastError = ""
 
-	hasActiveJob := false
+	// An in-flight update sync (lib/bin/agent download+install) counts as
+	// busy: assigning a job now could run it against a half-swapped toolchain.
+	hasActiveJob := hb.Syncing
 	if hb.JobID > 0 {
 		if job, err := s.Store.GetJob(ctx, hb.JobID); err == nil && job != nil && !job.Status.Terminal() {
 			// Ownership check: a node may only report on its own job. Without

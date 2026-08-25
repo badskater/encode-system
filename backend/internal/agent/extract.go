@@ -18,10 +18,15 @@ const maxExtractBytes = 4 << 30
 // extractBinZip unpacks a tools-folder zip over destDir. Defense in depth:
 // the controller validates the archive at publish time, but the agent is the
 // last line of defense — every entry is re-checked for path traversal,
-// absolute paths, and symlinks before anything touches the disk. Files that
-// cannot be replaced in place (a tool currently locked by a running process)
-// are staged as <name>.new so the NEXT sync can swap them, instead of
-// failing the whole update.
+// absolute paths, and symlinks before anything touches the disk.
+//
+// Failure semantics: ANY file that cannot be placed (locked by a running
+// process, disk error) fails the WHOLE extraction with an error. The caller
+// does not bump the bin version in that case, so the controller re-offers the
+// same package on the next heartbeat and the extraction retries from scratch
+// — extraction is idempotent (existing files are harmlessly rewritten), so
+// the file eventually lands once the lock clears. No half-applied package is
+// ever reported as synced.
 func extractBinZip(data []byte, destDir string) error {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -33,7 +38,7 @@ func extractBinZip(data []byte, destDir string) error {
 	var written int64
 	for _, zf := range zr.File {
 		name := strings.ReplaceAll(zf.Name, `\`, "/")
-		if err := safeRelPath(name); err != nil {
+		if err := SafeRelPath(name); err != nil {
 			return fmt.Errorf("entry %q: %w", zf.Name, err)
 		}
 		target := filepath.Join(destDir, filepath.FromSlash(name))
@@ -68,36 +73,35 @@ func extractBinZip(data []byte, destDir string) error {
 			rc.Close()
 			return fmt.Errorf("create temp for %q: %w", target, err)
 		}
-		n, err := io.Copy(out, rc)
+		// Stream with the remaining budget so a single entry cannot fill the
+		// disk before the cumulative check sees it.
+		limit := maxExtractBytes - written
+		n, err := io.Copy(out, io.LimitReader(rc, limit+1))
 		rc.Close()
 		out.Close()
 		if err != nil {
 			os.Remove(tmp)
 			return fmt.Errorf("write %q: %w", target, err)
 		}
-		written += n
-		if written > maxExtractBytes {
+		if n > limit {
 			os.Remove(tmp)
 			return fmt.Errorf("extracted size exceeds %d byte cap", maxExtractBytes)
 		}
+		written += n
 		if err := os.Rename(tmp, target); err != nil {
-			// In-use file (e.g. a locked dll): keep the staged copy so a
-			// later sync retries the swap; don't fail the whole package.
-			staged := target + ".new"
-			os.Remove(staged)
-			if rerr := os.Rename(tmp, staged); rerr != nil {
-				os.Remove(tmp)
-				return fmt.Errorf("swap %q (locked, staging also failed): %w", target, err)
-			}
-			continue
+			os.Remove(tmp)
+			// Locked file (a running tool holds it): fail the sync; the
+			// controller re-offers the package and we retry next heartbeat.
+			return fmt.Errorf("swap %q (file in use?): %w", target, err)
 		}
 	}
 	return nil
 }
 
-// safeRelPath rejects names that could escape the extraction root: absolute
-// paths, drive letters, UNC roots, or any ".." segment.
-func safeRelPath(name string) error {
+// SafeRelPath rejects names that could escape the extraction root: absolute
+// paths, drive letters, UNC roots, or any ".." segment. Exported so the
+// publish handler can apply the identical guard server-side at upload time.
+func SafeRelPath(name string) error {
 	if name == "" {
 		return fmt.Errorf("empty entry name")
 	}

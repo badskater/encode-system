@@ -79,13 +79,13 @@ func TestExtractBinZipOverwrites(t *testing.T) {
 func TestSafeRelPath(t *testing.T) {
 	bad := []string{"", "/x", `C:\x`, `\\server\x`, "a/../b", ".."}
 	for _, p := range bad {
-		if err := safeRelPath(p); err == nil {
+		if err := SafeRelPath(p); err == nil {
 			t.Errorf("%q should be rejected", p)
 		}
 	}
 	good := []string{"tool.exe", "a/b/c.dll", "a.exe.tmp"}
 	for _, p := range good {
-		if err := safeRelPath(p); err != nil {
+		if err := SafeRelPath(p); err != nil {
 			t.Errorf("%q wrongly rejected: %v", p, err)
 		}
 	}

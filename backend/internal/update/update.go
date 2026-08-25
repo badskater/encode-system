@@ -96,6 +96,9 @@ func (s *Store) Manifest() model.UpdateManifest {
 func (s *Store) PublishAgent(version string, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if version == s.manifest.AgentVersion {
+		return fmt.Errorf("agent version %s is already published", version)
+	}
 	hash, err := installPayload(s.agentPath(), r)
 	if err != nil {
 		return fmt.Errorf("publish agent: %w", err)
@@ -109,6 +112,9 @@ func (s *Store) PublishAgent(version string, r io.Reader) error {
 func (s *Store) PublishLib(version int64, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if version <= s.manifest.LibVersion {
+		return fmt.Errorf("lib version must exceed %d", s.manifest.LibVersion)
+	}
 	hash, err := installPayload(s.libPath(), r)
 	if err != nil {
 		return fmt.Errorf("publish lib: %w", err)
@@ -149,6 +155,9 @@ func installPayload(dest string, r io.Reader) (string, error) {
 func (s *Store) PublishBin(version int64, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if version <= s.manifest.BinVersion {
+		return fmt.Errorf("bin version must exceed %d", s.manifest.BinVersion)
+	}
 	hash, err := installPayload(s.binPath(), r)
 	if err != nil {
 		return fmt.Errorf("publish bin: %w", err)

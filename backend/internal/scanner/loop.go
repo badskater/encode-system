@@ -35,22 +35,31 @@ type LiveConfig func(ctx context.Context) (root string, interval time.Duration, 
 
 // RunLoop scans on the live-configured interval until ctx is cancelled. It
 // logs each created job and skips folders that already have a job (any
-// non-cancelled status). The interval is re-read each cycle.
+// non-cancelled status). The interval is re-read each cycle so Settings-page
+// edits apply on the next cycle without a restart; the ticker is stopped via
+// defer on every iteration so a panic in scanOnce cannot leak it.
 func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfig) {
 	for {
 		root, interval, defaultFlow := cfg(ctx)
 		if interval <= 0 {
 			interval = 30 * time.Second
 		}
-		tick := time.NewTicker(interval)
-		select {
-		case <-ctx.Done():
-			tick.Stop()
+		scanWithTicker(ctx, log, st, root, defaultFlow, interval)
+		if ctx.Err() != nil {
 			return
-		case <-tick.C:
-			scanOnce(ctx, log, st, root, defaultFlow)
 		}
-		tick.Stop()
+	}
+}
+
+// scanWithTicker runs exactly one scan after interval elapses (or returns
+// early on ctx cancel). Deferred Stop keeps the ticker leak-safe.
+func scanWithTicker(ctx context.Context, log *slog.Logger, st JobCreator, root, defaultFlow string, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	select {
+	case <-ctx.Done():
+	case <-tick.C:
+		scanOnce(ctx, log, st, root, defaultFlow)
 	}
 }
 

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
@@ -31,7 +32,14 @@ func (s *Server) defaultsSettings() *model.Settings {
 // hot paths (heartbeat/job rendering) read this every time so UI edits apply
 // without a controller restart.
 func (s *Server) currentSettings(ctx context.Context) *model.Settings {
-	if st, err := s.Store.GetSettings(ctx); err == nil && st != nil {
+	st, err := s.Store.GetSettings(ctx)
+	if err != nil {
+		// Distinguish "no row yet" (nil, nil) from a real failure: a corrupt
+		// row or a broken DB must be visible, or jobs would silently render
+		// with env defaults instead of the operator's configured paths.
+		s.Log.Warn("settings load failed, falling back to env defaults", "err", err)
+	}
+	if st != nil {
 		return st
 	}
 	return s.defaultsSettings()
@@ -114,17 +122,22 @@ type settingsErr string
 func (e settingsErr) Error() string { return string(e) }
 func errSettings(msg string) error  { return settingsErr(msg) }
 
-// isWindowsPath accepts C:\... , C:/... and \\server\share forms.
+// isWindowsPath accepts C:\... and C:/... (separator after the drive
+// letter is REQUIRED — "C:bin" is drive-RELATIVE and must be rejected) plus
+// \\server\share UNC forms.
 func isWindowsPath(p string) bool {
-	if len(p) >= 2 && p[1] == ':' {
+	if len(p) >= 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
 		return true
 	}
-	if len(p) >= 2 && (p[:2] == `\\` || p[:2] == `//`) {
+	if len(p) >= 2 && p[:2] == `\\` {
 		return true
 	}
 	return false
 }
 
+// isUnixPath accepts absolute container paths. The double-slash prefix is
+// rejected because it is how Windows UNC paths often sneak in — the
+// swapped-mapping guard is the whole point of this validation.
 func isUnixPath(p string) bool {
-	return len(p) > 0 && p[0] == '/'
+	return len(p) > 0 && p[0] == '/' && !strings.HasPrefix(p, "//")
 }

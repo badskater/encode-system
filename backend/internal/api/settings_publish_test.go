@@ -94,6 +94,31 @@ func TestUpdateSettingsRejectsBadPaths(t *testing.T) {
 	}
 }
 
+func TestSettingsPathValidationEdgeCases(t *testing.T) {
+	// Drive-relative paths ("C:bin") must NOT pass as absolute Windows
+	// paths — they resolve relative to the current dir on drive C.
+	if isWindowsPath("C:bin") {
+		t.Error("drive-relative C:bin accepted")
+	}
+	if isWindowsPath("C:") {
+		t.Error("bare C: accepted")
+	}
+	if !isWindowsPath(`C:\bin`) || !isWindowsPath(`C:/bin`) {
+		t.Error("legitimate drive paths rejected")
+	}
+	if !isWindowsPath(`\\server\share`) {
+		t.Error("UNC path rejected for node dir")
+	}
+	// Windows UNC written with slashes must NOT pass as a Unix controller
+	// root (the swapped-mapping guard).
+	if isUnixPath("//server/share") {
+		t.Error("slash-UNC accepted as unix path")
+	}
+	if !isUnixPath("/data/scripts") {
+		t.Error("legitimate unix path rejected")
+	}
+}
+
 func TestUpdateSettingsRequiresAuth(t *testing.T) {
 	e := newTestEnv(t)
 	ts := e.serve(t)

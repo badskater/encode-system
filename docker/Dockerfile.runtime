@@ -10,6 +10,7 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates tzdata python3 python3-pip && \
     pip3 install --break-system-packages ansible-core pywinrm && \
+    ansible-galaxy collection install ansible.windows && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY controller /app/controller

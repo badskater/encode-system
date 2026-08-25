@@ -24,7 +24,7 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	// The _pragma query params apply to EVERY connection the pool opens,
 	// unlike a one-shot Exec PRAGMA which a replacement connection would lose.
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

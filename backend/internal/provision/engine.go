@@ -285,20 +285,26 @@ func (e *Engine) logCap() int {
 // time-bounded chunks (the DB gets one append per flush window, not per
 // line). Context cancellation kills the process via CommandContext.
 //
-// Output plumbing uses cmd.StdoutPipe(): the read side reaches EOF when the
-// child exits (os/exec closes it). A plain io.Pipe deadlocks here — nothing
-// would close the write end after the child dies, so the scanner would wait
-// forever on a finished process.
+// Output plumbing uses an OS pipe (not io.Pipe): the child inherits the
+// write end and os/exec closes the parent's copy after Start, so the read
+// side reaches EOF when the child exits. Stderr is merged into the same
+// pipe — ansible reports fatal errors on stderr, so discarding it (as a
+// naive StdoutPipe setup does) would leave runs dying silently.
 func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, capBytes int) error {
-	stdout, err := cmd.StdoutPipe()
+	pr, pw, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+		return fmt.Errorf("create pipe: %w", err)
 	}
-	cmd.Stderr = cmd.Stdout // merge stderr into the same OS pipe
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 
 	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
 		return fmt.Errorf("start ansible-playbook: %w", err)
 	}
+	// Parent's write end must close so EOF depends only on the child.
+	pw.Close()
 
 	var (
 		mu  sync.Mutex
@@ -310,7 +316,16 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		buf.Reset()
 		mu.Unlock()
 		if chunk != "" {
-			_ = st.AppendProvisionRunLog(bg, id, chunk)
+			if err := st.AppendProvisionRunLog(bg, id, chunk); err != nil {
+				// Re-queue the chunk so a transient DB error cannot lose
+				// output; the next flush retries it (ahead of newer lines).
+				mu.Lock()
+				rebuf := &strings.Builder{}
+				rebuf.WriteString(chunk)
+				rebuf.WriteString(buf.String())
+				buf = *rebuf
+				mu.Unlock()
+			}
 		}
 	}
 	done := make(chan struct{})
@@ -327,7 +342,7 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		}
 	}()
 
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 64*1024), 512*1024)
 	for scanner.Scan() {
 		line := scanner.Text() + "\n"
@@ -347,6 +362,7 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		buf.WriteString(line)
 		mu.Unlock()
 	}
+	pr.Close()
 	close(done)
 	flush()
 
@@ -396,8 +412,10 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "ansible_connection: winrm\n")
 	fmt.Fprintf(&b, "ansible_winrm_transport: ntlm\n")
 	fmt.Fprintf(&b, "ansible_winrm_server_cert_validation: ignore\n")
-	fmt.Fprintf(&b, "ansible_winrm_read_timeout_sec: 120\n")
-	fmt.Fprintf(&b, "ansible_winrm_operation_timeout_sec: 130\n")
+	// pywinrm requirement: read_timeout MUST exceed operation_timeout (the
+	// read window wraps the operation with slack), both non-zero.
+	fmt.Fprintf(&b, "ansible_winrm_read_timeout_sec: 150\n")
+	fmt.Fprintf(&b, "ansible_winrm_operation_timeout_sec: 120\n")
 	return b.String()
 }
 

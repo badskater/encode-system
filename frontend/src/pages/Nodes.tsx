@@ -7,7 +7,7 @@ import { nodeBadge, timeAgo } from '../components/helpers';
 // NodesPage manages the fleet: register nodes (showing the one-time token),
 // enable/disable for work, and force reboots.
 export default function NodesPage() {
-  const { data: nodes, error } = usePolling<Node[]>(() => api.nodes(), 4000);
+  const { data: nodes, error, refresh: refreshNodes } = usePolling<Node[]>(() => api.nodes(), 4000);
   const { data: codes } = usePolling<PairingCode[]>(() => api.pairingCodes(), 10000);
   const [newName, setNewName] = useState('');
   const [issued, setIssued] = useState<{ name: string; token: string } | null>(null);
@@ -50,6 +50,7 @@ export default function NodesPage() {
     try {
       await api.deleteNode(n.id);
       setActionError(null);
+      await refreshNodes(); // row must vanish immediately, not on the next poll tick
     } catch (e) {
       setActionError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
     }

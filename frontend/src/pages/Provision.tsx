@@ -17,6 +17,12 @@ export default function ProvisionPage() {
   const [host, setHost] = useState('');
   const [port, setPort] = useState('5985');
   const [scheme, setScheme] = useState('http');
+  // The domain credential travels over whatever scheme is picked; the fleet
+  // runs http/5985 by default, so make the trade-off visible instead of
+  // silent.
+  const httpWarning = scheme === 'http'
+    ? 'WinRM over plain http sends the WinRM password unencrypted on the LAN. Use https/5986 if the node has a listener configured for it.'
+    : null;
   const [winrmUser, setWinrmUser] = useState('Administrator');
   const [password, setPassword] = useState('');
   const [nodeName, setNodeName] = useState('');
@@ -33,9 +39,11 @@ export default function ProvisionPage() {
   async function refresh() {
     try {
       setRuns(await api.provisionRuns());
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // NOTE: deliberately NOT clearing `error` here — a transient polling
+      // hiccup must not silently wipe a submission error the user hasn't
+      // read yet. Form errors clear when the next submit attempt starts.
+    } catch {
+      /* transient: keep the last known runs list */
     }
   }
 
@@ -176,6 +184,9 @@ export default function ProvisionPage() {
             </select>
           </label>
         </div>
+        {httpWarning && (
+          <div style={{ fontSize: 12, color: '#d29922', marginBottom: 8 }}>⚠ {httpWarning}</div>
+        )}
         <div className="toolbar">
           <label style={{ flex: 1 }}>
             <span style={{ display: 'block', marginBottom: 2 }}>WinRM user</span>

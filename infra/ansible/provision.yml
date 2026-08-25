@@ -195,7 +195,7 @@
             $py = & 'C:\Program Files\Python314\python.exe' --version 2>$null
             if ($py) { Write-Output "Python: $py" } else { Write-Output 'Python: MISSING'; $ok = $false }
             $vspy = & 'C:\Program Files\Python314\python.exe' -c "import vapoursynth; print(vapoursynth.__version__)" 2>$null
-            if ($vspy) { Write-Output "VapourSynth: R$vspy" } else { Write-Output 'VapourSynth: MISSING'; $ok = $false }
+            if ($vspy) { Write-Output "VapourSynth: $vspy" } else { Write-Output 'VapourSynth: MISSING'; $ok = $false }
             if (-not $ok) { exit 1 }
           register: toolchain_check
           changed_when: false
@@ -215,12 +215,33 @@
             dest: "{{ encode_agent_dir }}\\bin-package.zip"
           register: bin_upload
 
+        # Extract when the upload changed OR the tools dir is incomplete:
+        # a byte-identical zip must still repair a damaged/missing tree
+        # (the extraction stamps a marker holding the zip's hash; absence
+        # of the marker means "never completed successfully").
+        - name: Check bin tools integrity
+          ansible.windows.win_shell: |
+            $zip  = "{{ encode_agent_dir }}\bin-package.zip"
+            $mark = "{{ encode_bin_dir }}\.bin-package.hash"
+            $want = (Get-FileHash $zip -Algorithm SHA256).Hash
+            if ((Test-Path $mark) -and ((Get-Content $mark -Raw).Trim() -eq $want) -and (Test-Path "{{ encode_bin_dir }}")) {
+              Write-Output "intact"
+            } else {
+              Write-Output "extract-needed"
+            }
+          register: bin_integrity
+          changed_when: false
+
         - name: Extract bin package over tools dir
-          when: bin_upload is changed
+          when: bin_upload is changed or bin_integrity.stdout is search('extract-needed')
           ansible.windows.win_shell: |
             $ErrorActionPreference = 'Stop'
             Expand-Archive -LiteralPath "{{ encode_agent_dir }}\bin-package.zip" -DestinationPath "{{ encode_bin_dir }}" -Force
             (Get-ChildItem "{{ encode_bin_dir }}" -Recurse -File | Measure-Object).Count
+            # Stamp the marker LAST: a crashed extraction leaves no marker,
+            # so the next run retries instead of trusting a partial tree.
+            (Get-FileHash "{{ encode_agent_dir }}\bin-package.zip" -Algorithm SHA256).Hash |
+              Set-Content "{{ encode_bin_dir }}\.bin-package.hash" -Encoding ASCII
           register: bin_extract
           changed_when: true
 
@@ -271,6 +292,15 @@
             content: "{{ agent_config | to_nice_json }}"
           no_log: true
           register: agent_config_file
+
+        # A re-provisioned host may still hold node.token from its previous
+        # registration — the pairing proof below would then pass instantly
+        # without the new one-shot code ever being consumed. Remove it so
+        # "paired" always means "paired with THIS run's code".
+        - name: Clear stale pairing credential
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}\node.token"
+            state: absent
 
         - name: Install encode-agent Windows service
           ansible.windows.win_service:

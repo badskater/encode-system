@@ -5,11 +5,12 @@ import NodesPage from './pages/Nodes';
 import FlowsPage from './pages/Flows';
 import SeriesPage from './pages/Series';
 import StepsPage from './pages/Steps';
+import SettingsPage from './pages/Settings';
 import TokenGate from './components/TokenGate';
 import ChangePasswordDialog from './components/ChangePasswordDialog';
 import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './api/client';
 
-type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps';
+type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'settings';
 
 const PAGES: { id: Page; label: string }[] = [
   { id: 'dashboard', label: 'Dashboard' },
@@ -18,6 +19,7 @@ const PAGES: { id: Page; label: string }[] = [
   { id: 'series', label: 'Series' },
   { id: 'flows', label: 'Flows' },
   { id: 'steps', label: 'Steps' },
+  { id: 'settings', label: 'Settings' },
 ];
 
 export default function App() {
@@ -102,6 +104,7 @@ export default function App() {
         {page === 'series' && <SeriesPage />}
         {page === 'flows' && <FlowsPage />}
         {page === 'steps' && <StepsPage />}
+        {page === 'settings' && <SettingsPage />}
       </main>
       {showChangePassword && <ChangePasswordDialog onClose={() => setShowChangePassword(false)} />}
     </div>

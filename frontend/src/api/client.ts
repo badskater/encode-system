@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, Series, Settings, StepTemplate } from '../types';
+import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, Series, Settings, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -75,6 +75,23 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return res.json() as Promise<T>;
 }
 
+// publishUpload POSTs a payload file + version as multipart form-data with
+// the session credential. Used by the Settings page to publish a new agent
+// binary, EncodeLib.ps1, or bin-package zip to the fleet.
+async function publishUpload(path: string, version: string, file: File): Promise<UpdateManifest> {
+  const form = new FormData();
+  form.append('version', version);
+  form.append('file', file);
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { Authorization: AUTH_PREFIX + sessionValue() },
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? `${res.status}: publish failed`);
+  return data as UpdateManifest;
+}
+
 export const api = {
   health: () => request<{ status: string }>('GET', '/api/health'),
   settings: () => request<Settings>('GET', '/api/settings'),
@@ -111,6 +128,16 @@ export const api = {
       if (!res.ok) throw new Error(data.error ?? `${res.status}: password change failed`);
       return data as { status: string };
     }),
+
+  // ---------- Settings ----------
+  // (settings GET lives near the top with health)
+  saveSettings: (s: Settings) => request<Settings>('PUT', '/api/settings', s),
+
+  // ---------- Update publishing (agent / EncodeLib / bin package) ----------
+  manifest: () => request<UpdateManifest>('GET', '/api/updates/manifest'),
+  publishAgent: (version: string, file: File) => publishUpload('/api/updates/agent', version, file),
+  publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
+  publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
 
   nodes: () => request<Node[]>('GET', '/api/nodes'),
   createNode: (name: string) =>

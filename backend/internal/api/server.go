@@ -33,11 +33,12 @@ type Config struct {
 	NodeReleaseDir    string        // release mount on nodes
 	Group             string        // release group tag
 	Tag               string        // quality tag, e.g. 1080p
-	TasksBeforeReboot int           // reboot threshold (default 10)
-	RebootGracePeriod time.Duration // reboot attempt expires after this (default 10m)
-	StaleAfter        time.Duration // node offline after no heartbeat this long
-	DefaultFlowName   string        // flow used for auto-created jobs
-	DiscordWebhook    string        // optional job-outcome alerts (empty = off)
+	TasksBeforeReboot   int           // reboot threshold (default 10)
+	ScanIntervalSeconds int           // scanner cadence (default 30)
+	RebootGracePeriod   time.Duration // reboot attempt expires after this (default 10m)
+	StaleAfter          time.Duration // node offline after no heartbeat this long
+	DefaultFlowName     string        // flow used for auto-created jobs
+	DiscordWebhook      string        // optional job-outcome alerts (empty = off)
 }
 
 // Server bundles dependencies for all handlers.
@@ -54,6 +55,9 @@ type Server struct {
 func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Server, error) {
 	if cfg.TasksBeforeReboot <= 0 {
 		cfg.TasksBeforeReboot = 10
+	}
+	if cfg.ScanIntervalSeconds <= 0 {
+		cfg.ScanIntervalSeconds = 30
 	}
 	if cfg.RebootGracePeriod <= 0 {
 		cfg.RebootGracePeriod = 10 * time.Minute
@@ -228,6 +232,17 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/agent/pair", s.handleAgentPair)
 
 	mux.HandleFunc("GET /api/settings", s.withAdmin(s.handleGetSettings))
+	mux.HandleFunc("PUT /api/settings", s.withAdmin(s.handleUpdateSettings))
+
+	// Agent payloads: the update store serves agent binary, EncodeLib.ps1,
+	// and the bin-folder zip package to nodes (auth: node token).
+	mux.HandleFunc("GET /api/agent/download/bin", s.withNodeAuth(s.handleDownloadBin))
+
+	// Publishing: upload new agent/lib/bin payloads from the UI.
+	mux.HandleFunc("GET /api/updates/manifest", s.withAdmin(s.handleManifestAdmin))
+	mux.HandleFunc("POST /api/updates/agent", s.withAdmin(s.handlePublishAgent))
+	mux.HandleFunc("POST /api/updates/lib", s.withAdmin(s.handlePublishLib))
+	mux.HandleFunc("POST /api/updates/bin", s.withAdmin(s.handlePublishBin))
 
 	return logRequests(s.Log, mux)
 }

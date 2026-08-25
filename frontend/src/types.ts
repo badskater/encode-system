@@ -47,6 +47,34 @@ export interface ParamDef {
 
 export type ParamType = 'text' | 'number' | 'bool';
 
+// Settings: NFS shares, controller roots, remote path mapping, behavior.
+export interface Settings {
+  nfs_server?: string;
+  scripts_share?: string;
+  release_share?: string;
+  scripts_root: string;
+  release_root: string;
+  node_bin_dir: string;
+  node_scripts_dir: string;
+  node_release_dir: string;
+  scan_interval_seconds: number;
+  tasks_before_reboot: number;
+  group: string;
+  tag: string;
+  updated_at?: string;
+}
+
+// UpdateManifest: the agent/lib/bin versions the controller wants deployed.
+export interface UpdateManifest {
+  agent_version: string;
+  agent_sha256: string;
+  lib_version: number;
+  lib_sha256: string;
+  bin_version: number;
+  bin_sha256: string;
+  bin_size?: number;
+}
+
 export interface StepTemplate {
   id: number;
   key: string;
@@ -79,6 +107,7 @@ export interface Node {
   status: NodeStatus;
   agent_version: string;
   lib_version: number;
+  bin_version?: number;
   tasks_since_boot: number;
   reboot_pending: boolean;
   last_seen: string | null;

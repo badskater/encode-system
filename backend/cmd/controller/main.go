@@ -94,7 +94,8 @@ func main() {
 		Group:             env("ENCODE_GROUP", "OldFartsSubs"),
 		Tag:               env("ENCODE_TAG", "1080p"),
 		DefaultFlowName:   env("ENCODE_DEFAULT_FLOW", "default-1080"),
-		TasksBeforeReboot: envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
+		TasksBeforeReboot:   envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
+		ScanIntervalSeconds: envInt("ENCODE_SCAN_INTERVAL", 30),
 		DiscordWebhook:    env("ENCODE_DISCORD_WEBHOOK", ""),
 	}
 
@@ -112,9 +113,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Scanner loop: watch the scripts share for new episode folders.
-	interval := time.Duration(envInt("ENCODE_SCAN_INTERVAL", 30)) * time.Second
-	go scanner.RunLoop(ctx, log, st, cfg.ScriptsRoot, cfg.DefaultFlowName, interval)
+	// Scanner loop: watch the scripts share for new episode folders. The
+	// root, cadence, and default flow come from the LIVE settings store so
+	// Settings-page edits apply on the next cycle without a restart.
+	go scanner.RunLoop(ctx, log, st, func(scanCtx context.Context) (string, time.Duration, string) {
+		root := cfg.ScriptsRoot
+		interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
+		defaultFlow := cfg.DefaultFlowName
+		if st2, err := st.GetSettings(scanCtx); err == nil && st2 != nil {
+			if st2.ScriptsRoot != "" {
+				root = st2.ScriptsRoot
+			}
+			if st2.ScanIntervalSeconds >= 5 {
+				interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
+			}
+		}
+		return root, interval, defaultFlow
+	})
 
 	// Serve UI static files (built frontend) if present, then the API.
 	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes
@@ -136,7 +151,7 @@ func main() {
 	}()
 
 	log.Info("controller starting", "listen", *listen, "data", *dataDir,
-		"scripts_root", cfg.ScriptsRoot, "scan_interval", interval.String())
+		"scripts_root", cfg.ScriptsRoot, "scan_interval_s", cfg.ScanIntervalSeconds)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("http server", "err", err)
 		os.Exit(1)

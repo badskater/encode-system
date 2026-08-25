@@ -37,6 +37,7 @@ type Config struct {
 	Token          string `json:"token"`
 	PairingCode    string `json:"pairing_code"` // one-shot bootstrap, consumed once
 	DataDir        string `json:"data_dir"`     // e.g. C:\encode-agent
+	BinDir         string `json:"bin_dir"`      // tools folder kept in sync with the controller's bin package (e.g. C:\bin)
 	LibPath        string `json:"lib_path"`     // EncodeLib.ps1 location
 	HeartbeatEvery int    `json:"heartbeat_seconds"`
 	PowerShell     string `json:"powershell"` // optional override; default finds powershell.exe
@@ -50,6 +51,7 @@ type Agent struct {
 
 	Version    string // agent build version (set via ldflags)
 	LibVersion int64  // EncodeLib version on disk
+	BinVersion int64  // bin-package version on disk (persisted in data_dir)
 
 	mu         sync.Mutex
 	currentJob *model.JobPayload
@@ -68,6 +70,9 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 	if cfg.Token == "" && cfg.PairingCode == "" {
 		return nil, fmt.Errorf("token or pairing_code is required")
 	}
+	if cfg.BinDir == "" {
+		cfg.BinDir = `C:\bin`
+	}
 	if cfg.HeartbeatEvery <= 0 {
 		cfg.HeartbeatEvery = 15
 	}
@@ -80,7 +85,7 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 	if cfg.LibPath == "" {
 		cfg.LibPath = filepath.Join(cfg.DataDir, "EncodeLib.ps1")
 	}
-	return &Agent{
+	ag := &Agent{
 		Cfg: cfg,
 		Log: log,
 		// No hard client Timeout: large payload downloads are governed by
@@ -89,7 +94,23 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 		Client:  &http.Client{},
 		Version: version,
 		stopCh:  make(chan struct{}),
-	}, nil
+	}
+	// Bin version persists across agent restarts: a 200 MiB tools zip must
+	// not re-download on every service bounce while the controller's version
+	// still matches what is on disk.
+	if b, err := os.ReadFile(filepath.Join(cfg.DataDir, "bin-version")); err == nil {
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil {
+			ag.BinVersion = v
+		}
+	}
+	return ag, nil
+}
+
+// saveBinVersion persists the deployed bin-package version next to the agent
+// state so restarts do not re-download an unchanged package.
+func (a *Agent) saveBinVersion() error {
+	return os.WriteFile(filepath.Join(a.Cfg.DataDir, "bin-version"),
+		[]byte(strconv.FormatInt(a.BinVersion, 10)), 0o644)
 }
 
 // Stop signals the run loop to exit.
@@ -217,6 +238,7 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		Node:           a.Cfg.NodeName,
 		AgentVersion:   a.Version,
 		LibVersion:     a.LibVersion,
+		BinVersion:     a.BinVersion,
 		TasksSinceBoot: a.TasksSinceBoot(),
 	}
 	if job != nil {
@@ -555,6 +577,41 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 		}
 		a.LibVersion = m.LibVersion
 		a.Log.Info("EncodeLib.ps1 updated", "version", m.LibVersion)
+	}
+
+	// Sync the tools folder when the controller's bin package differs. Same
+	// mandatory-checksum rule; extracted over Cfg.BinDir only while idle so a
+	// running encode never sees a half-swapped toolchain.
+	if m.BinVersion > 0 && m.BinVersion != a.BinVersion {
+		if m.BinSHA256 == "" {
+			a.Log.Error("bin sync refused: manifest has no checksum")
+			return
+		}
+		a.mu.Lock()
+		busy := a.currentJob != nil
+		a.mu.Unlock()
+		if busy {
+			a.Log.Info("bin sync deferred: job running")
+			return
+		}
+		var buf limitedBuffer
+		if err := a.getAuth(ctx, "/api/agent/download/bin", &buf); err != nil {
+			a.Log.Error("download bin package failed", "err", err)
+			return
+		}
+		if got := sha256Bytes(buf.Bytes()); got != m.BinSHA256 {
+			a.Log.Error("bin checksum mismatch, refusing install", "want", m.BinSHA256, "got", got)
+			return
+		}
+		if err := extractBinZip(buf.Bytes(), a.Cfg.BinDir); err != nil {
+			a.Log.Error("extract bin package failed", "err", err, "dir", a.Cfg.BinDir)
+			return
+		}
+		a.BinVersion = m.BinVersion
+		if err := a.saveBinVersion(); err != nil {
+			a.Log.Warn("persist bin version failed", "err", err)
+		}
+		a.Log.Info("bin folder synced", "version", m.BinVersion, "dir", a.Cfg.BinDir)
 	}
 
 	// Update the agent binary when the controller's version differs. Same

@@ -38,6 +38,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	prevTasks := node.TasksSinceBoot
 	node.AgentVersion = hb.AgentVersion
 	node.LibVersion = hb.LibVersion
+	node.BinVersion = hb.BinVersion
 	node.TasksSinceBoot = hb.TasksSinceBoot
 	now := time.Now().UTC()
 	node.LastSeen = &now
@@ -106,7 +107,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	//    health-critical and must not be blocked behind an update the node
 	//    hasn't applied yet. The instruction is re-issued on every idle
 	//    heartbeat while the flag is set, so a missed packet self-heals.
-	if !hasActiveJob && node.TasksSinceBoot >= s.Cfg.TasksBeforeReboot {
+	limit := s.Cfg.TasksBeforeReboot
+	if st, err := s.Store.GetSettings(ctx); err == nil && st != nil && st.TasksBeforeReboot > 0 {
+		limit = st.TasksBeforeReboot
+	}
+	if !hasActiveJob && node.TasksSinceBoot >= limit {
 		if !node.RebootPending {
 			node.RebootPending = true
 			node.RebootIssuedAtTasks = node.TasksSinceBoot
@@ -129,11 +134,16 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		return
 	}
 
-	// 3. Offer updates while idle.
+	// 3. Offer updates while idle. The agent compares each manifest field
+	//    against its own state and syncs what differs: lib first (no restart
+	//    needed), then the bin folder, then the agent binary (restart via the
+	//    swap-bat trick). Re-issued every idle heartbeat until the node
+	//    reports matching versions.
 	m := s.Update.Manifest()
 	needsAgent := m.AgentVersion != "" && m.AgentVersion != node.AgentVersion
 	needsLib := m.LibVersion > 0 && m.LibVersion != node.LibVersion
-	if !hasActiveJob && (needsAgent || needsLib) {
+	needsBin := m.BinVersion > 0 && m.BinVersion != node.BinVersion
+	if !hasActiveJob && (needsAgent || needsLib || needsBin) {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "update", Update: &m})
 		return
 	}
@@ -176,12 +186,15 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 	if err != nil {
 		return nil, err
 	}
+	// Remote path mapping comes from the LIVE settings (editable in the UI),
+	// falling back to the env-provided defaults when nothing was saved yet.
+	st := s.currentSettings(ctx)
 	vars := flow.Vars{
-		BinDir:     s.Cfg.NodeBinDir,
-		ScriptsDir: s.Cfg.NodeScriptsDir,
-		ReleaseDir: s.Cfg.NodeReleaseDir,
-		Group:      s.Cfg.Group,
-		Tag:        s.Cfg.Tag,
+		BinDir:     st.NodeBinDir,
+		ScriptsDir: st.NodeScriptsDir,
+		ReleaseDir: st.NodeReleaseDir,
+		Group:      st.Group,
+		Tag:        st.Tag,
 	}
 	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {
@@ -685,14 +698,4 @@ func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleGetSettings exposes non-secret runtime config to the UI.
-func (s *Server) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"group":               s.Cfg.Group,
-		"tag":                 s.Cfg.Tag,
-		"tasks_before_reboot": s.Cfg.TasksBeforeReboot,
-		"default_flow":        s.Cfg.DefaultFlowName,
-		"scripts_root":        s.Cfg.ScriptsRoot,
-		"release_root":        s.Cfg.ReleaseRoot,
-	})
-}
+// Settings handlers live in handlers_settings.go.

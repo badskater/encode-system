@@ -76,6 +76,31 @@ type User struct {
 	CreatedAt    *time.Time `json:"created_at,omitempty"`
 }
 
+// Settings is the operator-editable runtime configuration (NFS shares,
+// controller roots, node path mapping, scan cadence, release naming). Stored
+// in the database; environment variables only seed the first boot.
+type Settings struct {
+	// NFS share description (informational + deployment guidance: the
+	// actual mounts are compose volumes on the Docker host).
+	NFSServer       string `json:"nfs_server"`
+	ScriptsShare    string `json:"scripts_share"`    // export path, e.g. /mnt/user/scripts
+	ReleaseShare    string `json:"release_share"`    // export path, e.g. /mnt/user/ReleaseFolders
+	// Controller-side roots (where the shares are mounted in the container).
+	ScriptsRoot     string `json:"scripts_root"`
+	ReleaseRoot     string `json:"release_root"`
+	// Remote path mapping: node-side locations used when rendering job
+	// scripts ($Job.BinDir / ScriptsDir / ReleaseDir).
+	NodeBinDir      string `json:"node_bin_dir"`
+	NodeScriptsDir  string `json:"node_scripts_dir"`
+	NodeReleaseDir  string `json:"node_release_dir"`
+	// Behavior.
+	ScanIntervalSeconds int    `json:"scan_interval_seconds"`
+	TasksBeforeReboot   int    `json:"tasks_before_reboot"`
+	Group               string `json:"group"`
+	Tag                 string `json:"tag"`
+	UpdatedAt           *time.Time `json:"updated_at,omitempty"`
+}
+
 // Session is an issued management session (token stored hashed at rest).
 type Session struct {
 	TokenHash string     `json:"-"`
@@ -94,6 +119,7 @@ type Node struct {
 	Status         NodeStatus `json:"status"`
 	AgentVersion   string     `json:"agent_version"`
 	LibVersion     int64      `json:"lib_version"`
+	BinVersion     int64      `json:"bin_version"` // bin package version on node (0 = none)
 	TasksSinceBoot int        `json:"tasks_since_boot"`
 	RebootPending  bool       `json:"reboot_pending"`
 	// RebootIssuedAtTasks snapshots the counter when the reboot instruction
@@ -182,6 +208,7 @@ type Heartbeat struct {
 	Node           string  `json:"node"`
 	AgentVersion   string  `json:"agent_version"`
 	LibVersion     int64   `json:"lib_version"`
+	BinVersion     int64   `json:"bin_version"` // bin package version on disk (0 = none)
 	TasksSinceBoot int     `json:"tasks_since_boot"`
 	JobID          int64   `json:"job_id,omitempty"`
 	JobStatus      string  `json:"job_status,omitempty"`
@@ -198,12 +225,19 @@ type JobPayload struct {
 	Flow   string            `json:"flow"`   // flow name, informational
 }
 
-// UpdateManifest describes the agent/lib versions the controller wants deployed.
+// UpdateManifest describes the agent/lib/bin versions the controller wants
+// deployed. Agents compare each field against what they run and sync what
+// differs (lib first, then the bin folder, then the agent binary itself).
 type UpdateManifest struct {
 	AgentVersion string `json:"agent_version"`
 	AgentSHA256  string `json:"agent_sha256"`
 	LibVersion   int64  `json:"lib_version"`
 	LibSHA256    string `json:"lib_sha256"`
+	// Bin folder package: a zip of the node tools dir (C:\bin). Version is a
+	// publish counter; agents extract it over their bin dir when it differs.
+	BinVersion int64  `json:"bin_version"`
+	BinSHA256  string `json:"bin_sha256"`
+	BinSize    int64  `json:"bin_size,omitempty"`
 }
 
 // HeartbeatReply is the controller's instruction channel to the agent.

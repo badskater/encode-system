@@ -145,6 +145,7 @@ export default function NodesPage() {
             <th>Reboot pending</th>
             <th>Agent</th>
             <th>Lib</th>
+            <th>Bin</th>
             <th>Last seen</th>
             <th />
           </tr>
@@ -161,6 +162,7 @@ export default function NodesPage() {
               <td>{n.reboot_pending ? 'yes' : 'no'}</td>
               <td className="muted">{n.agent_version || '—'}</td>
               <td className="muted">{n.lib_version || '—'}</td>
+              <td className="muted">{n.bin_version ? `v${n.bin_version}` : '—'}</td>
               <td className="muted">{timeAgo(n.last_seen)}</td>
               <td>
                 <button className="btn" onClick={() => reboot(n)}>

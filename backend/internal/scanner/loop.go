@@ -27,21 +27,30 @@ type JobCreator interface {
 // last bytes land.
 const SourceStableFor = 2 * time.Minute
 
-// RunLoop scans every interval until ctx is cancelled. It logs each created
-// job and skips folders that already have a job (any non-cancelled status).
-func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, root, defaultFlow string, interval time.Duration) {
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	tick := time.NewTicker(interval)
-	defer tick.Stop()
+// LiveConfig supplies the scanner's runtime parameters on every cycle so
+// Settings-page edits (watch root, cadence) apply without restarting the
+// controller. Returns the scripts root, the scan interval, and the default
+// flow name.
+type LiveConfig func(ctx context.Context) (root string, interval time.Duration, defaultFlow string)
+
+// RunLoop scans on the live-configured interval until ctx is cancelled. It
+// logs each created job and skips folders that already have a job (any
+// non-cancelled status). The interval is re-read each cycle.
+func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfig) {
 	for {
+		root, interval, defaultFlow := cfg(ctx)
+		if interval <= 0 {
+			interval = 30 * time.Second
+		}
+		tick := time.NewTicker(interval)
 		select {
 		case <-ctx.Done():
+			tick.Stop()
 			return
 		case <-tick.C:
 			scanOnce(ctx, log, st, root, defaultFlow)
 		}
+		tick.Stop()
 	}
 }
 

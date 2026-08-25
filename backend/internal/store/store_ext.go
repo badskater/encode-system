@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
   used_by INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  json TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate ext schema: %w", err)
@@ -55,7 +61,47 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
 			return fmt.Errorf("migrate flows.is_default: %w", err)
 		}
 	}
+	// nodes.bin_version tracks the deployed bin-package version.
+	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN bin_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate nodes.bin_version: %w", err)
+		}
+	}
 	return nil
+}
+
+// ---------- Settings ----------
+
+// GetSettings loads the persisted settings row. Returns nil (not an error)
+// when no row exists yet — callers merge environment defaults in that case.
+func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT json, updated_at FROM settings WHERE id = 1`)
+	var js, updatedAt string
+	if err := row.Scan(&js, &updatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var st model.Settings
+	if err := json.Unmarshal([]byte(js), &st); err != nil {
+		return nil, fmt.Errorf("unmarshal settings: %w", err)
+	}
+	st.UpdatedAt = ptrTime(updatedAt)
+	return &st, nil
+}
+
+// SaveSettings persists the settings row (single-row upsert on id=1).
+func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
+	b, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO settings (id, json, updated_at) VALUES (1, ?, datetime('now'))
+		 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
+		string(b))
+	return err
 }
 
 // ---------- Series ----------

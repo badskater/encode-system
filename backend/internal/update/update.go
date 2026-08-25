@@ -39,6 +39,7 @@ func NewStore(dir string) (*Store, error) {
 
 func (s *Store) agentPath() string { return filepath.Join(s.dir, "encode-agent.exe") }
 func (s *Store) libPath() string   { return filepath.Join(s.dir, "EncodeLib.ps1") }
+func (s *Store) binPath() string   { return filepath.Join(s.dir, "bin-package.zip") }
 func (s *Store) versionPath() string {
 	return filepath.Join(s.dir, "manifest.json")
 }
@@ -68,6 +69,16 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	}
 	if h, err := fileSHA256(s.libPath()); err == nil {
 		m.LibSHA256 = h
+	}
+	// Bin package is optional (a fleet can pre-install tools manually).
+	if fi, err := os.Stat(s.binPath()); err == nil {
+		if h, err := fileSHA256(s.binPath()); err == nil {
+			m.BinSHA256 = h
+			m.BinSize = fi.Size()
+		}
+	} else {
+		m.BinVersion = 0 // payload vanished: stop advertising it
+		m.BinSHA256 = ""
 	}
 	return m, true
 }
@@ -133,11 +144,33 @@ func installPayload(dest string, r io.Reader) (string, error) {
 	return hash, nil
 }
 
+// PublishBin stores a new tools-folder zip and bumps its version counter.
+// Nodes extract it over their bin dir when their bin_version differs.
+func (s *Store) PublishBin(version int64, r io.Reader) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hash, err := installPayload(s.binPath(), r)
+	if err != nil {
+		return fmt.Errorf("publish bin: %w", err)
+	}
+	fi, err := os.Stat(s.binPath())
+	if err != nil {
+		return fmt.Errorf("stat bin payload: %w", err)
+	}
+	s.manifest.BinVersion = version
+	s.manifest.BinSHA256 = hash
+	s.manifest.BinSize = fi.Size()
+	return s.persistLocked()
+}
+
 // AgentPayload opens the stored agent binary for serving.
 func (s *Store) AgentPayload() (*os.File, error) { return os.Open(s.agentPath()) }
 
 // LibPayload opens the stored EncodeLib.ps1 for serving.
 func (s *Store) LibPayload() (*os.File, error) { return os.Open(s.libPath()) }
+
+// BinPayload opens the stored bin-folder zip for serving.
+func (s *Store) BinPayload() (*os.File, error) { return os.Open(s.binPath()) }
 
 func writeFileHashing(path string, r io.Reader) error {
 	f, err := os.Create(path)

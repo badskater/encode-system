@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   status TEXT NOT NULL DEFAULT 'idle',
   agent_version TEXT NOT NULL DEFAULT '',
   lib_version INTEGER NOT NULL DEFAULT 0,
+  bin_version INTEGER NOT NULL DEFAULT 0,
   tasks_since_boot INTEGER NOT NULL DEFAULT 0,
   reboot_pending INTEGER NOT NULL DEFAULT 0,
   reboot_issued_at_tasks INTEGER NOT NULL DEFAULT 0,
@@ -183,14 +184,14 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
 
@@ -200,7 +201,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	var lastSeen, issuedAt sql.NullString
 	var createdAt string
 	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
-		&n.LibVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt)
+		&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +220,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes ORDER BY name`)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +232,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		var lastSeen, issuedAt sql.NullString
 		var createdAt string
 		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
-			&n.LibVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt); err != nil {
+			&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled == 1
@@ -251,8 +252,8 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 // UpdateNode persists mutable node fields after a heartbeat or UI action.
 func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
-  lib_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, reboot_issued_at=?, last_seen=?, last_error=? WHERE id=?`,
-		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.TasksSinceBoot,
+  lib_version=?, bin_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, reboot_issued_at=?, last_seen=?, last_error=? WHERE id=?`,
+		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.BinVersion, n.TasksSinceBoot,
 		boolToInt(n.RebootPending), n.RebootIssuedAtTasks, fmtPtrTime(n.RebootIssuedAt), fmtPtrTime(n.LastSeen), n.LastError, n.ID)
 	return err
 }
@@ -266,7 +267,7 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
-  lib_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
 

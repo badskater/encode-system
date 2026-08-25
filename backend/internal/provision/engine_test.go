@@ -1,8 +1,11 @@
 package provision
 
 import (
+	"context"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
@@ -106,6 +109,62 @@ func TestYamlQuoteEscapesSingleQuotes(t *testing.T) {
 	got = yamlQuote(`p'a"s\s`)
 	if got != `'p''a"s\s'` {
 		t.Errorf("bad escaping: %s", got)
+	}
+}
+
+// fakeProvStore is a minimal Store for engine-level tests.
+type fakeProvStore struct {
+	logs map[int64]string
+}
+
+func (f *fakeProvStore) GetSettings(ctx context.Context) (*model.Settings, error) {
+	return &model.Settings{ControllerURL: "http://c:8080"}, nil
+}
+func (f *fakeProvStore) CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error) {
+	pr.ID = 1
+	return pr, nil
+}
+func (f *fakeProvStore) GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error) {
+	return &model.ProvisionRun{ID: id, Status: "running"}, nil
+}
+func (f *fakeProvStore) ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error) {
+	return nil, nil
+}
+func (f *fakeProvStore) SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error {
+	return nil
+}
+func (f *fakeProvStore) AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error {
+	if f.logs == nil {
+		f.logs = map[int64]string{}
+	}
+	f.logs[id] += chunk
+	return nil
+}
+
+// Regression: streamCommand must terminate when the child process exits.
+// The original io.Pipe implementation deadlocked forever on a finished
+// process (the write end was never closed, so the scanner waited for an
+// EOF that would never come).
+func TestStreamCommandTerminatesAfterChildExit(t *testing.T) {
+	st := &fakeProvStore{}
+	cmd := exec.Command("sh", "-c", "echo hello; echo world >&2; echo done")
+	done := make(chan error, 1)
+	go func() {
+		done <- streamCommand(context.Background(), context.Background(), st, 1, cmd, 1024*1024)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("streamCommand error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("DEADLOCK: streamCommand did not return after the child exited")
+	}
+	logged := st.logs[1]
+	for _, want := range []string{"hello", "world", "done"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log missing %q (got %q)", want, logged)
+		}
 	}
 }
 

@@ -14,7 +14,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +44,7 @@ type Store interface {
 	GetSettings(ctx context.Context) (*model.Settings, error)
 	CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error)
 	GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error)
+	ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error)
 	SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error
 	AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error
 }
@@ -75,6 +75,27 @@ type Engine struct {
 
 	mu      sync.Mutex // serializes runs
 	running bool
+}
+
+// ReconcileStaleRuns marks any run left in queued/running state as failed.
+// Call once at controller startup: those runs belonged to the previous
+// process (crash, restart, redeploy) and will never finish — without this
+// they would show as "running" forever.
+func (e *Engine) ReconcileStaleRuns(ctx context.Context) error {
+	runs, err := e.Store.ListProvisionRuns(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		if r.Status == "queued" || r.Status == "running" {
+			_ = e.Store.AppendProvisionRunLog(ctx, r.ID,
+				"\n[controller] controller restarted while this run was active; marking failed\n")
+			if err := e.Store.SetProvisionRunStatus(ctx, r.ID, "failed", "interrupted by controller restart", true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 const (
@@ -263,10 +284,17 @@ func (e *Engine) logCap() int {
 // streamCommand runs cmd and appends combined output to the run log in
 // time-bounded chunks (the DB gets one append per flush window, not per
 // line). Context cancellation kills the process via CommandContext.
+//
+// Output plumbing uses cmd.StdoutPipe(): the read side reaches EOF when the
+// child exits (os/exec closes it). A plain io.Pipe deadlocks here — nothing
+// would close the write end after the child dies, so the scanner would wait
+// forever on a finished process.
 func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, capBytes int) error {
-	pr, pw := io.Pipe()
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	cmd.Stderr = cmd.Stdout // merge stderr into the same OS pipe
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start ansible-playbook: %w", err)
@@ -299,7 +327,7 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		}
 	}()
 
-	scanner := bufio.NewScanner(pr)
+	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 512*1024)
 	for scanner.Scan() {
 		line := scanner.Text() + "\n"
@@ -319,15 +347,14 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 		buf.WriteString(line)
 		mu.Unlock()
 	}
-	pw.Close()
 	close(done)
 	flush()
 
-	err := cmd.Wait()
+	waitErr := cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("provisioning timed out after %s", runTimeout)
 	}
-	if err != nil {
+	if waitErr != nil {
 		return fmt.Errorf("ansible-playbook exited with an error (see log)")
 	}
 	return nil

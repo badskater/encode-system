@@ -127,6 +127,12 @@ func main() {
 			return code, nil
 		},
 	}
+	// Freeze-proofing: any run left queued/running by a previous process
+	// (crash/restart/redeploy) is marked failed at startup instead of
+	// showing "running" forever.
+	if err := srv.Provision.ReconcileStaleRuns(context.Background()); err != nil {
+		log.Warn("reconcile stale provision runs", "err", err)
+	}
 	if generatedPass != "" {
 		// One-time disclosure, same boot as the account creation.
 		log.Warn("GENERATED admin password (shown once; set ENCODE_ADMIN_PASSWORD to pin your own)",

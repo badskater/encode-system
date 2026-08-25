@@ -217,6 +217,33 @@ the default.
 > Then pair the clone fresh (issue a pairing code and point `agent.json` at
 > it). Verified live: a clone of the test node was cleaned and paired as a
 > distinct second worker, and jobs distributed across both.
+>
+> **Easier: delete the stale registration first.** Nodes → *Delete* removes
+> the old name so a fresh provision of the clone cannot collide.
+
+## 8. Provisioning from the Web UI (preferred)
+
+The controller ships ansible-core + pywinrm + the provisioning playbook, so
+new nodes can be set up entirely from the browser — no workstation, no
+inventory files, no secrets on disk:
+
+1. **Settings → Controller URL**: set the address nodes can reach (the
+   Docker host's LAN IP + port). Required before provisioning.
+2. **Publish payloads** (Settings → Push to nodes): the agent binary at
+   minimum; EncodeLib.ps1 and the bin package zip if you want them deployed
+   in the same run.
+3. **Provision page**: enter host, WinRM port/user/password, node name, and
+   tick the options (toolchain installs MediaInfo CLI, AviSynth+, Python
+   3.14 x64 and VapourSynth via its official installer; NFS mounts use the
+   Settings shares; bin push expands the published tools folder).
+4. Watch the live run log; on success the node appears on the Nodes page
+   (the agent registers itself with a one-shot pairing code issued per run).
+
+Security notes: the WinRM password is written to a 0600 temp file for the
+duration of the run only — never stored, never logged, never passed on a
+command line. Re-provisioning a host whose node name already exists: delete
+the old registration first (Nodes → Delete). The manual Ansible flow in
+sections 2–6 remains available for air-gapped or workstation-driven deploys.
 
 ## Rollback & recovery
 

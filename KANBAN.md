@@ -11,6 +11,26 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (controller-driven provisioning)
+
+- WebUI Provision page: form (host, WinRM port/user/password, node name,
+  toolchain/NFS/bin toggles) → controller runs bundled ansible-core over
+  WinRM with the live Settings (controller_url, path mapping, NFS exports).
+- Zero-touch pairing: each run auto-issues a one-shot code; the agent
+  self-registers as a Windows service and persists its own credential.
+- Toolchain installs (idempotent, silent): MediaInfo CLI 26.05, AviSynth+
+  3.7.5 (InnoSetup /VERYSILENT), Python 3.14.7 x64, VapourSynth R79 via the
+  OFFICIAL NSIS installer (per operator decision — not pip), functional
+  idempotency checks (python import for VS).
+- Bin folder push: published bin-package.zip staged from the update store,
+  uploaded via win_copy, expanded over the node's tools dir.
+- Security: WinRM password never persisted (0600 temp vars file, deleted on
+  run end, never logged, never on a command line); run logs streamed live
+  with a 512 KiB cap; stale runs reconciled to failed at startup.
+- Node deletion endpoint (busy-guarded) so hosts can be re-provisioned after
+  name collisions; UI delete button on the Nodes page.
+- Live-verified: provisioning enc-test-docker-2 end-to-end from the browser.
+
 ## Done (Settings page + WebUI fleet push)
 
 - Settings page (live, no restart): NFS share record (server/exports),

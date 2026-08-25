@@ -13,6 +13,20 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (bin folder distribution via GitHub — encode-bin repo)
+
+- Public repo badskater/encode-bin: source of truth + distribution for the
+  node tools folder. Bin packages ship as GitHub Release assets (144 MB >
+  git's 100 MB commit-file cap), tagged v<bin_version>; release notes carry
+  the SHA-256. First release v3 = current fleet package (219's C:\bin with
+  dovi_tool), sha ca62575b… verified byte-for-byte.
+- Controller: new POST /api/updates/bin/url — fetches a package from a URL
+  (http(s) only, streamed to a temp file under the 1 GiB cap, optional
+  SHA-256 pin, same zip-slip/symlink validation as uploads, version counter
+  enforced). UI: Settings → Push to nodes → "Fetch & publish" form.
+  2 API tests (happy path + validation matrix incl. scheme guard, sha
+  mismatch, 404 upstream, corrupt zip, version conflict).
+
 ## Done (CI/CD on GitHub Actions)
 
 - Repo went public → security pre-flight first: 4 agent core dumps (~376 MB,

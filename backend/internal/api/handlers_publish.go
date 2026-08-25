@@ -3,9 +3,13 @@ package api
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -140,7 +144,7 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "read upload: "+err.Error())
 		return
 	}
-	if err := validateBinZip(body.Bytes()); err != nil {
+	if err := validateBinZip(bytes.NewReader(body.Bytes()), int64(len(body.Bytes()))); err != nil {
 		writeErr(w, http.StatusBadRequest, "bin package rejected: "+err.Error())
 		return
 	}
@@ -156,13 +160,120 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Update.Manifest())
 }
 
-// validateBinZip checks the uploaded package: must be a readable zip, every
-// entry must be a plain relative path (zip-slip guard: absolute, UNC, and
-// drive-letter paths rejected), no symlinks, sane entry count. Rejecting
-// here protects every node that would otherwise extract it. Takes the raw
-// bytes once — the caller's buffer is reused, no second copy.
-func validateBinZip(data []byte) error {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+// binFetchClient downloads bin packages from URLs. Generous timeout: a 144
+// MiB package over a modest uplink can legitimately take minutes.
+var binFetchClient = &http.Client{Timeout: 10 * time.Minute}
+
+// handlePublishBinFromURL fetches a bin package from a URL (e.g. a GitHub
+// release asset on badskater/encode-bin), validates it exactly like a
+// browser upload, and publishes it. JSON body: {"url": "...", "version": N,
+// "sha256": "optional hex digest"}. The download streams to a temp file
+// (never memory) under the same 1 GiB cap as uploads; when a sha256 is
+// given, a mismatch fails the publish BEFORE the package is stored.
+func (s *Server) handlePublishBinFromURL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL     string `json:"url"`
+		Version int64  `json:"version"`
+		SHA256  string `json:"sha256"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if req.Version <= 0 {
+		writeErr(w, http.StatusBadRequest, "version must be a positive integer")
+		return
+	}
+	// Scheme guard: only http(s). Anything else (file://, gopher://, …) is
+	// refused outright — an admin typo should never turn into a local read.
+	u, err := url.Parse(req.URL)
+	if err != nil || u.Scheme == "" {
+		writeErr(w, http.StatusBadRequest, "url is not valid")
+		return
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		writeErr(w, http.StatusBadRequest, "url must be http(s)")
+		return
+	}
+
+	// Download to a temp file with a hard size ceiling (streaming — a 144
+	// MiB package never sits in controller memory).
+	tmp, err := os.CreateTemp("", "encode-bin-fetch-*.zip")
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "create temp file")
+		return
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // best-effort cleanup on every exit path
+	defer tmp.Close()
+
+	fresp, err := binFetchClient.Get(req.URL)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "fetch failed: "+err.Error())
+		return
+	}
+	defer fresp.Body.Close()
+	if fresp.StatusCode != http.StatusOK {
+		writeErr(w, http.StatusBadGateway, fmt.Sprintf("fetch returned HTTP %d", fresp.StatusCode))
+		return
+	}
+	limited := io.LimitReader(fresp.Body, maxBinPublishBytes+1)
+	n, err := io.Copy(tmp, limited)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "download failed: "+err.Error())
+		return
+	}
+	if n > maxBinPublishBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "bin package too large")
+		return
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		writeErr(w, http.StatusInternalServerError, "rewind temp file")
+		return
+	}
+
+	// Optional integrity gate: when the operator pins a digest (release
+	// notes carry it), a mismatch aborts before anything is stored.
+	if want := strings.ToLower(strings.TrimSpace(req.SHA256)); want != "" {
+		h := sha256.New()
+		if _, err := io.Copy(h, io.TeeReader(tmp, io.Discard)); err != nil {
+			writeErr(w, http.StatusInternalServerError, "hash download")
+			return
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); got != want {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("sha256 mismatch: got %s, want %s", got, want))
+			return
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			writeErr(w, http.StatusInternalServerError, "rewind temp file")
+			return
+		}
+	}
+
+	if err := validateBinZip(tmp, n); err != nil {
+		writeErr(w, http.StatusBadRequest, "bin package rejected: "+err.Error())
+		return
+	}
+	if err := s.Update.PublishBin(req.Version, tmp); err != nil {
+		if strings.Contains(err.Error(), "must exceed") {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "publish bin")
+		return
+	}
+	s.Log.Info("bin package published from URL", "version", req.Version, "bytes", n, "url", req.URL)
+	writeJSON(w, http.StatusOK, s.Update.Manifest())
+}
+
+// validateBinZip checks a package: must be a readable zip, every entry must
+// be a plain relative path (zip-slip guard: absolute, UNC, and drive-letter
+// paths rejected), no symlinks, sane entry count. Rejecting here protects
+// every node that would otherwise extract it. Takes any ReaderAt + size so
+// both in-memory uploads and streamed temp files share one code path.
+func validateBinZip(r io.ReaderAt, size int64) error {
+	zr, err := zip.NewReader(r, size)
 	if err != nil {
 		return fmt.Errorf("not a valid zip archive: %w", err)
 	}

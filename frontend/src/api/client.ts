@@ -148,6 +148,8 @@ export const api = {
   publishAgent: (version: string, file: File) => publishUpload('/api/updates/agent', version, file),
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
+  publishBinFromURL: (url: string, version: number, sha256?: string) =>
+    request<UpdateManifest>('POST', '/api/updates/bin/url', { url, version, sha256: sha256 || undefined }),
 
   // Node provisioning (controller-driven Ansible).
   startProvision: (req: {

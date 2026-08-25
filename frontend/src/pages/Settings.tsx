@@ -51,6 +51,11 @@ export default function SettingsPage() {
   const [libFile, setLibFile] = useState<File | null>(null);
   const [binVersion, setBinVersion] = useState('');
   const [binFile, setBinFile] = useState<File | null>(null);
+  // bin-url form: fetch a package from a URL instead of uploading it
+  // (e.g. a GitHub release asset on the encode-bin repo).
+  const [binUrl, setBinUrl] = useState('');
+  const [binUrlVersion, setBinUrlVersion] = useState('');
+  const [binUrlSha, setBinUrlSha] = useState('');
   const [publishing, setPublishing] = useState('');
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
@@ -131,7 +136,7 @@ export default function SettingsPage() {
     }
   }
 
-  async function publish(kind: 'agent' | 'lib' | 'bin') {
+  async function publish(kind: 'agent' | 'lib' | 'bin' | 'bin-url') {
     setError(null);
     setNotice(null);
     setPublishing(kind);
@@ -152,7 +157,7 @@ export default function SettingsPage() {
         setLibFile(null);
         setLibVersion('');
         if (libFileRef.current) libFileRef.current.value = '';
-      } else {
+      } else if (kind === 'bin') {
         if (!binFile || !/^\d+$/.test(binVersion)) throw new Error('bin needs a numeric version + file');
         const tooBig = checkPayload(binFile, MAX_BIN_BYTES, 'bin package');
         if (tooBig) throw new Error(tooBig);
@@ -160,8 +165,21 @@ export default function SettingsPage() {
         setBinFile(null);
         setBinVersion('');
         if (binFileRef.current) binFileRef.current.value = '';
+      } else {
+        // bin-url: the controller downloads the zip (e.g. a GitHub release
+        // asset) and validates it exactly like a browser upload.
+        if (!binUrl.trim() || !/^\d+$/.test(binUrlVersion)) {
+          throw new Error('a download URL + numeric version are required');
+        }
+        if (!/^https?:\/\//.test(binUrl.trim())) {
+          throw new Error('URL must start with http:// or https://');
+        }
+        await api.publishBinFromURL(binUrl.trim(), Number(binUrlVersion), binUrlSha.trim() || undefined);
+        setBinUrl('');
+        setBinUrlVersion('');
+        setBinUrlSha('');
       }
-      setNotice(`${kind} published — idle nodes adopt it on their next heartbeat.`);
+      setNotice(`${kind === 'bin-url' ? 'bin package' : kind} published — idle nodes adopt it on their next heartbeat.`);
       // Refresh the manifest readout only — reloading settings here would
       // silently discard any unsaved edits in the form above.
       await refreshManifest();
@@ -353,6 +371,40 @@ export default function SettingsPage() {
           publish time — path traversal, absolute paths, and symlinks are
           rejected.
         </p>
+
+        <h3 style={{ marginTop: 18 }}>…or fetch the bin package from a URL</h3>
+        <p className="muted">
+          The controller downloads the zip itself and runs the exact same
+          validation. Typical source: a release asset on{' '}
+          <code>github.com/badskater/encode-bin</code> — the version number
+          must match the fleet&apos;s bin_version counter.
+        </p>
+        <label style={{ display: 'block', marginBottom: 8 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Download URL</span>
+          <input
+            style={{ width: '100%' }}
+            value={binUrl}
+            onChange={(e) => setBinUrl(e.target.value)}
+            placeholder="https://github.com/badskater/encode-bin/releases/download/v4/bin-package.zip"
+          />
+        </label>
+        <div className="toolbar" style={{ alignItems: 'flex-end' }}>
+          <label style={{ flex: 1 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>Version (must exceed {manifest?.bin_version ?? 0})</span>
+            <input style={{ width: '100%' }} value={binUrlVersion} onChange={(e) => setBinUrlVersion(e.target.value)} placeholder="e.g. 4" />
+          </label>
+          <label style={{ flex: 2 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>SHA-256 (optional, from the release notes)</span>
+            <input style={{ width: '100%' }} value={binUrlSha} onChange={(e) => setBinUrlSha(e.target.value)} placeholder="ca62575b…" />
+          </label>
+          <button
+            className="btn primary"
+            disabled={publishing !== '' || !binUrl.trim() || !/^\d+$/.test(binUrlVersion)}
+            onClick={() => publish('bin-url')}
+          >
+            {publishing === 'bin-url' ? 'Fetching…' : 'Fetch & publish'}
+          </button>
+        </div>
       </div>
     </>
   );

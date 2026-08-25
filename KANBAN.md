@@ -11,6 +11,31 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Settings page + WebUI fleet push)
+
+- Settings page (live, no restart): NFS share record (server/exports),
+  controller roots, REMOTE PATH MAPPING (node bin/scripts/release dirs used
+  by the job renderer), scan interval, reboot threshold, group/tag. Strict
+  path validation (Windows absolute vs Unix absolute, drive-relative and
+  slash-UNC rejected). Single-row settings table; env seeds defaults.
+  Scanner loop + job renderer + heartbeat reboot limit read settings LIVE.
+- Publishing from the WebUI: agent binary, EncodeLib.ps1, and bin-folder ZIP
+  packages (version-gated, zip-slip/symlink/drive/UNC validated at publish,
+  served to nodes with SHA-256). Nodes sync on idle heartbeat: lib -> bin
+  (idempotent re-extract, version bumped only after full success, locked
+  files retry next heartbeat) -> agent binary (service OR task/bare relaunch
+  via swap sidecar).
+- Agent hardening from adversarial review: sync steps independent (bin
+  failure never blocks agent self-update), Syncing heartbeat flag blocks job
+  assignment mid-swap, 1 GiB bin download cap matching the publish cap,
+  streaming decompression cap, per-payload manifest recovery across restarts.
+- Live-verified on the fleet: 219's C:\bin (137 MiB) zipped, published, and
+  auto-extracted on BOTH nodes; agent pushed 0.3.3 -> 0.8.x purely via the
+  publish endpoint; settings edits change scanner cadence without restart.
+- Fix found live: loadFromDisk demanded every payload exist, so publishing
+  agent+bin without EncodeLib wiped the manifest on restart — payloads now
+  recover independently (regression-tested).
+
 ## Done (change-password system — no password in .env)
 
 - POST /api/auth/password: verifies current password (wrong attempts count

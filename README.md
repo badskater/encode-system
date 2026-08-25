@@ -1,6 +1,6 @@
 # encode-system
 
-Distributed encode farm: a Linux control plane queues and monitors anime encoding jobs on a fleet of Windows Server 2025 nodes with Nvidia GPUs.
+Distributed encode farm: a Linux control plane queues and monitors encoding jobs on a fleet of Windows Server 2025 nodes with Nvidia GPUs.
 
 ## What it does
 

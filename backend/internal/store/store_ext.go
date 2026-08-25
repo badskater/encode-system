@@ -265,9 +265,46 @@ func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO settings (id, json, updated_at) VALUES (1, ?, datetime('now'))
-		 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
+	 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
 		string(b))
 	return err
+}
+
+// MigrateSettingsKey fills a settings key added by a newer build. It only
+// writes when a row exists AND the key is absent (an old-build save); a key
+// already present — including an operator-set blank — is never touched. The
+// row's updated_at is preserved so the patch does not masquerade as a manual
+// edit. Returns whether the row was changed.
+func (s *Store) MigrateSettingsKey(ctx context.Context, key string, value string) (bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT json FROM settings WHERE id = 1`)
+	var js string
+	if err := row.Scan(&js); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // nothing to migrate; defaults cover a fresh DB
+		}
+		return false, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(js), &raw); err != nil {
+		return false, fmt.Errorf("unmarshal settings json: %w", err)
+	}
+	if _, ok := raw[key]; ok {
+		return false, nil // key present (any value) — operator owns it now
+	}
+	v, err := json.Marshal(value)
+	if err != nil {
+		return false, err
+	}
+	raw[key] = v
+	patched, err := json.Marshal(raw)
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE settings SET json = ? WHERE id = 1`, string(patched)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ---------- Series ----------

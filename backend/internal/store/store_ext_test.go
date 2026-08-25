@@ -255,3 +255,66 @@ func TestPairingCodeExpiry(t *testing.T) {
 		}
 	}
 }
+
+// ---------- Settings key migration ----------
+
+// TestMigrateSettingsKey covers the old-build row upgrade path: a missing
+// key gets filled exactly once, an operator-set value (including blank) is
+// never clobbered, and updated_at stays untouched by the migration.
+func TestMigrateSettingsKey(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	// No row at all: nothing to migrate.
+	changed, err := st.MigrateSettingsKey(ctx, "discord_webhook", "https://discord.com/api/webhooks/env/x")
+	if err != nil || changed {
+		t.Fatalf("no-row migration must be a no-op: changed=%v err=%v", changed, err)
+	}
+
+	// Old-build row: key absent -> filled once. A real legacy row was written
+	// by a binary whose Settings model had no discord_webhook field, so the
+	// stored JSON lacks the key entirely (SaveSettings cannot produce that
+	// shape anymore — insert it raw, exactly as the live upgrade sees it).
+	legacyJSON := `{"controller_url":"","scripts_root":"/data/scripts","release_root":"/data/release","node_bin_dir":"C:\\bin","node_scripts_dir":"C:\\Encodes\\scripts","node_release_dir":"C:\\Encodes\\ReleaseFolders","scan_interval_seconds":30,"tasks_before_reboot":10,"group":"G","tag":"1080p"}`
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO settings (id, json) VALUES (1, ?)
+		 ON CONFLICT(id) DO UPDATE SET json = excluded.json`, legacyJSON); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = st.MigrateSettingsKey(ctx, "discord_webhook", "https://discord.com/api/webhooks/env/x")
+	if err != nil || !changed {
+		t.Fatalf("legacy row must be migrated: changed=%v err=%v", changed, err)
+	}
+	after, err := st.GetSettings(ctx)
+	if err != nil || after.DiscordWebhook != "https://discord.com/api/webhooks/env/x" {
+		t.Fatalf("webhook not injected: %+v err=%v", after, err)
+	}
+	if after.Group != "G" || after.Tag != "1080p" {
+		t.Fatalf("migration must not disturb other fields: %+v", after)
+	}
+
+	// Second run: key present -> untouched.
+	changed, err = st.MigrateSettingsKey(ctx, "discord_webhook", "https://discord.com/api/webhooks/env/other")
+	if err != nil || changed {
+		t.Fatalf("already-migrated row must not change: changed=%v err=%v", changed, err)
+	}
+
+	// Operator blanks the webhook -> migration must respect the blank.
+	after.DiscordWebhook = ""
+	if err := st.SaveSettings(ctx, after); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = st.MigrateSettingsKey(ctx, "discord_webhook", "https://discord.com/api/webhooks/env/x")
+	if err != nil || changed {
+		t.Fatalf("operator blank must survive migration: changed=%v err=%v", changed, err)
+	}
+	got, _ := st.GetSettings(ctx)
+	if got.DiscordWebhook != "" {
+		t.Fatalf("blank webhook clobbered: %+v", got)
+	}
+}

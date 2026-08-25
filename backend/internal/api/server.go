@@ -78,10 +78,35 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if err := s.seedDefaultFlow(); err != nil {
 		return nil, err
 	}
+	if err := s.migrateDiscordWebhook(); err != nil {
+		return nil, err
+	}
 	if err := s.seedAdminUser(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// migrateDiscordWebhook repairs installs where settings were saved by a
+// build that predates the discord_webhook key: such rows lack the key, and
+// the saved-row-is-authoritative rule would otherwise silently disable the
+// env-configured webhook on upgrade. The env value is injected exactly once
+// (key present afterwards, operator free to blank it). Fresh installs and
+// installs without a saved row need nothing — currentSettings falls back to
+// the env defaults.
+func (s *Server) migrateDiscordWebhook() error {
+	if s.Cfg.DiscordWebhook == "" {
+		return nil // nothing to inject; a missing key means "off" either way
+	}
+	ctx := ctxBg()
+	migrated, err := s.Store.MigrateSettingsKey(ctx, "discord_webhook", s.Cfg.DiscordWebhook)
+	if err != nil {
+		return fmt.Errorf("migrate settings discord_webhook: %w", err)
+	}
+	if migrated {
+		s.Log.Info("injected env Discord webhook into the saved settings row (key added by this release)")
+	}
+	return nil
 }
 
 // seedAdminUser ensures the management-plane admin account exists. On first

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,5 +111,79 @@ func TestLoopUsesFlowEpisodeNumber(t *testing.T) {
 	}
 	if st.created[0].ScriptFile != "1080.vpy" {
 		t.Errorf("script file not persisted on job: %+v", st.created[0])
+	}
+}
+
+// TestRunLoopLiveConfigAndCancellation verifies the RunLoop contract: the
+// live config is re-read every cycle (Settings-page cadence edits apply
+// without a restart), an interval change does not stall the loop, and ctx
+// cancellation ends it promptly.
+func TestRunLoopLiveConfigAndCancellation(t *testing.T) {
+	root := t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st := &fakeStore{existing: map[string]bool{}, flow: &model.Flow{ID: 9, Name: "default-1080"}}
+
+	var mu sync.Mutex
+	calls := 0
+	interval := 30 * time.Millisecond
+	cfg := func(ctx context.Context) (string, time.Duration, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return root, interval, "default-1080"
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		RunLoop(ctx, log, st, cfg)
+		close(done)
+	}()
+
+	// Several cycles with the initial interval.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	first := calls
+	mu.Unlock()
+	if first < 3 {
+		t.Fatalf("loop did not cycle: cfg called %d times", first)
+	}
+
+	// Change the cadence live: the loop must keep cycling on the new ticker.
+	mu.Lock()
+	interval = 20 * time.Millisecond
+	mu.Unlock()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n >= first+3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	second := calls
+	mu.Unlock()
+	if second < first+3 {
+		t.Fatalf("loop stalled after interval change: %d -> %d", first, second)
+	}
+
+	// Cancellation ends the loop promptly.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunLoop did not return after ctx cancel")
 	}
 }

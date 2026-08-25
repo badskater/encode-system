@@ -13,6 +13,15 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (default-4k flow)
+
+- Seeded default-4k flow (8 steps): source_rename → dgindex → hdr_probe →
+  audio_lang (jpn,eng @320k) → encode_4k → mux → release_copy → keyframes.
+  Boot-seeded alongside default-1080 (name-guarded; operator's default-flag
+  choice preserved; custom ENCODE_DEFAULT_FLOW names still seeded as older
+  builds did). Guard test pins every step to a builtin template.
+  Live-verified on the controller; default flag stays on default-1080.
+
 ## Done (bin folder distribution via GitHub — encode-bin repo)
 
 - Public repo badskater/encode-bin: source of truth + distribution for the

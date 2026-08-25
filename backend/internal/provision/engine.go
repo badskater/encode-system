@@ -260,6 +260,11 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	if ansibleBin == "" {
 		ansibleBin = "ansible-playbook"
 	}
+	// Startup marker: proves log-appends reach the DB before ansible even
+	// starts, so an empty final log is never ambiguous (it means ansible
+	// produced nothing, not that the plumbing dropped it).
+	_ = e.Store.AppendProvisionRunLog(bg, id,
+		"[controller] launching ansible-playbook ("+ansibleBin+")\n")
 	cmd := exec.CommandContext(ctx, ansibleBin,
 		"-i", filepath.Join(dir, "inventory.yml"),
 		"-e", "@"+filepath.Join(dir, "vars.yml"),

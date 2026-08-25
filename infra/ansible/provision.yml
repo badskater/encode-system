@@ -101,11 +101,15 @@
             url: https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Windows_x64.zip
             dest: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI.zip"
 
+        # win_unzip was removed from ansible.windows 3.x — Expand-Archive is
+        # native PowerShell and needs no module.
         - name: Extract MediaInfo
           when: not mediainfo_stat.stat.exists
-          ansible.windows.win_unzip:
-            src: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI.zip"
-            dest: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI"
+          ansible.windows.win_shell: |
+            Expand-Archive -LiteralPath "{{ encode_agent_dir }}\installers\MediaInfo_CLI.zip" `
+              -DestinationPath "{{ encode_agent_dir }}\installers\MediaInfo_CLI" -Force
+          register: mi_extract
+          changed_when: true
 
         - name: Install MediaInfo.exe
           when: not mediainfo_stat.stat.exists

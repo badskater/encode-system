@@ -150,6 +150,14 @@ func (s *Server) seedStepTemplates() error {
 			return fmt.Errorf("seed step template %s: %w", t.Key, err)
 		}
 	}
+	// Guarded factory upgrade: installs where the pre-FLAC mux template was
+	// already seeded keep it forever otherwise. Only untouched factory
+	// copies get the audio-selection upgrade.
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "mux", flow.MuxFactoryV1, flow.MuxTemplate()); err != nil {
+		return fmt.Errorf("upgrade mux template: %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded mux step template to the FLAC-aware factory version")
+	}
 	return nil
 }
 

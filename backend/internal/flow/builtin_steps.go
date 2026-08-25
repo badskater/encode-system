@@ -9,10 +9,13 @@ import "github.com/badskater/encode-system/backend/internal/model"
 // mux steps.
 const EncodeHevcName = "1080.hevc"
 
-// AudioWavName / AudioOpusName are the audio intermediate/final contract.
+// AudioWavName / AudioOpusName / AudioFlacName are the audio
+// intermediate/final contracts. The mux step consumes whichever of the two
+// finals is present (newest wins when both exist).
 const (
 	AudioWavName  = "audio.wav"
 	AudioOpusName = "audio.opus"
+	AudioFlacName = "audio.flac"
 )
 
 // BuiltinStepTemplates returns the seeded step templates. They are
@@ -25,6 +28,7 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		dgindexTemplate(),
 		audioTemplate(),
 		audioBranchTemplate(),
+		flacAudioTemplate(),
 		encodeTemplate(),
 		muxTemplate(),
 		crc32RenameTemplate(),
@@ -159,6 +163,58 @@ func audioTemplate() *model.StepTemplate {
 	}
 }
 
+func flacAudioTemplate() *model.StepTemplate {
+	return &model.StepTemplate{
+		Key:         "flac_audio",
+		Label:       "Audio (eac3to → FLAC)",
+		Description: "Demux one track straight to lossless FLAC with eac3to's built-in FLAC encoder. No WAV intermediate; the native bit depth is kept unless down16 is set (eac3to has no FLAC compression-level switch).",
+		Builtin:     true,
+		Params: []model.ParamDef{
+			{Key: "track", Label: "eac3to track index", Type: "number", Default: "2"},
+			{Key: "down16", Label: "Downconvert bit depth (eac3to -down16, TPDF dither)", Type: "bool", Default: "false"},
+		},
+		PowerShell: `function Invoke-FlacAudio {
+    param(
+        [Parameter(Mandatory=$true)] [pscustomobject] $Job,
+        [pscustomobject] $Params
+    )
+    Write-Output "ENCODE_STEP flac_audio 0"
+    $track = if ($Params.track) { $Params.track } else { '2' }
+    $eac3to = Resolve-Tool $Job.BinDir 'eac3to.exe'
+    $src = Find-SourceFile $Job.EpisodeDir
+    $flac = Join-Path $Job.EpisodeDir 'audio.flac'  # AudioFlacName contract
+
+    if ((Test-Path -LiteralPath $flac) -and ((Get-Item -LiteralPath $flac).LastWriteTime -gt (Get-Item -LiteralPath $src).LastWriteTime)) {
+        Write-Output "audio.flac already present and newer than source, reusing"
+        Write-Output "ENCODE_STEP flac_audio 100"
+        return
+    }
+    if (Test-Path -LiteralPath $flac) {
+        Write-Output "audio.flac is stale (older than source), re-extracting"
+        Remove-Item -LiteralPath $flac -Force
+    }
+
+    Write-Output "ENCODE_STEP flac_audio 10"
+    # eac3to v3.34 encodes FLAC itself when the destination ends in .flac
+    # (verified against the tool's own option list: there is NO FLAC
+    # compression-level switch). -down16 is appended only on request so
+    # lossless sources keep their native bit depth by default.
+    $args = @($src, "${track}:", $flac)
+    if ($Params.down16 -eq 'true') { $args += '-down16' }
+    Invoke-Tool -ExePath $eac3to -Arguments $args -Label 'eac3to'
+    if (-not (Test-Path -LiteralPath $flac)) {
+        throw "eac3to finished but $flac was not created (check track index $track)"
+    }
+    $size = (Get-Item -LiteralPath $flac).Length
+    if ($size -lt 1024) {
+        throw "audio.flac is suspiciously small ($size bytes) — eac3to likely found no audio on track $track"
+    }
+    Write-Output "flac_audio done: $size bytes"
+    Write-Output "ENCODE_STEP flac_audio 100"
+}`,
+	}
+}
+
 func encodeTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "encode",
@@ -251,11 +307,50 @@ func encodeTemplate() *model.StepTemplate {
 	}
 }
 
+// MuxFactoryV1 is the factory mux script shipped before FLAC audio support.
+// Boot uses it for a guarded upgrade: the template is only replaced when the
+// stored script still equals this version byte-for-byte (user edits block
+// the upgrade and stay in effect).
+// MuxTemplate returns the current factory mux template (exported for the
+// guarded factory upgrade in boot seeding).
+func MuxTemplate() *model.StepTemplate { return muxTemplate() }
+
+const MuxFactoryV1 = `function Invoke-Mux {
+    param(
+        [Parameter(Mandatory=$true)] [pscustomobject] $Job,
+        [pscustomobject] $Params
+    )
+    Write-Output "ENCODE_STEP mux 0"
+    $mkvmerge = Resolve-Tool $Job.BinDir 'mkvmerge.exe'
+    $hevc = $Job.HevcFile
+    $audio = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
+    $out = Join-Path $Job.EpisodeDir $Job.OutputName
+    foreach ($f in @($hevc, $audio)) {
+        if (-not (Test-Path -LiteralPath $f)) { throw "mux input missing: $f" }
+    }
+    $arguments = @(
+        '-o', $out, '--quiet',
+        '--language', '0:jpn', '--track-name', '0:Video',
+        '--default-track', '0:yes', '--forced-track', '0:no',
+        '-d', '0', '-A', '-S', '-T', '--no-global-tags', '--no-chapters',
+        '(', $hevc, ')',
+        '--language', '0:jpn', '--track-name', '0:Audio', '--forced-track', '0:no',
+        '-a', '0', '-D', '-S', '-T', '--no-global-tags', '--no-chapters',
+        '(', $audio, ')',
+        '--track-order', '0:0,1:0'
+    )
+    Invoke-Tool -ExePath $mkvmerge -Arguments $arguments -Label 'mkvmerge'
+    if (-not (Test-Path -LiteralPath $out)) {
+        throw "mkvmerge finished but $out was not created"
+    }
+    Write-Output "ENCODE_STEP mux 100"
+}`
+
 func muxTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "mux",
 		Label:       "MKV mux",
-		Description: "mkvmerge video + Opus audio with the standard track flags.",
+		Description: "mkvmerge video + the produced audio track (audio.flac preferred when both exist, newest wins) with the standard track flags.",
 		Builtin:     true,
 		Params:      []model.ParamDef{},
 		PowerShell: `function Invoke-Mux {
@@ -266,7 +361,29 @@ func muxTemplate() *model.StepTemplate {
     Write-Output "ENCODE_STEP mux 0"
     $mkvmerge = Resolve-Tool $Job.BinDir 'mkvmerge.exe'
     $hevc = $Job.HevcFile
-    $audio = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
+    # Audio selection: the flow decides the codec by running an audio step
+    # (opus or flac); mux consumes whichever final exists. When BOTH exist
+    # (a flow switched between codecs), the newest one wins — muxing the
+    # leftover stale track would silently ship yesterday's audio. Ties go
+    # to FLAC (lossless).
+    $opus = Join-Path $Job.EpisodeDir 'audio.opus'  # AudioOpusName contract
+    $flac = Join-Path $Job.EpisodeDir 'audio.flac'  # AudioFlacName contract
+    $opusExists = Test-Path -LiteralPath $opus
+    $flacExists = Test-Path -LiteralPath $flac
+    if ($opusExists -and $flacExists) {
+        if ((Get-Item -LiteralPath $flac).LastWriteTime -ge (Get-Item -LiteralPath $opus).LastWriteTime) {
+            $audio = $flac
+        } else {
+            $audio = $opus
+        }
+    } elseif ($flacExists) {
+        $audio = $flac
+    } elseif ($opusExists) {
+        $audio = $opus
+    } else {
+        throw "no audio track found in $($Job.EpisodeDir) (expected audio.flac or audio.opus — check the flow has an audio step)"
+    }
+    Write-Output "muxing audio track: $(Split-Path $audio -Leaf)"
     $out = Join-Path $Job.EpisodeDir $Job.OutputName
     foreach ($f in @($hevc, $audio)) {
         if (-not (Test-Path -LiteralPath $f)) { throw "mux input missing: $f" }

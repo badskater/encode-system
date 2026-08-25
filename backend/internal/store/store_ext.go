@@ -183,6 +183,34 @@ func (s *Store) SetProvisionRunStatus(ctx context.Context, id int64, status, err
 	return err
 }
 
+// UpgradeStepTemplateIfFactory replaces a builtin template's factory version
+// with a new one — but ONLY when the stored script still matches the old
+// factory version byte-for-byte. A template the user edited in the UI never
+// matches, so customizations survive factory upgrades. Returns whether the
+// upgrade was applied.
+func (s *Store) UpgradeStepTemplateIfFactory(ctx context.Context, key, oldPowerShell string, t *model.StepTemplate) (bool, error) {
+	if t.Params == nil {
+		t.Params = []model.ParamDef{}
+	}
+	pb, err := json.Marshal(t.Params)
+	if err != nil {
+		return false, fmt.Errorf("marshal params: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE step_templates
+		 SET label = ?, description = ?, params_json = ?, powershell = ?, updated_at = datetime('now')
+		 WHERE key = ? AND builtin = 1 AND powershell = ?`,
+		t.Label, t.Description, string(pb), t.PowerShell, key, oldPowerShell)
+	if err != nil {
+		return false, fmt.Errorf("upgrade step template: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // PruneProvisionRuns keeps only the most recent keep rows. Each row carries
 // a full run log, so the table must not grow without bound across the
 // controller's lifetime. Finished runs are pruned first (never a live one).

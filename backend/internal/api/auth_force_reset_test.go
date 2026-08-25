@@ -4,9 +4,11 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
 )
@@ -50,6 +52,20 @@ func TestForceAdminPasswordRecoveryHatch(t *testing.T) {
 		t.Fatal("original password broken by non-forced boot")
 	}
 
+	// Mint a session before the force reset: it must NOT survive (a reset
+	// may follow a compromise; stale/stolen sessions must die).
+	u, err := st.UserByUsername(ctxBg(), "admin")
+	if err != nil || u == nil {
+		t.Fatal("admin lookup failed")
+	}
+	staleTok, err := auth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctxBg(), auth.HashToken(staleTok), u.ID, time.Now().UTC().Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
 	// Boot 3: force flag set — hash overwritten with the env password.
 	if err := mk("recovery-pass-42", true); err != nil {
 		t.Fatal(err)
@@ -59,6 +75,9 @@ func TestForceAdminPasswordRecoveryHatch(t *testing.T) {
 	}
 	if pwOK(t, st, "admin", "original-pass-1") {
 		t.Fatal("old password survived a force reset")
+	}
+	if s, err := st.SessionByTokenHash(ctxBg(), auth.HashToken(staleTok)); err != nil || s != nil {
+		t.Fatal("pre-reset session survived the force reset")
 	}
 }
 

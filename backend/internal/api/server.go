@@ -97,7 +97,11 @@ func (s *Server) seedAdminUser() error {
 		// the stored hash so an operator who lost the password can get back
 		// in, then rotate from the UI and remove the env again. Without the
 		// flag an existing account is never touched by env values.
-		if s.Cfg.ForceAdminPassword && s.Cfg.AdminPassword != "" {
+		if s.Cfg.ForceAdminPassword {
+			if s.Cfg.AdminPassword == "" {
+				s.Log.Error("ENCODE_ADMIN_FORCE_PASSWORD is set but ENCODE_ADMIN_PASSWORD is empty — recovery skipped", "username", username)
+				return nil
+			}
 			hash, err := bcrypt.GenerateFromPassword([]byte(s.Cfg.AdminPassword), bcrypt.DefaultCost)
 			if err != nil {
 				return err
@@ -105,7 +109,12 @@ func (s *Server) seedAdminUser() error {
 			if err := s.Store.UpdateUserPassword(ctxBg(), existing.ID, string(hash)); err != nil {
 				return err
 			}
-			s.Log.Warn("admin password force-reset from environment (recovery hatch) — rotate it from the UI and unset the env", "username", username)
+			// A force-reset may follow a compromise, not just a lost
+			// password: revoke EVERY session so no pre-reset token survives.
+			if err := s.Store.DeleteUserSessions(ctxBg(), existing.ID, ""); err != nil {
+				s.Log.Warn("revoke sessions after force-reset", "err", err)
+			}
+			s.Log.Error("admin password FORCE-RESET from environment (recovery hatch) — rotate it from the UI and UNSET both env vars; leaving the flag set re-applies this password on every restart", "username", username)
 		}
 		return nil // already provisioned
 	}

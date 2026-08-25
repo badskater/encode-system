@@ -147,6 +147,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 // endpoint already throttles brute force.
 const minPasswordLen = 10
 
+// maxPasswordBytes caps input at bcrypt's own limit: the algorithm silently
+// truncates beyond 72 bytes, which would alias distinct long passwords.
+// Reject instead so the user's secret is exactly what they typed.
+const maxPasswordBytes = 72
+
 type changePasswordRequest struct {
 	Current string `json:"current_password"`
 	New     string `json:"new_password"`
@@ -160,6 +165,15 @@ type changePasswordRequest struct {
 // source of truth.
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFromCtx(r)
+	// Gate BEFORE any bcrypt work: without this, a session holder could
+	// brute-force the current password unthrottled (each attempt costs a
+	// full bcrypt comparison) and the endpoint would never honor the lockout
+	// it feeds.
+	if ok, wait := s.throttle.allow(); !ok {
+		writeErr(w, http.StatusTooManyRequests,
+			"too many failed attempts; retry in "+wait.Round(time.Second).String())
+		return
+	}
 	var req changePasswordRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -171,6 +185,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.New) < minPasswordLen {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("new password must be at least %d characters", minPasswordLen))
+		return
+	}
+	if len([]byte(req.New)) > maxPasswordBytes {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("new password must be at most %d bytes (bcrypt truncates beyond that)", maxPasswordBytes))
 		return
 	}
 	if req.New == req.Current {

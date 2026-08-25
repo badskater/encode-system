@@ -92,10 +92,24 @@ export const api = {
     }),
   logout: () => request<void>('POST', '/api/auth/logout'),
   me: () => request<{ username: string; expires_at: string }>('GET', '/api/auth/me'),
+  // Raw fetch (not the request() wrapper): this endpoint's 401 means "wrong
+  // CURRENT password", which must surface as an inline error — not trigger
+  // the session-expired bounce that request() applies to every other 401.
   changePassword: (currentPassword: string, newPassword: string) =>
-    request<{ status: string }>('POST', '/api/auth/password', {
-      current_password: currentPassword,
-      new_password: newPassword,
+    fetch('/api/auth/password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: AUTH_PREFIX + sessionValue(),
+      },
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `${res.status}: password change failed`);
+      return data as { status: string };
     }),
 
   nodes: () => request<Node[]>('GET', '/api/nodes'),

@@ -24,6 +24,10 @@ services:
       # After first boot the account hash lives in the database; rotate it
       # from the UI (Change password) and delete this line from .env.
       ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:-}
+      # Lost-password recovery hatch: with =1, ENCODE_ADMIN_PASSWORD overwrites
+      # the stored hash on startup (ERROR-logged, all sessions revoked).
+      # Rotate via the UI immediately after, then unset BOTH vars.
+      ENCODE_ADMIN_FORCE_PASSWORD: ${ENCODE_ADMIN_FORCE_PASSWORD:-}
       ENCODE_DATA: /data
       ENCODE_SCRIPTS_ROOT: /data/scripts
       ENCODE_RELEASE_ROOT: /data/release

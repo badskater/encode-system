@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +140,43 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	got, _ = doJSON(t, "GET", ts.URL+"/api/nodes", s2.Token, nil)
 	if got.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("stale session survived password change: %d", got.StatusCode)
+	}
+}
+
+func TestChangePasswordHonorsThrottleLockout(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	resp, body := doLogin(t, ts.URL, "admin", adminPassword)
+	var lr loginResp
+	mustUnmarshal(t, body, &lr)
+
+	// Drive the endpoint itself into lockout with wrong-current attempts.
+	for i := 0; i < maxFailedLogins; i++ {
+		resp, _ = doChangePassword(t, ts.URL, lr.Token, "wrong", "new-secret-12345")
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: want 401, got %d", i, resp.StatusCode)
+		}
+	}
+	// Next attempt must be 429 even with the CORRECT current password.
+	resp, _ = doChangePassword(t, ts.URL, lr.Token, adminPassword, "new-secret-12345")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("want 429 during lockout, got %d", resp.StatusCode)
+	}
+}
+
+func TestChangePasswordRejectsOverlong(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	resp, body := doLogin(t, ts.URL, "admin", adminPassword)
+	var lr loginResp
+	mustUnmarshal(t, body, &lr)
+
+	long := strings.Repeat("a", 73) // bcrypt truncates at 72 bytes
+	resp, _ = doChangePassword(t, ts.URL, lr.Token, adminPassword, long)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for >72-byte password, got %d", resp.StatusCode)
 	}
 }
 

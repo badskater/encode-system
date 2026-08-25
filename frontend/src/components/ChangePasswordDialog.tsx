@@ -14,6 +14,7 @@ export default function ChangePasswordDialog({ onClose }: { onClose: () => void 
   const [busy, setBusy] = useState(false);
 
   async function submit() {
+    if (busy || success) return; // Enter key-repeat / double-click guard
     setError('');
     if (!current || !next) {
       setError('All fields are required.');
@@ -36,7 +37,7 @@ export default function ChangePasswordDialog({ onClose }: { onClose: () => void 
       await api.changePassword(current, next);
       setSuccess(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : 'Password change failed');
+      setError(e instanceof Error ? e.message : 'Password change failed');
     } finally {
       setBusy(false);
     }
@@ -44,14 +45,17 @@ export default function ChangePasswordDialog({ onClose }: { onClose: () => void 
 
   if (success) {
     return (
-      <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-backdrop" onClick={onClose} role="dialog" aria-modal="true">
         <div className="card modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
           <h3>Password changed</h3>
           <p className="muted">
             Your password was updated and every other active session was signed
             out. You can now remove <code>ENCODE_ADMIN_PASSWORD</code> from the
             controller&apos;s <code>.env</code> — the account hash in the
-            database is the only source of truth.
+            database is the only source of truth. (If you ever lose this
+            password, the recovery hatch is <code>ENCODE_ADMIN_FORCE_PASSWORD=1</code>{' '}
+            with a temporary <code>ENCODE_ADMIN_PASSWORD</code> — see the
+            deployment docs.)
           </p>
           <div className="toolbar">
             <button className="btn primary" onClick={onClose}>
@@ -64,7 +68,7 @@ export default function ChangePasswordDialog({ onClose }: { onClose: () => void 
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={() => !busy && onClose()} role="dialog" aria-modal="true">
       <div className="card modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
         <h3>Change password</h3>
         <p className="muted">
@@ -100,7 +104,7 @@ export default function ChangePasswordDialog({ onClose }: { onClose: () => void 
             style={{ width: '100%' }}
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && submit()}
+            onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && submit()}
           />
         </label>
         <div className="toolbar">

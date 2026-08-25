@@ -47,12 +47,16 @@ describe('ChangePasswordDialog', () => {
 
     await waitFor(() => expect(screen.getByText('Password changed')).toBeInTheDocument());
     expect(spy).toHaveBeenCalledWith('old-secret-1', 'new-secret-123');
-    // Success screen advises removing the env password.
-    expect(screen.getByText(/ENCODE_ADMIN_PASSWORD/)).toBeInTheDocument();
+    // Success screen advises removing the env password (twice: the advice
+    // itself and the recovery-hatch note reference it).
+    expect(screen.getAllByText(/ENCODE_ADMIN_PASSWORD/).length).toBeGreaterThanOrEqual(1);
   });
 
-  it('surfaces server errors (wrong current password)', async () => {
-    vi.spyOn(api, 'changePassword').mockRejectedValue(new Error('401: current password is incorrect'));
+  it('surfaces server errors (wrong current password stays inline)', async () => {
+    // changePassword uses raw fetch (not the session wrapper), so a 401 here
+    // means "wrong CURRENT password" and surfaces as the server's error text —
+    // the dialog must stay mounted and show it, not bounce to login.
+    vi.spyOn(api, 'changePassword').mockRejectedValue(new Error('current password is incorrect'));
     render(<ChangePasswordDialog onClose={() => {}} />);
 
     fireEvent.change(screen.getByLabelText(/current password/i), { target: { value: 'wrong-old' } });
@@ -61,6 +65,8 @@ describe('ChangePasswordDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Change password' }));
 
     await waitFor(() => expect(screen.getByText('current password is incorrect')).toBeInTheDocument());
+    // Dialog still mounted: the heading is visible alongside the error.
+    expect(screen.getByRole('heading', { name: 'Change password' })).toBeInTheDocument();
   });
 
   it('closes on backdrop click', () => {

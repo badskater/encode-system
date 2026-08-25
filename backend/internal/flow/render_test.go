@@ -124,3 +124,25 @@ func TestStepOrderPreserved(t *testing.T) {
 		t.Error("step order not preserved (mux must come before encode in this flow)")
 	}
 }
+
+// TestDefault4kFlowStepsResolve: every step of the seeded 4K flow must map
+// to a builtin template — a step type without a template fails at render
+// time on a real job, so catch the mismatch here.
+func TestDefault4kFlowStepsResolve(t *testing.T) {
+	have := map[string]bool{}
+	for _, tpl := range BuiltinStepTemplates() {
+		have[tpl.Key] = true
+	}
+	fl := Default4kFlow()
+	if fl.Name != "default-4k" {
+		t.Fatalf("name = %q", fl.Name)
+	}
+	if len(fl.Steps) != 8 {
+		t.Fatalf("want 8 steps, got %d", len(fl.Steps))
+	}
+	for i, st := range fl.Steps {
+		if !have[st.TemplateKey()] {
+			t.Errorf("step %d (%s) has no builtin template", i, st.TemplateKey())
+		}
+	}
+}

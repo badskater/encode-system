@@ -200,25 +200,39 @@ func (s *Server) seedStepTemplates() error {
 	return nil
 }
 
-// seedDefaultFlow installs the standard 1080p flow on first boot and ensures
+// seedDefaultFlow installs the standard flows on first boot and ensures
 // exactly one flow carries the default flag. When no flow is default yet
 // (fresh installs and databases created before the flag existed), the
-// configured default flow takes the flag.
+// configured default flow takes the flag. Seeding is name-guarded: an
+// existing flow (factory or user-edited) is never touched.
 func (s *Server) seedDefaultFlow() error {
 	ctx := ctxBg()
-	if _, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err != nil {
+	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow()} {
+		if _, err := s.Store.FlowByName(ctx, seed.Name); err != nil {
+			if _, err := s.Store.CreateFlow(ctx, seed); err != nil {
+				return fmt.Errorf("seed flow %q: %w", seed.Name, err)
+			}
+			s.Log.Info("seeded flow", "name", seed.Name, "steps", len(seed.Steps))
+		}
+	}
+	fl, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName)
+	if err != nil {
+		// Compat: installs may configure a custom default-flow name via
+		// ENCODE_DEFAULT_FLOW; seed the 1080p factory flow under that name
+		// exactly as older builds did.
 		def := flow.DefaultFlow()
 		def.Name = s.Cfg.DefaultFlowName
 		if _, err := s.Store.CreateFlow(ctx, def); err != nil {
-			return fmt.Errorf("seed default flow: %w", err)
+			return fmt.Errorf("seed default flow %q: %w", def.Name, err)
 		}
-		s.Log.Info("seeded default flow", "name", def.Name, "steps", len(def.Steps))
-	}
-	if _, err := s.Store.DefaultFlow(ctx); err != nil {
-		fl, err := s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName)
-		if err != nil {
+		s.Log.Info("seeded flow", "name", def.Name, "steps", len(def.Steps))
+		if fl, err = s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err != nil {
 			return fmt.Errorf("resolve default flow: %w", err)
 		}
+	}
+	// Only mark the flag when no flow carries it yet — an operator's
+	// "make default" choice on the Flows page must survive restarts.
+	if _, err := s.Store.DefaultFlow(ctx); err != nil {
 		if err := s.Store.SetDefaultFlow(ctx, fl.ID); err != nil {
 			return fmt.Errorf("mark default flow: %w", err)
 		}

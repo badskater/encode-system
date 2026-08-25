@@ -325,15 +325,16 @@ func TestUIFlowCRUDViaAPI(t *testing.T) {
 		t.Fatalf("want 400 for invalid flow, got %d", resp2.StatusCode)
 	}
 
-	// List includes seeded default + the new flow.
+	// List includes the seeded flows (default-1080 + default-4k) + the new
+	// flow.
 	resp3, body3 := doJSON(t, "GET", ts.URL+"/api/flows", adminTok, nil)
 	if resp3.StatusCode != 200 {
 		t.Fatal(resp3.StatusCode)
 	}
 	var flows []model.Flow
 	json.Unmarshal(body3, &flows)
-	if len(flows) != 2 {
-		t.Fatalf("want 2 flows, got %d", len(flows))
+	if len(flows) != 3 {
+		t.Fatalf("want 3 flows (2 seeded + 1 created), got %d", len(flows))
 	}
 }
 

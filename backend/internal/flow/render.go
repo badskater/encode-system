@@ -78,6 +78,27 @@ func DefaultFlow() *model.Flow {
 	}
 }
 
+// Default4kFlow is the standard 2160p flow: same skeleton as the 1080p
+// default, with the HDR/4K chain — hdr_probe writes hdr.json (separate step
+// by design), audio_lang auto-selects the track by language priority, and
+// encode_4k consumes the sidecar (HDR10/HLG signaling or the Dolby Vision
+// RPU path). The mux reads audio.json for language tagging in both flows.
+func Default4kFlow() *model.Flow {
+	return &model.Flow{
+		Name: "default-4k",
+		Steps: []model.Step{
+			{Type: model.StepSourceRename, Params: map[string]string{"source_name": "src"}},
+			{Type: model.StepDGIndex},
+			{Type: model.StepType("hdr_probe")},
+			{Type: model.StepType("audio_lang"), Params: map[string]string{"languages": "jpn,eng", "bitrate": "320"}},
+			{Type: model.StepType("encode_4k")},
+			{Type: model.StepMux},
+			{Type: model.StepReleaseCopy},
+			{Type: model.StepKeyframes},
+		},
+	}
+}
+
 // psQuote renders a PowerShell single-quoted string literal, escaping embedded
 // single quotes by doubling them. All rendered values pass through here, which
 // keeps generated scripts injection-safe for arbitrary series names.

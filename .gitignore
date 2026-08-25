@@ -33,3 +33,7 @@ Thumbs.db
 # Test/coverage artifacts
 coverage/
 *.log
+# Core dumps (debug artifacts — they contain process memory incl. credentials; never commit)
+core
+core.*
+*.core

@@ -156,20 +156,25 @@
           changed_when: true
 
         # --- VapourSynth R79 (official NSIS installer, per operator choice) ---
-        - name: Check VapourSynth
-          ansible.windows.win_reg_stat:
-            path: HKLM:\SOFTWARE\VapourSynth
-          register: vs_stat
+        # Functional idempotency check: what matters is that the system
+        # Python can import vapoursynth (the installer registers its module
+        # into the detected Python; registry keys vary between releases).
+        - name: Check VapourSynth (python import)
+          ansible.windows.win_shell: |
+            & 'C:\Program Files\Python314\python.exe' -c "import vapoursynth" 2>$null
+            exit $LASTEXITCODE
+          register: vs_check
           failed_when: false
+          changed_when: false
 
         - name: Download VapourSynth installer
-          when: vs_stat is not mapping or not (vs_stat.exists | default(false))
+          when: vs_check.rc != 0
           ansible.windows.win_get_url:
             url: https://github.com/vapoursynth/vapoursynth/releases/download/R79/VapourSynth-x64-R79.exe
             dest: "{{ encode_agent_dir }}\\installers\\VapourSynth.exe"
 
         - name: Install VapourSynth (silent NSIS)
-          when: vs_stat is not mapping or not (vs_stat.exists | default(false))
+          when: vs_check.rc != 0
           ansible.windows.win_shell: |
             & "{{ encode_agent_dir }}\installers\VapourSynth.exe" /S
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

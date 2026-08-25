@@ -27,6 +27,13 @@ Mirror of the session task list. Move cards through columns as work lands.
   the endpoint (old 401, new works), removed the password line from the
   host's .env, recreated the container — login now runs purely off the DB
   hash; nodes/jobs/templates all intact.
+- Adversarial review round-trip (GLM + DeepSeek, both diffs): fixed the
+  401-bounce swallowing wrong-current-password errors (raw fetch), throttle
+  now GATES the change endpoint (bcrypt oracle closed), 72-byte bcrypt cap,
+  force-reset revokes all sessions + ERROR log + compose wiring, dialog
+  re-entrancy/backdrop/IME guards. Rejected: session-revocation TOCTOU and
+  non-transactional update+revoke (sub-second race inherent to
+  middleware-time session auth; requires DB failure to bite).
 
 ## Done (FileFlows-style plugins + fully editable steps)
 

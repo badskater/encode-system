@@ -87,8 +87,8 @@ type ProvisionRun struct {
 	WinRMUser     string     `json:"winrm_user"`
 	NodeName      string     `json:"node_name"` // desired agent/node name
 	Status        string     `json:"status"`    // queued|running|success|failed
-	OptionsJSON   string     `json:"-"`         // run options snapshot (no secrets)
-	Log           string     `json:"-"`         // full ansible output (served via API tail)
+	OptionsJSON   string     `json:"-"`              // run options snapshot (no secrets)
+	Log           string     `json:"log,omitempty"`  // full ansible output (single-run GET only)
 	Error         string     `json:"error,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`

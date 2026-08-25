@@ -1,6 +1,7 @@
 package update
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -62,5 +63,52 @@ func TestEmptyManifestWhenNoPayloads(t *testing.T) {
 	m := s.Manifest()
 	if m.AgentVersion != "" || m.LibVersion != 0 {
 		t.Fatalf("expected empty manifest: %+v", m)
+	}
+}
+
+// Regression (live deployment): publishing agent + bin but NEVER EncodeLib
+// used to make loadFromDisk discard the WHOLE manifest on restart (it
+// required every payload to exist), orphaning the published payloads and
+// resetting fleet-deployed versions. Payload recovery must be independent.
+func TestManifestSurvivesRestartWithPartialPayloads(t *testing.T) {
+	dir := t.TempDir()
+	s1, _ := NewStore(dir)
+	s1.PublishAgent("0.8.1", strings.NewReader("agent-bytes"))
+	s1.PublishBin(1, strings.NewReader("zip-bytes"))
+	// Deliberately NO PublishLib.
+
+	s2, err := NewStore(dir) // simulated controller restart
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := s2.Manifest()
+	if m.AgentVersion != "0.8.1" {
+		t.Errorf("agent entry lost on restart: %+v", m)
+	}
+	if m.BinVersion != 1 || m.BinSHA256 == "" {
+		t.Errorf("bin entry lost on restart: %+v", m)
+	}
+	if m.LibVersion != 0 {
+		t.Errorf("lib should stay unpublished: %+v", m)
+	}
+}
+
+// A payload deleted from disk must clear only ITS OWN entry.
+func TestManifestClearsOnlyVanishedPayload(t *testing.T) {
+	dir := t.TempDir()
+	s1, _ := NewStore(dir)
+	s1.PublishAgent("0.8.1", strings.NewReader("agent-bytes"))
+	s1.PublishBin(1, strings.NewReader("zip-bytes"))
+
+	if err := os.Remove(dir + "/bin-package.zip"); err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := NewStore(dir)
+	m := s2.Manifest()
+	if m.AgentVersion != "0.8.1" {
+		t.Errorf("agent entry must survive bin removal: %+v", m)
+	}
+	if m.BinVersion != 0 || m.BinSHA256 != "" {
+		t.Errorf("vanished bin must be cleared: %+v", m)
 	}
 }

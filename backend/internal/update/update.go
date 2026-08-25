@@ -44,7 +44,12 @@ func (s *Store) versionPath() string {
 	return filepath.Join(s.dir, "manifest.json")
 }
 
-// loadFromDisk rebuilds the manifest from previously stored payloads.
+// loadFromDisk rebuilds the manifest from previously stored payloads. Each
+// payload type is restored INDEPENDENTLY: a fleet may publish only some of
+// them (e.g. agent + bin but never EncodeLib), and a missing payload must
+// only invalidate ITS OWN entry — not the whole manifest. Discarding
+// everything because one payload was never published is what orphans the
+// others on every restart.
 func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	b, err := os.ReadFile(s.versionPath())
 	if err != nil {
@@ -54,23 +59,26 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return model.UpdateManifest{}, false
 	}
-	// Payloads must still exist, otherwise the manifest is stale.
-	if _, err := os.Stat(s.agentPath()); err != nil {
-		return model.UpdateManifest{}, false
+	// Agent payload: recompute the hash from what is actually on disk; a
+	// vanished payload clears its entry.
+	if _, err := os.Stat(s.agentPath()); err == nil {
+		if h, err := fileSHA256(s.agentPath()); err == nil {
+			m.AgentSHA256 = h
+		}
+	} else {
+		m.AgentVersion = ""
+		m.AgentSHA256 = ""
 	}
-	if _, err := os.Stat(s.libPath()); err != nil {
-		return model.UpdateManifest{}, false
+	// EncodeLib payload (often never published — that is fine).
+	if _, err := os.Stat(s.libPath()); err == nil {
+		if h, err := fileSHA256(s.libPath()); err == nil {
+			m.LibSHA256 = h
+		}
+	} else {
+		m.LibVersion = 0
+		m.LibSHA256 = ""
 	}
-	// Recompute hashes from what is actually on disk: if a payload was
-	// replaced or tampered with after publish, agents must receive the real
-	// hash, not a stale recorded one.
-	if h, err := fileSHA256(s.agentPath()); err == nil {
-		m.AgentSHA256 = h
-	}
-	if h, err := fileSHA256(s.libPath()); err == nil {
-		m.LibSHA256 = h
-	}
-	// Bin package is optional (a fleet can pre-install tools manually).
+	// Bin package.
 	if fi, err := os.Stat(s.binPath()); err == nil {
 		if h, err := fileSHA256(s.binPath()); err == nil {
 			m.BinSHA256 = h

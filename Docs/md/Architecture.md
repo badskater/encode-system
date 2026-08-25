@@ -55,7 +55,15 @@ node-side install.
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
-  `crc32_rename`, `release_copy`, `keyframes`.
+  `crc32_rename`, `release_copy`, `keyframes`, `discord_notify`.
+- **Discord notification step**: `discord_notify` posts an episode-progress
+  message to a Discord webhook when the flow reaches it (e.g. after mux or
+  release copy). Webhook resolution: flow param first, then the controller's
+  `ENCODE_DISCORD_WEBHOOK` injected into the `$Job` context at render time.
+  Best-effort: unreachable webhooks warn, never fail the encode; a URL
+  guard limits targets to discord.com/discordapp.com webhooks plus loopback
+  (mock testing). Distinct from the controller's job-outcome alerts
+  (`notify` package), which fire on done/failed.
 - **HDR/4K chain**: `hdr_probe` (a separate flow step) writes `hdr.json`
   (HDR10/HLG/DoVi detection from MediaInfo); `encode_4k` (2160p x265, CTU 64
   defaults) consumes the sidecar — it never probes the source itself.

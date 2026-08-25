@@ -24,6 +24,11 @@ type Vars struct {
 	ReleaseDir string // NFS release mount on the node, e.g. C:\Encodes\ReleaseFolders
 	Group      string // release group tag, e.g. OldFartsSubs
 	Tag        string // quality tag, e.g. 1080p
+	// DiscordWebhook is the controller's configured webhook (env). It is
+	// injected into the $Job context so the discord_notify step can fall
+	// back to it when a flow does not set its own webhook param. Empty =
+	// no global webhook; the step then relies on its param (or no-ops).
+	DiscordWebhook string
 }
 
 // TemplateResolver looks up a step template by key. Controllers resolve from
@@ -200,6 +205,7 @@ func Render(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver) (stri
 	b.WriteString("    ReleaseDir = $ReleaseDir; Group = " + psQuote(v.Group) + "; Tag = " + psQuote(v.Tag) + "\n")
 	b.WriteString("    OutputName = $OutputName; ReleaseFolder = $ReleaseFolder\n")
 	b.WriteString("    HevcFile = $HevcFile; AudioFile = $AudioFile\n")
+	b.WriteString("    DiscordWebhook = " + psQuote(v.DiscordWebhook) + "\n")
 	b.WriteString("    DefaultX265Args = $DefaultX265Args\n")
 	b.WriteString("}\n\n")
 

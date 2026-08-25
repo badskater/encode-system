@@ -13,6 +13,20 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Discord notification flow step)
+
+- New discord_notify step: posts an episode-progress message to a Discord
+  webhook when the flow reaches it. Webhook from the step param, falling
+  back to the controller's ENCODE_DISCORD_WEBHOOK injected into $Job at
+  render time (no per-flow pasting). Best-effort: unreachable webhook =
+  warning, encode continues. URL guard (discord.com/discordapp.com +
+  loopback) blocks exfiltration to arbitrary hosts; 2000-char Discord cap
+  handled; UTF-8 body for unicode series names (WebClient, PS 5.1-safe).
+- pwsh E2E vs a real mock webhook server: param path, controller fallback,
+  polite no-op skip, unreachable-webhook warning, exfil guard — all covered.
+- Distinct from the controller's job-outcome alerts (notify package), which
+  fire on done/failed regardless of the flow.
+
 ## Done (Dolby Vision RPU in encode_4k)
 
 - encode_4k consumes hdr.json from the separate hdr_probe step (no probing

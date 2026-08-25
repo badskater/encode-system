@@ -37,6 +37,7 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		crc32RenameTemplate(),
 		releaseCopyTemplate(),
 		keyframesTemplate(),
+		discordNotifyTemplate(),
 	}
 }
 

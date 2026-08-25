@@ -199,11 +199,12 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 		tag = sr.Tag
 	}
 	vars := flow.Vars{
-		BinDir:     st.NodeBinDir,
-		ScriptsDir: st.NodeScriptsDir,
-		ReleaseDir: st.NodeReleaseDir,
-		Group:      st.Group,
-		Tag:        tag,
+		BinDir:         st.NodeBinDir,
+		ScriptsDir:     st.NodeScriptsDir,
+		ReleaseDir:     st.NodeReleaseDir,
+		Group:          st.Group,
+		Tag:            tag,
+		DiscordWebhook: s.Cfg.DiscordWebhook,
 	}
 	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {

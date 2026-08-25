@@ -19,15 +19,21 @@ import (
 // maxPublishBytes caps each payload upload: agent ~50 MiB, lib tiny, bin
 // packages up to 1 GiB (a full tools folder with x265/eac3to/etc).
 const (
-	maxAgentPublishBytes = 64 << 20   // 64 MiB
-	maxLibPublishBytes   = 4 << 20    // 4 MiB
-	maxBinPublishBytes   = 1 << 30    // 1 GiB
+	maxAgentPublishBytes = 64 << 20 // 64 MiB
+	maxLibPublishBytes   = 4 << 20  // 4 MiB
+	maxBinPublishBytes   = 1 << 30  // 1 GiB
+	// Multipart framing/version-field headroom on top of the payload cap for
+	// the MaxBytesReader request-body limit.
+	maxMultipartOverhead = 1 << 20 // 1 MiB
 )
 
 // handlePublishAgent uploads a new agent binary from the UI. Form fields:
 // version (string, required) + file (binary). Nodes adopt it on their next
 // idle heartbeat.
 func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
+	// Hard request-body cap: aborts the transfer mid-stream when exceeded,
+	// so an oversize upload never occupies controller disk or memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAgentPublishBytes+maxMultipartOverhead)
 	if err := r.ParseMultipartForm(maxAgentPublishBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "multipart parse: "+err.Error())
 		return
@@ -64,6 +70,7 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 // handlePublishLib uploads a new EncodeLib.ps1. Form fields: version (int
 // counter, must exceed the current one) + file.
 func (s *Server) handlePublishLib(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxLibPublishBytes+maxMultipartOverhead)
 	if err := r.ParseMultipartForm(maxLibPublishBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "multipart parse: "+err.Error())
 		return
@@ -104,6 +111,7 @@ func (s *Server) handlePublishLib(w http.ResponseWriter, r *http.Request) {
 // traversal) before it is stored — a corrupt or malicious package is
 // rejected at publish time, not on the worker.
 func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBinPublishBytes+maxMultipartOverhead)
 	if err := r.ParseMultipartForm(maxBinPublishBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "multipart parse: "+err.Error())
 		return

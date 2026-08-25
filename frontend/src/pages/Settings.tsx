@@ -3,6 +3,27 @@ import { api } from '../api/client';
 import type { Settings, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
 
+// StringSettingKey = the Settings keys whose values are strings — the only
+// keys the free-text field() helper may edit. Number fields go through their
+// own inputs with explicit Number coercion, so a string can never be written
+// into a number field by accident.
+type StringSettingKey = {
+  [K in keyof Settings]-?: Settings[K] extends string | undefined ? K : never;
+}[keyof Settings];
+
+// Publish payload caps — mirror the server-side limits so an oversized or
+// mistyped file is rejected before a multi-GB upload even starts.
+const MAX_AGENT_BYTES = 64 * 1024 * 1024; // 64 MiB
+const MAX_LIB_BYTES = 4 * 1024 * 1024;    // 4 MiB
+const MAX_BIN_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
+function checkPayload(file: File, maxBytes: number, kind: string): string | null {
+  if (file.size > maxBytes) {
+    return `${kind} is ${(file.size / 1048576).toFixed(1)} MiB — the limit is ${(maxBytes / 1048576).toFixed(0)} MiB`;
+  }
+  return null;
+}
+
 // clampInt coerces a possibly-NaN/out-of-range number input into [lo, hi].
 function clampInt(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;
@@ -81,6 +102,11 @@ export default function SettingsPage() {
     setSettings((s) => (s ? { ...s, [key]: value } : s));
   }
 
+  // String-only variant for the free-text field() helper.
+  function setString(key: StringSettingKey, value: string) {
+    setSettings((s) => (s ? { ...s, [key]: value } : s));
+  }
+
   async function save() {
     if (!settings) return;
     setSaving(true);
@@ -112,18 +138,24 @@ export default function SettingsPage() {
     try {
       if (kind === 'agent') {
         if (!agentFile || !agentVersion.trim()) throw new Error('agent version + file are required');
+        const tooBig = checkPayload(agentFile, MAX_AGENT_BYTES, 'agent binary');
+        if (tooBig) throw new Error(tooBig);
         await api.publishAgent(agentVersion.trim(), agentFile);
         setAgentFile(null);
         setAgentVersion('');
         if (agentFileRef.current) agentFileRef.current.value = '';
       } else if (kind === 'lib') {
         if (!libFile || !/^\d+$/.test(libVersion)) throw new Error('lib needs a numeric version + file');
+        const tooBig = checkPayload(libFile, MAX_LIB_BYTES, 'EncodeLib');
+        if (tooBig) throw new Error(tooBig);
         await api.publishLib(Number(libVersion), libFile);
         setLibFile(null);
         setLibVersion('');
         if (libFileRef.current) libFileRef.current.value = '';
       } else {
         if (!binFile || !/^\d+$/.test(binVersion)) throw new Error('bin needs a numeric version + file');
+        const tooBig = checkPayload(binFile, MAX_BIN_BYTES, 'bin package');
+        if (tooBig) throw new Error(tooBig);
         await api.publishBin(Number(binVersion), binFile);
         setBinFile(null);
         setBinVersion('');
@@ -140,14 +172,14 @@ export default function SettingsPage() {
     }
   }
 
-  const field = (label: string, hint: string, key: keyof Settings, placeholder = '') => (
+  const field = (label: string, hint: string, key: StringSettingKey, placeholder = '') => (
     <label style={{ display: 'block', marginBottom: 12 }}>
       <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
       <input
         style={{ width: '100%' }}
         value={String(settings[key] ?? '')}
         placeholder={placeholder}
-        onChange={(e) => set(key, e.target.value as never)}
+        onChange={(e) => setString(key, e.target.value)}
       />
       <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
     </label>

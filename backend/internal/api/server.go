@@ -17,6 +17,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
 )
@@ -43,12 +44,13 @@ type Config struct {
 
 // Server bundles dependencies for all handlers.
 type Server struct {
-	Store    *store.Store
-	Update   *update.Store
-	Log      *slog.Logger
-	Cfg      Config
-	Notify   notify.Notifier
-	throttle *loginThrottle
+	Store     *store.Store
+	Update    *update.Store
+	Log       *slog.Logger
+	Cfg       Config
+	Notify    notify.Notifier
+	Provision *provision.Engine // node provisioning (nil = unavailable)
+	throttle  *loginThrottle
 }
 
 // New builds the server and seeds the default flow when absent.
@@ -230,6 +232,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/pairing", s.withAdmin(s.handleListPairingCodes))
 	mux.HandleFunc("POST /api/pairing", s.withAdmin(s.handleCreatePairingCode))
 	mux.HandleFunc("POST /api/agent/pair", s.handleAgentPair)
+
+	// Node provisioning (controller-driven Ansible).
+	mux.HandleFunc("POST /api/provision", s.withAdmin(s.handleStartProvision))
+	mux.HandleFunc("GET /api/provision/runs", s.withAdmin(s.handleListProvisionRuns))
+	mux.HandleFunc("GET /api/provision/runs/{id}", s.withAdmin(s.handleGetProvisionRunLog))
 
 	mux.HandleFunc("GET /api/settings", s.withAdmin(s.handleGetSettings))
 	mux.HandleFunc("PUT /api/settings", s.withAdmin(s.handleUpdateSettings))

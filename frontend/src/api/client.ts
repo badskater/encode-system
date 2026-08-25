@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, Series, Settings, StepTemplate, UpdateManifest } from '../types';
+import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -148,6 +148,21 @@ export const api = {
   publishAgent: (version: string, file: File) => publishUpload('/api/updates/agent', version, file),
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
+
+  // Node provisioning (controller-driven Ansible).
+  startProvision: (req: {
+    host: string;
+    port?: number;
+    scheme?: string;
+    winrm_user?: string;
+    winrm_password: string;
+    node_name: string;
+    install_toolchain: boolean;
+    mount_nfs: boolean;
+    push_bin: boolean;
+  }) => request<ProvisionRun>('POST', '/api/provision', req),
+  provisionRuns: () => request<ProvisionRun[]>('GET', '/api/provision/runs'),
+  provisionRun: (id: number) => request<ProvisionRun>('GET', `/api/provision/runs/${id}`),
 
   nodes: () => request<Node[]>('GET', '/api/nodes'),
   createNode: (name: string) =>

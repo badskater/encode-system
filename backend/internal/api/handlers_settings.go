@@ -15,6 +15,7 @@ import (
 // database row exists yet, and as the template for PUT responses.
 func (s *Server) defaultsSettings() *model.Settings {
 	return &model.Settings{
+		ControllerURL:       "", // operator sets the externally-reachable URL
 		ScriptsRoot:         s.Cfg.ScriptsRoot,
 		ReleaseRoot:         s.Cfg.ReleaseRoot,
 		NodeBinDir:          s.Cfg.NodeBinDir,
@@ -104,6 +105,13 @@ func validateSettings(st *model.Settings) error {
 	}
 	if st.Tag == "" {
 		return errSettings("tag is required")
+	}
+	// Controller URL (what nodes dial): required for provisioning, must be
+	// an absolute http(s) URL. Empty is tolerated until someone provisions.
+	if cu := strings.TrimSpace(st.ControllerURL); cu != "" {
+		if !strings.HasPrefix(cu, "http://") && !strings.HasPrefix(cu, "https://") {
+			return errSettings("controller_url must start with http:// or https://")
+		}
 	}
 	// Node paths must be absolute Windows paths (drive letter or UNC);
 	// controller paths must be absolute Unix paths. A swapped mapping is the

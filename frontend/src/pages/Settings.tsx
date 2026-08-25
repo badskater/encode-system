@@ -192,6 +192,17 @@ export default function SettingsPage() {
       {notice && <div className="card" style={{ borderColor: '#2ea043' }}>{notice}</div>}
 
       <div className="card">
+        <h3 style={{ marginTop: 0 }}>Controller URL (as seen by nodes)</h3>
+        <p className="muted">
+          The address the Windows nodes use to reach this controller — the one
+          baked into every provisioned <code>agent.json</code>. Use the Docker
+          host's LAN IP (the container's own hostname is usually unreachable
+          from outside). Required before provisioning a node.
+        </p>
+        {field('Controller URL', 'e.g. http://172.24.92.232:8080', 'controller_url', 'http://172.24.92.232:8080')}
+      </div>
+
+      <div className="card">
         <h3 style={{ marginTop: 0 }}>NFS shares</h3>
         <p className="muted">
           Record where the shares come from. Mounting itself stays in compose

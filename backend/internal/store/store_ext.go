@@ -51,6 +51,21 @@ CREATE TABLE IF NOT EXISTS settings (
   json TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS provision_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL DEFAULT 5985,
+  scheme TEXT NOT NULL DEFAULT 'http',
+  winrm_user TEXT NOT NULL DEFAULT 'Administrator',
+  node_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  options_json TEXT NOT NULL DEFAULT '{}',
+  log TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT
+);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate ext schema: %w", err)
@@ -89,6 +104,91 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 	}
 	st.UpdatedAt = ptrTime(updatedAt)
 	return &st, nil
+}
+
+// ---------- Provision runs ----------
+
+// CreateProvisionRun inserts a new run row and returns it with its ID.
+func (s *Store) CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO provision_runs (host, port, scheme, winrm_user, node_name, status, options_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		pr.Host, pr.Port, pr.Scheme, pr.WinRMUser, pr.NodeName, pr.Status, pr.OptionsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("create provision run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return s.GetProvisionRun(ctx, id)
+}
+
+// GetProvisionRun loads one run (log included — callers tail it).
+func (s *Store) GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, host, port, scheme, winrm_user, node_name, status, options_json, log, error, created_at, finished_at
+		 FROM provision_runs WHERE id = ?`, id)
+	var pr model.ProvisionRun
+	var createdAt string
+	var finishedAt sql.NullString
+	err := row.Scan(&pr.ID, &pr.Host, &pr.Port, &pr.Scheme, &pr.WinRMUser, &pr.NodeName,
+		&pr.Status, &pr.OptionsJSON, &pr.Log, &pr.Error, &createdAt, &finishedAt)
+	if err != nil {
+		return nil, err
+	}
+	pr.CreatedAt = parseTime(createdAt)
+	if finishedAt.Valid {
+		pr.FinishedAt = ptrTime(finishedAt.String)
+	}
+	return &pr, nil
+}
+
+// ListProvisionRuns returns runs newest-first (the UI shows the recent ones).
+func (s *Store) ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, host, port, scheme, winrm_user, node_name, status, error, created_at, finished_at
+		 FROM provision_runs ORDER BY id DESC LIMIT 25`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.ProvisionRun
+	for rows.Next() {
+		var pr model.ProvisionRun
+		var createdAt string
+		var finishedAt sql.NullString
+		if err := rows.Scan(&pr.ID, &pr.Host, &pr.Port, &pr.Scheme, &pr.WinRMUser, &pr.NodeName,
+			&pr.Status, &pr.Error, &createdAt, &finishedAt); err != nil {
+			return nil, err
+		}
+		pr.CreatedAt = parseTime(createdAt)
+		if finishedAt.Valid {
+			pr.FinishedAt = ptrTime(finishedAt.String)
+		}
+		out = append(out, &pr)
+	}
+	return out, rows.Err()
+}
+
+// SetProvisionRunStatus updates status + optional error/finished markers.
+func (s *Store) SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error {
+	if finished {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE provision_runs SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?`,
+			status, errMsg, id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE provision_runs SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+// AppendProvisionRunLog atomically appends output to the run's log column.
+// SQLite's || concat handles the append; the UI tails via GetProvisionRun.
+func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE provision_runs SET log = log || ? WHERE id = ?`, chunk, id)
+	return err
 }
 
 // SaveSettings persists the settings row (single-row upsert on id=1).

@@ -1,0 +1,284 @@
+# provision.yml — controller-driven single-node provisioning.
+#
+# NOT run from a workstation: the controller's provision engine invokes this
+# playbook with a generated inventory + vars.yml (winrm credentials and a
+# one-shot pairing code, 0600 temp files, deleted after the run).
+#
+# Variable contract (all provided by the engine):
+#   encode_controller_url, encode_node_name, encode_bin_dir,
+#   encode_scripts_mount, encode_release_mount, encode_agent_dir,
+#   encode_heartbeat_seconds, encode_nfs_scripts_export,
+#   encode_nfs_release_export, encode_mount_nfs, encode_install_toolchain,
+#   encode_push_bin, encode_has_lib, encode_pairing_code
+#
+# Everything is idempotent: re-running only fixes what is missing.
+---
+- name: Provision encode-system node
+  hosts: encode_nodes
+  gather_facts: false
+
+  tasks:
+    # --------------------------------------------------------------- NFS
+    - name: NFS client + share mounts
+      when: encode_mount_nfs | bool
+      block:
+        - name: Install NFS client feature (Services for NFS)
+          ansible.windows.win_feature:
+            name: NFS-Clnt
+            include_sub_features: true
+            state: present
+
+        - name: Create mount point directories
+          ansible.windows.win_file:
+            path: "{{ item }}"
+            state: directory
+          loop:
+            - "{{ encode_scripts_mount }}"
+            - "{{ encode_release_mount }}"
+
+        - name: Write NFS remount script
+          ansible.windows.win_copy:
+            dest: "{{ encode_agent_dir }}\\remount-nfs.ps1"
+            content: |
+              # Remount encode-system NFS shares. Idempotent.
+              $mounts = @{
+                '{{ encode_nfs_scripts_export }}' = '{{ encode_scripts_mount }}'
+                '{{ encode_nfs_release_export }}' = '{{ encode_release_mount }}'
+              }
+              foreach ($export in $mounts.Keys) {
+                $target = $mounts[$export]
+                $already = Get-CimInstance Win32_MappedLogicalDisk | Where-Object { $_.DeviceID -eq $target }
+                if ($already) { Write-Output "already mounted: $target"; continue }
+                & mount.exe -o anon $export $target
+                if ($LASTEXITCODE -ne 0) { Write-Error "mount failed: $export -> $target"; exit 1 }
+                Write-Output "mounted: $export -> $target"
+              }
+
+        - name: Ensure agent directory exists (remount script home)
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}"
+            state: directory
+
+        - name: Mount NFS shares now
+          ansible.windows.win_shell: |
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{{ encode_agent_dir }}\remount-nfs.ps1"
+          register: mount_now
+          changed_when: "'mounted:' in mount_now.stdout"
+          failed_when: mount_now.rc != 0
+
+        - name: Register startup task to remount NFS after reboot
+          ansible.windows.win_shell: |
+            $existing = Get-ScheduledTask -TaskName "encode-system-remount-nfs" -ErrorAction SilentlyContinue
+            if ($existing) { Write-Output "task exists"; exit 0 }
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -File '{{ encode_agent_dir }}\remount-nfs.ps1'"
+            $trigger = New-ScheduledTaskTrigger -AtStartup
+            Register-ScheduledTask -TaskName "encode-system-remount-nfs" `
+              -Action $action -Trigger $trigger -RunLevel Highest -User SYSTEM -Force
+            Write-Output "task registered"
+          register: remount_task
+          changed_when: "'task registered' in remount_task.stdout"
+          failed_when: remount_task.rc != 0
+
+    # ----------------------------------------------------------- Toolchain
+    - name: Install encode toolchain
+      when: encode_install_toolchain | bool
+      block:
+        - name: Toolchain staging directory
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}\\installers"
+            state: directory
+
+        # --- MediaInfo CLI 26.05 (zip, no installer) ---
+        - name: Check MediaInfo
+          ansible.windows.win_stat:
+            path: 'C:\Program Files\MediaInfo\MediaInfo.exe'
+          register: mediainfo_stat
+
+        - name: Download MediaInfo CLI zip
+          when: not mediainfo_stat.stat.exists
+          ansible.windows.win_get_url:
+            url: https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Windows_x64.zip
+            dest: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI.zip"
+
+        - name: Extract MediaInfo
+          when: not mediainfo_stat.stat.exists
+          ansible.windows.win_unzip:
+            src: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI.zip"
+            dest: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI"
+
+        - name: Install MediaInfo.exe
+          when: not mediainfo_stat.stat.exists
+          ansible.windows.win_copy:
+            src: "{{ encode_agent_dir }}\\installers\\MediaInfo_CLI\\MediaInfo.exe"
+            dest: 'C:\Program Files\MediaInfo\MediaInfo.exe'
+            remote_src: true
+
+        # --- AviSynth+ 3.7.5 (Inno Setup) ---
+        - name: Check AviSynth+
+          ansible.windows.win_reg_stat:
+            path: HKLM:\SOFTWARE\AviSynth
+          register: avisynth_stat
+
+        - name: Download AviSynth+ installer
+          when: not avisynth_stat.exists
+          ansible.windows.win_get_url:
+            url: https://github.com/AviSynth/AviSynthPlus/releases/download/v3.7.5/AviSynthPlus_3.7.5_20250420.exe
+            dest: "{{ encode_agent_dir }}\\installers\\AviSynthPlus.exe"
+
+        - name: Install AviSynth+ (silent)
+          when: not avisynth_stat.exists
+          ansible.windows.win_shell: |
+            & "{{ encode_agent_dir }}\installers\AviSynthPlus.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          register: avs_install
+          changed_when: true
+
+        # --- Python 3.14.7 x64 (before VapourSynth so it binds to it) ---
+        - name: Check Python
+          ansible.windows.win_command: '"C:\Program Files\Python314\python.exe" --version'
+          register: python_check
+          failed_when: false
+          changed_when: false
+
+        - name: Download Python 64-bit installer
+          when: python_check.rc != 0
+          ansible.windows.win_get_url:
+            url: https://www.python.org/ftp/python/3.14.7/python-3.14.7-amd64.exe
+            dest: "{{ encode_agent_dir }}\\installers\\python-amd64.exe"
+
+        - name: Install Python (silent, all users, fixed dir)
+          when: python_check.rc != 0
+          ansible.windows.win_shell: |
+            & "{{ encode_agent_dir }}\installers\python-amd64.exe" /quiet InstallAllUsers=1 PrependPath=0 Include_pip=1 Include_test=0 TargetDir="C:\Program Files\Python314"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          register: py_install
+          changed_when: true
+
+        # --- VapourSynth R79 (official NSIS installer, per operator choice) ---
+        - name: Check VapourSynth
+          ansible.windows.win_reg_stat:
+            path: HKLM:\SOFTWARE\VapourSynth
+          register: vs_stat
+          failed_when: false
+
+        - name: Download VapourSynth installer
+          when: vs_stat is not mapping or not (vs_stat.exists | default(false))
+          ansible.windows.win_get_url:
+            url: https://github.com/vapoursynth/vapoursynth/releases/download/R79/VapourSynth-x64-R79.exe
+            dest: "{{ encode_agent_dir }}\\installers\\VapourSynth.exe"
+
+        - name: Install VapourSynth (silent NSIS)
+          when: vs_stat is not mapping or not (vs_stat.exists | default(false))
+          ansible.windows.win_shell: |
+            & "{{ encode_agent_dir }}\installers\VapourSynth.exe" /S
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          register: vs_install
+          changed_when: true
+
+        # --- Sanity: report what landed ---
+        - name: Verify toolchain
+          ansible.windows.win_shell: |
+            $ok = $true
+            if (Test-Path 'C:\Program Files\MediaInfo\MediaInfo.exe') { Write-Output 'MediaInfo: OK' } else { Write-Output 'MediaInfo: MISSING'; $ok = $false }
+            if (Test-Path 'HKLM:\SOFTWARE\AviSynth') { Write-Output 'AviSynth+: OK' } else { Write-Output 'AviSynth+: MISSING'; $ok = $false }
+            $py = & 'C:\Program Files\Python314\python.exe' --version 2>$null
+            if ($py) { Write-Output "Python: $py" } else { Write-Output 'Python: MISSING'; $ok = $false }
+            $vspy = & 'C:\Program Files\Python314\python.exe' -c "import vapoursynth; print(vapoursynth.__version__)" 2>$null
+            if ($vspy) { Write-Output "VapourSynth: R$vspy" } else { Write-Output 'VapourSynth: MISSING'; $ok = $false }
+            if (-not $ok) { exit 1 }
+          register: toolchain_check
+          changed_when: false
+
+    # ------------------------------------------------------- Bin package
+    - name: Push tools folder (bin package)
+      when: encode_push_bin | bool
+      block:
+        - name: Ensure bin dir exists
+          ansible.windows.win_file:
+            path: "{{ encode_bin_dir }}"
+            state: directory
+
+        - name: Upload bin package zip
+          ansible.windows.win_copy:
+            src: "{{ playbook_dir }}/files/bin-package.zip"
+            dest: "{{ encode_agent_dir }}\\bin-package.zip"
+          register: bin_upload
+
+        - name: Extract bin package over tools dir
+          when: bin_upload is changed
+          ansible.windows.win_shell: |
+            Expand-Archive -LiteralPath "{{ encode_agent_dir }}\bin-package.zip" -DestinationPath "{{ encode_bin_dir }}" -Force
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            (Get-ChildItem "{{ encode_bin_dir }}" -Recurse -File | Measure-Object).Count
+          register: bin_extract
+          changed_when: true
+
+    # -------------------------------------------------------------- Agent
+    - name: Deploy and register the agent
+      block:
+        - name: Ensure agent directory exists
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}"
+            state: directory
+
+        - name: Copy agent binary
+          ansible.windows.win_copy:
+            src: "{{ playbook_dir }}/files/agent/encode-agent.exe"
+            dest: "{{ encode_agent_dir }}\\encode-agent.exe"
+          register: agent_binary
+
+        - name: Copy EncodeLib.ps1
+          when: encode_has_lib | bool
+          ansible.windows.win_copy:
+            src: "{{ playbook_dir }}/files/agent/EncodeLib.ps1"
+            dest: "{{ encode_agent_dir }}\\EncodeLib.ps1"
+
+        # agent.json carries the ONE-SHOT pairing code: the agent registers
+        # itself on first start and persists its own permanent credential.
+        - name: Write agent.json (pairing bootstrap)
+          ansible.windows.win_copy:
+            dest: "{{ encode_agent_dir }}\\agent.json"
+            content: |
+              {
+                "controller_url": "{{ encode_controller_url }}",
+                "node_name": "{{ encode_node_name }}",
+                "pairing_code": "{{ encode_pairing_code }}",
+                "data_dir": "{{ encode_agent_dir }}",
+                "bin_dir": "{{ encode_bin_dir }}",
+                "lib_path": "{{ encode_agent_dir }}\\EncodeLib.ps1",
+                "heartbeat_seconds": {{ encode_heartbeat_seconds }}
+              }
+          no_log: true
+
+        - name: Install encode-agent Windows service
+          ansible.windows.win_service:
+            name: encode-agent
+            display_name: "encode-system agent"
+            description: "Encode farm worker: heartbeats to the controller and runs encode jobs."
+            path: '"{{ encode_agent_dir }}\encode-agent.exe" -config "{{ encode_agent_dir }}\agent.json"'
+            start_mode: auto
+            state: started
+          register: agent_service
+
+        - name: Restart service when the binary changed
+          when: agent_binary is changed and not (agent_service is changed)
+          ansible.windows.win_service:
+            name: encode-agent
+            state: restarted
+
+        # Definitive pairing proof: the agent persists its permanent
+        # credential to <data_dir>\node.token once pairing succeeds.
+        - name: Wait for the agent to pair
+          ansible.windows.win_shell: |
+            if (Test-Path "{{ encode_agent_dir }}\node.token") {
+              Write-Output "AGENT PAIRED (credential persisted)"
+              exit 0
+            }
+            Write-Output "waiting for pairing..."
+            exit 1
+          register: pair_check
+          retries: 12
+          delay: 10
+          until: pair_check.rc == 0
+          changed_when: false

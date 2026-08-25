@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/api"
+	"github.com/badskater/encode-system/backend/internal/auth"
+	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/scanner"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -103,6 +105,27 @@ func main() {
 	if err != nil {
 		log.Error("init api server", "err", err)
 		os.Exit(1)
+	}
+
+	// Node provisioning engine: runs ansible-playbook (bundled in the image)
+	// against new Windows nodes using the live settings. Playbook directory
+	// is baked into the image at /app/provision by default.
+	srv.Provision = &provision.Engine{
+		Store:       st,
+		Payloads:    &provision.UpdateStoreAdapter{Up: up},
+		PlaybookDir: env("ENCODE_PROVISION_DIR", "/app/provision"),
+		LogCap:      512 * 1024,
+		IssuePairing: func(nameHint string) (string, error) {
+			b := make([]byte, 24)
+			if _, err := rand.Read(b); err != nil {
+				return "", err
+			}
+			code := hex.EncodeToString(b)
+			if _, err := st.CreatePairingCode(context.Background(), auth.HashToken(code), nameHint, time.Hour); err != nil {
+				return "", err
+			}
+			return code, nil
+		},
 	}
 	if generatedPass != "" {
 		// One-time disclosure, same boot as the account creation.

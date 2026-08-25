@@ -49,6 +49,7 @@ export type ParamType = 'text' | 'number' | 'bool';
 
 // Settings: NFS shares, controller roots, remote path mapping, behavior.
 export interface Settings {
+  controller_url?: string;
   nfs_server?: string;
   scripts_share?: string;
   release_share?: string;
@@ -62,6 +63,21 @@ export interface Settings {
   group: string;
   tag: string;
   updated_at?: string;
+}
+
+// ProvisionRun: one controller-driven Ansible provisioning attempt.
+export interface ProvisionRun {
+  id: number;
+  host: string;
+  port: number;
+  scheme: string;
+  winrm_user: string;
+  node_name: string;
+  status: 'queued' | 'running' | 'success' | 'failed';
+  error?: string;
+  log?: string;
+  created_at: string;
+  finished_at?: string;
 }
 
 // UpdateManifest: the agent/lib/bin versions the controller wants deployed.

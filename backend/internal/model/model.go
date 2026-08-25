@@ -76,10 +76,31 @@ type User struct {
 	CreatedAt    *time.Time `json:"created_at,omitempty"`
 }
 
+// ProvisionRun is one controller-driven Ansible provisioning attempt of a
+// Windows node. The WinRM password is NEVER stored: it lives only in the
+// temporary vars file for the duration of the run.
+type ProvisionRun struct {
+	ID            int64      `json:"id"`
+	Host          string     `json:"host"`      // WinRM target (ip or hostname)
+	Port          int        `json:"port"`      // WinRM port (default 5985)
+	Scheme        string     `json:"scheme"`    // http | https
+	WinRMUser     string     `json:"winrm_user"`
+	NodeName      string     `json:"node_name"` // desired agent/node name
+	Status        string     `json:"status"`    // queued|running|success|failed
+	OptionsJSON   string     `json:"-"`         // run options snapshot (no secrets)
+	Log           string     `json:"-"`         // full ansible output (served via API tail)
+	Error         string     `json:"error,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+}
+
 // Settings is the operator-editable runtime configuration (NFS shares,
 // controller roots, node path mapping, scan cadence, release naming). Stored
 // in the database; environment variables only seed the first boot.
 type Settings struct {
+	// Controller URL as seen by the NODES (provisioned agents connect here;
+	// the container's own hostname is usually meaningless outside Docker).
+	ControllerURL   string `json:"controller_url"`
 	// NFS share description (informational + deployment guidance: the
 	// actual mounts are compose volumes on the Docker host).
 	NFSServer       string `json:"nfs_server"`

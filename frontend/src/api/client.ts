@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { Flow, FlowExport, Job, JobStatus, Node, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
+import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -193,7 +193,9 @@ export const api = {
   importFlow: (payload: FlowExport) => request<Flow>('POST', '/api/flows/import', payload),
 
   series: () => request<Series[]>('GET', '/api/series'),
-  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean }) =>
+  createSeries: (body: { name: string; episodes: number; tag?: string; flow_id?: number }) =>
+    request<CreateSeriesResponse>('POST', '/api/series', body),
+  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
 
   stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),

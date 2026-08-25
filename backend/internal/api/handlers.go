@@ -191,12 +191,19 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 	// Remote path mapping comes from the LIVE settings (editable in the UI),
 	// falling back to the env-provided defaults when nothing was saved yet.
 	st := s.currentSettings(ctx)
+	tag := st.Tag
+	// Per-series tag override: a series with its own quality tag (e.g. a 4K
+	// re-encode run of a previously-1080p show) names its outputs and release
+	// folder after that tag instead of the global one.
+	if sr, err := s.Store.SeriesByName(ctx, job.Series); err == nil && sr.Tag != "" {
+		tag = sr.Tag
+	}
 	vars := flow.Vars{
 		BinDir:     st.NodeBinDir,
 		ScriptsDir: st.NodeScriptsDir,
 		ReleaseDir: st.NodeReleaseDir,
 		Group:      st.Group,
-		Tag:        st.Tag,
+		Tag:        tag,
 	}
 	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {

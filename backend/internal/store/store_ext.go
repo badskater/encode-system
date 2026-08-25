@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS series (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
   flow_id INTEGER NOT NULL DEFAULT 0,
+  tag TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -80,6 +81,12 @@ CREATE TABLE IF NOT EXISTS provision_runs (
 	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN bin_version INTEGER NOT NULL DEFAULT 0`); err != nil {
 		if !isDuplicateColumnErr(err) {
 			return fmt.Errorf("migrate nodes.bin_version: %w", err)
+		}
+	}
+	// series.tag: per-series quality tag override ("" = global settings tag).
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN tag TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate series.tag: %w", err)
 		}
 	}
 	return nil
@@ -278,14 +285,14 @@ func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Ser
 // SeriesByName loads a series by exact folder name.
 func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series WHERE name = ?`, name)
+		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series WHERE name = ?`, name)
 	return scanSeries(row)
 }
 
 // GetSeries loads a series by ID.
 func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series WHERE id = ?`, id)
+		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series WHERE id = ?`, id)
 	return scanSeries(row)
 }
 
@@ -293,7 +300,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 	var sr model.Series
 	var enabled int
 	var createdAt, updatedAt string
-	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &enabled, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	sr.Enabled = enabled == 1
@@ -305,7 +312,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 // ListSeries returns all series ordered by name.
 func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, flow_id, enabled, created_at, updated_at FROM series ORDER BY name`)
+		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +322,7 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 		var sr model.Series
 		var enabled int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &enabled, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		sr.Enabled = enabled == 1
@@ -329,8 +336,8 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 // UpdateSeries persists flow selection and enabled state.
 func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE series SET flow_id=?, enabled=?, updated_at=datetime('now') WHERE id=?`,
-		sr.FlowID, boolToInt(sr.Enabled), sr.ID)
+		`UPDATE series SET flow_id=?, tag=?, enabled=?, updated_at=datetime('now') WHERE id=?`,
+		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), sr.ID)
 	return err
 }
 
@@ -340,6 +347,13 @@ func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 func (s *Store) SetSeriesFlow(ctx context.Context, id, flowID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE series SET flow_id=?, updated_at=datetime('now') WHERE id=?`, flowID, id)
+	return err
+}
+
+// SetSeriesTag updates ONLY the quality tag override (same rationale).
+func (s *Store) SetSeriesTag(ctx context.Context, id int64, tag string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET tag=?, updated_at=datetime('now') WHERE id=?`, tag, id)
 	return err
 }
 

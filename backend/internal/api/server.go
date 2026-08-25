@@ -150,13 +150,21 @@ func (s *Server) seedStepTemplates() error {
 			return fmt.Errorf("seed step template %s: %w", t.Key, err)
 		}
 	}
-	// Guarded factory upgrade: installs where the pre-FLAC mux template was
-	// already seeded keep it forever otherwise. Only untouched factory
-	// copies get the audio-selection upgrade.
+	// Guarded factory upgrade chain for the mux template: installs where a
+	// pre-V3 mux template was already seeded keep it forever otherwise — only
+	// untouched factory copies get upgraded. V1 (pre-FLAC) and V2 (FLAC-aware,
+	// no language handling) both advance to the current language-aware factory
+	// version. User-edited mux scripts never match the byte-for-byte guard and
+	// stay in effect.
 	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "mux", flow.MuxFactoryV1, flow.MuxTemplate()); err != nil {
 		return fmt.Errorf("upgrade mux template: %w", err)
 	} else if upgraded {
-		s.Log.Info("upgraded mux step template to the FLAC-aware factory version")
+		s.Log.Info("upgraded mux step template to the current factory version (from V1)")
+	}
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "mux", flow.MuxFactoryV2, flow.MuxTemplate()); err != nil {
+		return fmt.Errorf("upgrade mux template: %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded mux step template to the language-aware factory version (from V2)")
 	}
 	return nil
 }
@@ -230,6 +238,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/flows/import", s.withAdmin(s.handleImportFlow))
 
 	mux.HandleFunc("GET /api/series", s.withAdmin(s.handleListSeries))
+	mux.HandleFunc("POST /api/series", s.withAdmin(s.handleCreateSeries))
 	mux.HandleFunc("PATCH /api/series/{id}", s.withAdmin(s.handlePatchSeries))
 
 	mux.HandleFunc("GET /api/step-templates", s.withAdmin(s.handleListStepTemplates))

@@ -48,8 +48,9 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FlowID  *int64 `json:"flow_id"`
-		Enabled *bool  `json:"enabled"`
+		FlowID  *int64  `json:"flow_id"`
+		Enabled *bool   `json:"enabled"`
+		Tag     *string `json:"tag"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -72,6 +73,17 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.Store.SetSeriesFlow(ctx, id, *req.FlowID); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series flow")
+			return
+		}
+	}
+	if req.Tag != nil {
+		tag := strings.TrimSpace(*req.Tag)
+		if err := validateSeriesName(tag); tag != "" && err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid tag: "+err.Error())
+			return
+		}
+		if err := s.Store.SetSeriesTag(ctx, id, tag); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series tag")
 			return
 		}
 	}

@@ -183,6 +183,7 @@ type Series struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`    // matches the share folder name exactly
 	FlowID    int64     `json:"flow_id"` // 0 = use the default flow
+	Tag       string    `json:"tag"`     // quality tag override; "" = global settings tag
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

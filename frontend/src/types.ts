@@ -29,10 +29,19 @@ export interface Series {
   id: number;
   name: string;
   flow_id: number; // 0 = default flow
+  tag: string; // quality tag override; "" = global settings tag
   enabled: boolean;
   jobs?: number;
   created_at: string;
   updated_at: string;
+}
+
+// Response of POST /api/series (create series with folder scaffolding).
+export interface CreateSeriesResponse {
+  series: Series;
+  scripts_folder: string;
+  release_folder: string;
+  episode_folders: string[];
 }
 
 export interface ParamDef {

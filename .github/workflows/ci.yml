@@ -1,0 +1,112 @@
+# Continuous integration: quality gates for every push/PR.
+#
+# Mirrors the AGENTS.md command map:
+#   backend/  -> go vet (lint), go build (typecheck), go test (tests)
+#   frontend/ -> eslint (lint), tsc -b --noEmit (typecheck), vitest (tests),
+#                vite build (build)
+#
+# pwsh-dependent flow tests run everywhere (PowerShell 7 is installed in CI);
+# they self-skip when pwsh is absent. The SQLite driver is modernc.org/sqlite
+# (pure Go), so tests need no system libraries.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Concurrency: a newer push to the same branch supersedes in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      # PowerShell for the rendered-job E2E tests. GitHub-hosted runners
+      # ship pwsh; the fallback registers the Microsoft repo if an image
+      # ever drops it (the tests self-skip when pwsh is truly absent).
+      - name: Ensure PowerShell 7
+        run: |
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh --version
+          else
+            . /etc/os-release
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends wget
+            wget -q "https://packages.microsoft.com/config/$ID/$VERSION_ID/packages-microsoft-prod.deb" -O /tmp/ms.deb
+            sudo dpkg -i /tmp/ms.deb
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends powershell
+            pwsh --version
+          fi
+
+      - name: Format check (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build controller (linux) + agent (windows)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/controller ./cmd/controller
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/encode-agent.exe ./cmd/agent
+          ls -la bin/
+
+  frontend:
+    name: Frontend (React/TS)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      - name: Typecheck (tsc)
+        run: npx tsc --noEmit
+
+      - name: Test (vitest)
+        run: npm run test -- --run
+
+      - name: Build (vite)
+        run: npm run build
+
+      - name: Upload built SPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: frontend/dist/
+          if-no-files-found: error

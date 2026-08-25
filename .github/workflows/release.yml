@@ -1,0 +1,92 @@
+# Continuous delivery: tagged releases produce the deploy bundle.
+#
+# The fleet's deployment model is bundle-based (docker/Dockerfile.runtime):
+# a pre-built controller binary + built SPA + provision playbook are copied
+# to the Docker host, then `docker compose build && up -d`. The Docker host
+# sits on a private LAN unreachable from GitHub runners, so CD stops at
+# publishing verified artifacts — deployment stays an explicit operator
+# action (or Hermes on request), never an automated push to production.
+#
+# Trigger: push a version tag (v*), e.g. `git tag v1.4.0 && git push origin v1.4.0`.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build release bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Backend binaries — same flags as the manual deploys.
+      - name: Build controller (linux/amd64)
+        working-directory: backend
+        run: >
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
+          -ldflags "-X main.Version=${{ steps.ver.outputs.version }}"
+          -o ../dist/controller ./cmd/controller
+
+      - name: Build agent (windows/amd64)
+        working-directory: backend
+        run: >
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build
+          -ldflags "-X main.Version=${{ steps.ver.outputs.version }}"
+          -o ../dist/encode-agent.exe ./cmd/agent
+
+      # Frontend SPA.
+      - name: Build UI
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          cp -r dist ../dist/ui
+
+      # Provision playbook (the controller copies provision.yml per run).
+      - name: Stage provision playbook
+        run: |
+          mkdir -p dist/provision
+          cp infra/ansible/provision.yml dist/provision/
+
+      # Checksums so a deploy can verify integrity out-of-band.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum controller encode-agent.exe > SHA256SUMS
+
+      # gh is pre-authenticated on GitHub runners via the automatic token.
+      - name: Create GitHub release
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          dist/controller
+          dist/encode-agent.exe
+          dist/SHA256SUMS
+
+      - name: Upload UI bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-${{ steps.ver.outputs.version }}
+          path: dist/ui/
+          if-no-files-found: error

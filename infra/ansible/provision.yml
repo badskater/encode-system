@@ -245,20 +245,27 @@
 
         # agent.json carries the ONE-SHOT pairing code: the agent registers
         # itself on first start and persists its own permanent credential.
+        # Build as a dict and serialize with to_nice_json: inline templating
+        # would inject raw backslashes from the path vars and produce invalid
+        # JSON escapes (e.g. \e in "C:\encode-agent").
+        - name: Build agent.json content
+          ansible.builtin.set_fact:
+            agent_config:
+              controller_url: "{{ encode_controller_url }}"
+              node_name: "{{ encode_node_name }}"
+              pairing_code: "{{ encode_pairing_code }}"
+              data_dir: "{{ encode_agent_dir }}"
+              bin_dir: "{{ encode_bin_dir }}"
+              lib_path: "{{ encode_agent_dir }}\\EncodeLib.ps1"
+              heartbeat_seconds: "{{ encode_heartbeat_seconds | int }}"
+          no_log: true
+
         - name: Write agent.json (pairing bootstrap)
           ansible.windows.win_copy:
             dest: "{{ encode_agent_dir }}\\agent.json"
-            content: |
-              {
-                "controller_url": "{{ encode_controller_url }}",
-                "node_name": "{{ encode_node_name }}",
-                "pairing_code": "{{ encode_pairing_code }}",
-                "data_dir": "{{ encode_agent_dir }}",
-                "bin_dir": "{{ encode_bin_dir }}",
-                "lib_path": "{{ encode_agent_dir }}\\EncodeLib.ps1",
-                "heartbeat_seconds": {{ encode_heartbeat_seconds }}
-              }
+            content: "{{ agent_config | to_nice_json }}"
           no_log: true
+          register: agent_config_file
 
         - name: Install encode-agent Windows service
           ansible.windows.win_service:
@@ -270,8 +277,8 @@
             state: started
           register: agent_service
 
-        - name: Restart service when the binary changed
-          when: agent_binary is changed and not (agent_service is changed)
+        - name: Restart service when the binary or config changed
+          when: (agent_binary is changed or agent_config_file is changed) and not (agent_service is changed)
           ansible.windows.win_service:
             name: encode-agent
             state: restarted

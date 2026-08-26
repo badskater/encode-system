@@ -29,6 +29,95 @@ const probeMediaInfoPS = resolveMediaInfoPS + `
     $info = ([string]::Join([char]10, $rawMi)) | ConvertFrom-Json
 `
 
+// HdrProbeFactoryV1 is the factory hdr_probe script as first shipped
+// (commit d2e1577). Boot uses it for a guarded upgrade: the V1 DoVi marker
+// check only matched /String-suffixed MediaInfo fields, while CLI MediaInfo
+// (>=22.x) emits plain names (HDR_Format, DolbyVision_Profile) — DV sources
+// misclassified as plain HDR10. Only untouched factory copies advance;
+// user-edited scripts stay in effect.
+const HdrProbeFactoryV1 = `function Invoke-HdrProbe {
+    param(
+        [Parameter(Mandatory=$true)] [pscustomobject] $Job,
+        [pscustomobject] $Params
+    )
+    Write-Output "ENCODE_STEP hdr_probe 0"
+    $src = Find-SourceFile $Job.EpisodeDir
+    $out = Join-Path $Job.EpisodeDir 'hdr.json'
+    if ((Test-Path -LiteralPath $out) -and ((Get-Item -LiteralPath $out).LastWriteTime -gt (Get-Item -LiteralPath $src).LastWriteTime)) {
+        Write-Output "hdr.json already present and newer than source, reusing"
+        Write-Output "ENCODE_STEP hdr_probe 100"
+        return
+    }
+    if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+
+    $mi = $null
+    foreach ($candidate in @((Join-Path $Job.BinDir 'MediaInfo.exe'), 'C:\Program Files\MediaInfo\MediaInfo.exe', 'C:\Program Files (x86)\MediaInfo\MediaInfo.exe')) {
+        if (Test-Path -LiteralPath $candidate) { $mi = $candidate; break }
+    }
+    if (-not $mi) { throw "MediaInfo.exe not found (install it or copy it to $($Job.BinDir))" }
+
+    $rawMi = & $mi --Output=JSON $src
+    if ($LASTEXITCODE -ne 0) { throw "MediaInfo exited with code $LASTEXITCODE" }
+    $info = ([string]::Join([char]10, $rawMi)) | ConvertFrom-Json
+
+    $tracks = @($info.media.track)
+    $video = $tracks | Where-Object { $_.'@type' -eq 'Video' } | Select-Object -First 1
+    if (-not $video) { throw "no video track found in $src" }
+
+    $transfer = ''
+    if ($video.PSObject.Properties['transfer_characteristics']) { $transfer = [string]$video.transfer_characteristics }
+    $primaries = ''
+    if ($video.PSObject.Properties['colour_primaries']) { $primaries = [string]$video.colour_primaries }
+    $maxCLL = ''
+    if ($video.PSObject.Properties['MaxCLL']) { $maxCLL = [string]$video.MaxCLL }
+    $maxFALL = ''
+    if ($video.PSObject.Properties['MaxFALL']) { $maxFALL = [string]$video.MaxFALL }
+    $masterDisplay = ''
+    if ($video.PSObject.Properties['MasteringDisplay_Luminance']) { $masterDisplay = [string]$video.MasteringDisplay_Luminance }
+
+    # Dolby Vision markers: MediaInfo reports a Dolby Video track and/or
+    # video-level DV fields depending on the container and MediaInfo version.
+    $dovi = $false
+    foreach ($tk in $tracks) {
+        if ([string]$tk.'@type' -eq 'Video') {
+            foreach ($p in @('DolbyVision/String', 'DV/String', 'HDR_Format/String')) {
+                if ($tk.PSObject.Properties[$p] -and [string]$tk.$p -match 'Dolby') { $dovi = $true }
+            }
+        }
+        if ([string]$tk.'@type' -match '^(Dolby|Other)$' -and [string]$tk.Format -match 'Dolby Vision') { $dovi = $true }
+    }
+
+    $hdr = 'SDR'
+    if ($transfer -match 'ST 2084|PQ|SMPTE 2084') { $hdr = 'HDR10' }
+    elseif ($transfer -match 'HLG') { $hdr = 'HLG' }
+    $width = 0
+    $height = 0
+    if ($video.Width) { $width = [int]$video.Width }
+    if ($video.Height) { $height = [int]$video.Height }
+
+    $data = [pscustomobject]@{
+        hdr             = $hdr
+        dovi            = $dovi
+        transfer        = $transfer
+        primaries       = $primaries
+        max_cll         = $maxCLL
+        max_fall        = $maxFALL
+        master_display  = $masterDisplay
+        width           = $width
+        height          = $height
+    }
+    [System.IO.File]::WriteAllText($out, ($data | ConvertTo-Json -Compress))
+    Write-Output "[hdr] $width x $height, transfer '$transfer', primaries '$primaries' -> $hdr (DoVi: $dovi)"
+    if ($dovi) {
+        Write-Output "[hdr] Dolby Vision detected. HDR10 signaling only; full DoVi RPU passthrough requires dovi_tool (future step)."
+    }
+    Write-Output "ENCODE_STEP hdr_probe 100"
+}`
+
+// HdrProbeTemplate returns the current factory hdr_probe template (exported
+// for the guarded factory upgrade in boot seeding).
+func HdrProbeTemplate() *model.StepTemplate { return hdrProbeTemplate() }
+
 func hdrProbeTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "hdr_probe",
@@ -68,12 +157,15 @@ func hdrProbeTemplate() *model.StepTemplate {
 
     # Dolby Vision markers: MediaInfo reports a Dolby Video track and/or
     # video-level DV fields depending on the container and MediaInfo version.
+    # CLI MediaInfo >= 22.x uses plain names (HDR_Format, DolbyVision_Profile);
+    # older/GUI builds use the /String suffixes. Both sets are checked.
     $dovi = $false
     foreach ($tk in $tracks) {
         if ([string]$tk.'@type' -eq 'Video') {
-            foreach ($p in @('DolbyVision/String', 'DV/String', 'HDR_Format/String')) {
+            foreach ($p in @('DolbyVision/String', 'DV/String', 'HDR_Format/String', 'HDR_Format', 'DolbyVision_Profile')) {
                 if ($tk.PSObject.Properties[$p] -and [string]$tk.$p -match 'Dolby') { $dovi = $true }
             }
+            if (-not $dovi -and $tk.PSObject.Properties['DolbyVision_Profile'] -and [string]$tk.DolbyVision_Profile -match '^\d+\.\d+') { $dovi = $true }
         }
         if ([string]$tk.'@type' -match '^(Dolby|Other)$' -and [string]$tk.Format -match 'Dolby Vision') { $dovi = $true }
     }

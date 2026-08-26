@@ -197,6 +197,14 @@ func (s *Server) seedStepTemplates() error {
 	} else if upgraded {
 		s.Log.Info("upgraded encode_4k step template to the Dolby Vision factory version")
 	}
+	// Guarded hdr_probe upgrade: V1 only matched /String-suffixed MediaInfo
+	// field names; CLI MediaInfo (>=22.x) emits plain names (HDR_Format,
+	// DolbyVision_Profile), so DV sources misclassified as plain HDR10.
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "hdr_probe", flow.HdrProbeFactoryV1, flow.HdrProbeTemplate()); err != nil {
+		return fmt.Errorf("upgrade hdr_probe template: %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded hdr_probe step template to the CLI-MediaInfo-compatible factory version")
+	}
 	return nil
 }
 

@@ -486,6 +486,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		Series     string `json:"series"`
 		EpisodeDir string `json:"episode_dir"`
 		ScriptType string `json:"script_type"` // avs | vpy
+		ScriptFile string `json:"script_file"` // optional, e.g. "2160.avs"; blank = "<type default>.<type>"
 		FlowID     int64  `json:"flow_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -509,7 +510,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	job, err := s.Store.CreateJob(ctx, &model.Job{
 		Series: req.Series, EpisodeDir: req.EpisodeDir,
 		Episode:    flow.EpisodeNumber(req.EpisodeDir),
-		ScriptType: req.ScriptType, FlowID: fl.ID,
+		ScriptType: req.ScriptType, ScriptFile: req.ScriptFile, FlowID: fl.ID,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "create job")

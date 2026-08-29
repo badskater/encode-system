@@ -89,6 +89,13 @@ CREATE TABLE IF NOT EXISTS provision_runs (
 			return fmt.Errorf("migrate series.tag: %w", err)
 		}
 	}
+	// jobs.script_file: the episode's filter script name (e.g. "2160.avs");
+	// blank = renderer default "<type default>.<type>". Older rows keep ''.
+	if _, err := s.db.Exec(`ALTER TABLE jobs ADD COLUMN script_file TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate jobs.script_file: %w", err)
+		}
+	}
 	return nil
 }
 

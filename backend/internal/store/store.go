@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   episode TEXT NOT NULL,
   episode_dir TEXT NOT NULL,
   script_type TEXT NOT NULL,
+  script_file TEXT NOT NULL DEFAULT '',
   flow_id INTEGER NOT NULL REFERENCES flows(id),
   status TEXT NOT NULL DEFAULT 'pending',
   node_id INTEGER NOT NULL DEFAULT 0,
@@ -391,9 +392,9 @@ func (s *Store) DeleteFlow(ctx context.Context, id int64) error {
 // CreateJob inserts a new pending job.
 func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO jobs (series, episode, episode_dir, script_type, flow_id, status)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-		j.Series, j.Episode, j.EpisodeDir, j.ScriptType, j.FlowID, string(model.JobPending))
+		`INSERT INTO jobs (series, episode, episode_dir, script_type, script_file, flow_id, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		j.Series, j.Episode, j.EpisodeDir, j.ScriptType, j.ScriptFile, j.FlowID, string(model.JobPending))
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
@@ -406,7 +407,7 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 
 // GetJob loads a job by ID.
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, flow_id, status,
+	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at
   FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
@@ -418,7 +419,7 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 	var outputsJSON string
 	var started, finished sql.NullString
 	var createdAt string
-	err := row.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.FlowID, &status,
+	err := row.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished)
 	if err != nil {
@@ -440,7 +441,7 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 
 // ListJobs returns jobs, optionally filtered by status, newest first.
 func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int) ([]*model.Job, error) {
-	q := `SELECT id, series, episode, episode_dir, script_type, flow_id, status,
+	q := `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at FROM jobs`
 	args := []any{}
 	if status != "" {
@@ -476,7 +477,7 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	var outputsJSON string
 	var started, finished sql.NullString
 	var createdAt string
-	err := rows.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.FlowID, &status,
+	err := rows.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished)
 	if err != nil {
@@ -588,7 +589,7 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 
 // ActiveJobForNode returns the node's assigned/running job, if any.
 func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, flow_id, status,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id LIMIT 1`, nodeID)
 	if err != nil {

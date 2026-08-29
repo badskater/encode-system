@@ -21,10 +21,17 @@ type Store struct {
 
 // Open opens (creating if needed) the SQLite database at path and applies
 // migrations. The pragmas keep SQLite safe for a single-writer controller.
+//
+// journal_mode is DELETE (rollback journal), NOT WAL: on the Docker host's
+// Ceph-backed volume the WAL/shm path corrupts its read view — sessions
+// written through the WAL become invisible to subsequent lookups
+// (reproduced on a pristine DB with this exact binary; the incident of
+// 2026-08-28 turned every login into a 401). The rollback journal uses no
+// shm/mmap and is the safe choice for a single-writer, low-volume store.
 func Open(path string) (*Store, error) {
 	// The _pragma query params apply to EVERY connection the pool opens,
 	// unlike a one-shot Exec PRAGMA which a replacement connection would lose.
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(DELETE)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

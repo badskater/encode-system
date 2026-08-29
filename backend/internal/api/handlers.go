@@ -77,6 +77,27 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 			"tasks", node.TasksSinceBoot, "previous", prevTasks)
 	}
 
+	// Orphan-job recovery: the heartbeat is authoritative about what a node is
+	// running. A job becomes 'running' only once this node has acknowledged it
+	// (reported it), so from then on every heartbeat must keep reporting it.
+	// If the DB says this node owns a RUNNING job but the heartbeat reports no
+	// active job, the node rebooted (or its agent restarted) mid-encode and the
+	// job died silently — fail it so it can be retried instead of staying stuck
+	// 'running' forever with the node phantom-busy. Assigned (not-yet-acknowledged)
+	// jobs are untouched to avoid racing a fresh assignment.
+	if !hasActiveJob {
+		if orphan, err := s.Store.ActiveJobForNode(ctx, node.ID); err == nil && orphan != nil &&
+			orphan.Status == model.JobRunning {
+			if err := s.Store.FinishJob(ctx, orphan.ID, model.JobFailed, -1,
+				"node stopped reporting the job (reboot/restart) — orphaned; retry it", nil, ""); err != nil {
+				s.Log.Warn("orphan job cleanup", "err", err, "job", orphan.ID)
+			} else {
+				s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+				s.notifyJobFinished(ctx, orphan.ID, "controller")
+			}
+		}
+	}
+
 	// Grace-period expiry: a reboot attempt older than the grace window is
 	// reset so the threshold logic below starts a fresh attempt (or frees the
 	// node if its counter already reset). This guarantees no node can be

@@ -39,6 +39,15 @@ func captureRunLog(path string) (string, error) {
 	// split a line mid-way. The newline itself is consumed (not included in
 	// the output body start) so the body begins at a full line.
 	cut := len(data) - maxFullLogBytes
+	// Align the byte cut to a rune boundary: if it landed inside a multibyte
+	// UTF-8 sequence, skip forward over continuation bytes (0x80-0xBF) so the
+	// truncated body never starts mid-rune. Encode logs carry CJK series
+	// names, so a raw byte offset routinely splits a 3-byte rune and would
+	// persist/serve invalid UTF-8. Advancing at most 3 bytes (a continuation
+	// byte can never start a valid sequence); kept size only shrinks (≤ 1 MiB).
+	for cut < len(data) && data[cut]&0xC0 == 0x80 {
+		cut++
+	}
 	nl := indexByteFrom(data, cut, '\n')
 	if nl >= 0 {
 		data = data[nl+1:]

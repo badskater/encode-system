@@ -87,16 +87,116 @@ func TestCaptureRunLogLargeFileTruncatesTo1MiB(t *testing.T) {
 	}
 }
 
-// TestCaptureRunLogMissing verifies that a nonexistent run.log yields an empty
-// string (and no error that would fail the completion report).
+// TestCaptureRunLogMissing verifies that a nonexistent run.log yields an error
+// (so executeJob's warning branch fires and operators see the read failure).
+// The caller is responsible for degrading gracefully (empty string + warn log).
 func TestCaptureRunLogMissing(t *testing.T) {
 	dir := t.TempDir()
 	got, err := captureRunLog(filepath.Join(dir, "does-not-exist.log"))
-	if err != nil {
-		t.Fatalf("missing file must not error (completion must still succeed): %v", err)
+	if err == nil {
+		t.Fatalf("missing file must return a non-nil error so executeJob can log the warning")
 	}
 	if got != "" {
 		t.Fatalf("missing file must return empty string, got %d bytes", len(got))
+	}
+}
+
+// TestLineObserverChunkedLines verifies the lineObserver reassembles full output
+// exactly (no lost or duplicated bytes) even when Write calls split lines
+// mid-write, and that every ENCODE_STEP marker line is observed.
+func TestLineObserverChunkedLines(t *testing.T) {
+	tr := newStepTracker()
+	obs := newLineObserver(nil, tr) // nil logger: observe still feeds tracker
+
+	// Feed writes that split lines mid-write.
+	writes := []string{
+		"ENCODE_STEP dgindex 5\nENCODE_",
+		"STEP encode 50\n",
+		"some non-marker line\n",
+	}
+	for _, w := range writes {
+		if _, err := obs.Write([]byte(w)); err != nil {
+			t.Fatalf("Write error: %v", err)
+		}
+	}
+	obs.flush()
+
+	want := strings.Join(writes, "")
+	if got := obs.String(); got != want {
+		t.Fatalf("String() did not reassemble input:\n got=%q\nwant=%q", got, want)
+	}
+	timings := tr.finish(time.Now())
+	if len(timings) != 2 {
+		t.Fatalf("expected 2 observed steps, got %d", len(timings))
+	}
+	if timings[0].Step != "dgindex" || timings[1].Step != "encode" {
+		t.Fatalf("steps = %q, %q; want dgindex, encode", timings[0].Step, timings[1].Step)
+	}
+}
+
+// TestLineObserverTimingLiveness verifies that markers observed through the
+// lineObserver path get DISTINCT arrival timestamps (live stamping), not a
+// single post-hoc timestamp. We assert second-start > first-start rather than
+// exact durations for robustness.
+func TestLineObserverTimingLiveness(t *testing.T) {
+	tr := newStepTracker()
+	obs := newLineObserver(nil, tr)
+
+	// First marker.
+	obs.Write([]byte("ENCODE_STEP dgindex 5\n"))
+	// A real sleep simulates inter-step wall-clock time.
+	time.Sleep(50 * time.Millisecond)
+	obs.Write([]byte("ENCODE_STEP encode 50\n"))
+	obs.flush()
+
+	timings := tr.finish(time.Now())
+	if len(timings) != 2 {
+		t.Fatalf("expected 2 timings, got %d", len(timings))
+	}
+	if !timings[1].StartedAt.After(timings[0].StartedAt) {
+		t.Fatalf("live stamping broken: second start %v not after first %v",
+			timings[1].StartedAt, timings[0].StartedAt)
+	}
+	if timings[0].DurationSec <= 0 {
+		t.Fatalf("first step duration must be > 0 with live stamping, got %v", timings[0].DurationSec)
+	}
+}
+
+// TestCompleteReportStepTimingsNilNormalizesToEmptySlice verifies that passing
+// a nil stepTimings slice (the three early completeJob failure paths) yields
+// "step_timings": [] on the wire, not null — for consistent controller unmarshal
+// parity.
+func TestCompleteReportStepTimingsNilNormalizesToEmptySlice(t *testing.T) {
+	dir := t.TempDir()
+	var capturedBody map[string]any
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/complete") {
+			raw, _ := io.ReadAll(r.Body)
+			json.Unmarshal(raw, &capturedBody)
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	}))
+	defer controller.Close()
+
+	a, _ := New(Config{
+		ControllerURL: controller.URL, NodeName: "n", Token: nodeTok(), DataDir: dir,
+		LibPath: filepath.Join(dir, "EncodeLib.ps1"),
+	}, "v", testLog())
+
+	// nil stepTimings — simulates an early completeJob failure path.
+	a.completeJob(7, "failed", -1, "early failure", nil, "", "", nil)
+
+	if capturedBody == nil {
+		t.Fatal("no completion body captured")
+	}
+	raw, ok := capturedBody["step_timings"].([]any)
+	if !ok {
+		t.Fatalf("step_timings must be a JSON array, got %T: %v",
+			capturedBody["step_timings"], capturedBody["step_timings"])
+	}
+	if len(raw) != 0 {
+		t.Fatalf("step_timings must be empty array, got len %d", len(raw))
 	}
 }
 

@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -19,14 +22,15 @@ const truncationMarker = "[…truncated…]\n"
 // captureRunLog reads the job's run.log and returns at most the last 1 MiB.
 // If the file is larger than the cap, it is trimmed to the first newline
 // boundary after the cap (never splitting a line mid-way) and prefixed with
-// the truncation marker. A missing file yields ("", nil) so a log-read
-// failure never aborts the completion report.
+// the truncation marker. A read failure returns the error so the caller
+// (executeJob) can log a warning and degrade to an empty string — the
+// completion still succeeds, but operators see that the log was not captured.
 func captureRunLog(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// Missing or unreadable log: report empty rather than failing the
-		// completion. The tail (captured separately) may still carry signal.
-		return "", nil
+		// Surface the read failure so executeJob's warning branch fires and
+		// operators can investigate; the caller degrades to "" + warn.
+		return "", err
 	}
 	if len(data) <= maxFullLogBytes {
 		return string(data), nil
@@ -114,4 +118,78 @@ func (t *stepTimingTracker) finish(finish time.Time) []model.StepTiming {
 		})
 	}
 	return out
+}
+
+// lineObserver is an io.Writer that tees child-process output live: it
+// accumulates ALL bytes into an internal buffer (runPowerShell still needs the
+// full output afterwards for tail extraction and the ENCODE_STEP_FAILED scan)
+// AND, for each complete line as it arrives, forwards ENCODE_STEP markers to
+// the agent log and the step-timing tracker at time.Now() — the arrival
+// instant, NOT a single post-hoc timestamp after cmd.Wait.
+//
+// Lines are split on '\n'. A Write may end mid-line; the trailing partial is
+// held in remainder and completed by the next Write. flush() must be called
+// after cmd.Wait to process any final partial line that never got a newline.
+type lineObserver struct {
+	log       *slog.Logger // agent logger for progress (may be nil in tests)
+	timings   *stepTimingTracker
+	buf       bytes.Buffer // accumulates ALL output verbatim
+	remainder string       // trailing partial line from the last Write
+}
+
+// newLineObserver creates a live-scanning writer. log may be nil (unit tests
+// that only care about the tracker); timings must be non-nil.
+func newLineObserver(log *slog.Logger, timings *stepTimingTracker) *lineObserver {
+	return &lineObserver{log: log, timings: timings}
+}
+
+// Write implements io.Writer. It appends p to the internal buffer (so
+// String() returns the full output) and processes every complete line now —
+// at arrival time — stamping the tracker with time.Now().
+func (o *lineObserver) Write(p []byte) (int, error) {
+	o.buf.Write(p) // accumulate ALL bytes verbatim
+
+	data := o.remainder + string(p)
+	o.remainder = ""
+	for {
+		nl := strings.IndexByte(data, '\n')
+		if nl < 0 {
+			// No more complete lines: keep the rest as the partial remainder.
+			o.remainder = data
+			break
+		}
+		line := data[:nl]
+		o.processLine(line)
+		data = data[nl+1:]
+	}
+	return len(p), nil
+}
+
+// flush processes any trailing partial line that never received a newline
+// (the final Write ended mid-line). Must be called once after cmd.Wait.
+func (o *lineObserver) flush() {
+	if o.remainder != "" {
+		o.processLine(o.remainder)
+		o.remainder = ""
+	}
+}
+
+// processLine checks a single complete line against the ENCODE_STEP regex and,
+// on match, logs progress and feeds the timing tracker at time.Now() (the
+// line's arrival instant).
+func (o *lineObserver) processLine(line string) {
+	m := stepLine.FindStringSubmatch(line)
+	if m == nil {
+		return
+	}
+	if o.log != nil {
+		o.log.Info("job progress", "step", m[1], "pct", m[2])
+	}
+	o.timings.observe(line, time.Now())
+}
+
+// String returns the full accumulated output, reassembled exactly — no lost
+// or duplicated bytes — for the post-Wait tail extraction and failure scan.
+func (o *lineObserver) String() string {
+	return o.buf.String()
 }

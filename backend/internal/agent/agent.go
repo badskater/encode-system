@@ -436,19 +436,22 @@ func (a *Agent) findPowerShell() string {
 // returns the exit code plus the last output lines and the step timing
 // tracker. Progress lines (ENCODE_STEP) are forwarded into the agent log for
 // heartbeat context AND feed the tracker's first-seen timestamps — the scan
-// is the SAME single pass over the output, not a second walk.
+// is LIVE: a lineObserver processes each complete line as it arrives (at
+// arrival time, time.Now()), not a post-hoc single-timestamp pass after
+// cmd.Wait. The full output is still accumulated for tail extraction and the
+// ENCODE_STEP_FAILED scan, which run unchanged.
 func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
 
-	var buf bytes.Buffer
+	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
 	f, err := os.Create(runLog)
 	if err == nil {
 		defer f.Close()
 	}
-	mw := io.MultiWriter(&buf)
+	mw := io.MultiWriter(observer) // tee: observer accumulates ALL output
 	if f != nil {
-		mw = io.MultiWriter(&buf, f)
+		mw = io.MultiWriter(observer, f) // run.log gets the raw bytes too
 	}
 	cmd.Stdout = mw
 	cmd.Stderr = mw
@@ -463,8 +466,10 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 			exitCode = -1
 		}
 	}
+	// Process any final trailing partial line that never got a newline.
+	observer.flush()
 
-	out := buf.String()
+	out := observer.String() // full accumulated output (no lost/dup bytes)
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) > 40 {
 		lines = lines[len(lines)-40:]
@@ -472,18 +477,11 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 	tail = strings.Join(lines, "\n")
 
 	// Extract the last failure marker for a compact error message.
+	// (This post-hoc scan is for error extraction only — progress logging
+	// and timing observation happen LIVE in lineObserver.Write above.)
 	for _, l := range lines {
 		if strings.HasPrefix(l, "ENCODE_STEP_FAILED") {
 			stepErr = strings.TrimSpace(l)
-		}
-	}
-	// Log progress transitions and feed the step timing tracker in the SAME
-	// scan. The tracker's observe records the first-seen timestamp per step.
-	now := time.Now()
-	for _, l := range strings.Split(out, "\n") {
-		if m := stepLine.FindStringSubmatch(l); m != nil {
-			a.Log.Info("job progress", "step", m[1], "pct", m[2])
-			timings.observe(l, now)
 		}
 	}
 	return exitCode, tail, stepErr, timings
@@ -494,6 +492,14 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 // Both are added as new JSON keys ("log_full", "step_timings") alongside the
 // legacy fields; old controllers ignore unknown keys, so adding them is safe.
 func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string, outputs []string, tail, fullLog string, stepTimings []model.StepTiming) {
+	// Normalize a nil slice to []model.StepTiming{} so the wire shape is
+	// always "step_timings":[] (never null). The three early-failure call
+	// sites pass nil; without this the controller would unmarshal null into a
+	// nil slice, breaking parity with the populated path. Consistent empty
+	// array, not null, for both code paths.
+	if stepTimings == nil {
+		stepTimings = []model.StepTiming{}
+	}
 	rep := map[string]any{
 		"status": status, "exit_code": exitCode, "error": errMsg,
 		"outputs": outputs, "log_tail": tail,

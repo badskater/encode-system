@@ -707,11 +707,13 @@ func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
 // RetryJob re-queues a failed/cancelled job as pending on no node. It returns
 // the number of rows re-queued (0 when the job is not retryable, e.g. still
 // running) so callers can distinguish success from a no-op. Stale v2 capture
-// (full_log, step_timings_json) is cleared alongside the v1 state so a retry
-// starts clean; retry_count/next_retry_at are managed by the queue layer.
+// (full_log, step_timings_json, next_retry_at) is cleared alongside the v1
+// state so a retry starts clean and is never blocked by a stale backoff gate
+// once the queue gates dispatch on next_retry_at; retry_count is managed by
+// the queue layer.
 func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
 		id)
 	if err != nil {
 		return 0, err

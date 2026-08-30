@@ -170,6 +170,49 @@ func TestJobV2FieldsRoundTrip(t *testing.T) {
 	check("ActiveJobForNode", active)
 }
 
+// TestRetryJobClearsNextRetryAt asserts that RetryJob — the clean-slate
+// primitive for re-running a job — clears next_retry_at along with the other
+// v2 capture fields. A manual retry must never remain blocked by a stale
+// backoff gate once the queue later gates dispatch on next_retry_at.
+func TestRetryJobClearsNextRetryAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+
+	j, err := s.CreateJob(ctx, &model.Job{
+		Series:     "RJ",
+		Episode:    "01",
+		EpisodeDir: "RJ/Ep 01",
+		ScriptType: "vpy",
+		FlowID:     flow.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark the job failed and stamp a future next_retry_at (the stale
+	// backoff gate a manual retry must clear), mirroring the direct-UPDATE
+	// pattern used elsewhere for v2 fields.
+	stamp := time.Date(2026, 8, 30, 13, 0, 0, 0, time.UTC)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status='failed', next_retry_at=? WHERE id=?`,
+		fmtTime(stamp), j.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := s.RetryJob(ctx, j.ID); err != nil || n != 1 {
+		t.Fatalf("RetryJob: rows=%d err=%v (want 1, nil)", n, err)
+	}
+
+	got, err := s.GetJob(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NextRetryAt != nil {
+		t.Fatalf("RetryJob did not clear next_retry_at: got %v want nil", got.NextRetryAt)
+	}
+}
+
 // TestSeriesNotifyRoundTrip asserts the series.notify column defaults true
 // for a freshly seeded series and survives a round-trip to false.
 func TestSeriesNotifyRoundTrip(t *testing.T) {

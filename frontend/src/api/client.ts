@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
+import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -167,6 +167,11 @@ export const api = {
   provisionRun: (id: number) => request<ProvisionRun>('GET', `/api/provision/runs/${id}`),
 
   nodes: () => request<Node[]>('GET', '/api/nodes'),
+  // nodeMetrics fetches the per-node metric history ring buffer
+  // (GET /api/nodes/{id}/metrics?range=1h|6h|24h). Returns the raw sample
+  // array; the Nodes detail panel renders CPU + GPU-util sparklines from it.
+  getNodeMetrics: (id: number, range: '1h' | '6h' | '24h') =>
+    request<NodeMetricSample[]>('GET', `/api/nodes/${id}/metrics?range=${range}`),
   createNode: (name: string) =>
     request<{ node: Node; token: string }>('POST', '/api/nodes', { name }),
   setNodeEnabled: (id: number, enabled: boolean) =>

@@ -3,6 +3,8 @@ import { api } from '../api/client';
 import type { Node, PairingCode } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { nodeBadge, timeAgo } from '../components/helpers';
+import NodeMetricChips from '../components/NodeMetricChips';
+import NodeMetricsPanel from '../components/NodeMetricsPanel';
 
 // NodesPage manages the fleet: register nodes (showing the one-time token),
 // enable/disable for work, and force reboots.
@@ -13,6 +15,10 @@ export default function NodesPage() {
   const [issued, setIssued] = useState<{ name: string; token: string } | null>(null);
   const [issuedPair, setIssuedPair] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // metricsNode is the node whose inline metrics panel is expanded (null =
+  // none). Only one panel open at a time; opening another closes the first,
+  // matching the single-detail-card pattern on the Jobs page.
+  const [metricsNode, setMetricsNode] = useState<Node | null>(null);
 
   async function register() {
     const name = newName.trim();
@@ -152,6 +158,7 @@ export default function NodesPage() {
             <th>Name</th>
             <th>Status</th>
             <th>Enabled</th>
+            <th>Metrics</th>
             <th>Tasks</th>
             <th>Reboot pending</th>
             <th>Agent</th>
@@ -163,27 +170,52 @@ export default function NodesPage() {
         </thead>
         <tbody>
           {(nodes ?? []).map((n) => (
-            <tr key={n.id}>
-              <td>{n.name}</td>
-              <td>{nodeBadge(n.status, !!n.online)}</td>
-              <td>
-                <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
-              </td>
-              <td>{n.tasks_since_boot}</td>
-              <td>{n.reboot_pending ? 'yes' : 'no'}</td>
-              <td className="muted">{n.agent_version || '—'}</td>
-              <td className="muted">{n.lib_version || '—'}</td>
-              <td className="muted">{n.bin_version ? `v${n.bin_version}` : '—'}</td>
-              <td className="muted">{timeAgo(n.last_seen)}</td>
-              <td>
-                <button className="btn" onClick={() => reboot(n)}>
-                  Reboot
-                </button>{' '}
-                <button className="btn danger" onClick={() => remove(n)}>
-                  Delete
-                </button>
-              </td>
-            </tr>
+            <>
+              <tr key={n.id}>
+                <td>{n.name}</td>
+                <td>{nodeBadge(n.status, !!n.online)}</td>
+                <td>
+                  <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
+                </td>
+                <td>
+                  <NodeMetricChips metrics={n.last_metrics} />
+                </td>
+                <td>{n.tasks_since_boot}</td>
+                <td>{n.reboot_pending ? 'yes' : 'no'}</td>
+                <td className="muted">{n.agent_version || '—'}</td>
+                <td className="muted">{n.lib_version || '—'}</td>
+                <td className="muted">{n.bin_version ? `v${n.bin_version}` : '—'}</td>
+                <td className="muted">{timeAgo(n.last_seen)}</td>
+                <td>
+                  <button
+                    className={`btn ${metricsNode?.id === n.id ? 'primary' : ''}`}
+                    onClick={() =>
+                      setMetricsNode(metricsNode?.id === n.id ? null : n)
+                    }
+                    title="Toggle the per-node metrics history panel"
+                  >
+                    Metrics
+                  </button>{' '}
+                  <button className="btn" onClick={() => reboot(n)}>
+                    Reboot
+                  </button>{' '}
+                  <button className="btn danger" onClick={() => remove(n)}>
+                    Delete
+                  </button>
+                </td>
+              </tr>
+              {metricsNode?.id === n.id && (
+                <tr key={`${n.id}-metrics`}>
+                  <td colSpan={11} style={{ padding: 0, border: 'none' }}>
+                    <NodeMetricsPanel
+                      nodeId={n.id}
+                      nodeName={n.name}
+                      onClose={() => setMetricsNode(null)}
+                    />
+                  </td>
+                </tr>
+              )}
+            </>
           ))}
         </tbody>
       </table>

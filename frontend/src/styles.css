@@ -152,6 +152,39 @@ pre {
   border-radius: 4px;
 }
 
+/* Metric chips: compact inline labels for the live node counters. */
+.metric-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.chip .chip-label {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.chip.warn {
+  border-color: var(--red);
+  background: rgba(248, 81, 73, 0.12);
+}
+.chip.warn .chip-value { color: var(--red); }
+
+/* Sparkline wrapper */
+.sparkline-wrap { color: var(--accent); }
+
 /* Flow builder */
 .flow-canvas { display: flex; gap: 24px; }
 .flow-steps { flex: 2; display: flex; flex-direction: column; gap: 8px; }

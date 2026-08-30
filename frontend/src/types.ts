@@ -139,6 +139,32 @@ export interface Node {
   last_seen: string | null;
   last_error?: string;
   online?: boolean;
+  // Most recent metric snapshot the agent reported in its heartbeat (C3
+  // phase). Absent for old agents and never-reported/offline nodes.
+  last_metrics?: NodeMetrics;
+}
+
+// NodeMetrics: the 8 live counters an encode agent reports each heartbeat.
+// All fields are optional-ish in practice (old agents omit them entirely,
+// hence last_metrics? on Node), but when present all eight arrive together.
+// GPU fields are -1 when the host has no GPU; callers gate GPU UI on that.
+export interface NodeMetrics {
+  cpu_pct: number;
+  mem_used_mb: number;
+  mem_total_mb: number;
+  disk_free_gb: number;
+  gpu_util: number; // -1 = no GPU on host
+  gpu_temp: number; // -1 = no GPU on host
+  gpu_mem_used_mb: number; // -1 = no GPU on host
+  encode_fps: number; // 0 = idle / not encoding
+}
+
+// NodeMetricSample is one row of GET /api/nodes/{id}/metrics?range=… — the
+// same eight counters plus a ts. The backend emits ts in
+// "2026-08-30 07:00:00" UTC shape (no Z); helpers.fmtTime appends Z when
+// parsing, and the panel does the same.
+export interface NodeMetricSample extends NodeMetrics {
+  ts: string;
 }
 
 // StepTiming: one row of the agent's per-step completion report (B1/B2

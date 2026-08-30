@@ -251,7 +251,10 @@ function DayBars({ days }: { days: { date: string; count: number }[] }) {
 // humanizeSeconds turns a seconds value into a compact "1h 23m" / "45m" /
 // "30s" / "—" string. Used for avg-duration cells. 0 → "—".
 function humanizeSeconds(sec: number): string {
-  if (!sec || sec <= 0) return '—';
+  // Non-finite (NaN/Infinity) or non-positive durations render a placeholder,
+  // never garbage like "Infinityh NaNm" — same discipline as
+  // StepTimingsView.humanizeDuration. 0 → "—" (no meaningful duration).
+  if (!Number.isFinite(sec) || sec <= 0) return '—';
   const s = Math.round(sec);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);

@@ -57,4 +57,28 @@ describe('StepTimingsView', () => {
     const bar = container.querySelector<HTMLElement>('.step-bar-fill')!;
     expect(bar.style.width).toBe('100%');
   });
+
+  it('renders corrupt durations safely (NaN/Infinity poison no bar)', () => {
+    const { container } = render(
+      <StepTimingsView
+        timings={[
+          timing('good', 100),
+          timing('bad', Number.NaN),
+          timing('worse', Number.POSITIVE_INFINITY),
+        ]}
+      />,
+    );
+    // Corrupt values render a placeholder, never "NaNm"/"Infinityh NaNm".
+    expect(screen.getAllByText('—').length).toBe(2);
+    const bars = container.querySelectorAll<HTMLElement>('.step-bar-fill');
+    // Every width must be valid CSS: finite, clamped 2-100%.
+    for (const bar of bars) {
+      const pct = Number.parseFloat(bar.style.width);
+      expect(Number.isFinite(pct)).toBe(true);
+      expect(pct).toBeGreaterThanOrEqual(2);
+      expect(pct).toBeLessThanOrEqual(100);
+    }
+    // The one healthy step still renders at full scale.
+    expect(bars[0].style.width).toBe('100%');
+  });
 });

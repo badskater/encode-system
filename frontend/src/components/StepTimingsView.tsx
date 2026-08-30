@@ -6,7 +6,10 @@ import type { StepTiming } from '../types';
 //   >= 1h  → "Hh MMm"
 // No chart library — the breakdown is a handful of rows, YAGNI.
 function humanizeDuration(sec: number): string {
-  const s = Math.max(0, Math.round(sec));
+  // Corrupt/non-finite durations (NaN/Infinity/negative from a bad report)
+  // must render a placeholder, never garbage like "NaNm".
+  if (!Number.isFinite(sec) || sec < 0) return '—';
+  const s = Math.round(sec);
   if (s < 60) return `${s}s`;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -22,7 +25,11 @@ function humanizeDuration(sec: number): string {
 // → renders nothing).
 export default function StepTimingsView({ timings }: { timings: StepTiming[] }) {
   if (!timings || timings.length === 0) return null;
-  const maxDur = Math.max(...timings.map((t) => t.duration_sec), 1);
+  // Sanitize durations before the max: a single NaN/Infinity would poison
+  // Math.max and turn EVERY bar width into "NaN%".
+  const dur = (t: StepTiming) =>
+    Number.isFinite(t.duration_sec) && t.duration_sec >= 0 ? t.duration_sec : 0;
+  const maxDur = Math.max(...timings.map(dur), 1);
   return (
     <>
       <h4>Step timings</h4>
@@ -37,7 +44,7 @@ export default function StepTimingsView({ timings }: { timings: StepTiming[] }) 
         </thead>
         <tbody>
           {timings.map((t, i) => {
-            const pct = Math.max(2, Math.round((t.duration_sec / maxDur) * 100));
+            const pct = Math.min(100, Math.max(2, Math.round((dur(t) / maxDur) * 100)));
             return (
               <tr key={`${t.step}-${i}`}>
                 <td>{t.step}</td>

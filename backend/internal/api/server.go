@@ -15,6 +15,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -49,6 +50,12 @@ type Server struct {
 	Cfg       Config
 	Provision *provision.Engine // node provisioning (nil = unavailable)
 	throttle  *loginThrottle
+	// Notifier, when non-nil, overrides the live Discord notifier resolved
+	// from settings on each job-outcome alert. Tests inject a recording
+	// notifier here to assert whether a notification fired (the auto-retry
+	// path must be silent). Production leaves this nil so notifyJobFinished
+	// resolves the webhook from currentSettings exactly as before.
+	Notifier notify.Notifier
 }
 
 // New builds the server and seeds the default flow when absent.

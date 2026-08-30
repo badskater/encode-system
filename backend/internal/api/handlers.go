@@ -189,16 +189,19 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
-	jobs, err := s.Store.ListJobs(ctx, model.JobPending, 1)
+	// NextAssignableJob gates on next_retry_at (a backoff-pending job is
+	// not ready yet) and orders by priority DESC then id DESC so urgent and
+	// newer jobs dispatch first. ListJobs stays for the UI, which must still
+	// show retry-pending jobs.
+	job, err := s.Store.NextAssignableJob(ctx)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list pending jobs")
 		return
 	}
-	if len(jobs) == 0 {
+	if job == nil {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
-	job := jobs[0]
 	payload, err := s.renderJob(ctx, job)
 	if err != nil {
 		s.Log.Error("render job failed", "job", job.ID, "err", err)
@@ -312,18 +315,67 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		return
 	}
 	s.Log.Info("job finished", "job", jobID, "status", status, "node", node.Name)
+
+	// Per-flow automatic retry: a failed job whose flow has a retry budget
+	// (MaxRetries > 0) and remaining attempts (RetryCount < MaxRetries) is
+	// silently re-queued as pending with a backoff gate instead of alerting.
+	// The node is already freed above (ReleaseNode), so the retry does not
+	// hold the box. When retries are exhausted, the flow has no policy, or
+	// the flow vanished, the job notifies as before — the notify path reads
+	// RetryCount off the job so the alert says "(after N retries)".
+	if status == model.JobFailed && s.shouldAutoRetry(ctx, job, jobID) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
+		return
+	}
 	s.notifyJobFinished(ctx, jobID, node.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
+}
+
+// shouldAutoRetry decides whether a just-failed job is silently re-queued
+// per its flow's retry policy, and performs the re-queue when so. Returns
+// true when the job was re-queued (caller must skip notification); false
+// when the job should notify (retries exhausted, no policy, or the flow
+// could not be resolved). A GetFlow error or a vanished flow is treated as
+// no-retry-policy so a broken flow lookup never strands a job.
+func (s *Server) shouldAutoRetry(ctx context.Context, job *model.Job, jobID int64) bool {
+	fl, err := s.Store.GetFlow(ctx, job.FlowID)
+	if err != nil || fl == nil || fl.MaxRetries <= 0 {
+		return false // no retry policy → notify
+	}
+	if job.RetryCount >= fl.MaxRetries {
+		return false // budget exhausted → notify (carries retry count)
+	}
+	// Backoff: the flow's configured minutes, with a sane minimum so a
+	// zero-value (operator forgot to set it) is never an instant retry.
+	backoff := time.Duration(fl.RetryBackoffMinutes) * time.Minute
+	if backoff <= 0 {
+		backoff = 1 * time.Minute
+	}
+	next := time.Now().UTC().Add(backoff)
+	nextRetryCount := job.RetryCount + 1
+	if err := s.Store.ScheduleJobRetry(ctx, jobID, nextRetryCount, next); err != nil {
+		s.Log.Warn("schedule job retry", "err", err, "job", jobID)
+		return false // scheduling failed → fall through to notify
+	}
+	s.Log.Warn("job auto-retry scheduled", "job", jobID, "retry", nextRetryCount,
+		"max", fl.MaxRetries, "backoff", backoff, "next_retry_at", next)
+	return true
 }
 
 // notifyJobFinished fires the outcome alert for a job that just reached a
 // terminal state. The job is re-read so the alert carries the recorded error
 // and timestamps. The notifier is resolved from the LIVE settings on every
 // call (Settings-page webhook edits take effect immediately, no restart);
-// an empty webhook is a no-op.
+// an empty webhook is a no-op. When s.Notifier is set (test injection), it
+// overrides the live resolution so tests can assert whether a notification
+// fired.
 func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName string) {
 	j, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
+		return
+	}
+	if s.Notifier != nil {
+		s.Notifier.JobFinished(ctx, j, nodeName)
 		return
 	}
 	notify.NewDiscord(s.discordWebhook(ctx), s.Log).JobFinished(ctx, j, nodeName)
@@ -684,9 +736,12 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
-// handlePatchJob changes a pending job's flow before it starts. Assigned or
-// running jobs refuse the change — their script is already on (or bound for)
-// a node, so swapping flows mid-flight would be meaningless.
+// handlePatchJob changes a pending job's flow and/or priority before it
+// starts. Assigned or running jobs refuse the change — their script is
+// already on (or bound for) a node, so swapping flows mid-flight would be
+// meaningless. Priority is the D2 queue weight (higher = dispatched sooner);
+// landing the API now is cheap since the handler is already open and the
+// assignment path already orders by priority.
 func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -694,10 +749,11 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FlowID *int64 `json:"flow_id"`
+		FlowID   *int64 `json:"flow_id"`
+		Priority *int   `json:"priority"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.FlowID == nil {
-		writeErr(w, http.StatusBadRequest, "flow_id required")
+	if err := decodeJSON(r, &req); err != nil || (req.FlowID == nil && req.Priority == nil) {
+		writeErr(w, http.StatusBadRequest, "flow_id or priority required")
 		return
 	}
 	ctx := r.Context()
@@ -707,16 +763,24 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if job.Status != model.JobPending {
-		writeErr(w, http.StatusConflict, "only pending jobs can change flow")
+		writeErr(w, http.StatusConflict, "only pending jobs can be patched")
 		return
 	}
-	if _, err := s.Store.GetFlow(ctx, *req.FlowID); err != nil {
-		writeErr(w, http.StatusBadRequest, "flow not found")
-		return
+	if req.FlowID != nil {
+		if _, err := s.Store.GetFlow(ctx, *req.FlowID); err != nil {
+			writeErr(w, http.StatusBadRequest, "flow not found")
+			return
+		}
+		if err := s.Store.SetJobFlow(ctx, id, *req.FlowID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update job flow")
+			return
+		}
 	}
-	if err := s.Store.SetJobFlow(ctx, id, *req.FlowID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "update job flow")
-		return
+	if req.Priority != nil {
+		if err := s.Store.SetJobPriority(ctx, id, *req.Priority); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update job priority")
+			return
+		}
 	}
 	job, err = s.Store.GetJob(ctx, id)
 	if err != nil {

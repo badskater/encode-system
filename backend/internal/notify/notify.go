@@ -57,7 +57,10 @@ func NewDiscord(webhookURL string, log *slog.Logger) Notifier {
 }
 
 // JobFinished formats and posts the outcome. Failures carry the error and a
-// short log tail so the alert is actionable without opening the UI.
+// short log tail so the alert is actionable without opening the UI. When a
+// job failed after exhausting its automatic retry budget, the retry count is
+// surfaced so the alert distinguishes a one-shot failure from one that burned
+// through its retries.
 func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string) {
 	var b strings.Builder
 	if j.Status == model.JobDone {
@@ -68,6 +71,9 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 		fmt.Fprintf(&b, "node: `%s` · step: `%s`", nodeName, j.Step)
 		if j.Error != "" {
 			fmt.Fprintf(&b, "\nerror: `%s`", truncate(j.Error, 300))
+		}
+		if j.RetryCount > 0 {
+			fmt.Fprintf(&b, "\n(after %d retries)", j.RetryCount)
 		}
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil && !j.StartedAt.IsZero() && !j.FinishedAt.IsZero() {

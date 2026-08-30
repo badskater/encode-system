@@ -191,12 +191,62 @@ CREATE INDEX IF NOT EXISTS idx_metrics_node_ts ON node_metrics(node_id, ts);
 	// Settings struct — no SQL column is needed. Their defaults (false) are
 	// the zero value of the bool fields, so old JSON rows that lack the keys
 	// unmarshal cleanly to "off". SaveSettings/GetSettings round-trip them.
+	// flows.options_json: per-flow retry policy (max_retries +
+	// retry_backoff_minutes) as a JSON blob, the same single-column pattern
+	// the settings table uses. Default '{}' so every old flow row unmarshals
+	// to a zero-value policy (retry OFF). All flow SELECT/INSERT/UPDATE sites
+	// carry this column via the marshalFlowOptions/scanFlowOptions helpers.
+	if _, err := s.db.Exec(`ALTER TABLE flows ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 flows.options_json: %w", err)
+		}
+	}
 	return nil
 }
 
 // isDuplicateColumnErr reports the SQLite "duplicate column" error shape.
 func isDuplicateColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column")
+}
+
+// flowOptions is the JSON shape stored in flows.options_json. Only the
+// per-flow retry policy fields live here today; future flow-level options
+// extend this struct. The zero-value struct marshals to {"max_retries":0,
+// "retry_backoff_minutes":0} which the caller interprets as retry OFF.
+type flowOptions struct {
+	MaxRetries          int `json:"max_retries"`
+	RetryBackoffMinutes int `json:"retry_backoff_minutes"`
+}
+
+// marshalFlowOptions serializes a Flow's retry policy into the options_json
+// column shape. A nil/empty flow never reaches here (callers guard), and the
+// marshal is infallible for this simple struct — but a marshal error (which
+// cannot occur for two ints) degrades to the zero-value '{}' so a flow is
+// never stranded by observability data.
+func marshalFlowOptions(f *model.Flow) string {
+	b, err := json.Marshal(flowOptions{
+		MaxRetries:          f.MaxRetries,
+		RetryBackoffMinutes: f.RetryBackoffMinutes,
+	})
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// scanFlowOptions deserializes options_json back onto a Flow. An empty or
+// malformed blob degrades to the zero value (retry OFF) rather than failing
+// the read — a corrupt options_json must never strand a flow lookup.
+func scanFlowOptions(f *model.Flow, optionsJSON string) {
+	if optionsJSON == "" {
+		return
+	}
+	var opts flowOptions
+	if err := json.Unmarshal([]byte(optionsJSON), &opts); err != nil {
+		return
+	}
+	f.MaxRetries = opts.MaxRetries
+	f.RetryBackoffMinutes = opts.RetryBackoffMinutes
 }
 
 func parseTime(s string) time.Time {
@@ -359,7 +409,8 @@ func (s *Store) CreateFlow(ctx context.Context, f *model.Flow) (*model.Flow, err
 	if err != nil {
 		return nil, fmt.Errorf("marshal steps: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO flows (name, steps_json) VALUES (?, ?)`, f.Name, string(b))
+	res, err := s.db.ExecContext(ctx, `INSERT INTO flows (name, steps_json, options_json) VALUES (?, ?, ?)`,
+		f.Name, string(b), marshalFlowOptions(f))
 	if err != nil {
 		return nil, fmt.Errorf("create flow: %w", err)
 	}
@@ -372,27 +423,28 @@ func (s *Store) CreateFlow(ctx context.Context, f *model.Flow) (*model.Flow, err
 
 // GetFlow loads a flow by ID.
 func (s *Store) GetFlow(ctx context.Context, id int64) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE id = ?`, id)
 	return scanFlow(row)
 }
 
 // FlowByName loads a flow by unique name.
 func (s *Store) FlowByName(ctx context.Context, name string) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE name = ?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE name = ?`, name)
 	return scanFlow(row)
 }
 
 func scanFlow(row *sql.Row) (*model.Flow, error) {
 	var f model.Flow
-	var stepsJSON string
+	var stepsJSON, optionsJSON string
 	var isDefault int
 	var createdAt, updatedAt string
-	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &optionsJSON, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
 		return nil, fmt.Errorf("unmarshal steps: %w", err)
 	}
+	scanFlowOptions(&f, optionsJSON)
 	f.IsDefault = isDefault == 1
 	f.CreatedAt = parseTime(createdAt)
 	f.UpdatedAt = parseTime(updatedAt)
@@ -401,7 +453,7 @@ func scanFlow(row *sql.Row) (*model.Flow, error) {
 
 // ListFlows returns all flows ordered by name.
 func (s *Store) ListFlows(ctx context.Context) ([]*model.Flow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -409,15 +461,16 @@ func (s *Store) ListFlows(ctx context.Context) ([]*model.Flow, error) {
 	var out []*model.Flow
 	for rows.Next() {
 		var f model.Flow
-		var stepsJSON string
+		var stepsJSON, optionsJSON string
 		var isDefault int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &optionsJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
 			return nil, err
 		}
+		scanFlowOptions(&f, optionsJSON)
 		f.IsDefault = isDefault == 1
 		f.CreatedAt = parseTime(createdAt)
 		f.UpdatedAt = parseTime(updatedAt)
@@ -432,8 +485,8 @@ func (s *Store) UpdateFlow(ctx context.Context, f *model.Flow) error {
 	if err != nil {
 		return fmt.Errorf("marshal steps: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE flows SET name=?, steps_json=?, updated_at=datetime('now') WHERE id=?`,
-		f.Name, string(b), f.ID)
+	_, err = s.db.ExecContext(ctx, `UPDATE flows SET name=?, steps_json=?, options_json=?, updated_at=datetime('now') WHERE id=?`,
+		f.Name, string(b), marshalFlowOptions(f), f.ID)
 	return err
 }
 
@@ -585,6 +638,15 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 func (s *Store) SetJobFlow(ctx context.Context, id, flowID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE jobs SET flow_id = ? WHERE id = ? AND status = 'pending'`, flowID, id)
+	return err
+}
+
+// SetJobPriority changes the queue weight of a pending job. Field-scoped SQL
+// so a concurrent flow/priority patch cannot lose writes. Guarded by status
+// in the handler (only pending jobs are patchable).
+func (s *Store) SetJobPriority(ctx context.Context, id int64, priority int) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET priority = ? WHERE id = ? AND status = 'pending'`, priority, id)
 	return err
 }
 
@@ -801,13 +863,56 @@ func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
 // once the queue gates dispatch on next_retry_at; retry_count is managed by
 // the queue layer.
 func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
+	// The guard accepts a terminal job (failed/cancelled/done) OR a pending
+	// job that is sitting behind a backoff gate (next_retry_at IS NOT NULL).
+	// The second clause lets the manual retry endpoint un-gate a job that was
+	// auto-retried — the operator can short-circuit the backoff to retry now.
+	// A plain pending job with no gate matches neither clause (it is already
+	// queued) and is correctly a no-op, surfacing as a 409 in the handler.
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL WHERE id=? AND (status IN ('failed','cancelled','done') OR (status='pending' AND next_retry_at IS NOT NULL))`,
 		id)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ScheduleJobRetry silently re-queues a failed job for automatic retry: it
+// flips the job back to pending, stamps retry_count, and sets next_retry_at
+// to the computed backoff time. The UPDATE is guarded by status='failed'
+// so it is atomic with the finished state — a job that already left the
+// failed state (manual retry, cancel) matches zero rows and is a no-op
+// (nil error). This prevents a retry from resurrecting a job a concurrent
+// path already moved on.
+func (s *Store) ScheduleJobRetry(ctx context.Context, jobID int64, retryCount int, nextRetryAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, retry_count=?, next_retry_at=? WHERE id=? AND status='failed'`,
+		retryCount, fmtTime(nextRetryAt), jobID)
+	return err
+}
+
+// NextAssignableJob returns the highest-priority pending job whose backoff
+// gate has elapsed (next_retry_at IS NULL OR <= now), ordered by priority
+// DESC then id DESC. The priority ordering lets Phase D2 exploit it for
+// urgent jobs; id DESC keeps FIFO order within a priority tier. Returns
+// nil (not an error) when no job is assignable. ListJobs stays unchanged
+// for the UI (retry-pending jobs remain visible).
+func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at
+  FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+  ORDER BY priority DESC, id DESC LIMIT 1`)
+	j, err := scanJob(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return j, nil
 }
 
 // CountFinishedTasksForNode counts terminal jobs completed by a node — used

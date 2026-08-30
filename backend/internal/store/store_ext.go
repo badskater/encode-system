@@ -415,7 +415,7 @@ func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) er
 // DefaultFlow returns the flow marked default, or an error when none exists.
 func (s *Store) DefaultFlow(ctx context.Context) (*model.Flow, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, steps_json, is_default, created_at, updated_at FROM flows WHERE is_default = 1 LIMIT 1`)
+		`SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE is_default = 1 LIMIT 1`)
 	return scanFlowV2(row)
 }
 
@@ -445,15 +445,16 @@ func (s *Store) SetDefaultFlow(ctx context.Context, id int64) error {
 // scanFlowV2 reads a flow row including is_default.
 func scanFlowV2(row *sql.Row) (*model.Flow, error) {
 	var f model.Flow
-	var stepsJSON string
+	var stepsJSON, optionsJSON string
 	var isDefault int
 	var createdAt, updatedAt string
-	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Name, &stepsJSON, &isDefault, &optionsJSON, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &f.Steps); err != nil {
 		return nil, fmt.Errorf("unmarshal steps: %w", err)
 	}
+	scanFlowOptions(&f, optionsJSON)
 	f.IsDefault = isDefault == 1
 	f.CreatedAt = parseTime(createdAt)
 	f.UpdatedAt = parseTime(updatedAt)

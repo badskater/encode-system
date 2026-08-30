@@ -58,12 +58,22 @@ func (s Step) TemplateKey() string { return string(s.Type) }
 // Flow is a named, ordered list of steps rendered into a job script.
 // Exactly one flow may be the default (used when a series has no flow set).
 type Flow struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Steps     []Step    `json:"steps"`
-	IsDefault bool      `json:"is_default"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Steps     []Step `json:"steps"`
+	IsDefault bool   `json:"is_default"`
+	// MaxRetries is the per-flow automatic retry budget: a failed job whose
+	// retry_count is below this is silently re-queued with backoff instead of
+	// alerting. Zero = retry OFF (the default for flows created before D1).
+	// Stored in options_json alongside RetryBackoffMinutes.
+	MaxRetries int `json:"max_retries"`
+	// RetryBackoffMinutes is the delay before a re-queued job becomes
+	// assignable again. Applied only when MaxRetries > 0; a zero value when
+	// retries are enabled defaults to a sensible minimum at the decision
+	// site so a retry is never instant. Stored in options_json.
+	RetryBackoffMinutes int       `json:"retry_backoff_minutes"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // User is a management-plane account (login-based, replaces the static

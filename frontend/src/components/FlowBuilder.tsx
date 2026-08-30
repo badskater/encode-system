@@ -52,14 +52,19 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
   // unconditionally so a stale value can't sneak through if the user
   // toggles retries back up later.
   const retryValid = useMemo(() => {
-    if (maxRetries < 0 || maxRetries > 10) return false;
-    if (maxRetries > 0 && (retryBackoff < 1 || retryBackoff > 1440)) return false;
+    // NaN (e.g. from a cleared number input on some browsers) must fail
+    // validation — relational comparisons with NaN are all false and would
+    // silently let it through to JSON.stringify → null on the wire.
+    if (!Number.isFinite(maxRetries) || maxRetries < 0 || maxRetries > 10) return false;
+    if (maxRetries > 0 && (!Number.isFinite(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
+      return false;
     return true;
   }, [maxRetries, retryBackoff]);
 
   const retryError = useMemo(() => {
-    if (maxRetries < 0 || maxRetries > 10) return 'Max retries must be 0–10';
-    if (maxRetries > 0 && (retryBackoff < 1 || retryBackoff > 1440))
+    if (!Number.isFinite(maxRetries) || maxRetries < 0 || maxRetries > 10)
+      return 'Max retries must be 0–10';
+    if (maxRetries > 0 && (!Number.isFinite(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
       return 'Retry backoff must be 1–1440 minutes';
     return null;
   }, [maxRetries, retryBackoff]);

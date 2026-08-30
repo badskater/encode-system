@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { api } from '../api/client';
 import type { Flow, Job, JobStatus, Node } from '../types';
 import { usePolling } from '../hooks/usePolling';
-import { jobBadge, fmtTime } from '../components/helpers';
+import { jobBadge, fmtTime, parseTime } from '../components/helpers';
 import JobLogDialog from '../components/JobLogDialog';
 import StepTimingsView from '../components/StepTimingsView';
 
@@ -152,7 +152,8 @@ export default function JobsPage() {
                 {(j.retry_count ?? 0) > 0 && (
                   <>
                     <span>retry {j.retry_count}</span>
-                    {j.next_retry_at && new Date(j.next_retry_at).getTime() > Date.now() && (
+                    {j.next_retry_at &&
+                      (parseTime(j.next_retry_at)?.getTime() ?? 0) > Date.now() && (
                       <span className="muted" style={{ marginLeft: 4 }}>
                         waits until {fmtTime(j.next_retry_at)}
                       </span>

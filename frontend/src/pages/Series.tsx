@@ -42,6 +42,17 @@ export default function SeriesPage() {
     }
   }
 
+  // toggleNotify mutes/unmutes a series' Discord job-outcome alerts. Muted
+  // series still queue and encode — only the alert is suppressed.
+  async function toggleNotify(sr: Series) {
+    try {
+      await api.patchSeries(sr.id, { notify: !sr.notify });
+      setActionError(null);
+    } catch (e) {
+      setActionError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   const flowName = (id: number) => {
     if (id === 0) return null;
     return flows?.find((f) => f.id === id)?.name ?? `#${id}`;
@@ -76,12 +87,15 @@ export default function SeriesPage() {
             <th>Progress</th>
             <th>Jobs</th>
             <th>Accepting work</th>
+            <th>Notify</th>
           </tr>
         </thead>
         <tbody>
           {(series ?? []).map((sr) => (
             <tr key={sr.id}>
-              <td>{sr.name}</td>
+              <td style={{ opacity: sr.notify === false ? 0.7 : undefined }}>
+                {sr.name}
+              </td>
               <td>
                 <select
                   value={sr.flow_id}
@@ -123,11 +137,22 @@ export default function SeriesPage() {
               <td>
                 <input type="checkbox" checked={sr.enabled} onChange={() => toggle(sr)} />
               </td>
+              <td>
+                <button
+                  className="btn"
+                  style={{ padding: '2px 6px', fontSize: 14 }}
+                  title={sr.notify === false ? 'Unmute Discord alerts' : 'Mute Discord alerts'}
+                  aria-label={sr.notify === false ? 'Unmute' : 'Mute'}
+                  onClick={() => toggleNotify(sr)}
+                >
+                  {sr.notify === false ? '🔕' : '🔔'}
+                </button>
+              </td>
             </tr>
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={6} className="muted">
+              <td colSpan={7} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>

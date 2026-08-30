@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Flow, Job, JobStatus, Node } from '../types';
 import { usePolling } from '../hooks/usePolling';
@@ -27,6 +27,35 @@ export default function JobsPage() {
   );
   const { data: nodes } = usePolling<Node[]>(() => api.nodes(), 30000);
   const { data: flows } = usePolling<Flow[]>(() => api.flows(), 30000);
+
+  // Deep-link consumption (Phase F2): Discord alert messages carry a link
+  // like /jobs?job=42. On mount we read that param once; when the polled job
+  // list arrives and contains that job, we auto-open its log dialog (same
+  // setLogJob path the Log button uses). The consumed ref prevents
+  // re-triggering on every poll tick — the dialog opens exactly once.
+  const deepLinkConsumed = useRef(false);
+  useEffect(() => {
+    if (deepLinkConsumed.current) return;
+    if (!jobs || jobs.length === 0) return;
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get('job');
+    if (!raw) {
+      deepLinkConsumed.current = true; // no param — mark consumed either way
+      return;
+    }
+    const id = Number(raw);
+    if (!Number.isFinite(id)) {
+      deepLinkConsumed.current = true;
+      return;
+    }
+    const found = jobs.find((j) => j.id === id);
+    if (found) {
+      deepLinkConsumed.current = true;
+      setLogJob(found);
+    }
+    // If not found yet, leave consumed=false so a later poll can match it
+    // (the job may still be loading). Once matched, it's consumed for good.
+  }, [jobs]);
 
   const nodeName = (id?: number) => nodes?.find((n) => n.id === id)?.name ?? '—';
   const flowName = (id: number) => flows?.find((f) => f.id === id)?.name ?? `#${id}`;

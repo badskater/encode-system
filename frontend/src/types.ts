@@ -46,6 +46,10 @@ export interface Series {
   episodes_failed?: number;
   episodes_active?: number;
   episodes_total?: number;
+  // Phase F2: per-series notify mute. When false the controller skips this
+  // series' Discord job-outcome alerts (done/failed); other series still
+  // notify. Defaults to true server-side for series created before the flag.
+  notify?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -90,6 +94,10 @@ export interface Settings {
   // fleet-wide (running jobs finish; nothing new dispatches). Toggled from
   // the Settings page; live — no controller restart needed.
   drain_mode?: boolean;
+  // Phase F2: hourly digest. When true the controller batches job-outcome
+  // alerts into one Discord summary per hour instead of one message per job.
+  // Round-trips via PUT /api/settings; absent/unchecked = per-job alerts.
+  notify_digest?: boolean;
   updated_at?: string;
 }
 

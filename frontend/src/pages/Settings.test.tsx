@@ -78,3 +78,43 @@ describe('Settings drain mode toggle', () => {
     expect(sent.drain_mode).toBe(true);
   });
 });
+
+describe('Settings hourly digest toggle', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the digest toggle bound to settings.notify_digest (off by default)', async () => {
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/hourly digest/i);
+    expect(toggle).toBeInTheDocument();
+    // defaults to false (notify_digest absent in baseSettings)
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('reflects settings.notify_digest=true as checked on load', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({ notify_digest: true }));
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/hourly digest/i);
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('sends notify_digest=true in the PUT body after toggling on and saving', async () => {
+    const saveSpy = vi
+      .spyOn(api, 'saveSettings')
+      .mockResolvedValue(baseSettings({ notify_digest: true }));
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/hourly digest/i);
+    fireEvent.click(toggle);
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+    // The digest toggle lives in the Discord notifications card — the
+    // second "Save settings" button belongs to that card.
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[1]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.notify_digest).toBe(true);
+  });
+});

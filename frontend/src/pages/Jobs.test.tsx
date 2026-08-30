@@ -187,3 +187,83 @@ describe('Jobs page', () => {
     expect(screen.queryByText(/waits until/i)).not.toBeInTheDocument();
   });
 });
+
+// Deep-link handling (Phase F2): when the Jobs page mounts with ?job=<id> in
+// the URL (e.g. clicked from a Discord alert), it auto-opens that job's log
+// dialog. The param is consumed once via a ref so it never re-triggers on
+// subsequent polls.
+describe('Jobs page deep-link (?job=…)', () => {
+  const originalSearch = window.location.search;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    // Restore the original search so other tests aren't affected.
+    window.history.replaceState({}, '', originalSearch);
+  });
+
+  it('auto-opens the log dialog for the job id in ?job= and shows the fetched log', async () => {
+    window.history.replaceState({}, '', '/jobs?job=2');
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 2, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('the deep-linked log body');
+
+    render(<JobsPage />);
+    await waitFor(() => expect(api.getJobLog).toHaveBeenCalledWith(2));
+    await waitFor(() =>
+      expect(screen.getByText(/Job #2/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText('the deep-linked log body')).toBeInTheDocument();
+  });
+
+  it('does not auto-open when no ?job= param is present', async () => {
+    window.history.replaceState({}, '', '/jobs');
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 50, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const logSpy = vi.spyOn(api, 'getJobLog').mockResolvedValue('log text');
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('50')).toBeInTheDocument());
+
+    // No log fetch fired automatically — the dialog wasn't auto-opened.
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-open when the job id is not in the polled list', async () => {
+    window.history.replaceState({}, '', '/jobs?job=999');
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 60, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const logSpy = vi.spyOn(api, 'getJobLog').mockResolvedValue('log text');
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('60')).toBeInTheDocument());
+
+    // The job isn't in the list, so the dialog never auto-opens.
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('consumes the param once — does not re-open on a subsequent poll', async () => {
+    window.history.replaceState({}, '', '/jobs?job=70');
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 70, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const logSpy = vi.spyOn(api, 'getJobLog').mockResolvedValue('first open');
+
+    render(<JobsPage />);
+    await waitFor(() => expect(logSpy).toHaveBeenCalledTimes(1));
+
+    // Fire a manual re-poll (usePolling re-runs fn). After the first poll
+    // the ref guard should prevent re-opening.
+    // Advance fake timers to trigger the next poll tick.
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(5000);
+    vi.useRealTimers();
+    // Give the async state update a chance to flush.
+    await waitFor(() => expect(logSpy).toHaveBeenCalledTimes(1));
+  });
+});

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import SeriesPage from './Series';
 import { api } from '../api/client';
@@ -144,5 +144,92 @@ describe('Series page progress column', () => {
     // No bar for a zero-total series.
     expect(document.querySelector('.step-bar-fill')).toBeNull();
     expect(screen.queryByText(/failed/)).not.toBeInTheDocument();
+  });
+});
+
+describe('Series page notify mute toggle', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a muted 🔕 button for a series with notify=false', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ notify: false }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    // Muted series shows the muted icon button.
+    const muteBtn = screen.getByRole('button', { name: /unmute/i });
+    expect(muteBtn).toBeInTheDocument();
+    expect(muteBtn.textContent).toContain('🔕');
+  });
+
+  it('renders an active 🔔 button for a series with notify=true (or absent)', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ notify: true }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    const muteBtn = screen.getByRole('button', { name: /mute/i });
+    expect(muteBtn).toBeInTheDocument();
+    expect(muteBtn.textContent).toContain('🔔');
+  });
+
+  it('PATCHes notify:false when muting an unmuted series', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ notify: true }),
+    ]);
+    mockEmpty();
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ notify: false }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /mute/i }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { notify: false }),
+    );
+  });
+
+  it('PATCHes notify:true when unmuting a muted series', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ notify: false }),
+    ]);
+    mockEmpty();
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ notify: true }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /unmute/i }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { notify: true }),
+    );
+  });
+
+  it('applies a subtle visual hint (opacity) to muted series names', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ notify: false }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    // The muted series name has reduced opacity.
+    const nameCell = screen.getByText('Show A');
+    expect(nameCell.style.opacity).toBe('0.7');
   });
 });

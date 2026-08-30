@@ -330,6 +330,21 @@ export default function SettingsPage() {
           'discord_webhook',
           'https://discord.com/api/webhooks/…',
         )}
+        {/* Hourly digest (Phase F2): batch job outcomes into one summary
+            message per hour instead of one message per job. Useful on busy
+            fleets where per-job alerts would flood the channel. Saved via
+            the existing settings PUT flow (same card's Save button). */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            checked={!!settings.notify_digest}
+            onChange={(e) => set('notify_digest', e.target.checked)}
+          />
+          <span>Hourly digest — batch job outcomes into one summary per hour</span>
+        </label>
+        <span className="muted" style={{ display: 'block', fontSize: 12 }}>
+          Summarizes done/failed outcomes hourly; untick for per-job alerts.
+        </span>
         <button className="btn primary" disabled={saving} onClick={save}>
           {saving ? 'Saving…' : 'Save settings'}
         </button>

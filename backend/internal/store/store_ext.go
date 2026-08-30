@@ -410,6 +410,99 @@ func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) er
 	return err
 }
 
+// ---------- Series progress (Phase F1) ----------
+
+// SeriesProgress holds the per-series encode progress counts derived from the
+// jobs table. EpisodesDone counts distinct episode_dir values with at least
+// one 'done' job; EpisodesFailed counts distinct episode_dirs whose jobs are
+// all 'failed' (an episode that eventually succeeded is done, not failed);
+// EpisodesActive counts distinct episode_dirs with an in-flight job
+// (pending/assigned/running); EpisodesSeen is the distinct episode_dir count
+// across ALL statuses — used as the fallback total when no scaffolded folders
+// are readable on disk.
+type SeriesProgress struct {
+	Done   int
+	Failed int
+	Active int
+	Seen   int
+}
+
+// SeriesProgressCounts computes progress counts for every series that has at
+// least one job row, in a single query (no N+1). The "eventually done wins"
+// semantic is applied Go-side: an episode_dir that appears in both the done
+// set and the failed set (a retried-then-succeeded episode) is counted as
+// done only, NOT failed.
+//
+// The query returns one row per distinct (series, episode_dir, status)
+// combination; Go collapses these into per-series done/failed/active/seen
+// sets with the set difference. Series with zero jobs simply do not appear
+// in the result map (callers treat absence as all-zero). The query is
+// covered by idx_jobs_episode_dir + idx_jobs_status so the cost is bounded.
+func (s *Store) SeriesProgressCounts(ctx context.Context) (map[string]SeriesProgress, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT DISTINCT series, episode_dir, status FROM jobs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Per-series sets of episode_dirs by status bucket. Using sets (not
+	// counts) lets us apply the "eventually done wins" set difference.
+	type seriesBuckets struct {
+		done   map[string]struct{}
+		failed map[string]struct{}
+		active map[string]struct{}
+		seen   map[string]struct{}
+	}
+	acc := map[string]*seriesBuckets{}
+
+	for rows.Next() {
+		var series, epDir, status string
+		if err := rows.Scan(&series, &epDir, &status); err != nil {
+			return nil, err
+		}
+		b, ok := acc[series]
+		if !ok {
+			b = &seriesBuckets{
+				done: map[string]struct{}{}, failed: map[string]struct{}{},
+				active: map[string]struct{}{}, seen: map[string]struct{}{},
+			}
+			acc[series] = b
+		}
+		b.seen[epDir] = struct{}{}
+		switch model.JobStatus(status) {
+		case model.JobDone:
+			b.done[epDir] = struct{}{}
+		case model.JobFailed:
+			b.failed[epDir] = struct{}{}
+		case model.JobPending, model.JobAssigned, model.JobRunning:
+			b.active[epDir] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]SeriesProgress, len(acc))
+	for series, b := range acc {
+		// "Eventually done wins": a failed episode_dir that also has a done
+		// job is removed from the failed set — it succeeded on retry.
+		failed := len(b.failed)
+		for ep := range b.failed {
+			if _, ok := b.done[ep]; ok {
+				failed--
+			}
+		}
+		out[series] = SeriesProgress{
+			Done:   len(b.done),
+			Failed: failed,
+			Active: len(b.active),
+			Seen:   len(b.seen),
+		}
+	}
+	return out, nil
+}
+
 // ---------- Flows: default management ----------
 
 // DefaultFlow returns the flow marked default, or an error when none exists.

@@ -1,16 +1,42 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/store"
 )
 
 // ---------- Series ----------
 
-// handleListSeries returns all registered series with job counts for the UI.
+// seriesView is the JSON shape of GET /api/series: the embedded Series row
+// plus the legacy jobs count and the Phase-F1 progress counters.
+type seriesView struct {
+	*model.Series
+	Jobs int `json:"jobs"`
+	// Phase F1: per-series encode progress. Done counts distinct episodes
+	// with a successful job; Failed counts episodes that never succeeded
+	// (an episode that eventually succeeded is done, not failed); Active
+	// counts episodes with an in-flight job; Total is the best available
+	// denominator (scaffolded episode folders on disk, or the distinct
+	// episode_dir count from jobs when the scripts root is not readable).
+	EpisodesDone   int `json:"episodes_done"`
+	EpisodesFailed int `json:"episodes_failed"`
+	EpisodesActive int `json:"episodes_active"`
+	EpisodesTotal  int `json:"episodes_total"`
+}
+
+// handleListSeries returns all registered series with job counts and
+// per-series encode progress for the UI. Progress counts are derived from
+// the jobs table in one query (done/failed/active with "eventually done
+// wins"); the total uses scaffolded episode folders on disk when the
+// scripts root is readable, falling back to the distinct episode_dir count
+// from jobs.
 func (s *Server) handleListSeries(w http.ResponseWriter, r *http.Request) {
 	series, err := s.Store.ListSeries(r.Context())
 	if err != nil {
@@ -22,20 +48,73 @@ func (s *Server) handleListSeries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "list jobs")
 		return
 	}
-	// Count jobs per series for the overview column.
+	// Count jobs per series for the overview column (legacy field).
 	counts := map[string]int{}
 	for _, j := range jobs {
 		counts[j.Series]++
 	}
-	type seriesView struct {
-		*model.Series
-		Jobs int `json:"jobs"`
+	// Phase F1: per-series progress from job history (one query, no N+1).
+	progress, err := s.Store.SeriesProgressCounts(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "series progress")
+		return
 	}
+	// Best-effort scaffolded-folder totals from the scripts root. The root
+	// is the controller-side mount; if it is missing or unreadable we fall
+	// back to the jobs-derived distinct count (progress.Seen). Wrapped
+	// defensively — a missing/unreadable root must never break the list.
+	scaffolded := s.countScaffoldedEpisodes(r.Context(), series, progress)
+
 	out := make([]seriesView, 0, len(series))
 	for _, sr := range series {
-		out = append(out, seriesView{Series: sr, Jobs: counts[sr.Name]})
+		p := progress[sr.Name] // absent → zero-value (no jobs)
+		total := scaffolded[sr.Name]
+		if total == 0 {
+			total = p.Seen // fallback: distinct dirs seen in jobs
+		}
+		out = append(out, seriesView{
+			Series:         sr,
+			Jobs:           counts[sr.Name],
+			EpisodesDone:   p.Done,
+			EpisodesFailed: p.Failed,
+			EpisodesActive: p.Active,
+			EpisodesTotal:  total,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// countScaffoldedEpisodes reads the scripts root and counts subdirectories
+// matching "Ep *" under each series' folder. Returns a map keyed by series
+// name. Best-effort: a missing/unreadable root or series dir yields 0 for
+// that series (the caller falls back to the jobs-derived count). This is
+// the best available denominator — model.Series has no persisted episode
+// count column, so the filesystem is the only source of truth for the
+// scaffolded total.
+func (s *Server) countScaffoldedEpisodes(ctx context.Context, series []*model.Series, progress map[string]store.SeriesProgress) map[string]int {
+	out := make(map[string]int, len(series))
+	root := s.currentSettings(ctx).ScriptsRoot
+	if root == "" {
+		return out
+	}
+	for _, sr := range series {
+		dir := filepath.Join(root, sr.Name)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // missing/unreadable → fallback to jobs-derived count
+		}
+		n := 0
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if strings.HasPrefix(e.Name(), "Ep ") {
+				n++
+			}
+		}
+		out[sr.Name] = n
+	}
+	return out
 }
 
 // handlePatchSeries updates a series' flow selection and enabled state.

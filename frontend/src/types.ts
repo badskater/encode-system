@@ -37,6 +37,15 @@ export interface Series {
   tag: string; // quality tag override; "" = global settings tag
   enabled: boolean;
   jobs?: number;
+  // Phase F1: per-series encode progress. Done counts distinct episodes
+  // with a successful job; Failed counts episodes that never succeeded
+  // (an episode that eventually succeeded is done, not failed); Active
+  // counts episodes with an in-flight job; Total is the best available
+  // denominator (scaffolded folders on disk, or distinct dirs from jobs).
+  episodes_done?: number;
+  episodes_failed?: number;
+  episodes_active?: number;
+  episodes_total?: number;
   created_at: string;
   updated_at: string;
 }

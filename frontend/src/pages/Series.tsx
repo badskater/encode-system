@@ -73,6 +73,7 @@ export default function SeriesPage() {
             <th>Series</th>
             <th>Encoding with</th>
             <th>Tag</th>
+            <th>Progress</th>
             <th>Jobs</th>
             <th>Accepting work</th>
           </tr>
@@ -110,6 +111,14 @@ export default function SeriesPage() {
                   onSave={(t) => changeTag(sr, t)}
                 />
               </td>
+              <td>
+                <ProgressCell
+                  done={sr.episodes_done ?? 0}
+                  failed={sr.episodes_failed ?? 0}
+                  active={sr.episodes_active ?? 0}
+                  total={sr.episodes_total ?? 0}
+                />
+              </td>
               <td>{sr.jobs ?? 0}</td>
               <td>
                 <input type="checkbox" checked={sr.enabled} onChange={() => toggle(sr)} />
@@ -118,7 +127,7 @@ export default function SeriesPage() {
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={5} className="muted">
+              <td colSpan={6} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>
@@ -191,5 +200,40 @@ function TagCell({
         }
       }}
     />
+  );
+}
+
+// ProgressCell renders a compact per-series encode progress summary:
+// "done/total" (e.g. 12/24) with a small fill bar whose width is done/total
+// %. When there are failed or in-flight episodes it appends a muted line
+// "N failed · N active". A series whose total denominator is 0 (no jobs
+// history and no scaffolded episode folders) shows muted "no jobs yet".
+// Reuses the .step-bar-track/.step-bar-fill classes from styles.css.
+function ProgressCell({
+  done,
+  failed,
+  active,
+  total,
+}: {
+  done: number;
+  failed: number;
+  active: number;
+  total: number;
+}) {
+  if (total === 0) {
+    return <span className="muted">no jobs yet</span>;
+  }
+  const pct = Math.min(100, Math.round((done / total) * 100));
+  const extra: string[] = [];
+  if (failed > 0) extra.push(`${failed} failed`);
+  if (active > 0) extra.push(`${active} active`);
+  return (
+    <div>
+      <div className="step-bar-track" title={`${done}/${total} episodes encoded`}>
+        <div className="step-bar-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <span>{done}/{total}</span>
+      {extra.length > 0 && <div className="muted">{extra.join(' · ')}</div>}
+    </div>
   );
 }

@@ -1,10 +1,17 @@
 import { useMemo, useState } from 'react';
 import type { Flow, Step, StepTemplate } from '../types';
 
+// RetryPolicy is the { max_retries, retry_backoff_minutes } pair the builder
+// hands to onSave alongside name + steps. max_retries=0 means retry is OFF.
+export interface RetryPolicy {
+  max_retries: number;
+  retry_backoff_minutes: number;
+}
+
 interface Props {
   initial: Flow | null;
   templates: StepTemplate[];
-  onSave: (name: string, steps: Step[]) => Promise<void>;
+  onSave: (name: string, steps: Step[], policy: RetryPolicy) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -33,10 +40,29 @@ function metaFor(templates: StepTemplate[], key: string) {
 export default function FlowBuilder({ initial, templates, onSave, onCancel }: Props) {
   const [name, setName] = useState(initial?.name ?? '');
   const [steps, setSteps] = useState<Step[]>(initial?.steps ?? []);
+  const [maxRetries, setMaxRetries] = useState(initial?.max_retries ?? 0);
+  const [retryBackoff, setRetryBackoff] = useState(initial?.retry_backoff_minutes ?? 15);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const canSave = useMemo(() => name.trim() !== '' && steps.length > 0, [name, steps]);
+
+  // Retry policy validation: max_retries 0-10, backoff 1-1440 minutes.
+  // Backoff is only meaningful when retries > 0, but we validate it
+  // unconditionally so a stale value can't sneak through if the user
+  // toggles retries back up later.
+  const retryValid = useMemo(() => {
+    if (maxRetries < 0 || maxRetries > 10) return false;
+    if (maxRetries > 0 && (retryBackoff < 1 || retryBackoff > 1440)) return false;
+    return true;
+  }, [maxRetries, retryBackoff]);
+
+  const retryError = useMemo(() => {
+    if (maxRetries < 0 || maxRetries > 10) return 'Max retries must be 0–10';
+    if (maxRetries > 0 && (retryBackoff < 1 || retryBackoff > 1440))
+      return 'Retry backoff must be 1–1440 minutes';
+    return null;
+  }, [maxRetries, retryBackoff]);
 
   function addStep(type: string) {
     const meta = metaFor(templates, type);
@@ -67,6 +93,11 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
   }
 
   async function save() {
+    // Client-side validation of the retry policy before hitting the API.
+    if (!retryValid) {
+      setError(retryError);
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -78,7 +109,10 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
           Object.entries(s.params ?? {}).filter(([, v]) => v.trim() !== ''),
         ),
       }));
-      await onSave(name.trim(), cleaned);
+      await onSave(name.trim(), cleaned, {
+        max_retries: maxRetries,
+        retry_backoff_minutes: maxRetries > 0 ? retryBackoff : 0,
+      });
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
     } finally {
@@ -102,6 +136,32 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
         </button>
       </div>
       {error && <div className="error-box">{error}</div>}
+
+      <div className="toolbar">
+        <label>
+          Max retries
+          <input
+            type="number"
+            min={0}
+            max={10}
+            value={maxRetries}
+            onChange={(e) => setMaxRetries(Number(e.target.value))}
+            style={{ width: 80, marginLeft: 6 }}
+          />
+        </label>
+        <label>
+          Retry backoff (min)
+          <input
+            type="number"
+            min={1}
+            max={1440}
+            value={retryBackoff}
+            disabled={maxRetries === 0}
+            onChange={(e) => setRetryBackoff(Number(e.target.value))}
+            style={{ width: 80, marginLeft: 6 }}
+          />
+        </label>
+      </div>
 
       <div className="flow-canvas">
         <div className="flow-steps">

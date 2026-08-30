@@ -40,6 +40,16 @@ export default function JobsPage() {
     }
   }
 
+  // changePriority PATCHes {priority} on a pending job, mirroring changeFlow.
+  async function changePriority(id: number, priority: number) {
+    try {
+      await api.patchJob(id, { priority });
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   async function retry(id: number) {
     try {
       await api.retryJob(id);
@@ -83,9 +93,11 @@ export default function JobsPage() {
             <th>Script</th>
             <th>Status</th>
             <th>Flow</th>
+            <th>Priority</th>
             <th>Node</th>
             <th>Step</th>
             <th>Created</th>
+            <th>Retry</th>
             <th />
           </tr>
         </thead>
@@ -119,9 +131,35 @@ export default function JobsPage() {
                   <span className="muted">{j.flow_id ? flowName(j.flow_id) : '—'}</span>
                 )}
               </td>
+              <td>
+                {j.status === 'pending' ? (
+                  <select
+                    value={j.priority ?? 0}
+                    onChange={(e) => changePriority(j.id, Number(e.target.value))}
+                    title="Set job priority"
+                  >
+                    <option value={0}>Normal</option>
+                    <option value={1}>High</option>
+                  </select>
+                ) : j.priority === 1 ? (
+                  <span className="badge yellow">High</span>
+                ) : null}
+              </td>
               <td className="muted">{j.node_id ? nodeName(j.node_id) : '—'}</td>
               <td className="muted">{j.step || '—'}</td>
               <td className="muted">{fmtTime(j.created_at)}</td>
+              <td className="muted">
+                {(j.retry_count ?? 0) > 0 && (
+                  <>
+                    <span>retry {j.retry_count}</span>
+                    {j.next_retry_at && new Date(j.next_retry_at).getTime() > Date.now() && (
+                      <span className="muted" style={{ marginLeft: 4 }}>
+                        waits until {fmtTime(j.next_retry_at)}
+                      </span>
+                    )}
+                  </>
+                )}
+              </td>
               <td>
                 {j.status === 'pending' && (
                   <button className="btn" onClick={() => cancel(j.id)}>
@@ -146,7 +184,7 @@ export default function JobsPage() {
           ))}
           {(jobs ?? []).length === 0 && (
             <tr>
-              <td colSpan={10} className="muted">
+              <td colSpan={12} className="muted">
                 No jobs {filter ? `with status ${filter}` : 'yet'}.
               </td>
             </tr>

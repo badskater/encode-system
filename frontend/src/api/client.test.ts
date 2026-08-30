@@ -68,4 +68,23 @@ describe('api client', () => {
     vi.stubGlobal('fetch', fetchMock);
     await expect(api.deleteFlow(3)).resolves.toBeUndefined();
   });
+
+  it('PATCHes a job priority', async () => {
+    setToken('tok');
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 5, priority: 1 }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.patchJob(5, { priority: 1 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [path, init] = fetchMock.mock.calls[0];
+    expect(path).toBe('/api/jobs/5');
+    expect(init.method).toBe('PATCH');
+    expect(init.headers['Content-Type']).toBe('application/json');
+    expect(JSON.parse(init.body)).toEqual({ priority: 1 });
+  });
 });

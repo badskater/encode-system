@@ -210,7 +210,10 @@ export const api = {
   },
   retryJob: (id: number) => request<Job>('POST', `/api/jobs/${id}/retry`),
   cancelJob: (id: number) => request<void>('POST', `/api/jobs/${id}/cancel`),
-  patchJob: (id: number, body: { flow_id: number }) =>
+  // patchJob updates a pending job's flow_id or priority. Same PATCH endpoint
+  // the backend exposes for per-job field changes; the body is a partial with
+  // one or both fields.
+  patchJob: (id: number, body: Partial<{ flow_id: number; priority: number }>) =>
     request<Job>('PATCH', `/api/jobs/${id}`, body),
   createJob: (body: { series: string; episode_dir: string; script_type: string; flow_id?: number }) =>
     request<Job>('POST', '/api/jobs', body),
@@ -218,7 +221,7 @@ export const api = {
   flows: () => request<Flow[]>('GET', '/api/flows'),
   createFlow: (flow: Omit<Flow, 'id' | 'created_at' | 'updated_at'>) =>
     request<Flow>('POST', '/api/flows', flow),
-  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps'>>) =>
+  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps' | 'max_retries' | 'retry_backoff_minutes'>>) =>
     request<Flow>('PUT', `/api/flows/${id}`, flow),
   deleteFlow: (id: number) => request<void>('DELETE', `/api/flows/${id}`),
   setDefaultFlow: (id: number) => request<Flow>('POST', `/api/flows/${id}/default`),

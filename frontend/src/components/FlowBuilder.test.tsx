@@ -134,10 +134,83 @@ describe('FlowBuilder', () => {
 
     // Text/number inputs prefilled with the declared defaults.
     expect((screen.getByDisplayValue('slow') as HTMLInputElement).value).toBe('slow');
-    expect((screen.getByDisplayValue('15') as HTMLInputElement).value).toBe('15');
+    // Query by label, not displayValue: the builder's retry_backoff_minutes
+    // field also defaults to 15, so getByDisplayValue('15') is now ambiguous.
+    // Targeting the CRF param by its label is more precise, not weaker.
+    expect((screen.getByLabelText('CRF (quality)') as HTMLInputElement).value).toBe('15');
     // Bool renders as a checked checkbox.
     const cb = screen.getByLabelText('Disable SAO') as HTMLInputElement;
     expect(cb.type).toBe('checkbox');
     expect(cb.checked).toBe(true);
+  });
+
+  it('renders max retries and backoff fields', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    expect(screen.getByLabelText(/max retries/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/backoff/i)).toBeInTheDocument();
+  });
+
+  it('disables backoff input when max retries is 0', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const backoff = screen.getByLabelText(/backoff/i) as HTMLInputElement;
+    expect(backoff.disabled).toBe(true);
+  });
+
+  it('enables backoff input when max retries > 0', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const retries = screen.getByLabelText(/max retries/i) as HTMLInputElement;
+    fireEvent.change(retries, { target: { value: '3' } });
+    const backoff = screen.getByLabelText(/backoff/i) as HTMLInputElement;
+    expect(backoff.disabled).toBe(false);
+  });
+
+  it('passes retry policy in onSave payload', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'retry-flow' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/max retries/i), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(/backoff/i), { target: { value: '15' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, , policy] = onSave.mock.calls[0];
+    expect(policy).toEqual({ max_retries: 3, retry_backoff_minutes: 15 });
+  });
+
+  it('blocks save when max retries exceeds 10', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/max retries/i), { target: { value: '11' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    // onSave must NOT be called — validation blocks it.
+    await waitFor(() => expect(screen.getByText(/retries must be 0/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when backoff is below 1', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad2' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/max retries/i), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(/backoff/i), { target: { value: '0' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/backoff must be 1/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
   });
 });

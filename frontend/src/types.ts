@@ -23,6 +23,11 @@ export interface Flow {
   is_default: boolean;
   created_at: string;
   updated_at: string;
+  // Retry policy (Phase D2). max_retries=0 (or absent) means no auto-retry.
+  // retry_backoff_minutes is the delay between retries; only meaningful when
+  // max_retries > 0.
+  max_retries?: number;
+  retry_backoff_minutes?: number;
 }
 
 export interface Series {
@@ -192,6 +197,11 @@ export interface Job {
   log_tail?: string;
   outputs?: string[];
   step_timings?: StepTiming[];
+  // Phase D2: priority (0=Normal, 1=High) settable on PENDING jobs only.
+  // retry_count + next_retry_at reflect the backend's auto-retry state.
+  priority?: number;
+  retry_count?: number;
+  next_retry_at?: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;

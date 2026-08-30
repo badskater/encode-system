@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Flow, FlowExport, Step } from '../types';
 import { usePolling } from '../hooks/usePolling';
-import FlowBuilder from '../components/FlowBuilder';
+import FlowBuilder, { type RetryPolicy } from '../components/FlowBuilder';
 
 // FlowsPage lists saved flow sequences, marks the default flow, and hosts the
 // visual builder plus JSON import/export. Multiple flows can coexist; the
@@ -15,11 +15,22 @@ export default function FlowsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  async function save(name: string, steps: Step[]) {
+  async function save(name: string, steps: Step[], policy: RetryPolicy) {
     if (editing) {
-      await api.updateFlow(editing.id, { name, steps });
+      await api.updateFlow(editing.id, {
+        name,
+        steps,
+        max_retries: policy.max_retries,
+        retry_backoff_minutes: policy.retry_backoff_minutes,
+      });
     } else {
-      await api.createFlow({ name, steps, is_default: false });
+      await api.createFlow({
+        name,
+        steps,
+        is_default: false,
+        max_retries: policy.max_retries,
+        retry_backoff_minutes: policy.retry_backoff_minutes,
+      });
     }
     setEditing(null);
     setCreating(false);
@@ -125,6 +136,7 @@ export default function FlowsPage() {
             <th>Name</th>
             <th>Pipeline</th>
             <th>Steps</th>
+            <th>Retry</th>
             <th>Default</th>
             <th />
           </tr>
@@ -142,6 +154,11 @@ export default function FlowsPage() {
                   .join(' → ')}
               </td>
               <td>{f.steps.length}</td>
+              <td className="muted">
+                {f.max_retries && f.max_retries > 0
+                  ? `retry ${f.max_retries}× @${f.retry_backoff_minutes ?? 15}m`
+                  : 'no retry'}
+              </td>
               <td>
                 {f.is_default ? (
                   <span className="badge blue">default</span>

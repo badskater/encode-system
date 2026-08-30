@@ -13,6 +13,50 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (observability & queue control, 2026-08-30)
+
+- Full job logs: agent completion report carries log_full (last 1 MiB of
+  run.log, line-cut aligned to UTF-8 rune boundaries + truncation marker;
+  controller re-caps defensively) → jobs.full_log → GET /api/jobs/{id}/log
+  (admin-auth, text/plain) → Jobs page log viewer dialog with download.
+  Old agents omit the field; both sides tested incl. >1 MiB, no-newline,
+  exact-boundary and CJK-corruption cases.
+- Step timings: ENCODE_STEP markers timestamped LIVE at output arrival
+  (lineObserver writer, no post-hoc scan) → step_timings_json → step-duration
+  table + proportional bars in the log dialog. First-seen-wins per step,
+  injected-clock tests, CRLF/BOM fixtures.
+- Node telemetry: agent collects cpu/ram/disk (PS CimInstance, locale-safe
+  parsing), gpu (nvidia-smi guarded, -1 when absent), encode fps (bounded
+  64 KiB tail parse of the live run.log) with a 4s budget that can never
+  block heartbeats → node_metrics ring (24h retention, per-node index-backed
+  prune, ≤500-point downsample) → /api/nodes/{id}/metrics + last_metrics in
+  the node list → UI chips, sparklines, fleet dashboard strip.
+- Fleet stats: GET /api/stats?range=24h|7d|30d|all — totals, avg duration,
+  per-node/flow breakdowns, failures-by-step, done-per-day, pure SQL over
+  job history (no schema). Stats page with range picker.
+- Retry policy: per-flow options_json (max_retries, backoff minutes; 0 = off,
+  floor 1m cap 24h). Silent auto-retry with next_retry_at gate (visible in
+  the Jobs table, unassignable until due); Discord only on final failure
+  "(after N retries)"; orphan recovery honors the policy; manual retry
+  clears the gate; stale-run fields cleared on re-queue.
+- Priority + drain: jobs.priority (PATCH while pending) orders assignment
+  priority DESC, id ASC (FIFO within tier); fleet drain mode (live setting)
+  pauses assignment only — running jobs finish, reboot/update unaffected.
+- Series progress: GET /api/series enriched with episodes done/failed/active/
+  total ("eventually done wins"; total from scaffolded Ep * folders with
+  jobs-derived fallback) → Progress column with bar + counts.
+- Notifications: per-series mute (🔔/🔕 toggle), Discord deep links to
+  /jobs?job=<id> (auto-opens the log viewer), optional hourly digest mode
+  (in-memory buffer, one summary/hour, empty ticks silent, restart-loss by
+  design).
+- verify_output built-in step (seeded after mux in new default flows;
+  existing fleets' flows untouched): MKV exists non-empty, ≥1 video + ≥1
+  audio track via mkvmerge -J, duration vs source (MediaInfo ±2s) with a
+  >60s sanity fallback. Byte-guarded factory; stubbed pwsh E2E (pass,
+  missing file, zero-length, no-audio).
+- Docs: Architecture (contracts + feature-set section), Operations
+  (11 new runbook rows), Deployment (no infra change), this KANBAN.
+
 ## Done (default-4k flow)
 
 - Seeded default-4k flow (8 steps): source_rename → dgindex → hdr_probe →

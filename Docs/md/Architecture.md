@@ -175,9 +175,20 @@ and import refuses flows referencing unknown templates.
   "job_status": "running",
   "step": "encode",
   "step_progress": 42.5,
-  "log_tail": "...last lines..."
+  "log_tail": "...last lines...",
+  "metrics": {
+    "cpu_pct": 71.5, "mem_used_mb": 24576, "mem_total_mb": 32768,
+    "disk_free_gb": 812, "gpu_util": 96, "gpu_temp": 64,
+    "gpu_mem_used_mb": 9216, "encode_fps": 12.34
+  }
 }
 ```
+
+`metrics` is optional (old agents omit it). GPU fields are `-1` when the node
+has no GPU / `nvidia-smi` is absent; `encode_fps` is parsed live from the
+current job's `run.log` tail (x265/ffmpeg fps lines), `0` when idle.
+Collection is best-effort with a bounded timeout budget — a metrics failure
+can never block or fail a heartbeat.
 
 Response:
 
@@ -192,7 +203,57 @@ Response:
 
 ### Job completion
 
-`POST /api/agent/job/<id>/complete` with `{ "status": "done|failed", "exit_code": n, "outputs": [paths], "log_tail": "..." }`.
+`POST /api/agent/job/<id>/complete` with `{ "status": "done|failed", "exit_code": n, "outputs": [paths], "log_tail": "...", "log_full": "...", "step_timings": [...] }`.
+
+`log_full` carries the last 1 MiB of the job's `run.log` (cut on a line
+boundary aligned to a UTF-8 rune boundary, `[…truncated…]` marker when cut);
+`step_timings` carries per-step wall-clock durations derived live from the
+`ENCODE_STEP` markers as output arrives (first-seen timestamp per step; a
+step's duration ends when the next step starts, the last step ends at job
+finish). Both fields are optional — old agents omit them, and the controller
+re-caps `log_full` at 1 MiB defensively.
+
+## Observability and queue control (2026-08-30 feature set)
+
+- **Full job logs + step timings** — persisted from the completion report
+  (`jobs.full_log`, `jobs.step_timings_json`); `GET /api/jobs/{id}/log`
+  serves the raw log (admin-auth); the Jobs page shows a log viewer dialog
+  and a per-step duration breakdown with proportional bars.
+- **Node telemetry** — heartbeat `metrics` are stored in a `node_metrics`
+  ring table (24h retention, pruned per insert on the `(node_id, ts)`
+  index); `GET /api/nodes/{id}/metrics?range=1h|6h|24h` downsamples to
+  ≤500 points; `GET /api/nodes` embeds each node's latest sample as
+  `last_metrics`. UI renders chips, sparklines, and a fleet strip.
+- **Fleet stats** — `GET /api/stats?range=24h|7d|30d|all` aggregates job
+  history in SQL (totals, avg duration, per-node/per-flow breakdowns,
+  failures-by-step, done-per-day). No dedicated storage — derived columns.
+- **Retry policy** — per-flow `options_json` (`max_retries`,
+  `retry_backoff_minutes`; zero retries = off). Failed jobs under a policy
+  re-queue silently (`retry_count+1`, `next_retry_at = now + backoff`,
+  floor 1 minute, cap 24h); Discord fires only on final failure with
+  "(after N retries)". Assignment gates on `next_retry_at` and orders
+  `priority DESC, id ASC` (FIFO within a priority tier). Orphan-job
+  recovery honors the same policy. Manual retry clears the gate.
+- **Job priority** — `jobs.priority` settable via `PATCH /api/jobs/{id}`
+  while pending; highest dispatches first.
+- **Drain mode** — live `settings.drain_mode`: heartbeats reply
+  `instruction: none` before any assignment (running jobs finish; reboot
+  and update instructions unaffected). For host maintenance / bin pushes.
+- **Series progress** — `GET /api/series` enriches each row with
+  `episodes_done/failed/active/total` from job history ("eventually done
+  wins": a retried success is not also failed); total falls back from
+  scaffolded `Ep *` folders on the scripts root to distinct job dirs.
+- **Notifications** — per-series mute (`series.notify`, UI toggle); Discord
+  alerts deep-link to `<controller_url>/jobs?job=<id>` (Jobs page
+  auto-opens the log dialog); optional hourly digest mode
+  (`settings.notify_digest`) buffers outcomes in memory and posts one
+  summary per hour (buffer lost on restart by design — the jobs table is
+  the source of truth).
+- **`verify_output` step** — post-mux integrity check seeded into the
+  default flows after `mux`: the MKV must exist non-empty, carry ≥1 video
+  and ≥1 audio track (`mkvmerge -J`), and pass a duration check — compared
+  against the source media via MediaInfo (±2s) when discoverable, else a
+  sanity floor (>60s). Factory text is byte-guarded like the other built-ins.
 
 ## Runtime flows
 

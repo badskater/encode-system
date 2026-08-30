@@ -25,6 +25,10 @@ Compose mounts the NFS shares into `/data/scripts` and `/data/release` (see
 sub-mounts. The SPA is baked into the image at `/app/ui` (served via
 `ENCODE_UI_DIR`), so it stays out of the data volume.
 
+All observability state — full job logs, step timings, node metrics history,
+retry/priority bookkeeping, stats — lives in the same SQLite DB; no new
+volumes, services, or infra are required by the 2026-08-30 feature set.
+
 **First deploy?** Follow `Docs/md/FirstNodeDeploy.md` — a copy-paste runbook
 covering controller setup, toolchain staging, inventory, credentials
 (manual token or pairing code), and smoke verification.

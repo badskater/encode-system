@@ -40,6 +40,17 @@
 | Get job alerts in Discord | Settings → Discord notifications → webhook URL → Save (env `ENCODE_DISCORD_WEBHOOK` seeds the default); done/failed alerts post automatically with series/episode/node/error. Blank = off. |
 | Push agent update | Upload new `encode-agent.exe`/`EncodeLib.ps1` to the controller's update store (they are SHA-256 hashed); manifest bump triggers staged rollout on idle nodes. Agents verify the checksum before installing. |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
+| Read a job's full log | UI → Jobs → **Log** on a finished job (monospace viewer + download); step timings render in the same dialog. |
+| See where jobs fail / how long they take | UI → Stats (24h/7d/30d): totals, per-node/per-flow durations, failures-by-step, episodes per day. |
+| Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
+| Pause assignment fleet-wide (drain) | UI → Settings → **Drain mode** toggle. Running jobs finish, nothing new dispatches; toggle off to resume. Use before pushing a bin package or host maintenance. |
+| Auto-retry failed jobs | Flow builder → Max retries (0 = off, up to 10) + Retry backoff minutes. Failed jobs re-queue silently until retries are exhausted; Discord fires once on final failure with "(after N retries)". |
+| Jump a job ahead in the queue | UI → Jobs → priority select on a pending job (Normal/High). High dispatches first; oldest wins within a tier. |
+| Silence a noisy series' alerts | UI → Series → 🔔/🔕 per row (mute applies to direct alerts and the digest). |
+| Batch job alerts into one hourly summary | UI → Settings → Discord notifications → **Hourly digest**. Per-job posts stop; one summary posts per hour with done/failed counts and per-job lines. |
+| Follow a Discord alert straight to the job | Alert links open `<controller_url>/jobs?job=<id>` — the Jobs page auto-opens that job's log viewer. |
+| Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
+| Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
 
 ## Known failure modes
 

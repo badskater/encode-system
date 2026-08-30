@@ -39,8 +39,12 @@ var sharedHTTP = &http.Client{Timeout: 10 * time.Second}
 // Discord accepts a JSON body of {"content": "..."}.
 type Discord struct {
 	WebhookURL string
-	HTTP       *http.Client
-	Log        *slog.Logger
+	// ControllerURL, when set, turns each alert into a deep link to the
+	// job on the Jobs page (…/jobs?job=<id>) so the operator can jump
+	// straight from the Discord alert to the full log/detail view.
+	ControllerURL string
+	HTTP          *http.Client
+	Log           *slog.Logger
 }
 
 // NewDiscord builds a notifier for the given webhook URL. An empty URL
@@ -56,11 +60,47 @@ func NewDiscord(webhookURL string, log *slog.Logger) Notifier {
 	}
 }
 
+// NewDiscordWithLink builds a notifier that appends a job deep link to every
+// alert when controllerURL is non-empty. An empty webhook URL returns Nop
+// (deep links are meaningless without a transport). The controller URL's
+// trailing slash is normalized at link-build time, not here.
+func NewDiscordWithLink(webhookURL, controllerURL string, log *slog.Logger) Notifier {
+	if strings.TrimSpace(webhookURL) == "" {
+		return Nop{}
+	}
+	return &Discord{
+		WebhookURL:    strings.TrimSpace(webhookURL),
+		ControllerURL: strings.TrimSpace(controllerURL),
+		HTTP:          sharedHTTP,
+		Log:           log,
+	}
+}
+
+// jobLink builds a deep link to a job on the Jobs page from the controller
+// URL. A trailing slash on the controller URL is trimmed so the join is
+// always clean ("http://host:8080/jobs?job=5", never a double slash).
+// Returns "" when the controller URL is unset (deep links are opt-in).
+func jobLink(controllerURL string, jobID int64) string {
+	controllerURL = strings.TrimSpace(controllerURL)
+	if controllerURL == "" {
+		return ""
+	}
+	controllerURL = strings.TrimRight(controllerURL, "/")
+	return fmt.Sprintf("%s/jobs?job=%d", controllerURL, jobID)
+}
+
+// discordCap is Discord's per-message content limit. The deep link and any
+// long error are truncated together so the whole payload always fits.
+const discordCap = 2000
+
 // JobFinished formats and posts the outcome. Failures carry the error and a
 // short log tail so the alert is actionable without opening the UI. When a
 // job failed after exhausting its automatic retry budget, the retry count is
 // surfaced so the alert distinguishes a one-shot failure from one that burned
-// through its retries.
+// through its retries. When ControllerURL is set, a deep link to the job is
+// appended so the operator can open the detail/log view in one click. The
+// whole payload is capped at Discord's 2000-char content limit (the link is
+// appended before capping so it survives truncation of a very long error).
 func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string) {
 	var b strings.Builder
 	if j.Status == model.JobDone {
@@ -79,8 +119,14 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 	if j.StartedAt != nil && j.FinishedAt != nil && !j.StartedAt.IsZero() && !j.FinishedAt.IsZero() {
 		fmt.Fprintf(&b, "\nduration: %s", j.FinishedAt.Sub(*j.StartedAt).Round(time.Second))
 	}
+	// Deep link to the Jobs page (opt-in via ControllerURL). Appended before
+	// the cap so a long error never pushes the link past the truncation cut.
+	if link := jobLink(d.ControllerURL, j.ID); link != "" {
+		fmt.Fprintf(&b, "\n%s", link)
+	}
 
-	payload := map[string]string{"content": b.String()}
+	content := truncate(b.String(), discordCap)
+	payload := map[string]string{"content": content}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return

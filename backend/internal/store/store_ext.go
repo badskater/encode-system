@@ -410,6 +410,16 @@ func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) er
 	return err
 }
 
+// SetSeriesNotify updates ONLY the notify (Discord mute) flag — field-scoped
+// SQL so a concurrent flow/tag patch cannot be clobbered by a stale
+// read-modify-write. A muted series (notify=false) suppresses both the direct
+// alert and the digest buffering for its jobs.
+func (s *Store) SetSeriesNotify(ctx context.Context, id int64, notify bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET notify=?, updated_at=datetime('now') WHERE id=?`, boolToInt(notify), id)
+	return err
+}
+
 // ---------- Series progress (Phase F1) ----------
 
 // SeriesProgress holds the per-series encode progress counts derived from the

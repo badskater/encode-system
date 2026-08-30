@@ -117,9 +117,10 @@ func (s *Server) countScaffoldedEpisodes(ctx context.Context, series []*model.Se
 	return out
 }
 
-// handlePatchSeries updates a series' flow selection and enabled state.
-// A series with flow_id 0 falls back to the default flow; disabled series
-// are skipped by the scanner (no new jobs are created for them).
+// handlePatchSeries updates a series' flow selection, enabled state, notify
+// (mute) flag, and tag override. A series with flow_id 0 falls back to the
+// default flow; disabled series are skipped by the scanner (no new jobs are
+// created for them).
 func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -129,6 +130,7 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		FlowID  *int64  `json:"flow_id"`
 		Enabled *bool   `json:"enabled"`
+		Notify  *bool   `json:"notify"`
 		Tag     *string `json:"tag"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -169,6 +171,12 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		if err := s.Store.SetSeriesEnabled(ctx, id, *req.Enabled); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series enabled")
+			return
+		}
+	}
+	if req.Notify != nil {
+		if err := s.Store.SetSeriesNotify(ctx, id, *req.Notify); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series notify")
 			return
 		}
 	}

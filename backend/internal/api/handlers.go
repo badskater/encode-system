@@ -421,16 +421,29 @@ func (s *Server) shouldAutoRetry(ctx context.Context, job *model.Job, jobID int6
 // an empty webhook is a no-op. When s.Notifier is set (test injection), it
 // overrides the live resolution so tests can assert whether a notification
 // fired.
+//
+// Per-series mute: a job whose series has Notify=false is skipped entirely —
+// no direct alert AND no digest buffering. An unknown series (scanner created
+// the job before the series row existed, or the row was deleted) is treated
+// as notify=true so muting is always an opt-in, never a silent default.
 func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName string) {
 	j, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
+		return
+	}
+	// Per-series mute: resolve the series row and skip when Notify is false.
+	// A lookup miss (unknown series) falls through to notify — muting is
+	// opt-in per series, never a default.
+	if sr, err := s.Store.SeriesByName(ctx, j.Series); err == nil && sr != nil && !sr.Notify {
+		s.Log.Debug("series muted — skipping notify", "job", jobID, "series", j.Series)
 		return
 	}
 	if s.Notifier != nil {
 		s.Notifier.JobFinished(ctx, j, nodeName)
 		return
 	}
-	notify.NewDiscord(s.discordWebhook(ctx), s.Log).JobFinished(ctx, j, nodeName)
+	st := s.currentSettings(ctx)
+	notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).JobFinished(ctx, j, nodeName)
 }
 
 // discordWebhook returns the effective Discord webhook. The persisted

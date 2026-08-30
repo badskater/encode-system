@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,11 +84,14 @@ func TestInsertNodeMetricNilIsNoop(t *testing.T) {
 }
 
 // TestPruneNodeMetricsRemovesOldRows inserts rows with backdated timestamps
-// and confirms prune deletes only the ones older than the maxAge window.
+// and confirms prune deletes only the ones older than the maxAge window,
+// scoped to the given node (a second node's stale row must survive — the
+// prune is per-node, not a full-table scan).
 func TestPruneNodeMetricsRemovesOldRows(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	node, _ := s.CreateNode(ctx, "enc-01", "h")
+	other, _ := s.CreateNode(ctx, "enc-02", "h2")
 
 	// Insert a fresh row (kept) and a backdated row older than the retention
 	// window (pruned). We backdate via a direct INSERT so we control the ts.
@@ -98,13 +102,20 @@ func TestPruneNodeMetricsRemovesOldRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backdate insert: %v", err)
 	}
+	// A backdated row for a DIFFERENT node — must survive a per-node prune.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO node_metrics (node_id, ts, cpu_pct, mem_used_mb, mem_total_mb, disk_free_gb, gpu_util, gpu_temp, gpu_mem_used_mb, encode_fps)
+		 VALUES (?, ?, 0, 0, 0, 0, -1, -1, -1, 0)`, other.ID, old); err != nil {
+		t.Fatalf("backdate insert (other): %v", err)
+	}
 	// Fresh row via the normal path (uses datetime('now')).
 	if err := s.InsertNodeMetric(ctx, node.ID, sampleMetrics()); err != nil {
 		t.Fatalf("fresh insert: %v", err)
 	}
 
-	// Prune with a 24h window — the 25h-old row must go, the fresh one stays.
-	if err := s.PruneNodeMetrics(ctx, 24*time.Hour); err != nil {
+	// Prune node's rows with a 24h window — the 25h-old row must go, the
+	// fresh one stays, and the other node's stale row must be untouched.
+	if err := s.PruneNodeMetrics(ctx, node.ID, 24*time.Hour); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
 	since := time.Now().UTC().Add(-48 * time.Hour)
@@ -112,6 +123,44 @@ func TestPruneNodeMetricsRemovesOldRows(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("after prune want 1 row (the fresh one), got %d", len(got))
 	}
+	otherGot, _ := s.ListNodeMetrics(ctx, other.ID, since, 0)
+	if len(otherGot) != 1 {
+		t.Fatalf("per-node prune must not touch other node: want 1 row, got %d", len(otherGot))
+	}
+}
+
+// TestPruneNodeMetricsUsesIndex asserts the per-node DELETE seeks the
+// composite index idx_metrics_node_ts(node_id, ts) rather than scanning the
+// whole table. EXPLAIN QUERY PLAN must report SEARCH (index), not SCAN.
+func TestPruneNodeMetricsUsesIndex(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// EXPLAIN QUERY PLAN returns one row per step with the plan text in the
+	// last column.
+	rows, err := s.db.QueryContext(ctx,
+		`EXPLAIN QUERY PLAN DELETE FROM node_metrics WHERE node_id = ? AND ts < datetime('now', ?)`,
+		int64(1), "-24 hours")
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plans []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		plans = append(plans, detail)
+	}
+	joined := strings.Join(plans, " | ")
+	for _, p := range plans {
+		if strings.Contains(p, "SEARCH") {
+			return // pass: index seek
+		}
+	}
+	t.Fatalf("prune plan must SEARCH the index, got: %s", joined)
 }
 
 // TestListNodeMetricsDownsamplesOver500 inserts 600 rows and confirms the
@@ -154,6 +203,68 @@ func TestListNodeMetricsDownsamplesOver500(t *testing.T) {
 		if !got[0].Ts.Equal(base) && !got[0].Ts.Equal(base.Add(time.Minute)) {
 			t.Logf("note: first sample ts=%v (base=%v)", got[0].Ts, base)
 		}
+	}
+}
+
+// TestListNodeMetricsDownsampleBoundary is the off-by-one regression guard.
+// With n=1000 raw rows and cap=500, stride = ceil(1000/500) = 2, so the
+// stride loop selects indices 0,2,4,…,998 = 500 rows. The last-row append
+// guard then fires (999 % 2 != 0 ⇒ last raw row not yet in out) and, WITHOUT
+// the len(out) < cap guard, appends one more → 501, one over cap. This test
+// asserts the invariant: len(out) <= cap, first raw sample always present,
+// last raw sample present when there is room (or len == cap as the reason).
+func TestListNodeMetricsDownsampleBoundary(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	node, _ := s.CreateNode(ctx, "enc-01", "h")
+
+	// Insert exactly 1000 rows with distinct ascending timestamps.
+	const n = 1000
+	// Truncate to whole-second precision: the DB stores ts as "2006-01-02
+	// 15:04:05" (no sub-second), so base must be whole-second-aligned for the
+	// first-sample equality assertion to hold.
+	base := time.Now().UTC().Add(-n * time.Minute).Truncate(time.Second)
+	for i := 0; i < n; i++ {
+		ts := base.Add(time.Duration(i) * time.Minute).Format("2006-01-02 15:04:05")
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO node_metrics (node_id, ts, cpu_pct, mem_used_mb, mem_total_mb, disk_free_gb, gpu_util, gpu_temp, gpu_mem_used_mb, encode_fps)
+		 VALUES (?, ?, ?, 0, 0, 0, -1, -1, -1, 0)`, node.ID, ts, float64(i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	since := time.Now().UTC().Add(-(n + 10) * time.Minute)
+	got, err := s.ListNodeMetrics(ctx, node.ID, since, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// Invariant 1: never exceed the cap.
+	if len(got) > metricsMaxPoints {
+		t.Fatalf("cap violated: want ≤%d, got %d", metricsMaxPoints, len(got))
+	}
+
+	// Invariant 2: the first raw sample is always present.
+	if len(got) == 0 {
+		t.Fatal("want at least one sample, got none")
+	}
+	firstRaw := base
+	if !got[0].Ts.Equal(firstRaw) {
+		t.Fatalf("first sample: want %v, got %v", firstRaw, got[0].Ts)
+	}
+
+	// Invariant 3: the last raw sample is present when there is room under
+	// the cap; when len == cap exactly, the cap is the reason it was dropped.
+	lastRaw := base.Add((n - 1) * time.Minute)
+	lastPresent := got[len(got)-1].Ts.Equal(lastRaw)
+	if !lastPresent && len(got) != metricsMaxPoints {
+		t.Fatalf("last raw sample missing and cap is not the reason: len=%d, cap=%d, last=%v",
+			len(got), metricsMaxPoints, got[len(got)-1].Ts)
+	}
+	if lastPresent {
+		t.Logf("last raw sample present: len=%d, cap=%d", len(got), metricsMaxPoints)
+	} else {
+		t.Logf("last raw sample dropped (cap full): len=%d, cap=%d", len(got), metricsMaxPoints)
 	}
 }
 

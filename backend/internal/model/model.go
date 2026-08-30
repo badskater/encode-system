@@ -164,8 +164,10 @@ type Node struct {
 	RebootIssuedAt *time.Time `json:"-"`
 	// Metrics is the last reported resource sample from a heartbeat, kept
 	// in-memory only (NOT persisted on the nodes table — the node_metrics
-	// ring table holds history). Populated from the latest heartbeat in a
-	// later phase; nil for old agents that do not report metrics yet.
+	// ring table holds history). This is the live in-process heartbeat
+	// sample; the restart-safe last-known sample is served from the DB via
+	// Store.LatestNodeMetric on the ListNodes path (see last_metrics there).
+	// nil for old agents that do not report metrics yet.
 	Metrics   *NodeMetrics `json:"metrics,omitempty"`
 	LastSeen  *time.Time   `json:"last_seen,omitempty"`
 	LastError string       `json:"last_error,omitempty"`

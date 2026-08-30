@@ -393,6 +393,12 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 		// Surface the last-reported metrics sample so the node list view
 		// can render a current snapshot without a separate fetch. nil when
 		// the node has never sent metrics (old agent or fresh registration).
+		//
+		// This is an N+1: one LatestNodeMetric query per node. That is
+		// acceptable at fleet scale (~2-20 nodes): each query is a single
+		// index seek on idx_metrics_node_ts, and a single-query
+		// join/window optimization is deferred (YAGNI until the fleet
+		// outgrows dozens of nodes).
 		lm, err := s.Store.LatestNodeMetric(r.Context(), n.ID)
 		if err != nil {
 			s.Log.Warn("latest node metric", "err", err, "node", n.Name)

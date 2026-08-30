@@ -12,8 +12,9 @@ import (
 // metricsRetention is the ring-buffer retention window. Rows older than this
 // are pruned on every insert so the table holds at most ~24h of samples per
 // node (bounded by the agent's heartbeat interval, e.g. ~2880 rows/node/day
-// at a 30s cadence). The delete is index-backed (idx_metrics_node_ts) and
-// cheap.
+// at a 30s cadence). The prune is scoped per node and seeks the composite
+// index idx_metrics_node_ts(node_id, ts), so it is an index seek (SEARCH),
+// not a full-table scan.
 const metricsRetention = 24 * time.Hour
 
 // metricsMaxPoints is the ceiling on the number of samples served by
@@ -43,11 +44,13 @@ func (s *Store) InsertNodeMetric(ctx context.Context, nodeID int64, m *model.Nod
 		m.GPUUtil, m.GPUTemp, m.GPUMemUsedMB, m.EncodeFPS); err != nil {
 		return fmt.Errorf("insert node metric: %w", err)
 	}
-	// Prune after every insert. The delete touches at most one stale row
-	// per heartbeat (a row ages out ~24h after it was written), so the
-	// cost is a single index-backed DELETE per heartbeat — negligible
+	// Prune after every insert, scoped to THIS node. The per-node DELETE
+	// seeks the composite index idx_metrics_node_ts(node_id, ts) (SEARCH,
+	// not SCAN — a ts-only predicate can't use the index, so the prune
+	// must carry node_id). At most one stale row ages out per heartbeat,
+	// so the cost is a single index-backed seek per insert — negligible
 	// against the insert itself.
-	if err := s.PruneNodeMetrics(ctx, metricsRetention); err != nil {
+	if err := s.PruneNodeMetrics(ctx, nodeID, metricsRetention); err != nil {
 		// Prune failure is non-fatal: the ring still grows correctly,
 		// it just isn't trimmed this cycle. Log-only at the caller.
 		return fmt.Errorf("prune node metrics: %w", err)
@@ -77,21 +80,27 @@ func (s *Store) LatestNodeMetric(ctx context.Context, nodeID int64) (*model.Node
 	return &m, nil
 }
 
-// PruneNodeMetrics deletes rows older than maxAge from node_metrics. Uses
-// SQLite's datetime modifier so the comparison stays in the same text format
-// the rows were written in (no cross-format parsing). Idempotent: a no-op
-// when nothing is older than the cutoff.
-func (s *Store) PruneNodeMetrics(ctx context.Context, maxAge time.Duration) error {
+// PruneNodeMetrics deletes rows older than maxAge for a single node from
+// node_metrics. The WHERE node_id = ? AND ts < … predicate seeks the composite
+// index idx_metrics_node_ts(node_id, ts) (EXPLAIN QUERY PLAN reports SEARCH,
+// not SCAN) — a ts-only predicate cannot use that index, so the prune is
+// scoped per node rather than a full-table sweep. Uses SQLite's datetime
+// modifier so the comparison stays in the same text format the rows were
+// written in (no cross-format parsing). Idempotent: a no-op when nothing is
+// older than the cutoff.
+func (s *Store) PruneNodeMetrics(ctx context.Context, nodeID int64, maxAge time.Duration) error {
 	// Format the negative duration as a SQLite datetime modifier ("-24 hours").
 	// SQLite accepts "-N hours" / "-N days"; we normalize to hours so the
 	// modifier is always valid regardless of how the caller expressed maxAge.
+	// int() truncates fractional hours, which is fine here: metricsRetention is
+	// a whole-hours constant (24h), so there is no sub-hour precision to lose.
 	hours := int(maxAge.Hours())
 	if hours <= 0 {
 		return nil // nothing to prune (or caller passed a non-positive window)
 	}
 	mod := fmt.Sprintf("-%d hours", hours)
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM node_metrics WHERE ts < datetime('now', ?)`, mod)
+		`DELETE FROM node_metrics WHERE node_id = ? AND ts < datetime('now', ?)`, nodeID, mod)
 	return err
 }
 
@@ -155,9 +164,17 @@ func (s *Store) ListNodeMetrics(ctx context.Context, nodeID int64, since time.Ti
 		}
 	}
 	// Guarantee the last sample is included so the most-recent point is
-	// always present (the dashboard's "current" reading).
-	if last := out[len(out)-1]; last.Ts != raw[len(raw)-1].Ts {
-		out = append(out, raw[len(raw)-1])
+	// always present (the dashboard's "current" reading) — but only when
+	// there is room under the cap. With a stride that divides evenly into
+	// the row count minus one (e.g. n=1000, stride=2: indices 0,2,…,998 =
+	// exactly cap rows), the last raw index (999) is NOT already in out and
+	// the unguarded append would push len(out) to cap+1 (501). Guarding with
+	// len(out) < cap holds the invariant len(out) <= cap; when out is full,
+	// the cap — not the missing last point — is the limiting factor.
+	if len(out) < cap {
+		if last := out[len(out)-1]; last.Ts != raw[len(raw)-1].Ts {
+			out = append(out, raw[len(raw)-1])
+		}
 	}
 	return out, nil
 }

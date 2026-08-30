@@ -351,7 +351,7 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 
 	jobDir := filepath.Join(a.Cfg.DataDir, "jobs", fmt.Sprintf("%d", job.ID))
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "")
+		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "", "", nil)
 		return
 	}
 	scriptPath := filepath.Join(jobDir, "job.ps1")
@@ -361,17 +361,17 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	// pwsh (7+) and PS 5.1 both honor it identically.
 	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(job.Script)...)
 	if err := os.WriteFile(scriptPath, scriptBytes, 0o644); err != nil {
-		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "")
+		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil)
 		return
 	}
 	if _, err := os.Stat(a.Cfg.LibPath); err != nil {
-		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "")
+		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil)
 		return
 	}
 
 	ps := a.findPowerShell()
 	runLog := filepath.Join(jobDir, "run.log")
-	exitCode, tail, stepErr := a.runPowerShell(ps, scriptPath, runLog)
+	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog)
 
 	status := "done"
 	errMsg := ""
@@ -398,7 +398,15 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 			outputs = append(outputs, artifact)
 		}
 	}
-	a.completeJob(job.ID, status, exitCode, errMsg, outputs, tail)
+	// Capture the last 1 MiB of run.log as the full log snapshot. A read
+	// failure must never abort the completion — captureRunLog returns ""
+	// on error, and we log a warning so operators can investigate.
+	fullLog, capErr := captureRunLog(runLog)
+	if capErr != nil {
+		log.Warn("full log capture failed; sending empty", "err", capErr)
+		fullLog = ""
+	}
+	a.completeJob(job.ID, status, exitCode, errMsg, outputs, tail, fullLog, timings.finish(time.Now()))
 	a.bumpCounter()
 	log.Info("job finished", "status", status, "exit_code", exitCode, "tasks_since_boot", a.TasksSinceBoot())
 }
@@ -425,9 +433,12 @@ func (a *Agent) findPowerShell() string {
 }
 
 // runPowerShell executes the job script, teeing output to run.log, and
-// returns the exit code plus the last output lines. Progress lines
-// (ENCODE_STEP) are forwarded into the agent log for heartbeat context.
-func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail string, stepErr string) {
+// returns the exit code plus the last output lines and the step timing
+// tracker. Progress lines (ENCODE_STEP) are forwarded into the agent log for
+// heartbeat context AND feed the tracker's first-seen timestamps — the scan
+// is the SAME single pass over the output, not a second walk.
+func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
 
 	var buf bytes.Buffer
@@ -443,7 +454,7 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 	cmd.Stderr = mw
 
 	if err := cmd.Start(); err != nil {
-		return -1, "", "start powershell: " + err.Error()
+		return -1, "", "start powershell: " + err.Error(), timings
 	}
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -466,20 +477,32 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 			stepErr = strings.TrimSpace(l)
 		}
 	}
-	// Log progress transitions.
+	// Log progress transitions and feed the step timing tracker in the SAME
+	// scan. The tracker's observe records the first-seen timestamp per step.
+	now := time.Now()
 	for _, l := range strings.Split(out, "\n") {
 		if m := stepLine.FindStringSubmatch(l); m != nil {
 			a.Log.Info("job progress", "step", m[1], "pct", m[2])
+			timings.observe(l, now)
 		}
 	}
-	return exitCode, tail, stepErr
+	return exitCode, tail, stepErr, timings
 }
 
-// completeJob reports the final state to the controller.
-func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string, outputs []string, tail string) {
+// completeJob reports the final state to the controller. fullLog is the
+// last-1-MiB run.log snapshot; stepTimings is the per-step wall-clock record.
+// Both are added as new JSON keys ("log_full", "step_timings") alongside the
+// legacy fields; old controllers ignore unknown keys, so adding them is safe.
+func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string, outputs []string, tail, fullLog string, stepTimings []model.StepTiming) {
 	rep := map[string]any{
 		"status": status, "exit_code": exitCode, "error": errMsg,
 		"outputs": outputs, "log_tail": tail,
+		// log_full: bounded full-log snapshot for the UI to show without
+		// re-reading agent files. Empty when capture failed or no log exists.
+		"log_full": fullLog,
+		// step_timings: per-step wall-clock samples for the observability
+		// dashboard. Empty slice when no ENCODE_STEP markers were emitted.
+		"step_timings": stepTimings,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

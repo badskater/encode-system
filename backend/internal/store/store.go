@@ -2,6 +2,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -667,6 +668,85 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now')`+progress+` WHERE id=?`,
 		string(status), exitCode, errMsg, string(b), logTail, id)
+	return err
+}
+
+// maxFullLogBytes is the controller-side cap on a persisted full_log. The
+// agent already caps its captureRunLog output at the same 1 MiB, but this is
+// a defense-in-depth guard: a buggy or hostile POST (or a future caller that
+// bypasses the agent path) must never write an unbounded log into the row
+// and stall the single-writer SQLite store.
+const maxFullLogBytes = 1 << 20 // 1 MiB
+
+// truncationMarker is prepended when a full_log exceeds the cap so the UI can
+// show that content was elided. Mirrors the agent's captureRunLog marker so
+// both sides agree on shape — a capped log always starts with this prefix.
+const truncationMarker = "[…truncated…]\n"
+
+// capFullLog trims fullLog to at most maxFullLogBytes. If the input is within
+// the cap it is returned verbatim. If it exceeds the cap, the content is cut
+// at the first newline at/after len-1MiB (never splitting a line mid-way) and
+// the truncation marker is prepended — the same rule as the agent's
+// captureRunLog, so a controller-side cap produces the identical shape.
+func capFullLog(fullLog string) string {
+	if len(fullLog) <= maxFullLogBytes {
+		return fullLog
+	}
+	data := []byte(fullLog)
+	// Start the tail window at the first byte that would bring us under the
+	// cap, then advance to the next newline so the body begins on a full line.
+	cut := len(data) - maxFullLogBytes
+	nl := bytes.IndexByte(data[cut:], '\n')
+	if nl >= 0 {
+		data = data[cut+nl+1:]
+	} else {
+		// No newline in the tail window: take the whole tail verbatim.
+		data = data[cut:]
+	}
+	return truncationMarker + string(data)
+}
+
+// marshalStepTimings serializes the per-step timing slice to the JSON shape
+// stored in step_timings_json. This is the single marshal contract for the
+// column: a nil slice becomes the literal '[]' (never NULL or ”) so every
+// read path unmarshals to a len-0 slice, and a marshal error — effectively
+// impossible for this simple struct — degrades to '[]' rather than failing
+// the finish over observability data.
+func marshalStepTimings(timings []model.StepTiming) []byte {
+	if timings == nil {
+		return []byte("[]")
+	}
+	b, err := json.Marshal(timings)
+	if err != nil {
+		return []byte("[]")
+	}
+	return b
+}
+
+// FinishJobWithReport marks a job terminal and persists the agent's full
+// completion report: the v1 finish columns (status/exit_code/error/outputs/
+// log_tail/finished_at) PLUS the v2 observability fields (full_log +
+// step_timings_json) the Phase-A agent report carries. It is the completion
+// path for agents that report logs and timings; the older FinishJob remains
+// for the two callers (orphan recovery, render-failed) that correctly pass
+// no log. full_log is capped at 1 MiB via capFullLog; timings are marshaled
+// via marshalStepTimings (the column's marshal contract).
+func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.JobStatus, exitCode int, errMsg string, outputs []string, logTail string, fullLog string, timings []model.StepTiming) error {
+	if outputs == nil {
+		outputs = []string{}
+	}
+	b, _ := json.Marshal(outputs)
+	timingsJSON := marshalStepTimings(timings)
+	capped := capFullLog(fullLog)
+	// progress=100 only for done jobs; a failed/cancelled job keeps its last
+	// progress so dashboards don't render failure as completion.
+	progress := ""
+	if status == model.JobDone {
+		progress = ", progress=100"
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+` WHERE id=?`,
+		string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON), id)
 	return err
 }
 

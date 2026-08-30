@@ -278,6 +278,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/jobs", s.withAdmin(s.handleListJobs))
 	mux.HandleFunc("POST /api/jobs", s.withAdmin(s.handleCreateJob))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
+	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
 	mux.HandleFunc("POST /api/jobs/{id}/retry", s.withAdmin(s.handleRetryJob))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.withAdmin(s.handleCancelJob))
 	mux.HandleFunc("PATCH /api/jobs/{id}", s.withAdmin(s.handlePatchJob))

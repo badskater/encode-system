@@ -259,11 +259,13 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		return
 	}
 	var rep struct {
-		Status   string   `json:"status"` // done | failed
-		ExitCode int      `json:"exit_code"`
-		Error    string   `json:"error"`
-		Outputs  []string `json:"outputs"`
-		LogTail  string   `json:"log_tail"`
+		Status      string             `json:"status"` // done | failed
+		ExitCode    int                `json:"exit_code"`
+		Error       string             `json:"error"`
+		Outputs     []string           `json:"outputs"`
+		LogTail     string             `json:"log_tail"`
+		LogFull     string             `json:"log_full"`     // v2: full captured run.log (agent omits on old builds → "")
+		StepTimings []model.StepTiming `json:"step_timings"` // v2: per-step start/duration (old agents → nil)
 	}
 	if err := decodeJSON(r, &rep); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid completion report")
@@ -289,7 +291,7 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 	if rep.Status != "done" {
 		status = model.JobFailed
 	}
-	if err := s.Store.FinishJob(ctx, jobID, status, rep.ExitCode, rep.Error, rep.Outputs, rep.LogTail); err != nil {
+	if err := s.Store.FinishJobWithReport(ctx, jobID, status, rep.ExitCode, rep.Error, rep.Outputs, rep.LogTail, rep.LogFull, rep.StepTimings); err != nil {
 		writeErr(w, http.StatusInternalServerError, "finish job")
 		return
 	}
@@ -573,6 +575,30 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleGetJobLog serves the full captured run.log for a job as raw text.
+// A job with no recorded log (old agent, or a finish path that carries no
+// log) answers 404 with an explicit message so the UI can distinguish
+// "no log" from "log empty". Admin-only: the log can hold paths and errors.
+func (s *Server) handleGetJobLog(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad job id")
+		return
+	}
+	job, err := s.Store.GetJob(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if job.FullLog == "" {
+		writeErr(w, http.StatusNotFound, "no log recorded for this job")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(job.FullLog))
 }
 
 // handleRetryJob re-queues a failed/cancelled/done job.

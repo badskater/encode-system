@@ -177,6 +177,32 @@ export const api = {
   jobs: (status?: JobStatus) =>
     request<Job[]>('GET', `/api/jobs${status ? `?status=${status}` : ''}`),
   job: (id: number) => request<Job>('GET', `/api/jobs/${id}`),
+  // getJobLog fetches the raw text/plain run log (up to 1 MiB). Not JSON, so
+  // it uses a raw fetch instead of request(); on a non-2xx it surfaces the
+  // server's error body when parseable (e.g. the 404 "no log recorded for
+  // this job"), matching how request() surfaces controller error messages.
+  // A 401 still triggers the session-expired bounce like every other call.
+  getJobLog: async (id: number): Promise<string> => {
+    const headers: Record<string, string> = {};
+    headers[AUTH_HEADER] = AUTH_PREFIX + sessionValue();
+    const res = await fetch(`/api/jobs/${id}/log`, { method: 'GET', headers });
+    if (res.status === 401) {
+      clearToken();
+      expiredHook?.();
+      throw new Error('401: session expired — log in again');
+    }
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const err = await res.json();
+        if (err.error) msg = err.error;
+      } catch {
+        /* non-JSON error body — keep statusText */
+      }
+      throw new Error(`${res.status}: ${msg}`);
+    }
+    return res.text();
+  },
   retryJob: (id: number) => request<Job>('POST', `/api/jobs/${id}/retry`),
   cancelJob: (id: number) => request<void>('POST', `/api/jobs/${id}/cancel`),
   patchJob: (id: number, body: { flow_id: number }) =>

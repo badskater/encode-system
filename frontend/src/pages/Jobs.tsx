@@ -3,15 +3,23 @@ import { api } from '../api/client';
 import type { Flow, Job, JobStatus, Node } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { jobBadge, fmtTime } from '../components/helpers';
+import JobLogDialog from '../components/JobLogDialog';
+import StepTimingsView from '../components/StepTimingsView';
 
 const FILTERS: (JobStatus | '')[] = ['', 'pending', 'assigned', 'running', 'done', 'failed'];
 
+// TERMINAL is the set of statuses for which a full log is available: a log
+// only exists once the agent has finished (done/failed) or the job was
+// cancelled out of the queue. Pending/assigned/running jobs have no log yet.
+const TERMINAL: ReadonlySet<JobStatus> = new Set(['done', 'failed', 'cancelled']);
+
 // JobsPage lists the queue with filters, retry/cancel actions, and a detail
-// view showing the captured log tail for post-mortems.
+// view showing the captured log tail and step-timing breakdown.
 export default function JobsPage() {
   const [filter, setFilter] = useState<JobStatus | ''>('');
   const [selected, setSelected] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [logJob, setLogJob] = useState<Job | null>(null);
 
   const { data: jobs } = usePolling<Job[]>(
     () => api.jobs(filter || undefined),
@@ -125,6 +133,14 @@ export default function JobsPage() {
                     Retry
                   </button>
                 )}
+                <button
+                  className="btn"
+                  onClick={() => setLogJob(j)}
+                  disabled={!TERMINAL.has(j.status)}
+                  title={TERMINAL.has(j.status) ? 'View full log' : 'No log until the job finishes'}
+                >
+                  Log
+                </button>
               </td>
             </tr>
           ))}
@@ -148,6 +164,9 @@ export default function JobsPage() {
             exit code: {selected.exit_code}
           </p>
           {selected.error && <div className="error-box">{selected.error}</div>}
+          {selected.step_timings && selected.step_timings.length > 0 && (
+            <StepTimingsView timings={selected.step_timings} />
+          )}
           {selected.log_tail && (
             <>
               <h4>Log tail</h4>
@@ -158,6 +177,15 @@ export default function JobsPage() {
             Close
           </button>
         </div>
+      )}
+
+      {logJob && (
+        <JobLogDialog
+          jobId={logJob.id}
+          jobLabel={`${logJob.series} Ep ${logJob.episode}`}
+          stepTimings={logJob.step_timings}
+          onClose={() => setLogJob(null)}
+        />
       )}
     </>
   );

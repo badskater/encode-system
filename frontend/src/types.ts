@@ -141,6 +141,15 @@ export interface Node {
   online?: boolean;
 }
 
+// StepTiming: one row of the agent's per-step completion report (B1/B2
+// phases). Populated when the agent finishes and reports timing data;
+// absent for old agents and early failures that never reported.
+export interface StepTiming {
+  step: string;
+  started_at: string;
+  duration_sec: number;
+}
+
 export interface Job {
   id: number;
   series: string;
@@ -156,6 +165,7 @@ export interface Job {
   error?: string;
   log_tail?: string;
   outputs?: string[];
+  step_timings?: StepTiming[];
   created_at: string;
   started_at: string | null;
   finished_at: string | null;

@@ -1,0 +1,143 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+import JobLogDialog from './JobLogDialog';
+import { api } from '../api/client';
+import type { StepTiming } from '../types';
+
+describe('JobLogDialog', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a loading state then the log text', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('line one\nline two');
+    render(<JobLogDialog jobId={42} jobLabel="Show Ep 01" onClose={() => {}} />);
+
+    // Loading indicator appears first.
+    expect(screen.getByText(/loading/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText(/loading/i)).not.toBeInTheDocument(),
+    );
+    // The log lives in a <pre> with horizontal scroll (no wrap).
+    const pre = document.querySelector('pre')!;
+    expect(pre).not.toBeNull();
+    expect(pre.textContent).toContain('line one');
+    expect(pre.textContent).toContain('line two');
+  });
+
+  it('shows the heading label including the job id and label', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('ok');
+    render(<JobLogDialog jobId={42} jobLabel="Show Ep 01" onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByText(/Job #42/)).toBeInTheDocument());
+    expect(screen.getByText(/Show Ep 01/)).toBeInTheDocument();
+  });
+
+  it('surfaces the server error message on rejection', async () => {
+    vi.spyOn(api, 'getJobLog').mockRejectedValue(
+      new Error('404: no log recorded for this job'),
+    );
+    render(<JobLogDialog jobId={7} jobLabel="x" onClose={() => {}} />);
+    await waitFor(() =>
+      expect(screen.getByText(/no log recorded for this job/)).toBeInTheDocument(),
+    );
+    // Dialog stays mounted.
+    expect(screen.getByRole('heading', { name: /Job #7/ })).toBeInTheDocument();
+  });
+
+  it('renders step timings above the log when provided', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('log');
+    const timings: StepTiming[] = [
+      { step: 'encode', started_at: '2026-01-02T03:04:05Z', duration_sec: 7705 },
+      { step: 'mux', started_at: '2026-01-02T05:12:30Z', duration_sec: 45 },
+    ];
+    render(
+      <JobLogDialog
+        jobId={1}
+        jobLabel="x"
+        onClose={() => {}}
+        stepTimings={timings}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText('Step timings')).toBeInTheDocument());
+    expect(screen.getByText('encode')).toBeInTheDocument();
+    expect(screen.getByText('2h 08m')).toBeInTheDocument();
+    expect(screen.getByText('mux')).toBeInTheDocument();
+  });
+
+  it('downloads the log as job-<id>.log via a blob URL', async () => {
+    const logText = 'download me';
+    vi.spyOn(api, 'getJobLog').mockResolvedValue(logText);
+    // jsdom omits URL.createObjectURL; provide a stub so the dialog can build
+    // the blob URL, then assert on the anchor it synthesizes.
+    const createUrl = vi.fn().mockReturnValue('blob:test-url');
+    const revokeUrl = vi.fn();
+    vi.stubGlobal('URL', { ...URL, createObjectURL: createUrl, revokeObjectURL: revokeUrl });
+    const clickSpy = vi.fn();
+    const anchorProto = HTMLAnchorElement.prototype;
+    const realClick = anchorProto.click;
+    anchorProto.click = vi.fn(function (this: HTMLAnchorElement) {
+      expect(this.href).toBe('blob:test-url');
+      expect(this.download).toBe('job-9.log');
+      clickSpy();
+    });
+    render(<JobLogDialog jobId={9} jobLabel="x" onClose={() => {}} />);
+    await waitFor(() => {
+      const pre = document.querySelector('pre');
+      expect(pre?.textContent).toContain(logText);
+    });
+    fireEvent.click(screen.getByRole('button', { name: /download/i }));
+    expect(createUrl).toHaveBeenCalledOnce();
+    expect(clickSpy).toHaveBeenCalled();
+    anchorProto.click = realClick;
+  });
+
+  it('closes on backdrop click when not loading', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('log');
+    const onClose = vi.fn();
+    const { container } = render(
+      <JobLogDialog jobId={1} jobLabel="x" onClose={onClose} />,
+    );
+    await waitFor(() => expect(screen.getByText('log')).toBeInTheDocument());
+    fireEvent.click(container.querySelector('.modal-backdrop')!);
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('does not close on backdrop click while loading', async () => {
+    let resolveLog: (v: string) => void = () => {};
+    vi.spyOn(api, 'getJobLog').mockReturnValue(
+      new Promise<string>((r) => {
+        resolveLog = r;
+      }),
+    );
+    const onClose = vi.fn();
+    const { container } = render(
+      <JobLogDialog jobId={1} jobLabel="x" onClose={onClose} />,
+    );
+    // Still loading: backdrop click must not close.
+    fireEvent.click(container.querySelector('.modal-backdrop')!);
+    expect(onClose).not.toHaveBeenCalled();
+    // Let the pending fetch resolve so React settles before unmount.
+    resolveLog('log');
+    await waitFor(() =>
+      expect(container.querySelector('pre')?.textContent).toContain('log'),
+    );
+  });
+
+  it('closes on the close button', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('log');
+    const onClose = vi.fn();
+    render(<JobLogDialog jobId={1} jobLabel="x" onClose={onClose} />);
+    await waitFor(() => expect(screen.getByText('log')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('closes on Escape when not loading', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('log');
+    const onClose = vi.fn();
+    render(<JobLogDialog jobId={1} jobLabel="x" onClose={onClose} />);
+    await waitFor(() => expect(screen.getByText('log')).toBeInTheDocument());
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalled();
+  });
+});

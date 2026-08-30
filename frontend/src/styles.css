@@ -129,6 +129,29 @@ pre {
   overflow-y: auto;
 }
 
+/* Full job-log viewer: taller than the default pre, whitespace preserved
+   (no wrap) so long lines scroll horizontally instead of reflowing. */
+.job-log-pre {
+  max-height: 60vh;
+  white-space: pre;
+  font-family: 'Cascadia Code', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  line-height: 1.5;
+}
+
+/* Step-timing bars: a tiny inline scale, no chart lib. */
+.step-bar-track {
+  background: #21262d;
+  border-radius: 4px;
+  height: 10px;
+  width: 140px;
+  overflow: hidden;
+}
+.step-bar-fill {
+  background: var(--accent);
+  height: 100%;
+  border-radius: 4px;
+}
+
 /* Flow builder */
 .flow-canvas { display: flex; gap: 24px; }
 .flow-steps { flex: 2; display: flex; flex-direction: column; gap: 8px; }

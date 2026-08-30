@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { api } from '../api/client';
 import type { Node, PairingCode } from '../types';
 import { usePolling } from '../hooks/usePolling';
@@ -170,8 +170,11 @@ export default function NodesPage() {
         </thead>
         <tbody>
           {(nodes ?? []).map((n) => (
-            <>
-              <tr key={n.id}>
+            // Keyed Fragment: the two-<tr> pattern (node row + optional metrics
+            // detail row) needs the key on the list element itself — shorthand
+            // <> can't take one and React warns per row.
+            <Fragment key={n.id}>
+              <tr>
                 <td>{n.name}</td>
                 <td>{nodeBadge(n.status, !!n.online)}</td>
                 <td>
@@ -205,7 +208,7 @@ export default function NodesPage() {
                 </td>
               </tr>
               {metricsNode?.id === n.id && (
-                <tr key={`${n.id}-metrics`}>
+                <tr>
                   <td colSpan={11} style={{ padding: 0, border: 'none' }}>
                     <NodeMetricsPanel
                       nodeId={n.id}
@@ -215,7 +218,7 @@ export default function NodesPage() {
                   </td>
                 </tr>
               )}
-            </>
+            </Fragment>
           ))}
         </tbody>
       </table>

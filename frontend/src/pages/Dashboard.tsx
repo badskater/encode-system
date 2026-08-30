@@ -12,8 +12,10 @@ export default function Dashboard() {
   const active = (jobs ?? []).filter((j) => ['assigned', 'running'].includes(j.status));
   const pending = (jobs ?? []).filter((j) => j.status === 'pending');
   const online = (nodes ?? []).filter((n) => n.online);
-  const busy = (nodes ?? []).filter((n) => n.status === 'busy');
-  const idle = (nodes ?? []).filter((n) => n.status === 'idle');
+  // Mirror nodeBadge's display model: an offline node never counts as
+  // busy/idle even if its last-reported status was stale.
+  const busy = (nodes ?? []).filter((n) => !!n.online && n.status === 'busy');
+  const idle = (nodes ?? []).filter((n) => !!n.online && n.status === 'idle');
 
   // Fleet metric averages are computed ONLY over nodes that reported
   // last_metrics (old agents and never-reported nodes are excluded entirely),

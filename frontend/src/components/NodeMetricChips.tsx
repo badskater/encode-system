@@ -17,8 +17,10 @@ export default function NodeMetricChips({ metrics }: { metrics?: NodeMetrics }) 
   const cpuWarn = m.cpu_pct > 80;
 
   // GB helpers — MB → GB with one decimal, matching the dashboard style.
-  const toGB = (mb: number) => (mb / 1024).toFixed(1);
-  const diskGB = (gb: number) => gb.toFixed(1);
+  // Non-finite values (corrupt metrics) render a placeholder, never "NaNGB" —
+  // symmetric with the fmtPct/fmtFps guards below.
+  const toGB = (mb: number) => (Number.isFinite(mb) ? (mb / 1024).toFixed(1) : '—');
+  const diskGB = (gb: number) => (Number.isFinite(gb) && gb >= 0 ? gb.toFixed(1) : '—');
 
   const hasGpu = m.gpu_util >= 0;
   const encoding = m.encode_fps > 0;

@@ -77,6 +77,10 @@ export interface Settings {
   group: string;
   tag: string;
   discord_webhook: string; // blank = Discord notifications off
+  // Drain mode (Phase D3): when true the backend pauses ALL job assignment
+  // fleet-wide (running jobs finish; nothing new dispatches). Toggled from
+  // the Settings page; live — no controller restart needed.
+  drain_mode?: boolean;
   updated_at?: string;
 }
 

@@ -292,7 +292,22 @@ export default function SettingsPage() {
             />
           </label>
         </div>
-        <button className="btn primary" disabled={saving} onClick={save}>
+        {/* Drain mode: finish running jobs, assign nothing. Use for host
+            maintenance or before pushing bin packages. Live — the backend
+            reads this flag on every idle heartbeat, so toggling it resumes
+            assignment without a controller restart. */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            checked={!!settings.drain_mode}
+            onChange={(e) => set('drain_mode', e.target.checked)}
+          />
+          <span>Drain mode — finish running jobs, assign nothing</span>
+        </label>
+        <span className="muted" style={{ display: 'block', fontSize: 12 }}>
+          Use for host maintenance or before pushing bin packages.
+        </span>
+        <button className="btn primary" disabled={saving} onClick={save} style={{ marginTop: 12 }}>
           {saving ? 'Saving…' : 'Save settings'}
         </button>
         {settings.updated_at && (

@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, StepTemplate, UpdateManifest } from '../types';
+import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -246,4 +246,11 @@ export const api = {
   pairingCodes: () => request<PairingCode[]>('GET', '/api/pairing'),
   createPairingCode: (body: { name_hint?: string; ttl_hours?: number }) =>
     request<{ pairing: PairingCode; code: string }>('POST', '/api/pairing', body),
+
+  // Fleet stats (Phase E): aggregate job-history snapshot
+  // (GET /api/stats?range=24h|7d|30d|all). Default range is 7d server-side;
+  // an unknown value falls back to 7d (not a 400), so the UI can pass any of
+  // the four canonical labels without validating.
+  getStats: (range: '24h' | '7d' | '30d' | 'all') =>
+    request<Stats>('GET', `/api/stats?range=${range}`),
 };

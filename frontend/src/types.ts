@@ -222,3 +222,49 @@ export interface Settings {
 
 // Step metadata for the builder now comes from the controller's step-template
 // registry (StepTemplate); the old hardcoded catalog was removed in phase 2.
+
+// ---------- Fleet stats (Phase E) ----------
+// GET /api/stats?range=24h|7d|30d|all — aggregate job-history snapshot
+// computed in SQL from the existing jobs columns + joins. No new storage.
+
+export interface StatsTotals {
+  done: number;
+  failed: number;
+  cancelled: number;
+  avg_duration_sec: number;
+}
+
+export interface StatsNodeRow {
+  node_id: number;
+  name: string;
+  done: number;
+  failed: number;
+  avg_duration_sec: number;
+}
+
+export interface StatsFlowRow {
+  flow_id: number;
+  name: string;
+  done: number;
+  failed: number;
+  avg_duration_sec: number;
+}
+
+export interface StatsStepRow {
+  step: string;
+  count: number;
+}
+
+export interface StatsDayRow {
+  date: string; // YYYY-MM-DD
+  count: number;
+}
+
+export interface Stats {
+  range_days: number; // 1|7|30|0(all)
+  totals: StatsTotals;
+  per_node: StatsNodeRow[];
+  per_flow: StatsFlowRow[];
+  failures_by_step: StatsStepRow[];
+  per_day: StatsDayRow[];
+}

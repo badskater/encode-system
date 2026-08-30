@@ -365,3 +365,68 @@ type HeartbeatReply struct {
 	RebootDelay int             `json:"reboot_delay_seconds,omitempty"`
 	Update      *UpdateManifest `json:"update,omitempty"`
 }
+
+// ---------- Fleet stats (Phase E) ----------
+
+// Stats is the aggregate job-history snapshot served by GET /api/stats.
+// Every field is derived in SQL from the existing jobs table + joins to
+// nodes/flows — no new storage. The range window (finished_at >= now-range)
+// scopes the aggregates; RangeDays echoes the resolved window so the UI can
+// label the view. An empty/never-used fleet returns a zeroed shape (not an
+// error) so the Stats page renders cleanly on a fresh install.
+type Stats struct {
+	RangeDays      int            `json:"range_days"`       // 1|7|30|0(all)
+	Totals         StatsTotals    `json:"totals"`           // done/failed/cancelled counts + avg duration
+	PerNode        []StatsNodeRow `json:"per_node"`         // per-node throughput/duration (only nodes with rows in range)
+	PerFlow        []StatsFlowRow `json:"per_flow"`         // per-flow throughput/duration
+	FailuresByStep []StatsStepRow `json:"failures_by_step"` // top-10 steps where jobs died
+	PerDay         []StatsDayRow  `json:"per_day"`          // day buckets for throughput trend
+}
+
+// StatsTotals aggregates the fleet-wide terminal counts and the average
+// finished-job duration within the range window. AvgDurationSec is 0 when
+// no finished jobs have both started_at and finished_at (the SQL AVG returns
+// NULL over zero rows — coerced to 0).
+type StatsTotals struct {
+	Done           int     `json:"done"`
+	Failed         int     `json:"failed"`
+	Cancelled      int     `json:"cancelled"`
+	AvgDurationSec float64 `json:"avg_duration_sec"`
+}
+
+// StatsNodeRow is one per-node aggregate row: the node's display name (LEFT
+// JOIN nodes), counts of done/failed jobs it completed in range, and its
+// average finished-job duration. Only nodes that have ≥1 finished job in
+// range appear (zero-row nodes are skipped — simpler, and the Nodes page
+// already lists the full fleet).
+type StatsNodeRow struct {
+	NodeID         int64   `json:"node_id"`
+	Name           string  `json:"name"`
+	Done           int     `json:"done"`
+	Failed         int     `json:"failed"`
+	AvgDurationSec float64 `json:"avg_duration_sec"`
+}
+
+// StatsFlowRow is one per-flow aggregate row (LEFT JOIN flows for the name).
+type StatsFlowRow struct {
+	FlowID         int64   `json:"flow_id"`
+	Name           string  `json:"name"`
+	Done           int     `json:"done"`
+	Failed         int     `json:"failed"`
+	AvgDurationSec float64 `json:"avg_duration_sec"`
+}
+
+// StatsStepRow is one row of failures-by-step attribution: the step column
+// (the last/current step the job reported) and how many jobs failed there.
+// Ordered by count DESC, capped at 10.
+type StatsStepRow struct {
+	Step  string `json:"step"`
+	Count int    `json:"count"`
+}
+
+// StatsDayRow is one day bucket of completed jobs for the throughput trend.
+// Date is the "YYYY-MM-DD" day slice of finished_at.
+type StatsDayRow struct {
+	Date  string `json:"date"`
+	Count int    `json:"count"`
+}

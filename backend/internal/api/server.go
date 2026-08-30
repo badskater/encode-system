@@ -321,6 +321,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.withAdmin(s.handleGetSettings))
 	mux.HandleFunc("PUT /api/settings", s.withAdmin(s.handleUpdateSettings))
 
+	// Fleet stats — aggregate job-history snapshot (Phase E).
+	mux.HandleFunc("GET /api/stats", s.withAdmin(s.handleStats))
+
 	// Agent payloads: the update store serves agent binary, EncodeLib.ps1,
 	// and the bin-folder zip package to nodes (auth: node token).
 	mux.HandleFunc("GET /api/agent/download/bin", s.withNodeAuth(s.handleDownloadBin))

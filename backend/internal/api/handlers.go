@@ -203,6 +203,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
+	// Drain mode: a live settings flag (editable in the UI, no restart)
+	// that pauses ALL job assignment fleet-wide. Running jobs keep running
+	// to completion — nothing here cancels in-flight work — but no new job
+	// is dispatched while the flag is on. Use it for host maintenance or
+	// before pushing a new bin package so no node starts an encode against
+	// a toolchain that's about to change. The check sits BEFORE the
+	// NextAssignableJob lookup so a draining fleet doesn't even dequeue.
+	// Toggled off in the UI, the next idle heartbeat resumes assignment.
+	if s.currentSettings(ctx).DrainMode {
+		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
+		return
+	}
 	// NextAssignableJob gates on next_retry_at (a backoff-pending job is
 	// not ready yet) and orders by priority DESC then id ASC so urgent jobs
 	// dispatch first and, within a priority tier, the oldest job wins

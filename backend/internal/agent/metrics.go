@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -82,6 +84,29 @@ func (a *Agent) gpuProbeDefault(ctx context.Context) (int, int, int) {
 		return -1, -1, -1
 	}
 	return parseNvidiaSmiCSV(strings.TrimSpace(string(out)))
+}
+
+// parseFlexibleFloat parses a float from PowerShell output, tolerating both
+// '.' and ',' decimal separators (e.g. a de-DE localized Windows host emits
+// "42,5"). It trims whitespace and a leading UTF-8 BOM. Returns an error
+// for garbage or inputs with both separators.
+func parseFlexibleFloat(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	// Strip a leading UTF-8 BOM (PowerShell console capture may include it).
+	s = strings.TrimPrefix(s, "\ufeff")
+	if s == "" {
+		return 0, fmt.Errorf("empty float")
+	}
+	// If the value uses a comma as decimal separator and there is no dot,
+	// normalize to a dot so strconv.ParseFloat understands it. If both
+	// separators are present, the string is ambiguous → reject.
+	if strings.ContainsRune(s, ',') {
+		if strings.ContainsRune(s, '.') {
+			return 0, fmt.Errorf("ambiguous decimal separators: %q", s)
+		}
+		s = strings.ReplaceAll(s, ",", ".")
+	}
+	return strconv.ParseFloat(s, 64)
 }
 
 // --- pure, unit-testable parsers ---
@@ -181,6 +206,11 @@ func driveLetterFromPath(p string) string {
 // returned. This bounds FPS parsing: a multi-GB run.log never gets fully
 // read. On read error (file missing, permission denied) returns the error
 // so the caller can degrade to 0 FPS.
+//
+// When the file is larger than `max`, the seek lands mid-line; the first
+// partial line fragment (everything up to and including the first '\n') is
+// discarded so downstream parsers see only complete lines. When the file
+// fits within `max` (offset 0), everything is kept as-is.
 func readTailBytes(path string, max int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -201,11 +231,24 @@ func readTailBytes(path string, max int) ([]byte, error) {
 		return nil, err
 	}
 	buf := make([]byte, max)
-	n, err := f.Read(buf)
-	if err != nil && n == 0 {
+	// FIX: use io.ReadFull instead of a single f.Read. A single Read may
+	// return fewer bytes than requested (allowed by the io.Reader contract),
+	// silently truncating the tail. io.ReadFull reads exactly len(buf) bytes
+	// unless the file ends early (→ io.ErrUnexpectedEOF, which we tolerate
+	// since the partial read is still valid data).
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && n == 0 {
 		return nil, err
 	}
-	return buf[:n], nil
+	result := buf[:n]
+	// FIX: when we seeked into the middle of the file (offset > 0), the
+	// buffer starts mid-line. Discard everything up to and including the
+	// first '\n' so FPS parsing sees only complete log lines. Best-effort:
+	// if there is no newline at all, keep the data rather than returning empty.
+	if idx := bytes.IndexByte(result, '\n'); idx >= 0 {
+		result = result[idx+1:]
+	}
+	return result, nil
 }
 
 // --- Agent struct additions and accessors ---
@@ -245,7 +288,7 @@ func (a *Agent) collectMetrics(ctx context.Context) *model.NodeMetrics {
 	// exercise the parsing path on Linux without shelling out).
 	if psRun != nil {
 		if out, err := psRun(cctx, cpuScript); err == nil {
-			if v, perr := strconv.ParseFloat(strings.TrimSpace(out), 64); perr == nil {
+			if v, perr := parseFlexibleFloat(out); perr == nil {
 				m.CPUPct = v
 			}
 		}
@@ -261,7 +304,7 @@ func (a *Agent) collectMetrics(ctx context.Context) *model.NodeMetrics {
 	// Disk free GB.
 	if psRun != nil {
 		if out, err := psRun(cctx, a.diskScript()); err == nil {
-			if v, perr := strconv.ParseFloat(strings.TrimSpace(out), 64); perr == nil {
+			if v, perr := parseFlexibleFloat(out); perr == nil {
 				m.DiskFreeGB = int64(v)
 			}
 		}
@@ -317,8 +360,13 @@ func (a *Agent) diskScript() string {
 
 // parseRAM parses the two-line WMI output (total KB, free KB) and populates
 // the metrics struct. Total is the first line; free is the second. Used KB
-// = total - free. All values are converted to MB.
+// = total - free. All values are converted to MB. Handles a leading UTF-8
+// BOM and CRLF line endings, both common in PowerShell console capture.
 func parseRAM(s string, m *model.NodeMetrics) {
+	// Strip a leading UTF-8 BOM (PowerShell console capture may include it).
+	s = strings.TrimPrefix(s, "\ufeff")
+	// Normalize CRLF to LF so Split on '\n' yields clean values.
+	s = strings.ReplaceAll(s, "\r\n", "\n")
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	if len(lines) < 2 {
 		return

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,119 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
+
+// --- locale-safe float parser (FIX 1) ---
+
+func TestParseFlexibleFloat(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want float64
+		ok   bool
+	}{
+		{"plain dot decimal", "42.5", 42.5, true},
+		{"comma decimal (de-DE locale)", "42,5", 42.5, true},
+		{"integer", "100", 100, true},
+		{"whitespace padded", "  23.7  ", 23.7, true},
+		{"empty", "", 0, false},
+		{"garbage", "abc", 0, false},
+		{"both separators rejected", "1.2.3", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseFlexibleFloat(c.in)
+			if c.ok {
+				if err != nil {
+					t.Fatalf("parseFlexibleFloat(%q) unexpected err: %v", c.in, err)
+				}
+				if got != c.want {
+					t.Errorf("parseFlexibleFloat(%q) = %v, want %v", c.in, got, c.want)
+				}
+			} else {
+				if err == nil {
+					t.Errorf("parseFlexibleFloat(%q) = %v, want error", c.in, got)
+				}
+			}
+		})
+	}
+}
+
+// TestCollectMetricsLocaleCommaDecimal verifies that CPU/disk values emitted
+// with a comma decimal separator (de-DE, fr-FR, … localized Windows host)
+// are parsed correctly rather than silently reporting 0.
+func TestCollectMetricsLocaleCommaDecimal(t *testing.T) {
+	dir := t.TempDir()
+	a, _ := New(Config{
+		ControllerURL: "http://x", NodeName: "n", Token: nodeTok(), DataDir: dir,
+	}, "v", testLog())
+	a.runPS = func(ctx context.Context, script string) (string, error) {
+		switch {
+		case strings.Contains(script, "Win32_Processor"):
+			return "42,5", nil // CPU load %, comma decimal (de-DE)
+		case strings.Contains(script, "Win32_OperatingSystem"):
+			return "8388608\n4194304", nil
+		case strings.Contains(script, "Win32_LogicalDisk"):
+			return "100,0", nil // 100 GB free, comma decimal
+		default:
+			return "", nil
+		}
+	}
+	a.gpuProbe = func(ctx context.Context) (int, int, int) { return -1, -1, -1 }
+
+	m := a.collectMetrics(context.Background())
+	if m.CPUPct != 42.5 {
+		t.Errorf("CPUPct = %v, want 42.5 (comma decimal not parsed)", m.CPUPct)
+	}
+	if m.DiskFreeGB != 100 {
+		t.Errorf("DiskFreeGB = %d, want 100", m.DiskFreeGB)
+	}
+}
+
+// TestParseCPUCommaCRLF verifies the CPU parse path handles a comma-decimal
+// value followed by CRLF line endings (Windows console output).
+func TestParseCPUCommaCRLF(t *testing.T) {
+	dir := t.TempDir()
+	a, _ := New(Config{
+		ControllerURL: "http://x", NodeName: "n", Token: nodeTok(), DataDir: dir,
+	}, "v", testLog())
+	a.runPS = func(ctx context.Context, script string) (string, error) {
+		if strings.Contains(script, "Win32_Processor") {
+			return "42,5\r\n", nil
+		}
+		return "", nil
+	}
+	a.gpuProbe = func(ctx context.Context) (int, int, int) { return -1, -1, -1 }
+
+	m := a.collectMetrics(context.Background())
+	if m.CPUPct != 42.5 {
+		t.Errorf("CPUPct = %v, want 42.5 (comma+CRLF not parsed)", m.CPUPct)
+	}
+}
+
+// TestParseRAMBOMCRLF verifies the RAM parser handles a UTF-8 BOM prefix
+// and CRLF line endings, both common in Windows console capture.
+func TestParseRAMBOMCRLF(t *testing.T) {
+	dir := t.TempDir()
+	a, _ := New(Config{
+		ControllerURL: "http://x", NodeName: "n", Token: nodeTok(), DataDir: dir,
+	}, "v", testLog())
+	a.runPS = func(ctx context.Context, script string) (string, error) {
+		if strings.Contains(script, "Win32_OperatingSystem") {
+			// UTF-8 BOM + CRLF endings (Windows console capture).
+			return "\xef\xbb\xbf8388608\r\n4194304\r\n", nil
+		}
+		return "", nil
+	}
+	a.gpuProbe = func(ctx context.Context) (int, int, int) { return -1, -1, -1 }
+
+	m := a.collectMetrics(context.Background())
+	if m.MemTotalMB != 8192 {
+		t.Errorf("MemTotalMB = %d, want 8192 (BOM/CRLF not handled)", m.MemTotalMB)
+	}
+	if m.MemUsedMB != 4096 {
+		t.Errorf("MemUsedMB = %d, want 4096", m.MemUsedMB)
+	}
+}
 
 // --- drive letter helper ---
 
@@ -157,6 +271,58 @@ func TestReadTailBytes(t *testing.T) {
 		_, err := readTailBytes(filepath.Join(t.TempDir(), "nope.log"), 4096)
 		if err == nil {
 			t.Fatal("expected error for missing file")
+		}
+	})
+
+	// FIX 2+3: A file larger than the read cap means the tail starts mid-line.
+	// The first partial line fragment (up to the first '\n') must be dropped so
+	// FPS parsing sees only complete log lines. The read must also return the
+	// full cap worth of bytes (io.ReadFull), not a short read.
+	t.Run("large file drops first partial line", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "big.log")
+		// Each line: "lineNNN: " + 100 'x' + '\n' = 110 bytes.
+		makeLine := func(n int) string {
+			return fmt.Sprintf("line%03d: ", n) + strings.Repeat("x", 100) + "\n"
+		}
+		var sb strings.Builder
+		const numLines = 1000 // 110 KiB > 64 KiB cap
+		for i := 0; i < numLines; i++ {
+			sb.WriteString(makeLine(i))
+		}
+		full := sb.String()
+		os.WriteFile(p, []byte(full), 0o644)
+
+		const readCap = 64 * 1024
+		got, err := readTailBytes(p, readCap)
+		if err != nil {
+			t.Fatalf("readTailBytes err: %v", err)
+		}
+		// FIX 2: io.ReadFull reads the full cap before the partial-line
+		// drop; the result is smaller by the discarded fragment. It must
+		// be close to readCap (not a short Read).
+		if len(got) > readCap {
+			t.Fatalf("got %d bytes, want ≤ %d", len(got), readCap)
+		}
+		if len(got) < readCap-200 {
+			t.Fatalf("got %d bytes, want ≥ %d (full ReadFull minus partial line)", len(got), readCap-200)
+		}
+		// FIX 3: the raw seek offset is 110000-65536 = 44464, which lands
+		// mid-line (44464 % 110 = 24, so 24 bytes into a line). After the
+		// partial-line drop, every line in the tail must start with "line".
+		resultLines := strings.Split(string(got), "\n")
+		// Drop the trailing empty element from the final '\n'.
+		if n := len(resultLines); n > 0 && resultLines[n-1] == "" {
+			resultLines = resultLines[:n-1]
+		}
+		for i, ln := range resultLines {
+			if ln == "" {
+				continue
+			}
+			if !strings.HasPrefix(ln, "line") {
+				t.Fatalf("line %d starts %q — partial fragment not dropped: %q",
+					i, ln[:min(4, len(ln))], ln[:min(30, len(ln))])
+			}
 		}
 	})
 }

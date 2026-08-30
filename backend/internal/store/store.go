@@ -126,6 +126,70 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 			}
 		}
 	}
+	// Schema v2: observability/queue feature set — job logs/timings/
+	// priority/retry, series notify, node metrics ring. Reuses the same
+	// tolerant-ALTER pattern (duplicate-column = already applied).
+	if err := s.migrateV2(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateV2 applies the schema v2 additions. Each ALTER is tolerant of the
+// already-migrated case (duplicate-column error) so opening an existing v2
+// database is a no-op. The node_metrics table uses CREATE TABLE IF NOT EXISTS.
+func (s *Store) migrateV2() error {
+	// jobs: full_log (complete capture), step_timings_json (per-step
+	// wall-clock samples), priority (queue dispatch weight), retry_count
+	// (re-queue count for backoff), next_retry_at (backoff gate).
+	jobAlters := []string{
+		`ALTER TABLE jobs ADD COLUMN full_log TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN step_timings_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN next_retry_at TEXT`,
+	}
+	for _, alt := range jobAlters {
+		if _, err := s.db.Exec(alt); err != nil {
+			if !isDuplicateColumnErr(err) {
+				return fmt.Errorf("migrate v2 jobs: %w", err)
+			}
+		}
+	}
+	// series: notify controls per-series Discord alerts. Defaults 1 (true)
+	// so existing series keep alerting (pre-v2 behavior).
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN notify INTEGER NOT NULL DEFAULT 1`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 series.notify: %w", err)
+		}
+	}
+	// node_metrics: rolling resource samples (one row per heartbeat) for
+	// the observability dashboard. Index on (node_id, ts) supports the
+	// "latest N samples for node" query shape.
+	metricsSchema := `
+CREATE TABLE IF NOT EXISTS node_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  cpu_pct REAL NOT NULL DEFAULT 0,
+  mem_used_mb INTEGER NOT NULL DEFAULT 0,
+  mem_total_mb INTEGER NOT NULL DEFAULT 0,
+  disk_free_gb INTEGER NOT NULL DEFAULT 0,
+  gpu_util INTEGER NOT NULL DEFAULT -1,
+  gpu_temp INTEGER NOT NULL DEFAULT -1,
+  gpu_mem_used_mb INTEGER NOT NULL DEFAULT -1,
+  encode_fps REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_node_ts ON node_metrics(node_id, ts);
+`
+	if _, err := s.db.Exec(metricsSchema); err != nil {
+		return fmt.Errorf("migrate v2 node_metrics: %w", err)
+	}
+	// settings: the table is a single-row JSON blob (id, json, updated_at),
+	// so drain_mode and notify_digest live as fields inside the marshaled
+	// Settings struct — no SQL column is needed. Their defaults (false) are
+	// the zero value of the bool fields, so old JSON rows that lack the keys
+	// unmarshal cleanly to "off". SaveSettings/GetSettings round-trip them.
 	return nil
 }
 
@@ -389,12 +453,15 @@ func (s *Store) DeleteFlow(ctx context.Context, id int64) error {
 
 // ---------- Jobs ----------
 
-// CreateJob inserts a new pending job.
+// CreateJob inserts a new pending job. Priority is honored so the queue can
+// dispatch higher-priority jobs first; the other v2 fields (full_log,
+// step_timings_json, retry_count, next_retry_at) default in the schema and
+// are populated later by the completion/report paths.
 func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO jobs (series, episode, episode_dir, script_type, script_file, flow_id, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		j.Series, j.Episode, j.EpisodeDir, j.ScriptType, j.ScriptFile, j.FlowID, string(model.JobPending))
+		`INSERT INTO jobs (series, episode, episode_dir, script_type, script_file, flow_id, status, priority)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.Series, j.Episode, j.EpisodeDir, j.ScriptType, j.ScriptFile, j.FlowID, string(model.JobPending), j.Priority)
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
@@ -408,7 +475,8 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 // GetJob loads a job by ID.
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
-  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at
   FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -416,12 +484,13 @@ func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 func scanJob(row *sql.Row) (*model.Job, error) {
 	var j model.Job
 	var status string
-	var outputsJSON string
-	var started, finished sql.NullString
+	var outputsJSON, timingsJSON string
+	var started, finished, nextRetry sql.NullString
 	var createdAt string
 	err := row.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
-		&createdAt, &started, &finished)
+		&createdAt, &started, &finished,
+		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry)
 	if err != nil {
 		return nil, err
 	}
@@ -430,11 +499,17 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 	if err := json.Unmarshal([]byte(outputsJSON), &j.Outputs); err != nil {
 		return nil, fmt.Errorf("job %d: outputs_json: %w", j.ID, err)
 	}
+	if err := json.Unmarshal([]byte(timingsJSON), &j.StepTimings); err != nil {
+		return nil, fmt.Errorf("job %d: step_timings_json: %w", j.ID, err)
+	}
 	if started.Valid {
 		j.StartedAt = ptrTime(started.String)
 	}
 	if finished.Valid {
 		j.FinishedAt = ptrTime(finished.String)
+	}
+	if nextRetry.Valid {
+		j.NextRetryAt = ptrTime(nextRetry.String)
 	}
 	return &j, nil
 }
@@ -442,7 +517,8 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 // ListJobs returns jobs, optionally filtered by status, newest first.
 func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int) ([]*model.Job, error) {
 	q := `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
-  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at FROM jobs`
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at FROM jobs`
 	args := []any{}
 	if status != "" {
 		q += ` WHERE status = ?`
@@ -474,12 +550,13 @@ func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int)
 func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	var j model.Job
 	var status string
-	var outputsJSON string
-	var started, finished sql.NullString
+	var outputsJSON, timingsJSON string
+	var started, finished, nextRetry sql.NullString
 	var createdAt string
 	err := rows.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
-		&createdAt, &started, &finished)
+		&createdAt, &started, &finished,
+		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry)
 	if err != nil {
 		return nil, err
 	}
@@ -488,11 +565,17 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	if err := json.Unmarshal([]byte(outputsJSON), &j.Outputs); err != nil {
 		return nil, fmt.Errorf("job %d: outputs_json: %w", j.ID, err)
 	}
+	if err := json.Unmarshal([]byte(timingsJSON), &j.StepTimings); err != nil {
+		return nil, fmt.Errorf("job %d: step_timings_json: %w", j.ID, err)
+	}
 	if started.Valid {
 		j.StartedAt = ptrTime(started.String)
 	}
 	if finished.Valid {
 		j.FinishedAt = ptrTime(finished.String)
+	}
+	if nextRetry.Valid {
+		j.NextRetryAt = ptrTime(nextRetry.String)
 	}
 	return &j, nil
 }
@@ -590,7 +673,8 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 // ActiveJobForNode returns the node's assigned/running job, if any.
 func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
-  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id LIMIT 1`, nodeID)
 	if err != nil {
 		return nil, err
@@ -622,10 +706,12 @@ func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
 
 // RetryJob re-queues a failed/cancelled job as pending on no node. It returns
 // the number of rows re-queued (0 when the job is not retryable, e.g. still
-// running) so callers can distinguish success from a no-op.
+// running) so callers can distinguish success from a no-op. Stale v2 capture
+// (full_log, step_timings_json) is cleared alongside the v1 state so a retry
+// starts clean; retry_count/next_retry_at are managed by the queue layer.
 func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', started_at=NULL, finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','done')`,
 		id)
 	if err != nil {
 		return 0, err

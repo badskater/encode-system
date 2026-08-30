@@ -96,7 +96,8 @@ type ProvisionRun struct {
 
 // Settings is the operator-editable runtime configuration (NFS shares,
 // controller roots, node path mapping, scan cadence, release naming). Stored
-// in the database; environment variables only seed the first boot.
+// in the database as a JSON blob in a single-row table; environment variables
+// only seed the first boot.
 type Settings struct {
 	// Controller URL as seen by the NODES (provisioned agents connect here;
 	// the container's own hostname is usually meaningless outside Docker).
@@ -122,8 +123,16 @@ type Settings struct {
 	// DiscordWebhook is the live-editable Discord webhook used by both the
 	// job-outcome alerts and the discord_notify flow step (as the fallback
 	// when a flow omits its own webhook param). Empty = notifications off.
-	DiscordWebhook string     `json:"discord_webhook"`
-	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
+	DiscordWebhook string `json:"discord_webhook"`
+	// DrainMode stops the queue from assigning new jobs to nodes — used to
+	// safely drain the farm for maintenance without cancelling in-flight
+	// encodes. Persisted in the settings JSON blob (not a SQL column).
+	DrainMode bool `json:"drain_mode"`
+	// NotifyDigest collapses per-job outcome alerts into a periodic digest
+	// when true; false keeps the immediate per-job alert behavior. Persisted
+	// in the settings JSON blob (not a SQL column).
+	NotifyDigest bool       `json:"notify_digest"`
+	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
 }
 
 // Session is an issued management session (token stored hashed at rest).
@@ -153,9 +162,14 @@ type Node struct {
 	// RebootIssuedAt records when the instruction was issued; after a grace
 	// period the flag expires so a node cannot be locked out forever.
 	RebootIssuedAt *time.Time `json:"-"`
-	LastSeen       *time.Time `json:"last_seen,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	// Metrics is the last reported resource sample from a heartbeat, kept
+	// in-memory only (NOT persisted on the nodes table — the node_metrics
+	// ring table holds history). Populated from the latest heartbeat in a
+	// later phase; nil for old agents that do not report metrics yet.
+	Metrics   *NodeMetrics `json:"metrics,omitempty"`
+	LastSeen  *time.Time   `json:"last_seen,omitempty"`
+	LastError string       `json:"last_error,omitempty"`
+	CreatedAt time.Time    `json:"created_at"`
 }
 
 // Job is one episode encode assignment.
@@ -178,17 +192,63 @@ type Job struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// FullLog is the complete captured stdout/stderr of the job (unlike
+	// LogTail which is a bounded tail). Kept on the jobs row so the UI can
+	// show the full run without re-reading agent files. Empty = no full
+	// log captured yet (old jobs pre-v2 carry '').
+	FullLog string `json:"full_log,omitempty"`
+	// StepTimings records per-step start time and wall-clock duration for
+	// the observability dashboard. Unmarshaled from the step_timings_json
+	// column; nil/empty when the agent has not reported any timings.
+	StepTimings []StepTiming `json:"step_timings,omitempty"`
+	// Priority is the queue dispatch weight (higher = dispatched sooner).
+	// Defaults to 0 (FIFO order) for jobs created before the priority field.
+	Priority int `json:"priority,omitempty"`
+	// RetryCount is how many times this job has been re-queued after
+	// failure. The queue uses it to apply backoff via NextRetryAt.
+	RetryCount int `json:"retry_count,omitempty"`
+	// NextRetryAt gates re-dispatch of a failed-then-retried job: the
+	// queue will not pick it up until this time. nil = immediately ready.
+	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
+}
+
+// StepTiming is one per-step wall-clock sample on a job. The controller
+// populates it from agent heartbeat/report data to render the observability
+// timeline. StartedAt is the step's start; DurationSec is elapsed seconds.
+type StepTiming struct {
+	Step        string    `json:"step"`
+	StartedAt   time.Time `json:"started_at"`
+	DurationSec float64   `json:"duration_sec"`
+}
+
+// NodeMetrics is a point-in-time resource sample for a node, reported by the
+// agent in its heartbeat and persisted into the node_metrics ring table for
+// history. GPU fields use -1 to mean "no GPU reported" (a headless node or
+// one whose agent predates GPU telemetry); callers must guard on <0.
+type NodeMetrics struct {
+	CPUPct       float64 `json:"cpu_pct"`
+	MemUsedMB    int64   `json:"mem_used_mb"`
+	MemTotalMB   int64   `json:"mem_total_mb"`
+	DiskFreeGB   int64   `json:"disk_free_gb"`
+	GPUUtil      int     `json:"gpu_util"`        // -1 = no GPU reported
+	GPUTemp      int     `json:"gpu_temp"`        // -1 = no GPU reported
+	GPUMemUsedMB int     `json:"gpu_mem_used_mb"` // -1 = no GPU reported
+	EncodeFPS    float64 `json:"encode_fps"`
 }
 
 // Series is a registered show/folder on the scripts share with its own flow
 // assignment and enable state. Episodes of a series may run on any enabled
 // node (the queue distributes one job per idle node automatically).
 type Series struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`    // matches the share folder name exactly
-	FlowID    int64     `json:"flow_id"` // 0 = use the default flow
-	Tag       string    `json:"tag"`     // quality tag override; "" = global settings tag
-	Enabled   bool      `json:"enabled"`
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`    // matches the share folder name exactly
+	FlowID  int64  `json:"flow_id"` // 0 = use the default flow
+	Tag     string `json:"tag"`     // quality tag override; "" = global settings tag
+	Enabled bool   `json:"enabled"`
+	// Notify controls whether job outcomes for this series emit Discord
+	// alerts. Defaults true (matches pre-v2 behavior where every job
+	// alerted) so a silent series is an opt-in, not an opt-out.
+	Notify    bool      `json:"notify"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -242,6 +302,9 @@ type Heartbeat struct {
 	Step           string  `json:"step,omitempty"`
 	StepProgress   float64 `json:"step_progress,omitempty"`
 	LogTail        string  `json:"log_tail,omitempty"`
+	// Metrics is the agent's latest resource sample. nil for old agents
+	// that do not report metrics — callers must nil-check before use.
+	Metrics *NodeMetrics `json:"metrics,omitempty"`
 }
 
 // JobPayload is what the controller hands to an agent to run a job.

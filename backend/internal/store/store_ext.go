@@ -329,25 +329,26 @@ func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Ser
 // SeriesByName loads a series by exact folder name.
 func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series WHERE name = ?`, name)
+		`SELECT id, name, flow_id, tag, enabled, notify, created_at, updated_at FROM series WHERE name = ?`, name)
 	return scanSeries(row)
 }
 
 // GetSeries loads a series by ID.
 func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series WHERE id = ?`, id)
+		`SELECT id, name, flow_id, tag, enabled, notify, created_at, updated_at FROM series WHERE id = ?`, id)
 	return scanSeries(row)
 }
 
 func scanSeries(row *sql.Row) (*model.Series, error) {
 	var sr model.Series
-	var enabled int
+	var enabled, notify int
 	var createdAt, updatedAt string
-	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	sr.Enabled = enabled == 1
+	sr.Notify = notify == 1
 	sr.CreatedAt = parseTime(createdAt)
 	sr.UpdatedAt = parseTime(updatedAt)
 	return &sr, nil
@@ -356,7 +357,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 // ListSeries returns all series ordered by name.
 func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, created_at, updated_at FROM series ORDER BY name`)
+		`SELECT id, name, flow_id, tag, enabled, notify, created_at, updated_at FROM series ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -364,12 +365,13 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	var out []*model.Series
 	for rows.Next() {
 		var sr model.Series
-		var enabled int
+		var enabled, notify int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		sr.Enabled = enabled == 1
+		sr.Notify = notify == 1
 		sr.CreatedAt = parseTime(createdAt)
 		sr.UpdatedAt = parseTime(updatedAt)
 		out = append(out, &sr)
@@ -377,11 +379,11 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	return out, rows.Err()
 }
 
-// UpdateSeries persists flow selection and enabled state.
+// UpdateSeries persists flow selection, enabled state, and notify flag.
 func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE series SET flow_id=?, tag=?, enabled=?, updated_at=datetime('now') WHERE id=?`,
-		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), sr.ID)
+		`UPDATE series SET flow_id=?, tag=?, enabled=?, notify=?, updated_at=datetime('now') WHERE id=?`,
+		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), boolToInt(sr.Notify), sr.ID)
 	return err
 }
 

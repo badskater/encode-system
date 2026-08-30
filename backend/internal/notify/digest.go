@@ -100,6 +100,9 @@ func FlushDigest(log *slog.Logger, webhookURL, controllerURL string, buf *Digest
 		return // notifications off; buffer already drained
 	}
 
+	// "failed" here means "not done" — the buffer only ever receives done/failed
+	// completions (cancelled jobs never reach notifyJobFinished), so the bucket
+	// is accurate in practice; the name is kept for the Discord message text.
 	done, failed := 0, 0
 	for _, e := range entries {
 		if e.Status == model.JobDone {

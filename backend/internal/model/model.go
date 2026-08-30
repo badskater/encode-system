@@ -236,6 +236,22 @@ type NodeMetrics struct {
 	EncodeFPS    float64 `json:"encode_fps"`
 }
 
+// NodeMetricSample is one persisted row from the node_metrics ring table, as
+// served to the dashboard via GET /api/nodes/{id}/metrics. It mirrors the
+// persisted columns; Ts is the sample timestamp in UTC. GPU fields use -1 to
+// mean "no GPU reported" (same convention as NodeMetrics).
+type NodeMetricSample struct {
+	Ts           time.Time `json:"ts"`
+	CPUPct       float64   `json:"cpu_pct"`
+	MemUsedMB    int64     `json:"mem_used_mb"`
+	MemTotalMB   int64     `json:"mem_total_mb"`
+	DiskFreeGB   int64     `json:"disk_free_gb"`
+	GPUUtil      int       `json:"gpu_util"`
+	GPUTemp      int       `json:"gpu_temp"`
+	GPUMemUsedMB int       `json:"gpu_mem_used_mb"`
+	EncodeFPS    float64   `json:"encode_fps"`
+}
+
 // Series is a registered show/folder on the scripts share with its own flow
 // assignment and enable state. Episodes of a series may run on any enabled
 // node (the queue distributes one job per idle node automatically).

@@ -374,6 +374,163 @@ func TestNodeRegistrationViaAPI(t *testing.T) {
 
 func itoa(i int64) string { return strconv.FormatInt(i, 10) }
 
+// metricsHeartbeat builds a heartbeat carrying a full resource sample.
+func metricsHeartbeat(node string, tasks int) model.Heartbeat {
+	hb := heartbeat(node, tasks, 0)
+	hb.Metrics = &model.NodeMetrics{
+		CPUPct: 55.5, MemUsedMB: 4096, MemTotalMB: 8192, DiskFreeGB: 250,
+		GPUUtil: 80, GPUTemp: 65, GPUMemUsedMB: 1024, EncodeFPS: 29.97,
+	}
+	return hb
+}
+
+// TestHeartbeatWithMetricsPersistsRow confirms a heartbeat carrying metrics
+// writes a row to node_metrics AND the metrics endpoint serves it.
+func TestHeartbeatWithMetricsPersistsRow(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, metricsHeartbeat("enc-01", 1))
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+
+	// GET /api/nodes/{id}/metrics must return the inserted sample.
+	url := ts.URL + "/api/nodes/" + itoa(e.node.ID) + "/metrics?range=1h"
+	resp2, body2 := doJSON(t, "GET", url, adminTok, nil)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("metrics endpoint: %d %s", resp2.StatusCode, body2)
+	}
+	var samples []model.NodeMetricSample
+	if err := json.Unmarshal(body2, &samples); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, body2)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("want 1 sample, got %d (%s)", len(samples), body2)
+	}
+	s := samples[0]
+	if s.CPUPct != 55.5 || s.MemUsedMB != 4096 || s.GPUUtil != 80 || s.EncodeFPS != 29.97 {
+		t.Fatalf("field mismatch: %+v", s)
+	}
+}
+
+// TestHeartbeatWithoutMetricsWritesNoRow confirms an old-agent heartbeat
+// (nil Metrics) writes no row and the metrics endpoint returns an empty array.
+func TestHeartbeatWithoutMetricsWritesNoRow(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	// Old-agent heartbeat: no Metrics field.
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 1, 0))
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+
+	url := ts.URL + "/api/nodes/" + itoa(e.node.ID) + "/metrics?range=1h"
+	resp2, body2 := doJSON(t, "GET", url, adminTok, nil)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("metrics endpoint: %d %s", resp2.StatusCode, body2)
+	}
+	var samples []model.NodeMetricSample
+	if err := json.Unmarshal(body2, &samples); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, body2)
+	}
+	if len(samples) != 0 {
+		t.Fatalf("old agent must write no rows, got %d", len(samples))
+	}
+}
+
+// TestNodeListShowsLastMetrics confirms GET /api/nodes surfaces
+// last_metrics when a heartbeat has carried metrics.
+func TestNodeListShowsLastMetrics(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	// Send a heartbeat WITH metrics.
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, metricsHeartbeat("enc-01", 1))
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+
+	resp2, body2 := doJSON(t, "GET", ts.URL+"/api/nodes", adminTok, nil)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("list nodes: %d %s", resp2.StatusCode, body2)
+	}
+	var view []struct {
+		*model.Node
+		Online      bool               `json:"online"`
+		LastMetrics *model.NodeMetrics `json:"last_metrics"`
+	}
+	if err := json.Unmarshal(body2, &view); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, body2)
+	}
+	if len(view) != 1 {
+		t.Fatalf("want 1 node, got %d", len(view))
+	}
+	if view[0].LastMetrics == nil {
+		t.Fatal("last_metrics should be present after a metrics heartbeat")
+	}
+	if view[0].LastMetrics.CPUPct != 55.5 {
+		t.Fatalf("last_metrics cpu: want 55.5, got %v", view[0].LastMetrics.CPUPct)
+	}
+}
+
+// TestNodeListOmitsLastMetricsWhenAbsent confirms last_metrics is null/omitted
+// when the node has never sent metrics.
+func TestNodeListOmitsLastMetricsWhenAbsent(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	// No heartbeat sent — node has no metrics.
+	resp, body := doJSON(t, "GET", ts.URL+"/api/nodes", adminTok, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("list nodes: %d %s", resp.StatusCode, body)
+	}
+	var view []struct {
+		*model.Node
+		Online      bool               `json:"online"`
+		LastMetrics *model.NodeMetrics `json:"last_metrics"`
+	}
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, body)
+	}
+	if len(view) != 1 {
+		t.Fatalf("want 1 node, got %d", len(view))
+	}
+	if view[0].LastMetrics != nil {
+		t.Fatalf("last_metrics must be nil for a node with no metrics, got %+v", view[0].LastMetrics)
+	}
+}
+
+// TestMetricsEndpointRequiresAdmin confirms the metrics endpoint returns 401
+// without an admin session.
+func TestMetricsEndpointRequiresAdmin(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	url := ts.URL + "/api/nodes/" + itoa(e.node.ID) + "/metrics?range=1h"
+	resp, _ := doJSON(t, "GET", url, "", nil)
+	if resp.StatusCode != 401 {
+		t.Fatalf("want 401 without admin token, got %d", resp.StatusCode)
+	}
+	resp2, _ := doJSON(t, "GET", url, "bad-token", nil)
+	if resp2.StatusCode != 401 {
+		t.Fatalf("want 401 with bad token, got %d", resp2.StatusCode)
+	}
+}
+
+// TestMetricsEndpoint404ForUnknownNode confirms a non-existent node id 404s.
+func TestMetricsEndpoint404ForUnknownNode(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	url := ts.URL + "/api/nodes/999999/metrics?range=1h"
+	resp, _ := doJSON(t, "GET", url, adminTok, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("want 404 for unknown node, got %d", resp.StatusCode)
+	}
+}
+
 // Regression (adversarial review): the reboot instruction must be RE-ISSUED on
 // every idle heartbeat while the flag is set — a missed packet must not brick
 // the node forever.

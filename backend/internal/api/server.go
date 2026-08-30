@@ -274,6 +274,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PATCH /api/nodes/{id}", s.withAdmin(s.handlePatchNode))
 	mux.HandleFunc("DELETE /api/nodes/{id}", s.withAdmin(s.handleDeleteNode))
 	mux.HandleFunc("POST /api/nodes/{id}/reboot", s.withAdmin(s.handleRebootNode))
+	mux.HandleFunc("GET /api/nodes/{id}/metrics", s.withAdmin(s.handleNodeMetrics))
 
 	mux.HandleFunc("GET /api/jobs", s.withAdmin(s.handleListJobs))
 	mux.HandleFunc("POST /api/jobs", s.withAdmin(s.handleCreateJob))

@@ -423,26 +423,51 @@ func (s *Server) shouldAutoRetry(ctx context.Context, job *model.Job, jobID int6
 // fired.
 //
 // Per-series mute: a job whose series has Notify=false is skipped entirely —
-// no direct alert AND no digest buffering. An unknown series (scanner created
-// the job before the series row existed, or the row was deleted) is treated
-// as notify=true so muting is always an opt-in, never a silent default.
+// no direct alert AND no digest buffering. The mute check runs BEFORE the
+// digest branch so a muted series never enters the buffer. An unknown series
+// (scanner created the job before the series row existed, or the row was
+// deleted) is treated as notify=true so muting is always an opt-in, never a
+// silent default.
+//
+// Digest mode: when settings.NotifyDigest is ON (and the series is not
+// muted), the outcome is pushed to the in-memory digest buffer and no direct
+// alert fires — StartDigestLoop's hourly ticker flushes a single summary.
+// When OFF, behavior is unchanged (immediate per-job alert). The buffer is
+// initialized in New, so s.digest and s.digest.buf are never nil here.
 func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName string) {
 	j, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return
 	}
 	// Per-series mute: resolve the series row and skip when Notify is false.
+	// This runs BEFORE the digest check so a muted series is never buffered.
 	// A lookup miss (unknown series) falls through to notify — muting is
 	// opt-in per series, never a default.
 	if sr, err := s.Store.SeriesByName(ctx, j.Series); err == nil && sr != nil && !sr.Notify {
 		s.Log.Debug("series muted — skipping notify", "job", jobID, "series", j.Series)
 		return
 	}
+	st := s.currentSettings(ctx)
+	// Digest mode: buffer the outcome for an hourly summary instead of
+	// alerting per job. The buffer is built in New, so s.digest.buf is
+	// never nil; the guard is defensive against a misconfigured server.
+	if st.NotifyDigest {
+		if s.digest != nil && s.digest.buf != nil {
+			s.digest.buf.Push(notify.DigestEntry{
+				JobID:    j.ID,
+				Series:   j.Series,
+				Episode:  j.Episode,
+				Status:   j.Status,
+				NodeName: nodeName,
+				At:       time.Now().UTC(),
+			})
+		}
+		return // no direct post; the digest loop flushes a summary
+	}
 	if s.Notifier != nil {
 		s.Notifier.JobFinished(ctx, j, nodeName)
 		return
 	}
-	st := s.currentSettings(ctx)
 	notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).JobFinished(ctx, j, nodeName)
 }
 

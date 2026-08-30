@@ -162,6 +162,13 @@ func main() {
 		return root, interval, defaultFlow
 	})
 
+	// Digest loop: when settings.NotifyDigest is ON, buffer job-outcome
+	// events and flush one hourly summary instead of per-job alerts. Each
+	// tick reads live settings, so toggling digest on/off on the Settings
+	// page applies on the next tick without a restart. Bound to the same
+	// ctx as the scanner so SIGTERM stops both cleanly.
+	srv.StartDigestLoop(ctx)
+
 	// Serve UI static files (built frontend) if present, then the API.
 	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes
 	// the SPA into /app/ui, keeping it out of the persistent volume).

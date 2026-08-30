@@ -126,6 +126,14 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 	}
 
 	content := truncate(b.String(), discordCap)
+	d.post(ctx, content)
+}
+
+// post sends a single pre-formatted content string to the webhook. Shared by
+// JobFinished (per-job alerts) and flushDigest (batched summary) so the
+// digest path reuses the exact same transport + error handling without
+// duplicating the HTTP boilerplate.
+func (d *Discord) post(ctx context.Context, content string) {
 	payload := map[string]string{"content": content}
 	body, err := json.Marshal(payload)
 	if err != nil {

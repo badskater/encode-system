@@ -56,6 +56,22 @@ type Server struct {
 	// path must be silent). Production leaves this nil so notifyJobFinished
 	// resolves the webhook from currentSettings exactly as before.
 	Notifier notify.Notifier
+	// digest holds buffered job-outcome events when settings.NotifyDigest is
+	// ON. A ticker started by StartDigestLoop flushes it hourly, posting one
+	// summary instead of per-job alerts. Built in New (never nil — the buffer
+	// is always present so notifyJobFinished can push without a nil check on
+	// the state; only the loop is started later). In-memory only — a restart
+	// loses pending events (acceptable: observability data, not state; the
+	// jobs table is the source of truth).
+	digest *digestState
+}
+
+// digestState bundles the buffer + flush plumbing so Server carries one
+// field instead of two. Built by New (the buffer is always present so
+// notifyJobFinished can push without a nil check on the state itself);
+// StartDigestLoop starts the ticker goroutine that flushes it hourly.
+type digestState struct {
+	buf *notify.DigestBuffer
 }
 
 // New builds the server and seeds the default flow when absent.
@@ -75,7 +91,10 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	if cfg.DefaultFlowName == "" {
 		cfg.DefaultFlowName = "default-1080"
 	}
-	s := &Server{Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{}}
+	s := &Server{
+		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
+		digest: &digestState{buf: notify.NewDigestBuffer()},
+	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
 	}
@@ -114,6 +133,60 @@ func (s *Server) migrateDiscordWebhook() error {
 		s.Log.Info("injected env Discord webhook into the saved settings row (key added by this release)")
 	}
 	return nil
+}
+
+// digestInterval is the flush cadence for the hourly digest loop. The loop
+// rebuilds the ticker only if a future variant makes this configurable; for
+// now it is a fixed hourly tick.
+const digestInterval = time.Hour
+
+// StartDigestLoop launches the hourly digest flusher as a background goroutine
+// bound to ctx. It is modeled on scanner.RunLoop's lifecycle: ONE ticker is
+// kept alive and stopped via defer at function exit so a panic in the flush
+// path cannot leak it, and the interval is re-read each cycle so a future
+// configurable cadence would apply on the next tick without a restart.
+//
+// Each tick reads the LIVE settings. When NotifyDigest is OFF the tick is a
+// no-op (the buffer keeps any events buffered during a previous ON period;
+// they flush on the next tick where digest is ON again — this is acceptable
+// because the buffer is observability data, not state, and the jobs table
+// remains the source of truth). When ON, the buffer is drained and, if
+// non-empty, posted as a single Discord summary via FlushDigest. The webhook
+// and controller URL are resolved live per flush so Settings-page edits apply
+// immediately. A controller restart loses any buffered-but-unflushed events
+// (acceptable — see DigestBuffer docs).
+//
+// Safe to call when s.digest is nil (a no-op guard lets tests skip the loop).
+func (s *Server) StartDigestLoop(ctx context.Context) {
+	if s.digest == nil || s.digest.buf == nil {
+		return // no buffer initialized; nothing to flush (test/edge guard)
+	}
+	go s.runDigestLoop(ctx)
+}
+
+func (s *Server) runDigestLoop(ctx context.Context) {
+	tick := time.NewTicker(digestInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			s.flushDigestTick(ctx)
+		}
+	}
+}
+
+// flushDigestTick runs one digest flush. Live settings drive whether the
+// flush actually posts: digest OFF → the tick is silent (buffer retains
+// events from a previous ON period for the next ON tick); digest ON → drain
+// + post if non-empty.
+func (s *Server) flushDigestTick(ctx context.Context) {
+	st := s.currentSettings(ctx)
+	if !st.NotifyDigest {
+		return // digest off; buffered events wait for the next ON tick
+	}
+	notify.FlushDigest(s.Log, st.DiscordWebhook, st.ControllerURL, s.digest.buf, time.Now().UTC())
 }
 
 // seedAdminUser ensures the management-plane admin account exists. On first

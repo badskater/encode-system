@@ -97,6 +97,13 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// job died silently — fail it so it can be retried instead of staying stuck
 	// 'running' forever with the node phantom-busy. Assigned (not-yet-acknowledged)
 	// jobs are untouched to avoid racing a fresh assignment.
+	//
+	// The orphan finish is routed through the same retry-decision helper as an
+	// agent-reported failure (shouldAutoRetry): a flow with a retry policy
+	// silently re-queues the orphan instead of alerting immediately, so a
+	// controller-detected failure gets identical treatment to an agent-reported
+	// one. When the orphan is auto-retried, notify is skipped (the helper already
+	// scheduled the retry); otherwise it notifies as before.
 	if !hasActiveJob {
 		if orphan, err := s.Store.ActiveJobForNode(ctx, node.ID); err == nil && orphan != nil &&
 			orphan.Status == model.JobRunning {
@@ -104,8 +111,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 				"node stopped reporting the job (reboot/restart) — orphaned; retry it", nil, ""); err != nil {
 				s.Log.Warn("orphan job cleanup", "err", err, "job", orphan.ID)
 			} else {
-				s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
-				s.notifyJobFinished(ctx, orphan.ID, "controller")
+				// Re-read the job so shouldAutoRetry sees the just-stamped
+				// failed state (RetryCount etc. from the DB row).
+				failed, _ := s.Store.GetJob(ctx, orphan.ID)
+				if failed != nil && s.shouldAutoRetry(ctx, failed, orphan.ID) {
+					s.Log.Info("orphaned job auto-retried (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+				} else {
+					s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+					s.notifyJobFinished(ctx, orphan.ID, "controller")
+				}
 			}
 		}
 	}
@@ -190,9 +204,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		return
 	}
 	// NextAssignableJob gates on next_retry_at (a backoff-pending job is
-	// not ready yet) and orders by priority DESC then id DESC so urgent and
-	// newer jobs dispatch first. ListJobs stays for the UI, which must still
-	// show retry-pending jobs.
+	// not ready yet) and orders by priority DESC then id ASC so urgent jobs
+	// dispatch first and, within a priority tier, the oldest job wins
+	// (true FIFO). ListJobs stays for the UI, which must still show
+	// retry-pending jobs.
 	job, err := s.Store.NextAssignableJob(ctx)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list pending jobs")
@@ -323,6 +338,14 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 	// hold the box. When retries are exhausted, the flow has no policy, or
 	// the flow vanished, the job notifies as before — the notify path reads
 	// RetryCount off the job so the alert says "(after N retries)".
+	//
+	// Crash window: if the controller crashes between FinishJobWithReport
+	// (above) and shouldAutoRetry/ScheduleJobRetry (below), the job stays
+	// in the 'failed' state with no backoff gate — it will NOT be retried
+	// until an operator retries it manually via the UI. This is by design:
+	// the alternative (retrying on the next boot) would require a startup
+	// scan, and a job that failed legitimately would be re-dispatched into
+	// the same failure. The manual retry path (RetryJob) recovers it.
 	if status == model.JobFailed && s.shouldAutoRetry(ctx, job, jobID) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 		return
@@ -337,6 +360,13 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 // when the job should notify (retries exhausted, no policy, or the flow
 // could not be resolved). A GetFlow error or a vanished flow is treated as
 // no-retry-policy so a broken flow lookup never strands a job.
+//
+// This is the shared retry-decision helper: both handleJobComplete
+// (agent-reported failure) and the orphan-recovery path in handleHeartbeat
+// (controller-detected failure) call it so the same logical failure gets
+// identical treatment — auto-retry when a policy exists, notify otherwise.
+// Without this, an agent-reported failure silently retried while a
+// controller-detected orphan alerted immediately.
 func (s *Server) shouldAutoRetry(ctx context.Context, job *model.Job, jobID int64) bool {
 	fl, err := s.Store.GetFlow(ctx, job.FlowID)
 	if err != nil || fl == nil || fl.MaxRetries <= 0 {
@@ -345,12 +375,22 @@ func (s *Server) shouldAutoRetry(ctx context.Context, job *model.Job, jobID int6
 	if job.RetryCount >= fl.MaxRetries {
 		return false // budget exhausted → notify (carries retry count)
 	}
-	// Backoff: the flow's configured minutes, with a sane minimum so a
-	// zero-value (operator forgot to set it) is never an instant retry.
-	backoff := time.Duration(fl.RetryBackoffMinutes) * time.Minute
-	if backoff <= 0 {
-		backoff = 1 * time.Minute
+	// Backoff: the flow's configured minutes, clamped to a 24h ceiling.
+	// The clamp must happen on the MINUTES value BEFORE the multiply: a
+	// huge RetryBackoffMinutes (e.g. 999,999,999,999) multiplied by
+	// time.Minute overflows time.Duration to a negative Duration, which
+	// stamps next_retry_at in the PAST and causes instant re-dispatch.
+	// 24h (1440 minutes) is generous for any legitimate backoff; an
+	// operator who wants to park a job longer can disable it and retry
+	// manually.
+	minutes := fl.RetryBackoffMinutes
+	if minutes <= 0 {
+		minutes = 1
 	}
+	if minutes > 1440 {
+		minutes = 1440
+	}
+	backoff := time.Duration(minutes) * time.Minute
 	next := time.Now().UTC().Add(backoff)
 	nextRetryCount := job.RetryCount + 1
 	if err := s.Store.ScheduleJobRetry(ctx, jobID, nextRetryCount, next); err != nil {

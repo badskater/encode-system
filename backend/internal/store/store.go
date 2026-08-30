@@ -885,26 +885,36 @@ func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 // failed state (manual retry, cancel) matches zero rows and is a no-op
 // (nil error). This prevents a retry from resurrecting a job a concurrent
 // path already moved on.
+//
+// The clear set mirrors RetryJob: the failed run's stale observability
+// fields (started_at, finished_at, error, exit_code, outputs_json,
+// log_tail, full_log, step_timings_json) are wiped so a re-queued pending
+// job never briefly shows the old run's error/log to the UI. Without this,
+// a just-retried job sits 'pending' carrying the previous failure's error
+// message and log tail until it is re-assigned.
 func (s *Store) ScheduleJobRetry(ctx context.Context, jobID int64, retryCount int, nextRetryAt time.Time) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, retry_count=?, next_retry_at=? WHERE id=? AND status='failed'`,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, retry_count=?, next_retry_at=?,
+		 started_at=NULL, finished_at=NULL, error='', exit_code=0, outputs_json='[]', log_tail='', full_log='', step_timings_json='[]'
+		 WHERE id=? AND status='failed'`,
 		retryCount, fmtTime(nextRetryAt), jobID)
 	return err
 }
 
 // NextAssignableJob returns the highest-priority pending job whose backoff
 // gate has elapsed (next_retry_at IS NULL OR <= now), ordered by priority
-// DESC then id DESC. The priority ordering lets Phase D2 exploit it for
-// urgent jobs; id DESC keeps FIFO order within a priority tier. Returns
-// nil (not an error) when no job is assignable. ListJobs stays unchanged
-// for the UI (retry-pending jobs remain visible).
+// DESC then id ASC. Priority DESC dispatches urgent jobs first; id ASC is
+// true FIFO within a priority tier — episodes encode in submission order
+// on an encode farm, not newest-first. Returns nil (not an error) when no
+// job is assignable. ListJobs stays unchanged for the UI (retry-pending
+// jobs remain visible).
 func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, priority, retry_count, next_retry_at
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
-  ORDER BY priority DESC, id DESC LIMIT 1`)
+  ORDER BY priority DESC, id ASC LIMIT 1`)
 	j, err := scanJob(row)
 	if err != nil {
 		if err == sql.ErrNoRows {

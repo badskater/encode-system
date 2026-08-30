@@ -475,3 +475,150 @@ func (c *captureWebhookServer) LastBody() map[string]string {
 	}
 	return c.bodies[len(c.bodies)-1]
 }
+
+// TestOrphanRecoveryHonorsRetryPolicy asserts that when the heartbeat's
+// orphan-recovery path fails a job whose node stopped reporting it, and the
+// flow has a retry policy, the job is silently re-queued (pending again)
+// instead of notifying immediately. This makes the orphan failure get the
+// SAME treatment as an agent-reported failure (auto-retry), closing the
+// inconsistency where a controller-detected orphan alerted immediately while
+// an agent-reported failure stayed silent.
+func TestOrphanRecoveryHonorsRetryPolicy(t *testing.T) {
+	e, rec, fl := newRetryTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	// Create a job on the retry-policy flow and assign it to the node.
+	job, err := e.server.Store.CreateJob(ctx, &model.Job{
+		Series: "O", Episode: "01", EpisodeDir: "O/Ep 01", ScriptType: "vpy", FlowID: fl.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.server.Store.AssignJob(ctx, job.ID, e.node.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Advance it to running so the orphan path sees a RUNNING job.
+	if err := e.server.Store.UpdateJobStatus(ctx, job.ID, model.JobRunning, "encode", 33, "tail"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Heartbeat reporting NO active job (JobID=0): the DB says this node
+	// owns a RUNNING job, but the heartbeat doesn't mention it → orphan.
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 1, 0))
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+
+	// The orphan must have been auto-retried: job is pending again with
+	// retry_count incremented and a backoff gate.
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobPending {
+		t.Fatalf("orphaned job status = %q, want pending (auto-retried)", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", got.RetryCount)
+	}
+	if got.NextRetryAt == nil {
+		t.Fatal("next_retry_at not set after orphan auto-retry")
+	}
+	// The notify must NOT fire — the orphan path consulted the retry policy
+	// and re-queued silently, exactly like an agent-reported failure.
+	if rec.count() != 0 {
+		t.Fatalf("orphan auto-retry must NOT notify, got %d calls", rec.count())
+	}
+}
+
+// TestOrphanRecoveryNoPolicyNotifies asserts that when the orphan-recovery
+// path fails a job whose flow has NO retry policy, it notifies immediately
+// (the existing behavior, preserved for the no-policy case).
+func TestOrphanRecoveryNoPolicyNotifies(t *testing.T) {
+	e := newTestEnv(t)
+	rec := &recordingNotifier{}
+	e.server.Notifier = rec
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	// The seeded default flow has no retry policy (MaxRetries=0).
+	fl, err := e.server.Store.FlowByName(ctx, "default-1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := e.server.Store.CreateJob(ctx, &model.Job{
+		Series: "O2", Episode: "01", EpisodeDir: "O2/Ep 01", ScriptType: "vpy", FlowID: fl.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.server.Store.AssignJob(ctx, job.ID, e.node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.server.Store.UpdateJobStatus(ctx, job.ID, model.JobRunning, "encode", 10, "tail"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Orphan the job (heartbeat with no active job).
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 1, 0))
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobFailed {
+		t.Fatalf("orphaned job status = %q, want failed", got.Status)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("orphan with no retry policy must notify, got %d calls", rec.count())
+	}
+}
+
+// TestBackoffClampOnAbsurdValue asserts that a flow with an absurdly large
+// RetryBackoffMinutes does NOT overflow time.Duration into a negative value
+// (which would stamp next_retry_at in the PAST and cause instant
+// re-dispatch). The backoff is clamped to 24h so the retry is parked, not
+// instantly re-dispatched, and never lands in the past.
+func TestBackoffClampOnAbsurdValue(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	// Create a flow with an absurd backoff (999,999,999,999 minutes → would
+	// overflow time.Duration to a negative Duration if multiplied naively).
+	fl, err := e.server.Store.CreateFlow(ctx, &model.Flow{
+		Name:                "absurd-backoff",
+		Steps:               []model.Step{{Type: model.StepDGIndex}},
+		MaxRetries:          1,
+		RetryBackoffMinutes: 999999999999,
+	})
+	if err != nil {
+		t.Fatalf("create absurd-backoff flow: %v", err)
+	}
+	job, err := e.server.Store.CreateJob(ctx, &model.Job{
+		Series: "A", Episode: "01", EpisodeDir: "A/Ep 01", ScriptType: "vpy", FlowID: fl.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.server.Store.AssignJob(ctx, job.ID, e.node.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	completeJob(t, ts.URL, e, job.ID, "failed")
+
+	got, _ := e.server.Store.GetJob(ctx, job.ID)
+	if got.Status != model.JobPending {
+		t.Fatalf("job status = %q, want pending (auto-retried)", got.Status)
+	}
+	if got.NextRetryAt == nil {
+		t.Fatal("next_retry_at not set")
+	}
+	// The clamp must keep next_retry_at ≈ now+24h (within a generous bound),
+	// and NEVER in the past.
+	if got.NextRetryAt.Before(time.Now().UTC()) {
+		t.Fatalf("backoff overflow: next_retry_at %v is in the past (overflow → instant dispatch)", got.NextRetryAt)
+	}
+	want := time.Now().UTC().Add(24 * time.Hour)
+	if got.NextRetryAt.Sub(want).Abs() > 10*time.Second {
+		t.Fatalf("next_retry_at = %v, want ~%v (24h clamp)", got.NextRetryAt, want)
+	}
+}

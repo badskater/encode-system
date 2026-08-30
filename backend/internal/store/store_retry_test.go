@@ -9,6 +9,16 @@ import (
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 
+// mustCreateNode creates a node and fails the test on error (test helper).
+func mustCreateNode(t *testing.T, s *Store, name string) int64 {
+	t.Helper()
+	n, err := s.CreateNode(context.Background(), name, "hash-"+name)
+	if err != nil {
+		t.Fatalf("create node %s: %v", name, err)
+	}
+	return n.ID
+}
+
 // ---------- options_json round-trip ----------
 
 // TestFlowOptionsRoundTrip asserts the per-flow retry policy survives a
@@ -168,6 +178,78 @@ func TestScheduleJobRetryOnFailed(t *testing.T) {
 	}
 }
 
+// TestScheduleJobRetryClearsStaleRunState asserts ScheduleJobRetry wipes the
+// failed run's observability fields so a re-queued pending job never briefly
+// shows the old run's error/log to the UI. The clear set must mirror
+// RetryJob: started_at=NULL, finished_at=NULL, error=”, exit_code=0,
+// outputs_json='[]', log_tail=”, full_log=”, step_timings_json='[]'.
+func TestScheduleJobRetryClearsStaleRunState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow := seedFlow(t, s)
+
+	j, err := s.CreateJob(ctx, &model.Job{Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Assign + run + fail with a full report so every stale field is
+	// populated (error, exit_code, outputs, log_tail, full_log,
+	// step_timings_json, started_at, finished_at).
+	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-clear")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateJobStatus(ctx, j.ID, model.JobRunning, "encode", 50, "run tail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 9, "encode crashed",
+		[]string{"stale.mkv"}, "final tail", "full log body",
+		[]model.StepTiming{{Step: "encode", DurationSec: 120}}); err != nil {
+		t.Fatalf("finish with report: %v", err)
+	}
+	// Confirm the stale state is present before retry.
+	pre, _ := s.GetJob(ctx, j.ID)
+	if pre.Error != "encode crashed" || pre.ExitCode != 9 || pre.LogTail != "final tail" ||
+		pre.FullLog != "full log body" || len(pre.Outputs) != 1 || len(pre.StepTimings) != 1 ||
+		pre.StartedAt == nil || pre.FinishedAt == nil {
+		t.Fatalf("pre-retry stale state not populated: %+v", pre)
+	}
+
+	// ScheduleJobRetry must clear ALL of those fields.
+	next := time.Now().UTC().Add(1 * time.Minute)
+	if err := s.ScheduleJobRetry(ctx, j.ID, 1, next); err != nil {
+		t.Fatalf("schedule retry: %v", err)
+	}
+
+	got, _ := s.GetJob(ctx, j.ID)
+	if got.Status != model.JobPending {
+		t.Fatalf("status = %q, want pending", got.Status)
+	}
+	if got.Error != "" {
+		t.Errorf("error = %q, want empty", got.Error)
+	}
+	if got.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0", got.ExitCode)
+	}
+	if got.LogTail != "" {
+		t.Errorf("log_tail = %q, want empty", got.LogTail)
+	}
+	if got.FullLog != "" {
+		t.Errorf("full_log = %q, want empty", got.FullLog)
+	}
+	if len(got.Outputs) != 0 {
+		t.Errorf("outputs = %v, want empty", got.Outputs)
+	}
+	if len(got.StepTimings) != 0 {
+		t.Errorf("step_timings = %v, want empty", got.StepTimings)
+	}
+	if got.StartedAt != nil {
+		t.Errorf("started_at = %v, want nil", got.StartedAt)
+	}
+	if got.FinishedAt != nil {
+		t.Errorf("finished_at = %v, want nil", got.FinishedAt)
+	}
+}
+
 // TestScheduleJobRetryRefusesNonFailed asserts the guarded UPDATE refuses a
 // job that is NOT failed (e.g. running), so a retry can never resurrect a
 // live job.
@@ -228,13 +310,14 @@ func TestNextAssignableJobSkipsFutureRetry(t *testing.T) {
 
 // TestNextAssignableJobIncludesPastAndNull asserts a pending job with a
 // past next_retry_at (backoff elapsed) and one with NULL (no retry) are
-// both assignable.
+// both assignable, and that within a priority tier the OLDEST job (lowest
+// id) wins — true FIFO, so episodes encode in submission order on a farm.
 func TestNextAssignableJobIncludesPastAndNull(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	flow := seedFlow(t, s)
 
-	// Job A: past next_retry_at (backoff elapsed).
+	// Job A: past next_retry_at (backoff elapsed). Created first → lowest id.
 	a, err := s.CreateJob(ctx, &model.Job{Series: "A", Episode: "01", EpisodeDir: "A/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -245,9 +328,8 @@ func TestNextAssignableJobIncludesPastAndNull(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Job B: NULL next_retry_at (no retry).
-	b, err := s.CreateJob(ctx, &model.Job{Series: "B", Episode: "01", EpisodeDir: "B/Ep 01", ScriptType: "vpy", FlowID: flow.ID})
-	if err != nil {
+	// Job B: NULL next_retry_at (no retry). Created second → higher id.
+	if _, err := s.CreateJob(ctx, &model.Job{Series: "B", Episode: "01", EpisodeDir: "B/Ep 01", ScriptType: "vpy", FlowID: flow.ID}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -258,15 +340,15 @@ func TestNextAssignableJobIncludesPastAndNull(t *testing.T) {
 	if got == nil {
 		t.Fatal("expected an assignable job, got nil")
 	}
-	// Both are priority 0; id DESC means B (created second) wins.
-	if got.ID != b.ID {
-		t.Fatalf("expected job %d (id DESC), got %d", b.ID, got.ID)
+	// Both are priority 0; id ASC (FIFO) means A (created first) wins.
+	if got.ID != a.ID {
+		t.Fatalf("expected job %d (oldest, FIFO within tier), got %d", a.ID, got.ID)
 	}
 }
 
 // TestNextAssignableJobOrdersPriorityThenID asserts the ORDER BY
-// priority DESC, id DESC picks the highest-priority job first, breaking
-// ties by newest (highest id).
+// priority DESC, id ASC picks the highest-priority job first, breaking
+// ties by OLDEST id (true FIFO within a priority tier).
 func TestNextAssignableJobOrdersPriorityThenID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -305,15 +387,15 @@ func TestNextAssignableJobOrdersPriorityThenID(t *testing.T) {
 	if got2 == nil || got2.ID != med.ID {
 		t.Fatalf("expected job %d next, got %+v", med.ID, got2)
 	}
-	// Tie-break: two jobs at the same priority → newest id wins.
+	// Tie-break: two jobs at the same priority → OLDEST id wins (FIFO).
 	if _, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='pending', priority=5 WHERE id=?`, low.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Now low (id=low.ID, priority=5) and med (id=med.ID, priority=5) are
-	// both pending at priority 5. med has the higher id.
+	// both pending at priority 5. low has the lower id (created first).
 	got3, _ := s.NextAssignableJob(ctx)
-	if got3 == nil || got3.ID != med.ID {
-		t.Fatalf("expected tie-break to pick higher id %d, got %+v", med.ID, got3)
+	if got3 == nil || got3.ID != low.ID {
+		t.Fatalf("expected tie-break to pick oldest id %d (FIFO), got %+v", low.ID, got3)
 	}
 }
 

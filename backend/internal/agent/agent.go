@@ -57,6 +57,17 @@ type Agent struct {
 	currentJob *model.JobPayload
 	syncing    bool // update sync in progress: job assignment must wait
 
+	// rlGuard holds the current job's run.log path, guarded for concurrent
+	// heartbeat reads while executeJob sets/clears it. Separate from a.mu so
+	// FPS tail-reads do not couple to job-state mutations.
+	rlGuard runLogGuard
+
+	// Injectable exec seams for metrics collectors. nil → production
+	// defaults (runPSDefault, gpuProbeDefault). Tests inject fakes to
+	// verify parsing without shelling out to PowerShell or nvidia-smi.
+	runPS    psFunc
+	gpuProbe gpuFunc
+
 	wg       sync.WaitGroup // tracks in-flight job/update goroutines for clean shutdown
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -95,6 +106,12 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 		Client:  &http.Client{},
 		Version: version,
 		stopCh:  make(chan struct{}),
+	}
+	// Default metrics exec seam: only Windows has PowerShell; on other
+	// platforms (Linux test hosts) the seam stays nil and the CPU/RAM/
+	// disk collectors are skipped (tests inject fakes to exercise parsing).
+	if runtime.GOOS == "windows" {
+		ag.runPS = ag.runPSDefault
 	}
 	// Bin version persists across agent restarts: a 200 MiB tools zip must
 	// not re-download on every service bounce while the controller's version
@@ -244,6 +261,11 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		BinVersion:     binVer,
 		Syncing:        syncing, // update in flight -> controller holds jobs back
 		TasksSinceBoot: a.TasksSinceBoot(),
+		// Metrics is collected best-effort on every heartbeat. Old
+		// controllers ignore the unknown key, so this is wire-safe.
+		// The pointer is always non-nil: zero values are meaningful
+		// (0 = not yet sampled, -1 = no GPU).
+		Metrics: a.collectMetrics(ctx),
 	}
 	if job != nil {
 		hb.JobID = job.ID
@@ -371,6 +393,11 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 
 	ps := a.findPowerShell()
 	runLog := filepath.Join(jobDir, "run.log")
+	// Expose the run.log path to the heartbeat goroutine so FPS can be
+	// parsed from the live log tail. Set before the job starts and
+	// cleared after completion; concurrent reads are safe via rlGuard.
+	a.setRunLogPath(runLog)
+	defer a.setRunLogPath("")
 	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog)
 
 	status := "done"

@@ -108,6 +108,31 @@ func TestAudioStepParamsPropagate(t *testing.T) {
 	}
 }
 
+// TestRenderVerifyOutputLinksFunction: a flow containing the verify_output
+// step must render a script that links the Invoke-VerifyOutput function and
+// invokes it in the pipeline (same Contains-style assertion the other render
+// tests use for Invoke-Mux / Invoke-VideoEncode).
+func TestRenderVerifyOutputLinksFunction(t *testing.T) {
+	f := &model.Flow{Name: "verify-only", Steps: []model.Step{
+		{Type: model.StepMux},
+		{Type: model.StepType("verify_output")},
+	}}
+	j := &model.Job{ID: 4, Series: "S", Episode: "01", EpisodeDir: "S/Ep 01", ScriptType: "vpy"}
+	script, err := Render(f, j, testVars(), nil)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		"function Invoke-VerifyOutput",
+		"Invoke-VerifyOutput -Job $Job -Params $stepParams",
+		"ENCODE_STEP verify_output",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script missing %q", want)
+		}
+	}
+}
+
 func TestStepOrderPreserved(t *testing.T) {
 	f := &model.Flow{Name: "reversed", Steps: []model.Step{
 		{Type: model.StepMux},
@@ -137,8 +162,9 @@ func TestDefault4kFlowStepsResolve(t *testing.T) {
 	if fl.Name != "default-4k" {
 		t.Fatalf("name = %q", fl.Name)
 	}
-	if len(fl.Steps) != 8 {
-		t.Fatalf("want 8 steps, got %d", len(fl.Steps))
+	// 9 steps: verify_output was added to the seeds (after mux, before release_copy).
+	if len(fl.Steps) != 9 {
+		t.Fatalf("want 9 steps, got %d", len(fl.Steps))
 	}
 	for i, st := range fl.Steps {
 		if !have[st.TemplateKey()] {
@@ -157,8 +183,9 @@ func TestDefault4kCPUFlowStepsResolve(t *testing.T) {
 	if fl.Name != "default-4k-cpu" {
 		t.Fatalf("name = %q", fl.Name)
 	}
-	if len(fl.Steps) != 7 {
-		t.Fatalf("want 7 steps (no dgindex), got %d", len(fl.Steps))
+	// 8 steps: verify_output was added to the seeds (after mux, before release_copy).
+	if len(fl.Steps) != 8 {
+		t.Fatalf("want 8 steps (no dgindex), got %d", len(fl.Steps))
 	}
 	for _, st := range fl.Steps {
 		if st.TemplateKey() == "dgindex" {

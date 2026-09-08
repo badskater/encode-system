@@ -17,6 +17,29 @@
 // fallback never fails a job whose MKV simply has no source to compare
 // against — it only catches the degenerate (truncated/empty-timeline) case.
 // The chosen mode is reported on the ENCODE_STEP log line.
+//
+// REAL TOOL UNIT CONVENTIONS (adversarial review — unit mismatch fix):
+//
+//   - mkvmerge -J (JSON identify) reports the container duration under
+//     `container.duration` in NANOSECONDS (e.g. a 24-min episode reports
+//     1440000000000). Some builds also emit a top-level `duration` with the
+//     same ns value; older/alternate builds once used ms. The code reads
+//     container.duration first (the documented shape) with a top-level
+//     fallback, treats the raw value as NANOSECONDS, and converts to ms via
+//     [int64]([double]$rawNs / 1000000.0). This is the MKVToolNix JSON
+//     identify convention; treating ns as ms made source-compare fail with
+//     a ~10^6× delta and sanity pass trivially (a huge number clears the
+//     60s floor without verifying anything).
+//
+//   - MediaInfo CLI --Output=JSON General-track `Duration` units differ
+//     across builds: modern builds emit milliseconds (float); some emit
+//     seconds. The step UNIT-NORMALIZES the raw value against the now-correct
+//     mkvmerge ms value: it evaluates the raw value as ms, seconds (×1000),
+//     µs (÷1000), and ns (÷1e6), then picks the interpretation minimizing the
+//     absolute delta to $mkvDurationMs. This makes the check correct
+//     regardless of the installed MediaInfo version. Normalization is needed
+//     because operators run mixed MediaInfo builds and the source-compare
+//     tolerance (±2s) is meaningless if the source is off by a unit scale.
 package flow
 
 import "github.com/badskater/encode-system/backend/internal/model"
@@ -68,14 +91,22 @@ const VerifyOutputFactoryV1 = `function Invoke-VerifyOutput {
     }
     Write-Output "[verify] tracks: $($videoTracks.Count) video, $($audioTracks.Count) audio"
 
-    # Container duration in ms (mkvmerge -J reports it on the container's
-    # top-level duration field). Used for both the source-compare and the
-    # sanity-check modes.
+    # Container duration. mkvmerge -J (JSON identify) reports the duration
+    # under container.duration in NANOSECONDS — the MKVToolNix JSON identify
+    # convention (e.g. a 24-min episode = 1440000000000 ns). Some builds also
+    # emit a top-level duration with the same ns value, so read
+    # container.duration first (the documented shape) and fall back to the
+    # top-level field. Convert ns to ms so the source-compare delta and the
+    # 60s sanity floor compare real values, not raw counts.
     $mkvDurationMs = 0
-    if ($ident.PSObject.Properties['duration']) {
-        try { $mkvDurationMs = [int64][double]$ident.duration } catch { }
-    } elseif ($ident.container.PSObject.Properties['duration']) {
-        try { $mkvDurationMs = [int64][double]$ident.container.duration } catch { }
+    $rawNs = 0.0
+    if ($null -ne $ident.PSObject.Properties['container'] -and $null -ne $ident.container -and $ident.container.PSObject.Properties['duration']) {
+        try { $rawNs = [double]$ident.container.duration } catch { }
+    } elseif ($ident.PSObject.Properties['duration']) {
+        try { $rawNs = [double]$ident.duration } catch { }
+    }
+    if ($rawNs -gt 0) {
+        $mkvDurationMs = [int64]([double]$rawNs / 1000000.0)
     }
 
     # Duration integrity. Two modes:
@@ -111,7 +142,36 @@ const VerifyOutputFactoryV1 = `function Invoke-VerifyOutput {
                     $tracks = @($info.media.track)
                     $general = $tracks | Where-Object { $_.'@type' -eq 'General' } | Select-Object -First 1
                     if ($general -and $general.PSObject.Properties['Duration']) {
-                        try { $sourceDurationMs = [int64][double]$general.Duration } catch { }
+                        # MediaInfo General Duration units differ across
+                        # builds (modern: ms float; some: seconds). Parse
+                        # the raw value and unit-normalize against the now-
+                        # correct mkvmerge ms value by evaluating each
+                        # candidate interpretation (raw as ms, raw*1000 =
+                        # seconds, raw/1000 = micros, raw/1e6 = ns) and
+                        # keeping the one minimizing the absolute delta.
+                        $rawDuration = 0.0
+                        try { $rawDuration = [double]$general.Duration } catch { }
+                        if ($rawDuration -gt 0 -and $mkvDurationMs -gt 0) {
+                            $candidates = @(
+                                @{ name = 'ms';          ms = [int64]$rawDuration },
+                                @{ name = 'seconds';     ms = [int64]([double]$rawDuration * 1000.0) },
+                                @{ name = 'microseconds';ms = [int64]([double]$rawDuration / 1000.0) },
+                                @{ name = 'nanoseconds';  ms = [int64]([double]$rawDuration / 1000000.0) }
+                            )
+                            $best = $null
+                            $bestDelta = [double]::MaxValue
+                            foreach ($c in $candidates) {
+                                $d = [math]::Abs($mkvDurationMs - $c.ms)
+                                if ($d -lt $bestDelta) {
+                                    $bestDelta = $d
+                                    $best = $c
+                                }
+                            }
+                            if ($best -and $best.ms -gt 0) {
+                                $sourceDurationMs = $best.ms
+                                Write-Output "[verify] source duration normalized: raw $rawDuration -> $sourceDurationMs ms (interpreted as $($best.name))"
+                            }
+                        }
                     }
                     if ($sourceDurationMs -gt 0) {
                         $mode = 'source-compare'
@@ -160,7 +220,7 @@ func verifyOutputTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "verify_output",
 		Label:       "Verify output (post-mux)",
-		Description: "Post-mux integrity check: confirms the release MKV exists and is non-empty, has at least one video AND one audio track, and passes a duration check. Duration is compared against the source media (±2s) when a source is discoverable via Find-SourceFile + MediaInfo; otherwise a sanity floor (60s) is applied. Place AFTER mux, BEFORE release_copy so it checks the mux artifact directly.",
+		Description: "Post-mux integrity check: confirms the release MKV exists and is non-empty, has at least one video AND one audio track, and passes a duration check. Duration is compared against the source media (±2s) when a source is discoverable via Find-SourceFile + MediaInfo; otherwise a sanity floor (60s) is applied. mkvmerge reports container.duration in nanoseconds (converted to ms); MediaInfo General Duration is unit-normalized against the mkv value because builds differ (ms vs seconds). Place AFTER mux, BEFORE release_copy so it checks the mux artifact directly.",
 		Builtin:     true,
 		Params:      []model.ParamDef{},
 		PowerShell:  VerifyOutputFactoryV1,

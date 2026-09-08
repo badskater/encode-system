@@ -11,42 +11,78 @@ import (
 )
 
 // TestRenderedVerifyOutputExecutesInPowerShell runs the verify_output step
-// end to end under pwsh with stubbed mkvmerge and MediaInfo, covering the
-// pass path (source-compare mode) and three failure modes (missing file,
-// zero-length, no audio track). Skipped when pwsh is absent.
+// end to end under pwsh with stubbed mkvmerge and MediaInfo, covering:
+//   - pass_source_compare_ns:   real mkvmerge shape (container.duration in
+//     ns) + MediaInfo General Duration in ms float (modern build).
+//   - pass_source_compare_seconds: MediaInfo emits SECONDS instead of ms;
+//     the unit-normalization must still produce delta 0 (proves itself).
+//   - pass_top_level_duration_fallback: mkvmerge omits container.duration
+//     and reports only the top-level duration (ns) — exercises the fallback.
+//   - no_audio_track_ns: video-only tracks in the real container shape;
+//     verify must reject the missing audio track.
+//   - missing_file / zero_length: failure modes (unchanged shape).
+//
+// Skipped when pwsh is absent.
 //
 // The stub mechanism mirrors render_e2e_test.go: bash scripts named *.exe
 // that pwsh executes via shebang on Linux. The mkvmerge stub detects -J
 // (identify mode) and emits a JSON payload read from a sidecar file, so each
 // subtest swaps the JSON without rewriting the stub.
+//
+// Duration values are in NANOSECONDS for the mkvmerge payloads (1440000000000
+// ns = 1440000 ms = a 24-minute episode) to match the real MKVToolNix JSON
+// identify convention. MediaInfo payloads carry the General-track Duration
+// in the unit under test (ms float or seconds float).
 func TestRenderedVerifyOutputExecutesInPowerShell(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {
 		t.Skip("pwsh not installed; skipping PowerShell integration test")
 	}
 
-	// mkvmerge -J JSON payloads.
-	const mkvJSONGood = `{
-  "duration": 1440000,
+	// mkvmerge -J JSON payloads (NANOSECONDS in container.duration — the
+	// real MKVToolNix JSON identify shape). 1440000000000 ns = 1440000 ms.
+	const mkvJSONContainerNs = `{
+  "container": { "type": "Matroska", "duration": 1440000000000 },
   "tracks": [
     { "type": "video" },
     { "type": "audio" }
   ]
 }`
-	// Same duration but only a video track — verify must reject this.
-	const mkvJSONNoAudio = `{
-  "duration": 1440000,
+	// Top-level duration fallback: some builds emit only a top-level
+	// duration (ns) without a container subobject. Exercises the fallback.
+	const mkvJSONTopLevelNs = `{
+  "duration": 1440000000000,
+  "tracks": [
+    { "type": "video" },
+    { "type": "audio" }
+  ]
+}`
+	// Same duration but only a video track (real container shape, ns) —
+	// verify must reject this for the missing audio track.
+	const mkvJSONNoAudioNs = `{
+  "container": { "type": "Matroska", "duration": 1440000000000 },
   "tracks": [
     { "type": "video" }
   ]
 }`
 
-	// MediaInfo stub payload: General track Duration matching the mkvmerge
-	// duration (1440000) so source-compare passes with delta 0.
-	const mediaInfoJSON = `{
+	// MediaInfo stub payload: General track Duration in MILLISECONDS (float)
+	// — modern build convention. Matches the mkv duration (1440000 ms) so
+	// source-compare passes with delta 0 after normalization picks 'ms'.
+	const mediaInfoJSONMs = `{
   "media": {
     "track": [
       { "@type": "General", "Duration": 1440000.0 }
+    ]
+  }
+}`
+	// MediaInfo emitting SECONDS (1440.0) — an older/alternate build
+	// convention. Normalization must interpret raw*1000 and still hit
+	// delta 0 against the 1440000 ms mkv duration.
+	const mediaInfoJSONSeconds = `{
+  "media": {
+    "track": [
+      { "@type": "General", "Duration": 1440.0 }
     ]
   }
 }`
@@ -69,46 +105,70 @@ cat "$(dirname "$0")/mediainfo.json"
 `
 
 	cases := []struct {
-		name       string
-		mkvJSON    string
-		hasMedia   bool // create MediaInfo.exe + mediainfo.json (source-compare)
-		hasSrc     bool // create src.mkv (source for Find-SourceFile)
-		createMKV  bool // create the muxed MKV at the output path
-		mkvBytes   int  // bytes to write (0 = zero-length file)
-		wantFail   bool
-		wantSubstr string // expected failure substring (empty for pass)
+		name        string
+		mkvJSON     string
+		mediaJSON   string // MediaInfo payload (empty = no MediaInfo stub)
+		hasSrc      bool   // create src.mkv (source for Find-SourceFile)
+		createMKV   bool   // create the muxed MKV at the output path
+		mkvBytes    int    // bytes to write (0 = zero-length file)
+		wantFail    bool
+		wantSubstr  string // expected failure substring (empty for pass)
+		wantNormSub string // expected normalization log substring (pass cases)
 	}{
 		{
-			name:      "pass_source_compare",
-			mkvJSON:   mkvJSONGood,
-			hasMedia:  true,
+			name:        "pass_source_compare_ns",
+			mkvJSON:     mkvJSONContainerNs,
+			mediaJSON:   mediaInfoJSONMs,
+			hasSrc:      true,
+			createMKV:   true,
+			mkvBytes:    9,
+			wantFail:    false,
+			wantNormSub: "interpreted as ms",
+		},
+		{
+			name:        "pass_source_compare_seconds",
+			mkvJSON:     mkvJSONContainerNs,
+			mediaJSON:   mediaInfoJSONSeconds,
+			hasSrc:      true,
+			createMKV:   true,
+			mkvBytes:    9,
+			wantFail:    false,
+			wantNormSub: "interpreted as seconds",
+		},
+		{
+			name:      "pass_top_level_duration_fallback",
+			mkvJSON:   mkvJSONTopLevelNs,
+			mediaJSON: mediaInfoJSONMs,
 			hasSrc:    true,
 			createMKV: true,
 			mkvBytes:  9,
 			wantFail:  false,
+			// Top-level duration fallback still normalizes MediaInfo ms.
+			wantNormSub: "interpreted as ms",
+		},
+		{
+			name:       "no_audio_track_ns",
+			mkvJSON:    mkvJSONNoAudioNs,
+			mediaJSON:  mediaInfoJSONMs,
+			createMKV:  true,
+			mkvBytes:   9,
+			wantFail:   true,
+			wantSubstr: "no audio track",
 		},
 		{
 			name:       "missing_file",
-			mkvJSON:    mkvJSONGood,
+			mkvJSON:    mkvJSONContainerNs,
 			createMKV:  false,
 			wantFail:   true,
 			wantSubstr: "muxed MKV not found",
 		},
 		{
 			name:       "zero_length",
-			mkvJSON:    mkvJSONGood,
+			mkvJSON:    mkvJSONContainerNs,
 			createMKV:  true,
 			mkvBytes:   0,
 			wantFail:   true,
 			wantSubstr: "zero-length",
-		},
-		{
-			name:       "no_audio_track",
-			mkvJSON:    mkvJSONNoAudio,
-			createMKV:  true,
-			mkvBytes:   9,
-			wantFail:   true,
-			wantSubstr: "no audio track",
 		},
 	}
 
@@ -124,10 +184,12 @@ cat "$(dirname "$0")/mediainfo.json"
 
 			// Stub tools (bash scripts named *.exe; pwsh runs them on Linux).
 			stubs := map[string]string{
-				"mkvmerge.exe":   mkvmergeStub,
-				"mkvmerge.json":  tc.mkvJSON,
-				"MediaInfo.exe":  mediaInfoStub,
-				"mediainfo.json": mediaInfoJSON,
+				"mkvmerge.exe":  mkvmergeStub,
+				"mkvmerge.json": tc.mkvJSON,
+			}
+			if tc.mediaJSON != "" {
+				stubs["MediaInfo.exe"] = mediaInfoStub
+				stubs["mediainfo.json"] = tc.mediaJSON
 			}
 			for name, body := range stubs {
 				p := filepath.Join(binDir, name)
@@ -215,6 +277,15 @@ cat "$(dirname "$0")/mediainfo.json"
 				// Source-compare mode must be reported.
 				if !strings.Contains(text, "mode: source-compare") {
 					t.Errorf("output missing 'mode: source-compare' (expected source-compare mode)")
+				}
+				// Normalization log must appear and name the chosen unit.
+				if tc.wantNormSub != "" && !strings.Contains(text, tc.wantNormSub) {
+					t.Errorf("output missing normalization log %q", tc.wantNormSub)
+				}
+				// The MKV duration must be reported in ms (converted from ns),
+				// i.e. 1440000 — not the raw 1440000000000.
+				if !strings.Contains(text, "MKV duration: 1440000 ms") {
+					t.Errorf("output missing 'MKV duration: 1440000 ms' (ns→ms conversion)")
 				}
 			}
 		})

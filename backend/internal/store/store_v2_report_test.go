@@ -39,6 +39,12 @@ func TestFinishJobWithReportPersistsLogAndTimings(t *testing.T) {
 	fullLog := "line one\nline two\nENCODE_JOB_DONE\n"
 	outputs := []string{"FL - 01 [1080p].mkv"}
 
+	// FinishJobWithReport is guarded to assigned/running jobs (a concurrent
+	// cancel must not be overwritten) — move the job through the real
+	// lifecycle before completing it.
+	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt1")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", outputs, "ENCODE_JOB_DONE", fullLog, wantTimings); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
@@ -98,6 +104,9 @@ func TestFinishJobWithReportNilTimingsStoresEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt2")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", "log", nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
@@ -145,6 +154,9 @@ func TestFinishJobWithReportCapsFullLogOverOneMiB(t *testing.T) {
 	for i := 0; i < over; i++ {
 		sb.WriteString("Lxxxxxxxxxx\n")
 	}
+	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt3")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", sb.String(), nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
@@ -189,6 +201,9 @@ func TestFinishJobWithReportFailedJobKeepsProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt4")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 9, "encode failed", nil, "tail", "log", nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}

@@ -149,19 +149,20 @@ func TestFailedCompletionRetryExhaustedNotifies(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Pre-set retry_count to MaxRetries so the first failure exhausts the
-	// budget (MaxRetries=2, so retry_count=2 means exhausted). Stamp it via
-	// the same path the auto-retry uses: fail the job, then ScheduleJobRetry
-	// to set retry_count=2 + a past backoff, then RetryJob to make it
-	// pending again (clearing next_retry_at). The net result: a pending job
-	// with retry_count=2 and no backoff gate, ready to be assigned.
+	// budget (MaxRetries=2, so retry_count=2 means exhausted). Build the
+	// state through the real lifecycle: assign → fail → ScheduleJobRetry
+	// with retry_count=2 and a PAST backoff gate. Net result: a pending job
+	// with retry_count=2 and an elapsed gate, ready to be re-assigned.
+	// (RetryJob is NOT used here — it now resets retry_count to 0, which
+	// would undo the exhausted budget we're setting up.)
+	if err := e.server.Store.AssignJob(ctx, job.ID, e.node.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.server.Store.FinishJob(ctx, job.ID, model.JobFailed, 1, "pre", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	past := time.Now().UTC().Add(-1 * time.Minute)
 	if err := e.server.Store.ScheduleJobRetry(ctx, job.ID, 2, past); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.server.Store.RetryJob(ctx, job.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Now assign it and fail it — this failure exhausts the budget.

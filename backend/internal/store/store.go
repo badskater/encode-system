@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -634,20 +635,54 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	return &j, nil
 }
 
-// SetJobFlow changes the flow of a pending job (guarded by the caller).
-func (s *Store) SetJobFlow(ctx context.Context, id, flowID int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET flow_id = ? WHERE id = ? AND status = 'pending'`, flowID, id)
-	return err
-}
-
-// SetJobPriority changes the queue weight of a pending job. Field-scoped SQL
-// so a concurrent flow/priority patch cannot lose writes. Guarded by status
-// in the handler (only pending jobs are patchable).
-func (s *Store) SetJobPriority(ctx context.Context, id int64, priority int) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET priority = ? WHERE id = ? AND status = 'pending'`, priority, id)
-	return err
+// PatchPendingJob updates a pending job's flow_id and/or priority in a single
+// guarded UPDATE (WHERE id=? AND status='pending'). This replaces the old
+// two-call SetJobFlow+SetJobPriority sequence in handlePatchJob, which had a
+// race window: between the two writes the job could be assigned, leaving the
+// second write silently no-op'ing (or partially applying flow but not
+// priority, or vice versa). A single atomic UPDATE closes that window.
+//
+// Either pointer may be nil (skip that field — COALESCE-style conditional
+// SET). Returns changed=true when exactly one row matched (the job was
+// pending and got updated); changed=false when zero rows matched (the job
+// is no longer pending — caller answers 409). SetJobFlow/SetJobPriority
+// are retained for any other callers and the store-level tests.
+func (s *Store) PatchPendingJob(ctx context.Context, id int64, flowID *int64, priority *int) (bool, error) {
+	// Build a conditional SET clause from the non-nil pointers so a nil
+	// field leaves the column untouched (no need to read-then-write).
+	var sets []string
+	var args []any
+	if flowID != nil {
+		sets = append(sets, "flow_id=?")
+		args = append(args, *flowID)
+	}
+	if priority != nil {
+		sets = append(sets, "priority=?")
+		args = append(args, *priority)
+	}
+	if len(sets) == 0 {
+		// Nothing to patch — still check the job is pending so the caller
+		// gets an honest 409 on a non-pending job (matches the handler's
+		// "at least one field" guard, which already rejects this, but the
+		// method is safe to call directly from tests).
+		var status string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id=?`, id).Scan(&status)
+		if err != nil {
+			return false, err
+		}
+		return status == "pending", nil
+	}
+	args = append(args, id)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET `+strings.Join(sets, ", ")+` WHERE id=? AND status='pending'`, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // JobExistsForEpisode reports whether any job (non-cancelled) already covers this episode dir.
@@ -794,6 +829,14 @@ func marshalStepTimings(timings []model.StepTiming) []byte {
 	return b
 }
 
+// ErrJobNotFinishable is returned by FinishJobWithReport when the job is no
+// longer in an assignable/running state — a concurrent cancel (or a prior
+// completion that raced the Terminal() pre-check) already moved the job out
+// of 'assigned'/'running'. Callers use this to answer idempotently instead
+// of erroring: the job is already in a terminal state, so the completion
+// report is a no-op, not a failure.
+var ErrJobNotFinishable = errors.New("job is not in a finishable state (already terminal/cancelled)")
+
 // FinishJobWithReport marks a job terminal and persists the agent's full
 // completion report: the v1 finish columns (status/exit_code/error/outputs/
 // log_tail/finished_at) PLUS the v2 observability fields (full_log +
@@ -802,6 +845,15 @@ func marshalStepTimings(timings []model.StepTiming) []byte {
 // for the two callers (orphan recovery, render-failed) that correctly pass
 // no log. full_log is capped at 1 MiB via capFullLog; timings are marshaled
 // via marshalStepTimings (the column's marshal contract).
+//
+// The UPDATE is guarded by status IN ('assigned','running') so a concurrent
+// cancel (or a duplicate completion that raced past the Terminal() pre-check)
+// cannot re-finish a job that already left the live state. When the guard
+// matches zero rows, ErrJobNotFinishable is returned so the caller can
+// answer idempotently (the job is already terminal — say "already_recorded",
+// don't notify or retry) instead of 500-ing. The handler's Terminal()
+// pre-check remains the fast path; this guard closes the narrow window
+// between that check and this write.
 func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.JobStatus, exitCode int, errMsg string, outputs []string, logTail string, fullLog string, timings []model.StepTiming) error {
 	if outputs == nil {
 		outputs = []string{}
@@ -815,10 +867,20 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 	if status == model.JobDone {
 		progress = ", progress=100"
 	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+` WHERE id=?`,
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+` WHERE id=? AND status IN ('assigned','running')`,
 		string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON), id)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrJobNotFinishable
+	}
+	return nil
 }
 
 // ActiveJobForNode returns the node's assigned/running job, if any.
@@ -860,8 +922,10 @@ func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
 // running) so callers can distinguish success from a no-op. Stale v2 capture
 // (full_log, step_timings_json, next_retry_at) is cleared alongside the v1
 // state so a retry starts clean and is never blocked by a stale backoff gate
-// once the queue gates dispatch on next_retry_at; retry_count is managed by
-// the queue layer.
+// once the queue gates dispatch on next_retry_at. retry_count is reset to 0
+// (why: operator intervention refreshes the automatic retry budget — without
+// this, an exhausted job that was manually retried could never auto-retry
+// again, locking it out of the policy the operator just chose to use).
 func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	// The guard accepts a terminal job (failed/cancelled/done) OR a pending
 	// job that is sitting behind a backoff gate (next_retry_at IS NOT NULL).
@@ -870,7 +934,7 @@ func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	// A plain pending job with no gate matches neither clause (it is already
 	// queued) and is correctly a no-op, surfacing as a 409 in the handler.
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL WHERE id=? AND (status IN ('failed','cancelled','done') OR (status='pending' AND next_retry_at IS NOT NULL))`,
+		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL, retry_count=0 WHERE id=? AND (status IN ('failed','cancelled','done') OR (status='pending' AND next_retry_at IS NOT NULL))`,
 		id)
 	if err != nil {
 		return 0, err

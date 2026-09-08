@@ -444,7 +444,17 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func decodeJSON(r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
+	return decodeJSONLimit(r, v, maxBodyBytes)
+}
+
+// decodeJSONLimit is like decodeJSON but with a caller-specified body cap. It
+// is used by the job-complete route, which carries a full run.log (up to 1 MiB
+// pre-JSON-escaping) plus step timings — JSON string escaping (newlines → \n,
+// quotes → \") inflates the wire payload past the 1 MiB the agent captured, so
+// a real ≥1-MiB-log completion would hit the generic 1 MiB cap and 400 (orphaning
+// the job). All other routes keep the 1 MiB default via decodeJSON.
+func decodeJSONLimit(r *http.Request, v any, limit int64) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
@@ -457,8 +467,18 @@ type ctxKey string
 const nodeCtxKey ctxKey = "node"
 
 // maxBodyBytes caps request bodies so a malicious or broken client cannot
-// exhaust controller memory with oversized JSON.
+// exhaust controller memory with oversized JSON. Applies to ALL decodeJSON
+// routes except the job-complete route (see maxCompleteBodyBytes).
 const maxBodyBytes = 1 << 20 // 1 MiB
+
+// maxCompleteBodyBytes is the body cap for POST /api/agent/job/{id}/complete.
+// The agent captures run.log at up to 1 MiB, but JSON string escaping
+// (newlines → \n, quotes → \", control chars → \uXXXX) inflates the wire
+// payload past 1 MiB; step_timings_json adds more. A 4 MiB cap accommodates
+// the worst-case escaped log (each byte of a 1 MiB log becomes at most 6
+// bytes via \uXXXX) plus timings and headroom, while still bounding memory.
+// Only the complete route uses this; all other routes keep the 1 MiB default.
+const maxCompleteBodyBytes = 4 << 20 // 4 MiB
 
 // bearer extracts the token from an Authorization header (case-insensitive
 // scheme per RFC 7235).

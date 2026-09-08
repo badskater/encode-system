@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/store"
 )
 
 // ctxBg returns a background context for startup seeding operations.
@@ -113,8 +115,22 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 			} else {
 				// Re-read the job so shouldAutoRetry sees the just-stamped
 				// failed state (RetryCount etc. from the DB row).
-				failed, _ := s.Store.GetJob(ctx, orphan.ID)
-				if failed != nil && s.shouldAutoRetry(ctx, failed, orphan.ID) {
+				failed, err := s.Store.GetJob(ctx, orphan.ID)
+				if err != nil {
+					// Transient DB error reading back the just-failed job. Log
+					// ERROR (not WARN) so the operator sees it in the controller
+					// logs — the job row itself is already 'failed' and visible
+					// in the UI, so this does NOT strand the job. Skip retry
+					// and notify for this cycle: retry needs the job row to
+					// read RetryCount/the flow's policy, and notify would just
+					// re-read the same failing DB; both would add nothing
+					// against the same transient error. The next heartbeat's
+					// orphan check will re-evaluate (the job is terminal now,
+					// so it won't be re-orphaned, but an operator can retry
+					// it manually from the UI).
+					s.Log.Error("orphan recovery: GetJob after finish failed (job is already failed+visible in UI; skipped retry/notify this cycle)",
+						"job", orphan.ID, "err", err)
+				} else if s.shouldAutoRetry(ctx, failed, orphan.ID) {
 					s.Log.Info("orphaned job auto-retried (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
 				} else {
 					s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
@@ -309,7 +325,7 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		LogFull     string             `json:"log_full"`     // v2: full captured run.log (agent omits on old builds → "")
 		StepTimings []model.StepTiming `json:"step_timings"` // v2: per-step start/duration (old agents → nil)
 	}
-	if err := decodeJSON(r, &rep); err != nil {
+	if err := decodeJSONLimit(r, &rep, maxCompleteBodyBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid completion report")
 		return
 	}
@@ -334,6 +350,17 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		status = model.JobFailed
 	}
 	if err := s.Store.FinishJobWithReport(ctx, jobID, status, rep.ExitCode, rep.Error, rep.Outputs, rep.LogTail, rep.LogFull, rep.StepTimings); err != nil {
+		// FinishJobWithReport is guarded by status IN ('assigned','running').
+		// A zero-rows match means the job left the live state between the
+		// Terminal() pre-check above and this write (concurrent cancel, or a
+		// duplicate completion that raced past the check). Answer
+		// idempotently — the job is already terminal, so this report is a
+		// no-op: do NOT notify or retry (both have already happened or will
+		// never happen). This is the same shape as the Terminal() fast path.
+		if errors.Is(err, store.ErrJobNotFinishable) {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "already_recorded"})
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "finish job")
 		return
 	}
@@ -861,16 +888,22 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "flow not found")
 			return
 		}
-		if err := s.Store.SetJobFlow(ctx, id, *req.FlowID); err != nil {
-			writeErr(w, http.StatusInternalServerError, "update job flow")
-			return
-		}
 	}
-	if req.Priority != nil {
-		if err := s.Store.SetJobPriority(ctx, id, *req.Priority); err != nil {
-			writeErr(w, http.StatusInternalServerError, "update job priority")
-			return
-		}
+	// Atomic single-UPDATE patch: both flow_id and priority land in one guarded
+	// statement (WHERE id=? AND status='pending'), closing the race window
+	// the old two-call SetJobFlow+SetJobPriority sequence had (between the
+	// two writes the job could be assigned, leaving the second write a
+	// silent no-op or partially applied). A zero-rows match means the job
+	// left the pending state between the status check above and this write
+	// (concurrent assignment) — answer 409, the honest result.
+	changed, err := s.Store.PatchPendingJob(ctx, id, req.FlowID, req.Priority)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "patch pending job")
+		return
+	}
+	if !changed {
+		writeErr(w, http.StatusConflict, "job is no longer pending")
+		return
 	}
 	job, err = s.Store.GetJob(ctx, id)
 	if err != nil {
@@ -974,6 +1007,12 @@ func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
 	if len(req.Steps) > 0 {
 		existing.Steps = req.Steps
 	}
+	// PUT semantics replace the policy: copy the retry fields unconditionally
+	// so a PUT with max_retries=0 (policy OFF) persists, matching the frontend
+	// which always sends both fields. Without this, a PUT that turns the
+	// retry policy OFF would leave the stale old values in options_json.
+	existing.MaxRetries = req.MaxRetries
+	existing.RetryBackoffMinutes = req.RetryBackoffMinutes
 	if err := flow.ValidateForRender(existing, s.storeResolver()); err != nil {
 		writeErr(w, http.StatusBadRequest, "flow invalid: "+err.Error())
 		return

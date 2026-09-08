@@ -194,7 +194,7 @@ describe('FlowBuilder', () => {
 
     fireEvent.click(screen.getByText('Create flow'));
     // onSave must NOT be called — validation blocks it.
-    await waitFor(() => expect(screen.getByText(/retries must be 0/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/retries must be a whole number/i)).toBeInTheDocument());
     expect(onSave).not.toHaveBeenCalled();
   });
 
@@ -210,7 +210,23 @@ describe('FlowBuilder', () => {
     fireEvent.change(screen.getByLabelText(/backoff/i), { target: { value: '0' } });
 
     fireEvent.click(screen.getByText('Create flow'));
-    await waitFor(() => expect(screen.getByText(/backoff must be 1/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/backoff must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when retry values are fractional (Go int fields reject them)', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'frac' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    // type=number allows arbitrary values via fireEvent.change regardless of step
+    fireEvent.change(screen.getByLabelText(/max retries/i), { target: { value: '2.5' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/retries must be a whole number/i)).toBeInTheDocument());
     expect(onSave).not.toHaveBeenCalled();
   });
 });

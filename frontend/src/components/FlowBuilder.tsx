@@ -55,17 +55,19 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
     // NaN (e.g. from a cleared number input on some browsers) must fail
     // validation — relational comparisons with NaN are all false and would
     // silently let it through to JSON.stringify → null on the wire.
-    if (!Number.isFinite(maxRetries) || maxRetries < 0 || maxRetries > 10) return false;
-    if (maxRetries > 0 && (!Number.isFinite(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
+    // Integer check: Go's json decoder rejects 2.5 into an int field, so a
+    // fractional value that passes here would 400 on save — block it client-side.
+    if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 10) return false;
+    if (maxRetries > 0 && (!Number.isInteger(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
       return false;
     return true;
   }, [maxRetries, retryBackoff]);
 
   const retryError = useMemo(() => {
-    if (!Number.isFinite(maxRetries) || maxRetries < 0 || maxRetries > 10)
-      return 'Max retries must be 0–10';
-    if (maxRetries > 0 && (!Number.isFinite(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
-      return 'Retry backoff must be 1–1440 minutes';
+    if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 10)
+      return 'Max retries must be a whole number 0–10';
+    if (maxRetries > 0 && (!Number.isInteger(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
+      return 'Retry backoff must be a whole number 1–1440 minutes';
     return null;
   }, [maxRetries, retryBackoff]);
 

@@ -89,6 +89,20 @@ func jobLink(controllerURL string, jobID int64) string {
 	return fmt.Sprintf("%s/jobs?job=%d", controllerURL, jobID)
 }
 
+// fleetLink builds a link to the Jobs fleet view (no per-job query) from the
+// controller URL. It is the digest's counterpart to jobLink: a digest has no
+// single job to deep-link to, so it links to the fleet page instead of
+// abusing jobLink(id=0) and stripping "?job=0" afterward. Returns "" when
+// the controller URL is unset (same opt-in semantics as jobLink).
+func fleetLink(controllerURL string) string {
+	controllerURL = strings.TrimSpace(controllerURL)
+	if controllerURL == "" {
+		return ""
+	}
+	controllerURL = strings.TrimRight(controllerURL, "/")
+	return controllerURL + "/jobs"
+}
+
 // discordCap is Discord's per-message content limit. The deep link and any
 // long error are truncated together so the whole payload always fits.
 const discordCap = 2000
@@ -99,8 +113,9 @@ const discordCap = 2000
 // surfaced so the alert distinguishes a one-shot failure from one that burned
 // through its retries. When ControllerURL is set, a deep link to the job is
 // appended so the operator can open the detail/log view in one click. The
-// whole payload is capped at Discord's 2000-char content limit (the link is
-// appended before capping so it survives truncation of a very long error).
+// body is truncated FIRST (without the link), then the link is appended, so
+// the link ALWAYS survives on long messages — the old order (append link,
+// then truncate) cut the link first because truncate keeps the head.
 func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string) {
 	var b strings.Builder
 	if j.Status == model.JobDone {
@@ -119,12 +134,25 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 	if j.StartedAt != nil && j.FinishedAt != nil && !j.StartedAt.IsZero() && !j.FinishedAt.IsZero() {
 		fmt.Fprintf(&b, "\nduration: %s", j.FinishedAt.Sub(*j.StartedAt).Round(time.Second))
 	}
-	// Deep link to the Jobs page (opt-in via ControllerURL). Appended before
-	// the cap so a long error never pushes the link past the truncation cut.
-	if link := jobLink(d.ControllerURL, j.ID); link != "" {
-		fmt.Fprintf(&b, "\n%s", link)
-	}
 
+	// Deep link to the Jobs page (opt-in via ControllerURL). The link is
+	// reserved from the cap and appended AFTER truncation so it always
+	// survives on long messages: truncate the body to (cap - link - 1 for
+	// the newline separator), then append the link. When no link is set,
+	// the whole body is capped at discordCap as before.
+	link := jobLink(d.ControllerURL, j.ID)
+	if link != "" {
+		// Reserve space for the link + the "\n" separator before truncating.
+		body := truncate(b.String(), discordCap-len(link)-1)
+		content := body + "\n" + link
+		// Defensive: content must never exceed the cap (truncate's ellipsis
+		// could push it over by 3 bytes in the worst case).
+		if len(content) > discordCap {
+			content = truncate(content, discordCap)
+		}
+		d.post(ctx, content)
+		return
+	}
 	content := truncate(b.String(), discordCap)
 	d.post(ctx, content)
 }

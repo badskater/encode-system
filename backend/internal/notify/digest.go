@@ -129,10 +129,10 @@ func FlushDigest(log *slog.Logger, webhookURL, controllerURL string, buf *Digest
 		shown++
 	}
 	// Controller link to the Jobs fleet view (a digest has no single job to
-	// deep-link to). jobLink with id 0 produces "…/jobs?job=0"; we strip the
-	// query so the digest links to the fleet, not job #0.
-	if link := jobLink(controllerURL, 0); link != "" {
-		fmt.Fprintf(&b, "%s", strings.TrimSuffix(link, "?job=0"))
+	// deep-link to). fleetLink produces the jobs base URL without a query
+	// string; jobLink stays for per-job links in the direct-alert path.
+	if link := fleetLink(controllerURL); link != "" {
+		fmt.Fprintf(&b, "%s", link)
 	}
 
 	content := truncate(b.String(), discordCap)

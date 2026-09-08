@@ -56,6 +56,33 @@ Mirror of the session task list. Move cards through columns as work lands.
   missing file, zero-length, no-audio).
 - Docs: Architecture (contracts + feature-set section), Operations
   (11 new runbook rows), Deployment (no infra change), this KANBAN.
+- Adversarial review round (GLM + DeepSeek over the full 31-commit diff,
+  chunked by subsystem; every finding verified against code before action):
+  4 fixed with regression tests — captureRunLog OOM on multi-GB logs
+  (bounded tail-window read), verify_output vs the REAL tools (mkvmerge
+  schema v20 nests duration at container.properties.duration in
+  NANOSECONDS — verified against the official schema; MediaInfo Duration
+  unit-normalized against the mkv ms value so ms/seconds builds both work;
+  e2e stubs rebuilt to real shapes + both legacy fallback branches),
+  completion reports orphaned by the global 1 MiB body cap (JSON escaping
+  inflates a 1 MiB log past it — job-complete route now 4 MiB), flow PUT
+  silently dropped the retry policy (handleUpdateFlow copied only
+  Name/Steps). Also hardened: FinishJobWithReport guarded against
+  concurrent cancel (ErrJobNotFinishable), manual retry refreshes the
+  auto-retry budget (retry_count=0), Discord deep links survive
+  truncation, atomic PatchPendingJob, orphan-recovery GetJob errors
+  logged, fractional retry-field validation, keyed Fragment row fix.
+  Rejected with evidence: digest buffer "unsynchronized" (mutex present),
+  ?range overflow (exact-string switch), orphan reorder hazard (terminal
+  idempotency + node-ownership guards), "new" none instruction (predates
+  drain).
+- Live-verified on the test controller (172.24.92.232, 1.12.0-observability,
+  binary md5-matched after compose rebuild; DB snapshotted pre-deploy):
+  stats/metrics/log endpoints (auth + empty-state shapes), verify_output
+  seeded, flow retry-policy PUT→GET round-trip, drain toggle live
+  round-trip, series progress counts computed from real job history
+  (4K Test: 3/3), old agents (0.9.0, offline) coexist — new fields
+  optional end to end. Agent push to 219/229 deferred to the operator.
 
 ## Done (default-4k flow)
 

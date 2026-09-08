@@ -20,16 +20,19 @@
 //
 // REAL TOOL UNIT CONVENTIONS (adversarial review — unit mismatch fix):
 //
-//   - mkvmerge -J (JSON identify) reports the container duration under
-//     `container.duration` in NANOSECONDS (e.g. a 24-min episode reports
-//     1440000000000). Some builds also emit a top-level `duration` with the
-//     same ns value; older/alternate builds once used ms. The code reads
-//     container.duration first (the documented shape) with a top-level
-//     fallback, treats the raw value as NANOSECONDS, and converts to ms via
-//     [int64]([double]$rawNs / 1000000.0). This is the MKVToolNix JSON
-//     identify convention; treating ns as ms made source-compare fail with
-//     a ~10^6× delta and sanity pass trivially (a huge number clears the
-//     60s floor without verifying anything).
+//   - mkvmerge -J (JSON identify, schema v20) reports the segment duration
+//     at `container.properties.duration` in NANOSECONDS ("The file's/
+//     segment's duration in nanoseconds" — a 24-min episode reports
+//     1440000000000; verified against mkvtoolnix.download/doc/
+//     mkvmerge-identification-output-schema-v20.json). container.duration
+//     and a top-level duration do NOT exist in schema-v20 output; the code
+//     reads container.properties.duration first and falls back to those two
+//     legacy shapes defensively, treats the raw value as NANOSECONDS, and
+//     converts to ms via [int64]([double]$rawNs / 1000000.0). Treating ns
+//     as ms made source-compare fail with a ~10^6× delta and sanity pass
+//     trivially (a huge number clears the 60s floor without verifying
+//     anything); reading the wrong nesting made the duration always 0 and
+//     failed every real job at the "zero or missing" check.
 //
 //   - MediaInfo CLI --Output=JSON General-track `Duration` units differ
 //     across builds: modern builds emit milliseconds (float); some emit
@@ -91,18 +94,26 @@ const VerifyOutputFactoryV1 = `function Invoke-VerifyOutput {
     }
     Write-Output "[verify] tracks: $($videoTracks.Count) video, $($audioTracks.Count) audio"
 
-    # Container duration. mkvmerge -J (JSON identify) reports the duration
-    # under container.duration in NANOSECONDS — the MKVToolNix JSON identify
-    # convention (e.g. a 24-min episode = 1440000000000 ns). Some builds also
-    # emit a top-level duration with the same ns value, so read
-    # container.duration first (the documented shape) and fall back to the
-    # top-level field. Convert ns to ms so the source-compare delta and the
-    # 60s sanity floor compare real values, not raw counts.
+    # Container duration. mkvmerge -J (JSON identify, schema v20) reports the
+    # segment duration at container.properties.duration in NANOSECONDS ("The
+    # file's/segment's duration in nanoseconds" — e.g. a 24-min episode =
+    # 1440000000000 ns). NOTE the nesting: container.duration does NOT exist
+    # in real output (the schema is additionalProperties:false with
+    # properties/recognized/supported/type); older code and test stubs that
+    # assumed container.duration always read zero against the real tool.
+    # Read container.properties.duration first, then container.duration,
+    # then top-level duration as legacy fallbacks. Convert ns to ms so the
+    # source-compare delta and the 60s sanity floor compare real values.
     $mkvDurationMs = 0
     $rawNs = 0.0
-    if ($null -ne $ident.PSObject.Properties['container'] -and $null -ne $ident.container -and $ident.container.PSObject.Properties['duration']) {
+    $containerOk = ($null -ne $ident.PSObject.Properties['container'] -and $null -ne $ident.container)
+    if ($containerOk -and $null -ne $ident.container.PSObject.Properties['properties'] -and $null -ne $ident.container.properties -and $ident.container.properties.PSObject.Properties['duration']) {
+        try { $rawNs = [double]$ident.container.properties.duration } catch { }
+    }
+    if ($rawNs -le 0 -and $containerOk -and $ident.container.PSObject.Properties['duration']) {
         try { $rawNs = [double]$ident.container.duration } catch { }
-    } elseif ($ident.PSObject.Properties['duration']) {
+    }
+    if ($rawNs -le 0 -and $ident.PSObject.Properties['duration']) {
         try { $rawNs = [double]$ident.duration } catch { }
     }
     if ($rawNs -gt 0) {

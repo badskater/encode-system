@@ -12,13 +12,18 @@ import (
 
 // TestRenderedVerifyOutputExecutesInPowerShell runs the verify_output step
 // end to end under pwsh with stubbed mkvmerge and MediaInfo, covering:
-//   - pass_source_compare_ns:   real mkvmerge shape (container.duration in
-//     ns) + MediaInfo General Duration in ms float (modern build).
+//   - pass_source_compare_ns:   real mkvmerge schema-v20 shape
+//     (container.properties.duration in ns) + MediaInfo General Duration
+//     in ms float (modern build).
 //   - pass_source_compare_seconds: MediaInfo emits SECONDS instead of ms;
 //     the unit-normalization must still produce delta 0 (proves itself).
-//   - pass_top_level_duration_fallback: mkvmerge omits container.duration
-//     and reports only the top-level duration (ns) — exercises the fallback.
-//   - no_audio_track_ns: video-only tracks in the real container shape;
+//   - pass_top_level_duration_fallback: mkvmerge reports only the top-level
+//     duration (ns, legacy shape) — exercises the last fallback branch.
+//   - pass_container_flat_duration_fallback: duration directly on container
+//     (non-schema-v20 legacy shape) — exercises the middle fallback branch.
+//   - pass_sanity_mode_no_source: no source media + no MediaInfo stub →
+//     falls back to the >60s sanity floor.
+//   - no_audio_track_ns: video-only tracks in the real schema-v20 shape;
 //     verify must reject the missing audio track.
 //   - missing_file / zero_length: failure modes (unchanged shape).
 //
@@ -39,17 +44,38 @@ func TestRenderedVerifyOutputExecutesInPowerShell(t *testing.T) {
 		t.Skip("pwsh not installed; skipping PowerShell integration test")
 	}
 
-	// mkvmerge -J JSON payloads (NANOSECONDS in container.duration — the
-	// real MKVToolNix JSON identify shape). 1440000000000 ns = 1440000 ms.
+	// mkvmerge -J JSON payloads. The REAL shape (identification schema v20,
+	// verified against mkvtoolnix.download/doc/mkvmerge-identification-
+	// output-schema-v20.json) nests the segment duration at
+	// container.properties.duration in NANOSECONDS — container has exactly
+	// {properties, recognized, supported, type}, no direct duration field.
+	// 1440000000000 ns = 1440000 ms = a 24-min episode.
 	const mkvJSONContainerNs = `{
+  "container": {
+    "type": "Matroska",
+    "recognized": true,
+    "supported": true,
+    "properties": {
+      "container_type": 17,
+      "duration": 1440000000000
+    }
+  },
+  "tracks": [
+    { "type": "video" },
+    { "type": "audio" }
+  ]
+}`
+	// Fallback shape: duration directly on container (not schema-v20 output,
+	// but the factory supports it defensively). Exercises the middle branch.
+	const mkvJSONContainerFlatNs = `{
   "container": { "type": "Matroska", "duration": 1440000000000 },
   "tracks": [
     { "type": "video" },
     { "type": "audio" }
   ]
 }`
-	// Top-level duration fallback: some builds emit only a top-level
-	// duration (ns) without a container subobject. Exercises the fallback.
+	// Top-level duration fallback: legacy/alternate shape (ns) with no
+	// container subobject. Exercises the last fallback branch.
 	const mkvJSONTopLevelNs = `{
   "duration": 1440000000000,
   "tracks": [
@@ -57,10 +83,18 @@ func TestRenderedVerifyOutputExecutesInPowerShell(t *testing.T) {
     { "type": "audio" }
   ]
 }`
-	// Same duration but only a video track (real container shape, ns) —
-	// verify must reject this for the missing audio track.
+	// Real schema-v20 shape but only a video track — verify must reject
+	// this for the missing audio track.
 	const mkvJSONNoAudioNs = `{
-  "container": { "type": "Matroska", "duration": 1440000000000 },
+  "container": {
+    "type": "Matroska",
+    "recognized": true,
+    "supported": true,
+    "properties": {
+      "container_type": 17,
+      "duration": 1440000000000
+    }
+  },
   "tracks": [
     { "type": "video" }
   ]
@@ -145,6 +179,27 @@ cat "$(dirname "$0")/mediainfo.json"
 			wantFail:  false,
 			// Top-level duration fallback still normalizes MediaInfo ms.
 			wantNormSub: "interpreted as ms",
+		},
+		{
+			name:      "pass_container_flat_duration_fallback",
+			mkvJSON:   mkvJSONContainerFlatNs,
+			mediaJSON: mediaInfoJSONMs,
+			hasSrc:    true,
+			createMKV: true,
+			mkvBytes:  9,
+			wantFail:  false,
+			// container.duration (non-schema-v20 shape) still normalizes ms.
+			wantNormSub: "interpreted as ms",
+		},
+		{
+			name:      "pass_sanity_mode_no_source",
+			mkvJSON:   mkvJSONContainerNs,
+			hasSrc:    false,
+			createMKV: true,
+			mkvBytes:  9,
+			wantFail:  false,
+			// No source discoverable → sanity mode; 1440000 ms > 60s floor.
+			wantNormSub: "mode: sanity",
 		},
 		{
 			name:       "no_audio_track_ns",
@@ -274,9 +329,14 @@ cat "$(dirname "$0")/mediainfo.json"
 				if strings.Contains(text, "ENCODE_STEP_FAILED") {
 					t.Errorf("unexpected ENCODE_STEP_FAILED in passing case")
 				}
-				// Source-compare mode must be reported.
-				if !strings.Contains(text, "mode: source-compare") {
-					t.Errorf("output missing 'mode: source-compare' (expected source-compare mode)")
+				// Mode assertion: source-compare when a source AND a MediaInfo
+				// stub are present; sanity otherwise (no source to compare).
+				if tc.hasSrc && tc.mediaJSON != "" {
+					if !strings.Contains(text, "mode: source-compare") {
+						t.Errorf("output missing 'mode: source-compare' (expected source-compare mode)")
+					}
+				} else if !strings.Contains(text, "mode: sanity") {
+					t.Errorf("output missing 'mode: sanity' (expected sanity fallback)")
 				}
 				// Normalization log must appear and name the chosen unit.
 				if tc.wantNormSub != "" && !strings.Contains(text, tc.wantNormSub) {

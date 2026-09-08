@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -26,19 +27,51 @@ const truncationMarker = "[…truncated…]\n"
 // (executeJob) can log a warning and degrade to an empty string — the
 // completion still succeeds, but operators see that the log was not captured.
 func captureRunLog(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	// Bounded read: run.log for a multi-hour 4K encode can reach gigabytes,
+	// so stat first and read only the tail window when the file exceeds the
+	// cap (os.ReadFile of the whole log would spike the agent's RSS and can
+	// OOM the node — the cap exists precisely because these logs are big).
+	f, err := os.Open(path)
 	if err != nil {
 		// Surface the read failure so executeJob's warning branch fires and
 		// operators can investigate; the caller degrades to "" + warn.
 		return "", err
 	}
-	if len(data) <= maxFullLogBytes {
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	var data []byte
+	if st.Size() <= int64(maxFullLogBytes) {
+		data, err = io.ReadAll(f)
+		if err != nil {
+			return "", err
+		}
 		return string(data), nil
+	}
+	// Large file: seek to end-(cap+slack) so the rune-align + newline scan
+	// below can still land within the cap. The extra slack (64 bytes) covers
+	// a worst-case rune boundary + newline skip eating into the window.
+	const alignSlack = 64
+	off := st.Size() - int64(maxFullLogBytes) - alignSlack
+	if off < 0 {
+		off = 0
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return "", err
+	}
+	data, err = io.ReadAll(f)
+	if err != nil {
+		return "", err
 	}
 	// Trim to the last 1 MiB, then advance to the first newline so we never
 	// split a line mid-way. The newline itself is consumed (not included in
 	// the output body start) so the body begins at a full line.
 	cut := len(data) - maxFullLogBytes
+	if cut < 0 {
+		cut = 0
+	}
 	// Align the byte cut to a rune boundary: if it landed inside a multibyte
 	// UTF-8 sequence, skip forward over continuation bytes (0x80-0xBF) so the
 	// truncated body never starts mid-rune. Encode logs carry CJK series

@@ -231,7 +231,7 @@ func verifyOutputTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "verify_output",
 		Label:       "Verify output (post-mux)",
-		Description: "Post-mux integrity check: confirms the release MKV exists and is non-empty, has at least one video AND one audio track, and passes a duration check. Duration is compared against the source media (±2s) when a source is discoverable via Find-SourceFile + MediaInfo; otherwise a sanity floor (60s) is applied. mkvmerge reports container.duration in nanoseconds (converted to ms); MediaInfo General Duration is unit-normalized against the mkv value because builds differ (ms vs seconds). Place AFTER mux, BEFORE release_copy so it checks the mux artifact directly.",
+		Description: "Post-mux integrity check: confirms the release MKV exists and is non-empty, has at least one video AND one audio track, and passes a duration check. Duration is compared against the source media (±2s) when a source is discoverable via Find-SourceFile + MediaInfo; otherwise a sanity floor (60s) is applied. mkvmerge reports the segment duration at container.properties.duration in nanoseconds (converted to ms; schema v20); MediaInfo General Duration is unit-normalized against the mkv value because builds differ (ms vs seconds). Place AFTER mux, BEFORE release_copy so it checks the mux artifact directly.",
 		Builtin:     true,
 		Params:      []model.ParamDef{},
 		PowerShell:  VerifyOutputFactoryV1,

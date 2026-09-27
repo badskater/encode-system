@@ -140,4 +140,50 @@ describe('JobLogDialog', () => {
     fireEvent.keyDown(document.body, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
   });
+  it('streams live progress for a running job and refetches the log on final', async () => {
+    // getJobLog: 404 while running (no captured log yet), real log after final.
+    let calls = 0;
+    vi.spyOn(api, 'getJobLog').mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('404: no log recorded for this job');
+      return 'captured full log';
+    });
+    // Capture the stream callback so the test can push events.
+    let pushEvent: ((ev: unknown) => void) | null = null;
+    vi.spyOn(api, 'streamJobLog').mockImplementation(
+      async (_id, onEvent) => {
+        pushEvent = onEvent as (ev: unknown) => void;
+        // Never resolves until the test pushes the final event; the dialog
+        // aborts on unmount, so a pending promise is safe here.
+        await new Promise<void>(() => {});
+      },
+    );
+
+    render(
+      <JobLogDialog jobId={9} jobLabel="Show Ep 02" onClose={() => {}} jobStatus="running" />,
+    );
+
+    // The 404 on a running job must NOT surface as an error box.
+    await waitFor(() => expect(screen.queryByText(/loading/i)).not.toBeInTheDocument());
+    expect(screen.queryByText(/no log recorded/)).not.toBeInTheDocument();
+
+    // A live progress event renders the tail + step/percent header.
+    pushEvent!({ type: 'progress', step: 'encode', progress: 42, log_tail: 'frame 1234' });
+    await waitFor(() => expect(screen.getByText('frame 1234')).toBeInTheDocument());
+    expect(screen.getByText(/Live tail — encode \(42%\)/)).toBeInTheDocument();
+
+    // The final event triggers a refetch of the captured log.
+    pushEvent!({ type: 'final', status: 'done', exit_code: 0, full_log: true });
+    await waitFor(() => expect(screen.getByText('captured full log')).toBeInTheDocument());
+  });
+
+  it('does not open a stream for a terminal job', async () => {
+    vi.spyOn(api, 'getJobLog').mockResolvedValue('old log');
+    const streamSpy = vi.spyOn(api, 'streamJobLog');
+    render(
+      <JobLogDialog jobId={3} jobLabel="x" onClose={() => {}} jobStatus="done" />,
+    );
+    await waitFor(() => expect(screen.getByText('old log')).toBeInTheDocument());
+    expect(streamSpy).not.toHaveBeenCalled();
+  });
 });

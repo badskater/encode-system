@@ -1,7 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { StepTiming } from '../types';
+import type { JobLogStreamEvent, JobStatus, StepTiming } from '../types';
 import StepTimingsView from './StepTimingsView';
+
+// terminalStatuses mirrors the backend JobStatus.Terminal() set: for these,
+// the captured full log (GET /log) is the only content — no live stream.
+const terminalStatuses: JobStatus[] = ['done', 'failed', 'cancelled'];
 
 // JobLogDialog fetches the raw text/plain job log (GET /api/jobs/{id}/log)
 // only when the operator opens it — the jobs list deliberately carries no
@@ -9,42 +13,88 @@ import StepTimingsView from './StepTimingsView';
 // render above the log so the operator sees the breakdown and the raw log in
 // one view; the Jobs page has no separate expanded detail row today, so the
 // dialog is the single home for both (noted fallback in the B3 spec).
+//
+// Live mode: when jobStatus is non-terminal, the dialog also opens the SSE
+// stream (GET /api/jobs/{id}/log/stream) and renders the live step/progress/
+// tail above the (still absent) full log. The full log only exists after
+// completion, so while live the stream IS the content; on the final event
+// the dialog refetches the captured log so the operator sees the complete
+// run without reopening.
 export default function JobLogDialog({
   jobId,
   jobLabel,
   onClose,
   stepTimings,
+  jobStatus,
 }: {
   jobId: number;
   jobLabel: string;
   onClose: () => void;
   stepTimings?: StepTiming[];
+  jobStatus?: JobStatus;
 }) {
   const [log, setLog] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
+  const [live, setLive] = useState<JobLogStreamEvent | null>(null);
+  const preRef = useRef<HTMLPreElement>(null);
 
-  useEffect(() => {
-    let mounted = true;
-    setBusy(true);
-    api
+  // fetchFullLog is shared between initial load and the post-final refetch.
+  function fetchFullLog(): Promise<void> {
+    return api
       .getJobLog(jobId)
       .then((text) => {
-        if (mounted) {
-          setLog(text);
-          setError(null);
-        }
+        setLog(text);
+        setError(null);
       })
       .catch((e) => {
-        if (mounted) setError(e instanceof Error ? e.message : 'failed to load log');
+        // A running job has no captured log yet (404 "no log recorded") —
+        // not an error worth showing while the live stream is active.
+        if (jobStatus && !terminalStatuses.includes(jobStatus)) return;
+        setError(e instanceof Error ? e.message : 'failed to load log');
       })
-      .finally(() => {
-        if (mounted) setBusy(false);
-      });
-    return () => {
-      mounted = false;
-    };
+      .finally(() => setBusy(false));
+  }
+
+  useEffect(() => {
+    setBusy(true);
+    fetchFullLog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
+
+  // Live SSE stream while the job is non-terminal. The server closes the
+  // stream on the final event; we then refetch the captured full log so the
+  // dialog shows the complete run. AbortController cancels on unmount or
+  // when the job flips terminal (dialog re-render with new status).
+  useEffect(() => {
+    if (!jobStatus || terminalStatuses.includes(jobStatus)) return;
+    const ac = new AbortController();
+    api
+      .streamJobLog(
+        jobId,
+        (ev) => {
+          setLive(ev);
+          if (ev.type === 'final') {
+            setBusy(true);
+            fetchFullLog();
+          }
+        },
+        ac.signal,
+      )
+      .catch(() => {
+        /* aborted on unmount or stream closed by server — not an error */
+      });
+    return () => ac.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, jobStatus]);
+
+  // Auto-scroll the live tail so the operator always sees the newest lines.
+  useEffect(() => {
+    if (live?.type === 'progress' && preRef.current) {
+      preRef.current.scrollTop = preRef.current.scrollHeight;
+    }
+  }, [live]);
+
 
   // Escape closes the dialog when not loading (matches the existing dialogs'
   // backdrop-close-on-not-busy behavior). The page has no global Escape
@@ -90,6 +140,25 @@ export default function JobLogDialog({
         {error && <div className="error-box">{error}</div>}
         {stepTimings && stepTimings.length > 0 && (
           <StepTimingsView timings={stepTimings} />
+        )}
+        {live && live.type === 'progress' && (
+          <>
+            <h4>
+              Live tail {live.step ? `— ${live.step}` : ''}
+              {typeof live.progress === 'number' && live.progress > 0
+                ? ` (${live.progress.toFixed(0)}%)`
+                : ''}
+            </h4>
+            <pre className="job-log-pre" ref={preRef}>
+              {live.log_tail ?? ''}
+            </pre>
+          </>
+        )}
+        {live && live.type === 'final' && (
+          <p className="muted">
+            Job finished ({live.status}
+            {live.error ? `: ${live.error}` : ''}) — loading captured log…
+          </p>
         )}
         {log !== null && (
           <>

@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { CreateSeriesResponse, Flow, FlowExport, Job, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { CreateSeriesResponse, Flow, FlowExport, Job, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -210,6 +210,54 @@ export const api = {
   },
   retryJob: (id: number) => request<Job>('POST', `/api/jobs/${id}/retry`),
   cancelJob: (id: number) => request<void>('POST', `/api/jobs/${id}/cancel`),
+  // streamJobLog opens the SSE live-progress stream for one job and invokes
+  // onEvent per parsed frame. Uses fetch + ReadableStream (not EventSource):
+  // EventSource cannot send the Authorization header the endpoint requires.
+  // Returns an abort function so the caller (dialog unmount) can cancel the
+  // stream; the server also closes it when the job reaches a terminal state.
+  streamJobLog: async (
+    id: number,
+    onEvent: (ev: JobLogStreamEvent) => void,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    const headers: Record<string, string> = { Accept: 'text/event-stream' };
+    headers[AUTH_HEADER] = AUTH_PREFIX + sessionValue();
+    const res = await fetch(`/api/jobs/${id}/log/stream`, { headers, signal });
+    if (res.status === 401) {
+      clearToken();
+      expiredHook?.();
+      throw new Error('401: session expired — log in again');
+    }
+    if (!res.ok || !res.body) {
+      throw new Error(`${res.status}: stream failed`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buf += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line; a frame's payload is the
+      // "data: " line(s). Keep-alive comment frames (": ping") carry no data
+      // and are skipped by the parser below.
+      let sep: number;
+      while ((sep = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        const dataLines = frame
+          .split('\n')
+          .filter((l) => l.startsWith('data:'))
+          .map((l) => l.slice(5).trim());
+        if (dataLines.length === 0) continue; // comment/ping frame
+        try {
+          onEvent(JSON.parse(dataLines.join('\n')) as JobLogStreamEvent);
+        } catch {
+          /* malformed frame — ignore, keep streaming */
+        }
+      }
+    }
+  },
   // patchJob updates a pending job's flow_id or priority. Same PATCH endpoint
   // the backend exposes for per-job field changes; the body is a partial with
   // one or both fields.

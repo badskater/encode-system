@@ -202,6 +202,21 @@ export interface StepTiming {
   duration_sec: number;
 }
 
+// JobLogStreamEvent: one frame of the SSE live-progress stream
+// (GET /api/jobs/{id}/log/stream). "progress" frames carry the live
+// step/percentage/log tail while a job runs; the terminal "final" frame
+// carries status/error/exit_code and signals the stream is closing.
+export interface JobLogStreamEvent {
+  type: 'progress' | 'final';
+  step?: string;
+  progress?: number;
+  log_tail?: string;
+  status?: string;
+  error?: string;
+  exit_code?: number;
+  full_log?: boolean;
+}
+
 export interface Job {
   id: number;
   series: string;

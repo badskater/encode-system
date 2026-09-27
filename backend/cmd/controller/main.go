@@ -176,6 +176,21 @@ func main() {
 	// ctx as the scanner/digest loops so SIGTERM stops all of them cleanly.
 	srv.StartRetentionLoop(ctx)
 
+	// DB backup scheduler: periodic VACUUM INTO snapshots under
+	// <dataDir>/backups (keeps the newest 24 scheduled ones; manual
+	// snapshots are never auto-pruned). Enabled/interval live-adjustable
+	// via the Settings UI (PUT /api/backup/settings); env sets the boot
+	// defaults. The loop polls every 30s so changes apply without a
+	// restart.
+	srv.Backup = &api.BackupManager{
+		Store:   st,
+		Dir:     filepath.Join(*dataDir, "backups"),
+		Log:     log,
+		Enabled: env("ENCODE_BACKUP_ENABLED", "false") == "true",
+		Every:   time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
+	}
+	go srv.Backup.Run(ctx)
+
 	// Serve UI static files (built frontend) if present, then the API.
 	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes
 	// the SPA into /app/ui, keeping it out of the persistent volume).
@@ -202,6 +217,17 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("controller stopped")
+}
+
+// clampInt bounds v to [lo, hi].
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // envInt parses an integer env var with a fallback.

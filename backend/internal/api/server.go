@@ -49,7 +49,11 @@ type Server struct {
 	Log       *slog.Logger
 	Cfg       Config
 	Provision *provision.Engine // node provisioning (nil = unavailable)
-	throttle  *loginThrottle
+	// Backup owns DB snapshot scheduling (scheduled + manual). Set by main
+	// after New; nil in tests that don't exercise backup routes (handlers
+	// 503 when nil).
+	Backup   *BackupManager
+	throttle *loginThrottle
 	// Notifier, when non-nil, overrides the live Discord notifier resolved
 	// from settings on each job-outcome alert. Tests inject a recording
 	// notifier here to assert whether a notification fired (the auto-retry
@@ -380,6 +384,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/tokens", s.withAdmin(s.handleListAPITokens))
 	mux.HandleFunc("POST /api/tokens", s.withAdmin(s.handleCreateAPIToken))
 	mux.HandleFunc("DELETE /api/tokens/{id}", s.withAdmin(s.handleDeleteAPIToken))
+	mux.HandleFunc("GET /api/backup", s.withAdmin(s.handleBackupStatus))
+	mux.HandleFunc("POST /api/backup", s.withAdmin(s.handleBackupNow))
+	mux.HandleFunc("PUT /api/backup/settings", s.withAdmin(s.handleUpdateBackupSettings))
+	mux.HandleFunc("GET /api/backup/{name}", s.withAdmin(s.handleBackupDownload))
+	mux.HandleFunc("DELETE /api/backup/{name}", s.withAdmin(s.handleBackupDelete))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
 	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
 	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -1158,5 +1160,25 @@ func (s *Store) DeleteAPIToken(ctx context.Context, id int64) error {
 func (s *Store) TouchAPIToken(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`,
 		time.Now().UTC().Format(time.RFC3339), id)
+	return err
+}
+
+// ---------- DB backup ----------
+
+// BackupTo writes a consistent snapshot of the database to dest using
+// SQLite's VACUUM INTO — an online, transaction-safe copy that needs no
+// write lock beyond the vacuum itself and produces a standalone, compacted
+// SQLite file (restore = stop controller, replace encode.db, start).
+// Fails if dest already exists so a caller bug can't clobber a previous
+// good backup.
+func (s *Store) BackupTo(ctx context.Context, dest string) error {
+	if _, err := os.Stat(dest); err == nil {
+		return fmt.Errorf("backup destination exists: %s", dest)
+	}
+	// VACUUM INTO takes a single-quoted string literal; dest is generated
+	// by the server (timestamped filename in the data dir), never user
+	// input — but escape quotes defensively anyway.
+	literal := "'" + strings.ReplaceAll(dest, "'", "''") + "'"
+	_, err := s.db.ExecContext(ctx, "VACUUM INTO "+literal)
 	return err
 }

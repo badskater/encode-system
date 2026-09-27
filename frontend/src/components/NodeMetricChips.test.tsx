@@ -77,4 +77,28 @@ describe('NodeMetricChips', () => {
     const { container } = render(<NodeMetricChips metrics={undefined} />);
     expect(container.querySelector('[data-chip]')).toBeNull();
   });
+
+  it('applies the warn class to the disk chip when free space is below the alert threshold', () => {
+    const { container } = render(
+      <NodeMetricChips metrics={metrics({ disk_free_gb: 20 })} diskAlertGB={50} />,
+    );
+    const diskChip = container.querySelector('[data-chip="disk"]')!;
+    expect(diskChip.className).toMatch(/warn/i);
+  });
+
+  it('does not warn when disk is above the threshold', () => {
+    const { container } = render(
+      <NodeMetricChips metrics={metrics({ disk_free_gb: 200 })} diskAlertGB={50} />,
+    );
+    const diskChip = container.querySelector('[data-chip="disk"]')!;
+    expect(diskChip.className).not.toMatch(/warn/i);
+  });
+
+  it('does not warn when the threshold is 0 (disabled), even at 1 GB free', () => {
+    const { container } = render(
+      <NodeMetricChips metrics={metrics({ disk_free_gb: 1 })} diskAlertGB={0} />,
+    );
+    const diskChip = container.querySelector('[data-chip="disk"]')!;
+    expect(diskChip.className).not.toMatch(/warn/i);
+  });
 });

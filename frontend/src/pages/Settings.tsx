@@ -128,6 +128,8 @@ export default function SettingsPage() {
         // Retention allows 0 (keep forever) as a first-class value;
         // clampInt maps a cleared (NaN) field to lo=0 — the safe default.
         job_retention_days: clampInt(settings.job_retention_days ?? 0, 0, 3650),
+        // 0 = disabled; a cleared (NaN) field maps to lo=0, the safe default.
+        disk_alert_gb: clampInt(settings.disk_alert_gb ?? 0, 0, 100000),
       };
       const saved = await api.saveSettings(toSave);
       setSettings(saved);
@@ -309,6 +311,20 @@ export default function SettingsPage() {
               value={settings.job_retention_days ?? 0}
               onChange={(e) => set('job_retention_days', Number(e.target.value))}
               title="Terminal jobs older than this are pruned hourly. 0 keeps history forever."
+            />
+          </label>
+          <label style={{ flex: 1 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>
+              Disk alert (GB free, 0 = off)
+            </span>
+            <input
+              type="number"
+              min={0}
+              max={100000}
+              style={{ width: '100%' }}
+              value={settings.disk_alert_gb ?? 0}
+              onChange={(e) => set('disk_alert_gb', Number(e.target.value))}
+              title="Nodes below this free space alert Discord (1/hour) and take no new jobs until they recover. 0 disables."
             />
           </label>
           <label style={{ flex: 1 }}>

@@ -109,6 +109,10 @@ export interface Settings {
   // ago are pruned hourly by the controller. 0 (default) = keep forever.
   // Valid range on save: 0 or 1-3650.
   job_retention_days?: number;
+  // Free-disk alert threshold (GB) measured on the agent's work drive.
+  // A node below it fires a Discord alert (1/hour per node) and takes no
+  // new jobs until it recovers. 0/absent = disabled.
+  disk_alert_gb?: number;
   updated_at?: string;
 }
 

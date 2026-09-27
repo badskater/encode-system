@@ -10,11 +10,15 @@ import type { NodeMetrics } from '../types';
 //
 // The CPU chip gets a "warn" class when usage exceeds 80% — the same visual
 // hint as the dashboard's "reboot approaching" marker.
-export default function NodeMetricChips({ metrics }: { metrics?: NodeMetrics }) {
+export default function NodeMetricChips({ metrics, diskAlertGB = 0 }: { metrics?: NodeMetrics; diskAlertGB?: number }) {
   if (!metrics) return null;
   const m = metrics;
 
   const cpuWarn = m.cpu_pct > 80;
+  // Disk warn mirrors the controller's soft-drain trigger: below the
+  // configured threshold (0 = disabled) the chip flips to warn so the
+  // operator sees WHY a node stopped taking jobs.
+  const diskWarn = diskAlertGB > 0 && m.disk_free_gb > 0 && m.disk_free_gb < diskAlertGB;
 
   // GB helpers — MB → GB with one decimal, matching the dashboard style.
   // Non-finite values (corrupt metrics) render a placeholder, never "NaNGB" —
@@ -35,7 +39,7 @@ export default function NodeMetricChips({ metrics }: { metrics?: NodeMetrics }) 
         <span className="chip-label">RAM</span>
         <span className="chip-value">{toGB(m.mem_used_mb)}/{toGB(m.mem_total_mb)}GB</span>
       </span>
-      <span className="chip" data-chip="disk" title="Free disk space">
+      <span className={`chip ${diskWarn ? 'warn' : ''}`} data-chip="disk" title={diskWarn ? `Free disk below the ${diskAlertGB} GB alert threshold — node is soft-drained` : 'Free disk space'}>
         <span className="chip-label">DISK</span>
         <span className="chip-value">{diskGB(m.disk_free_gb)}GB</span>
       </span>

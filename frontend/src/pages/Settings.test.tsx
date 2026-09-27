@@ -186,3 +186,37 @@ describe('Settings agent rollback', () => {
     );
   });
 });
+
+describe('Settings disk alert threshold', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the disk alert field defaulting to 0 and sends the edited value on save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({ disk_alert_gb: 40 }));
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText(/disk alert/i)) as HTMLInputElement;
+    expect(field.value).toBe('0');
+
+    fireEvent.change(field, { target: { value: '40' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.disk_alert_gb).toBe(40);
+  });
+
+  it('clamps an oversized disk alert value to 100000 before saving', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText(/disk alert/i)) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: '999999' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.disk_alert_gb).toBe(100000);
+  });
+});

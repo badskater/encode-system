@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react';
 import { api } from '../api/client';
-import type { Node, PairingCode } from '../types';
+import type { Node, PairingCode, Settings } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { nodeBadge, timeAgo } from '../components/helpers';
 import NodeMetricChips from '../components/NodeMetricChips';
@@ -11,6 +11,9 @@ import NodeMetricsPanel from '../components/NodeMetricsPanel';
 export default function NodesPage() {
   const { data: nodes, error, refresh: refreshNodes } = usePolling<Node[]>(() => api.nodes(), 4000);
   const { data: codes } = usePolling<PairingCode[]>(() => api.pairingCodes(), 10000);
+  // Settings drive the disk-chip warn threshold (disk_alert_gb); a fetch
+  // failure just means no warn highlighting — the page still renders.
+  const { data: settings } = usePolling<Settings>(() => api.settings(), 30000);
   const [newName, setNewName] = useState('');
   const [issued, setIssued] = useState<{ name: string; token: string } | null>(null);
   const [issuedPair, setIssuedPair] = useState<string | null>(null);
@@ -200,7 +203,7 @@ export default function NodesPage() {
                   />
                 </td>
                 <td>
-                  <NodeMetricChips metrics={n.last_metrics} />
+                  <NodeMetricChips metrics={n.last_metrics} diskAlertGB={settings?.disk_alert_gb ?? 0} />
                 </td>
                 <td>{n.tasks_since_boot}</td>
                 <td>{n.reboot_pending ? 'yes' : 'no'}</td>

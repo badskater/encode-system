@@ -42,6 +42,18 @@ export default function SeriesPage() {
     }
   }
 
+  // togglePause holds the series at BOTH gates: the scanner stops queueing
+  // and already-pending jobs stop dispatching until unpause. Unlike the
+  // enabled checkbox, pausing preserves queue position.
+  async function togglePause(sr: Series) {
+    try {
+      await api.patchSeries(sr.id, { paused: !sr.paused });
+      setActionError(null);
+    } catch (e) {
+      setActionError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   // toggleNotify mutes/unmutes a series' Discord job-outcome alerts. Muted
   // series still queue and encode — only the alert is suppressed.
   async function toggleNotify(sr: Series) {
@@ -87,13 +99,14 @@ export default function SeriesPage() {
             <th>Progress</th>
             <th>Jobs</th>
             <th>Accepting work</th>
+            <th>Paused</th>
             <th>Notify</th>
           </tr>
         </thead>
         <tbody>
           {(series ?? []).map((sr) => (
             <tr key={sr.id}>
-              <td style={{ opacity: sr.notify === false ? 0.7 : undefined }}>
+              <td style={{ opacity: sr.paused ? 0.55 : sr.notify === false ? 0.7 : undefined }}>
                 {sr.name}
               </td>
               <td>
@@ -141,6 +154,17 @@ export default function SeriesPage() {
                 <button
                   className="btn"
                   style={{ padding: '2px 6px', fontSize: 14 }}
+                  title={sr.paused ? 'Resume scanning and dispatch' : 'Pause scanning and hold queued jobs'}
+                  aria-label={sr.paused ? 'Resume' : 'Pause'}
+                  onClick={() => togglePause(sr)}
+                >
+                  {sr.paused ? '▶️' : '⏸️'}
+                </button>
+              </td>
+              <td>
+                <button
+                  className="btn"
+                  style={{ padding: '2px 6px', fontSize: 14 }}
                   title={sr.notify === false ? 'Unmute Discord alerts' : 'Mute Discord alerts'}
                   aria-label={sr.notify === false ? 'Unmute' : 'Mute'}
                   onClick={() => toggleNotify(sr)}
@@ -152,7 +176,7 @@ export default function SeriesPage() {
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={7} className="muted">
+              <td colSpan={8} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>

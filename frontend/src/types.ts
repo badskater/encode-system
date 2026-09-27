@@ -50,6 +50,10 @@ export interface Series {
   // series' Discord job-outcome alerts (done/failed); other series still
   // notify. Defaults to true server-side for series created before the flag.
   notify?: boolean;
+  // Per-series pause: stronger than enabled=false. Paused series skip the
+  // scanner AND their already-queued pending jobs hold at dispatch until
+  // unpause; queue position is preserved. Absent/false = running.
+  paused?: boolean;
   created_at: string;
   updated_at: string;
 }

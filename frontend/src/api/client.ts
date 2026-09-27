@@ -293,7 +293,7 @@ export const api = {
   series: () => request<Series[]>('GET', '/api/series'),
   createSeries: (body: { name: string; episodes: number; tag?: string; flow_id?: number }) =>
     request<CreateSeriesResponse>('POST', '/api/series', body),
-  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean }) =>
+  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
 
   stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),

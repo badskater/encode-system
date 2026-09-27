@@ -233,3 +233,75 @@ describe('Series page notify mute toggle', () => {
     expect(nameCell.style.opacity).toBe('0.7');
   });
 });
+
+describe('Series page pause toggle', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a ▶️ resume button for a paused series', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ paused: true }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    const pauseBtn = screen.getByRole('button', { name: /resume/i });
+    expect(pauseBtn).toBeInTheDocument();
+    expect(pauseBtn.textContent).toContain('▶️');
+  });
+
+  it('renders a ⏸️ pause button for an unpaused series', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ paused: false }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    const pauseBtn = screen.getByRole('button', { name: /^pause/i });
+    expect(pauseBtn).toBeInTheDocument();
+    expect(pauseBtn.textContent).toContain('⏸️');
+  });
+
+  it('PATCHes paused:true when pausing', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ paused: false }),
+    ]);
+    mockEmpty();
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ paused: true }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /^pause/i }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { paused: true }),
+    );
+  });
+
+  it('PATCHes paused:false when resuming', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ paused: true }),
+    ]);
+    mockEmpty();
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ paused: false }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /resume/i }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { paused: false }),
+    );
+  });
+});

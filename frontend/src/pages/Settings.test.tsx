@@ -118,3 +118,37 @@ describe('Settings hourly digest toggle', () => {
     expect(sent.notify_digest).toBe(true);
   });
 });
+
+describe('Settings job retention', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the retention field defaulting to 0 and sends the edited value on save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({ job_retention_days: 90 }));
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText(/job retention/i)) as HTMLInputElement;
+    expect(field.value).toBe('0');
+
+    fireEvent.change(field, { target: { value: '90' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.job_retention_days).toBe(90);
+  });
+
+  it('clamps an out-of-range retention value into 0-3650 before saving', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText(/job retention/i)) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: '99999' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.job_retention_days).toBe(3650);
+  });
+});

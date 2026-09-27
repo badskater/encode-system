@@ -125,6 +125,9 @@ export default function SettingsPage() {
         ...settings,
         scan_interval_seconds: clampInt(settings.scan_interval_seconds, 5, 3600),
         tasks_before_reboot: clampInt(settings.tasks_before_reboot, 1, 1000),
+        // Retention allows 0 (keep forever) as a first-class value;
+        // clampInt maps a cleared (NaN) field to lo=0 — the safe default.
+        job_retention_days: clampInt(settings.job_retention_days ?? 0, 0, 3650),
       };
       const saved = await api.saveSettings(toSave);
       setSettings(saved);
@@ -273,6 +276,20 @@ export default function SettingsPage() {
               style={{ width: '100%' }}
               value={settings.tasks_before_reboot}
               onChange={(e) => set('tasks_before_reboot', Number(e.target.value))}
+            />
+          </label>
+          <label style={{ flex: 1 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>
+              Job retention (days, 0 = forever)
+            </span>
+            <input
+              type="number"
+              min={0}
+              max={3650}
+              style={{ width: '100%' }}
+              value={settings.job_retention_days ?? 0}
+              onChange={(e) => set('job_retention_days', Number(e.target.value))}
+              title="Terminal jobs older than this are pruned hourly. 0 keeps history forever."
             />
           </label>
           <label style={{ flex: 1 }}>

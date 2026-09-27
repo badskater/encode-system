@@ -98,6 +98,10 @@ export interface Settings {
   // alerts into one Discord summary per hour instead of one message per job.
   // Round-trips via PUT /api/settings; absent/unchecked = per-job alerts.
   notify_digest?: boolean;
+  // Job history retention: terminal jobs finished more than this many days
+  // ago are pruned hourly by the controller. 0 (default) = keep forever.
+  // Valid range on save: 0 or 1-3650.
+  job_retention_days?: number;
   updated_at?: string;
 }
 

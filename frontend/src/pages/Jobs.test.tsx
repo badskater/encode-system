@@ -186,6 +186,62 @@ describe('Jobs page', () => {
     expect(screen.queryByText(/retry \d/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/waits until/i)).not.toBeInTheDocument();
   });
+
+  it('selects rows and runs a bulk retry with affected/skipped feedback', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([
+      jobFixture({ id: 31, status: 'failed' }),
+      jobFixture({ id: 32, status: 'running' }),
+    ]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'retry', affected: 1, skipped: [32],
+    });
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('31')).toBeInTheDocument());
+
+    // No bulk buttons until something is checked.
+    expect(screen.queryByRole('button', { name: /retry selected/i })).not.toBeInTheDocument();
+
+    // Check both rows via the header select-all.
+    fireEvent.click(screen.getByLabelText('Select all jobs'));
+    expect(screen.getByText('2 selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /retry selected/i }));
+    await waitFor(() => expect(bulkSpy).toHaveBeenCalledWith('retry', [31, 32]));
+    await waitFor(() =>
+      expect(screen.getByText('retry: 1 affected, 1 skipped')).toBeInTheDocument(),
+    );
+    // Selection clears after the op.
+    expect(screen.queryByText('2 selected')).not.toBeInTheDocument();
+  });
+
+  it('bulk cancel uses the checked ids and clears on filter change', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 41, status: 'pending' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'cancel', affected: 1, skipped: [],
+    });
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('41')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 41'));
+    // Changing the filter drops the selection instead of acting on hidden rows.
+    // getAllByRole: pending rows carry their own flow/priority selects —
+    // the filter select is the first combobox on the page.
+    const filterSelect = screen.getAllByRole('combobox')[0];
+    fireEvent.change(filterSelect, { target: { value: 'pending' } });
+    expect(screen.queryByText('1 selected')).not.toBeInTheDocument();
+
+    // Re-check and cancel.
+    fireEvent.click(screen.getByLabelText('Select job 41'));
+    fireEvent.click(screen.getByRole('button', { name: /cancel selected/i }));
+    await waitFor(() => expect(bulkSpy).toHaveBeenCalledWith('cancel', [41]));
+    await waitFor(() => expect(screen.getByText('cancel: 1 affected')).toBeInTheDocument());
+  });
 });
 
 // Deep-link handling (Phase F2): when the Jobs page mounts with ?job=<id> in

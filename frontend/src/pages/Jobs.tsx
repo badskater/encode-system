@@ -20,6 +20,12 @@ export default function JobsPage() {
   const [selected, setSelected] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logJob, setLogJob] = useState<Job | null>(null);
+  // Bulk selection: job ids checked for a bulk retry/cancel. Kept as a Set
+  // for O(1) toggles; cleared after each bulk op and when the filter changes
+  // (a selection that spans filters would act on rows the operator can no
+  // longer see — dangerous for destructive ops).
+  const [checked, setChecked] = useState<Set<number>>(new Set());
+  const [bulkMsg, setBulkMsg] = useState<string | null>(null);
 
   const { data: jobs } = usePolling<Job[]>(
     () => api.jobs(filter || undefined),
@@ -97,6 +103,43 @@ export default function JobsPage() {
     }
   }
 
+  // bulk runs one bulk action over the checked ids, then reports the
+  // affected/skipped counts and clears the selection. The server's guard
+  // does the real work (skipped = wrong-state or missing rows), so the UI
+  // never pre-filters by status.
+  async function bulk(action: 'retry' | 'cancel') {
+    const ids = [...checked];
+    if (ids.length === 0) return;
+    try {
+      const res = await api.bulkJobs(action, ids);
+      setBulkMsg(
+        `${action}: ${res.affected} affected` +
+          (res.skipped.length > 0 ? `, ${res.skipped.length} skipped` : ''),
+      );
+      setChecked(new Set());
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  // toggleCheck flips one row; selectAllChecked mirrors "every visible row
+  // is checked" for the header checkbox (indeterminate state handled inline).
+  function toggleCheck(id: number) {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const visibleIds = (jobs ?? []).map((j) => j.id);
+  const allChecked = visibleIds.length > 0 && visibleIds.every((id) => checked.has(id));
+  function toggleSelectAll() {
+    setChecked(allChecked ? new Set() : new Set(visibleIds));
+  }
+
   return (
     <>
       <h2>Jobs</h2>
@@ -104,18 +147,48 @@ export default function JobsPage() {
 
       <div className="toolbar">
         <label className="muted">Filter:</label>
-        <select value={filter} onChange={(e) => setFilter(e.target.value as JobStatus | '')}>
+        <select
+          value={filter}
+          onChange={(e) => {
+            setFilter(e.target.value as JobStatus | '');
+            // Filter change clears the bulk selection: acting on rows the
+            // operator can no longer see would be surprising for a
+            // destructive op.
+            setChecked(new Set());
+          }}
+        >
           {FILTERS.map((f) => (
             <option key={f} value={f}>
               {f || 'all'}
             </option>
           ))}
         </select>
+        {checked.size > 0 && (
+          <>
+            <span className="muted">{checked.size} selected</span>
+            <button className="btn" onClick={() => bulk('retry')}>
+              Retry selected
+            </button>
+            <button className="btn danger" onClick={() => bulk('cancel')}>
+              Cancel selected
+            </button>
+          </>
+        )}
       </div>
+      {bulkMsg && <p className="muted">{bulkMsg}</p>}
 
       <table>
         <thead>
           <tr>
+            <th>
+              <input
+                type="checkbox"
+                checked={allChecked}
+                onChange={toggleSelectAll}
+                aria-label="Select all jobs"
+                title="Select all visible jobs"
+              />
+            </th>
             <th>#</th>
             <th>Series</th>
             <th>Ep</th>
@@ -133,6 +206,14 @@ export default function JobsPage() {
         <tbody>
           {(jobs ?? []).map((j) => (
             <tr key={j.id}>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={checked.has(j.id)}
+                  onChange={() => toggleCheck(j.id)}
+                  aria-label={`Select job ${j.id}`}
+                />
+              </td>
               <td>
                 <a href="#" onClick={(e) => { e.preventDefault(); setSelected(j); }}>
                   {j.id}
@@ -214,7 +295,7 @@ export default function JobsPage() {
           ))}
           {(jobs ?? []).length === 0 && (
             <tr>
-              <td colSpan={12} className="muted">
+              <td colSpan={13} className="muted">
                 No jobs {filter ? `with status ${filter}` : 'yet'}.
               </td>
             </tr>

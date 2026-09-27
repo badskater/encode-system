@@ -210,6 +210,16 @@ export const api = {
   },
   retryJob: (id: number) => request<Job>('POST', `/api/jobs/${id}/retry`),
   cancelJob: (id: number) => request<void>('POST', `/api/jobs/${id}/cancel`),
+  // bulkJobs applies one guarded action to a list of job ids
+  // (POST /api/jobs/bulk). Ids that do not match the action's state guard
+  // come back in "skipped" — the server never fails a batch over a
+  // mixed-status selection.
+  bulkJobs: (action: 'retry' | 'cancel', ids: number[]) =>
+    request<{ action: string; affected: number; skipped: number[] }>(
+      'POST',
+      '/api/jobs/bulk',
+      { action, ids },
+    ),
   // streamJobLog opens the SSE live-progress stream for one job and invokes
   // onEvent per parsed frame. Uses fetch + ReadableStream (not EventSource):
   // EventSource cannot send the Authorization header the endpoint requires.

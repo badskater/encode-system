@@ -33,6 +33,16 @@ export default function SeriesPage() {
     }
   }
 
+  async function changeNodeGroup(sr: Series, nodeGroup: string) {
+    try {
+      await api.patchSeries(sr.id, { node_group: nodeGroup });
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   async function toggle(sr: Series) {
     try {
       await api.patchSeries(sr.id, { enabled: !sr.enabled });
@@ -96,6 +106,7 @@ export default function SeriesPage() {
             <th>Series</th>
             <th>Encoding with</th>
             <th>Tag</th>
+            <th>Nodes</th>
             <th>Progress</th>
             <th>Jobs</th>
             <th>Accepting work</th>
@@ -139,6 +150,15 @@ export default function SeriesPage() {
                 />
               </td>
               <td>
+                <TagCell
+                  tag={sr.node_group ?? ''}
+                  globalTag="any node"
+                  fallbackSuffix=""
+                  title="Click to restrict this series to a node group (blank = any node)"
+                  onSave={(g) => changeNodeGroup(sr, g)}
+                />
+              </td>
+              <td>
                 <ProgressCell
                   done={sr.episodes_done ?? 0}
                   failed={sr.episodes_failed ?? 0}
@@ -176,7 +196,7 @@ export default function SeriesPage() {
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={8} className="muted">
+              <td colSpan={9} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>
@@ -204,10 +224,17 @@ function TagCell({
   tag,
   globalTag,
   onSave,
+  title = 'Click to set a per-series tag override',
+  fallbackSuffix = ' (global)',
 }: {
   tag: string;
   globalTag: string;
   onSave: (t: string) => void;
+  title?: string;
+  // Text appended to the inherited value shown for a blank cell. Tags
+  // inherit the global settings tag ("1080p (global)"); groups don't
+  // inherit anything, so the group cell passes "".
+  fallbackSuffix?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(tag);
@@ -217,13 +244,13 @@ function TagCell({
       <span
         className="muted"
         style={{ cursor: 'pointer' }}
-        title="Click to set a per-series tag override"
+        title={title}
         onClick={() => {
           setValue(tag);
           setEditing(true);
         }}
       >
-        {tag || <em>{globalTag} (global)</em>}
+        {tag || <em>{globalTag}{fallbackSuffix}</em>}
       </span>
     );
   }

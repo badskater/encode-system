@@ -54,6 +54,9 @@ export interface Series {
   // scanner AND their already-queued pending jobs hold at dispatch until
   // unpause; queue position is preserved. Absent/false = running.
   paused?: boolean;
+  // Routing label: non-empty restricts this series' jobs to nodes with a
+  // matching group (wildcard nodes still accept them). '' = any node.
+  node_group?: string;
   created_at: string;
   updated_at: string;
 }
@@ -169,6 +172,9 @@ export interface Node {
   name: string;
   enabled: boolean;
   status: NodeStatus;
+  // Routing label matched against series.node_group; '' = wildcard node
+  // that accepts jobs from any series.
+  group?: string;
   agent_version: string;
   lib_version: number;
   bin_version?: number;

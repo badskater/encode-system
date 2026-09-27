@@ -180,6 +180,8 @@ export const api = {
     request<{ node: Node; token: string }>('POST', '/api/nodes', { name }),
   setNodeEnabled: (id: number, enabled: boolean) =>
     request<Node>('PATCH', `/api/nodes/${id}`, { enabled }),
+  setNodeGroup: (id: number, group: string) =>
+    request<Node>('PATCH', `/api/nodes/${id}`, { group }),
   rebootNode: (id: number) => request<Node>('POST', `/api/nodes/${id}/reboot`),
   deleteNode: (id: number) => request<void>('DELETE', `/api/nodes/${id}`),
 
@@ -293,7 +295,7 @@ export const api = {
   series: () => request<Series[]>('GET', '/api/series'),
   createSeries: (body: { name: string; episodes: number; tag?: string; flow_id?: number }) =>
     request<CreateSeriesResponse>('POST', '/api/series', body),
-  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean }) =>
+  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean; node_group?: string }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
 
   stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),

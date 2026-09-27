@@ -305,3 +305,39 @@ describe('Series page pause toggle', () => {
     );
   });
 });
+describe('Series page node-group cell', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows the group when set and PATCHes node_group on edit', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ node_group: 'gpu' }),
+    ]);
+    mockEmpty();
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ node_group: 'cpu' }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('gpu')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('gpu'));
+    const input = screen.getByPlaceholderText('any node');
+    fireEvent.change(input, { target: { value: 'cpu' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { node_group: 'cpu' }),
+    );
+  });
+
+  it('renders the "any node" hint when node_group is blank', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture({ node_group: '' })]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+    expect(screen.getByText('any node')).toBeInTheDocument();
+  });
+});

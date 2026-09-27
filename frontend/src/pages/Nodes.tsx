@@ -42,6 +42,18 @@ export default function NodesPage() {
     }
   }
 
+  // changeGroup sets the routing label; blank = wildcard node that accepts
+  // jobs from any series (series.node_group matching happens at dispatch).
+  async function changeGroup(n: Node, group: string) {
+    try {
+      await api.setNodeGroup(n.id, group);
+      setActionError(null);
+      refreshNodes();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
   async function reboot(n: Node) {
     try {
       await api.rebootNode(n.id);
@@ -158,6 +170,7 @@ export default function NodesPage() {
             <th>Name</th>
             <th>Status</th>
             <th>Enabled</th>
+            <th>Group</th>
             <th>Metrics</th>
             <th>Tasks</th>
             <th>Reboot pending</th>
@@ -179,6 +192,12 @@ export default function NodesPage() {
                 <td>{nodeBadge(n.status, !!n.online)}</td>
                 <td>
                   <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
+                </td>
+                <td>
+                  <GroupCell
+                    group={n.group ?? ''}
+                    onSave={(g) => changeGroup(n, g)}
+                  />
                 </td>
                 <td>
                   <NodeMetricChips metrics={n.last_metrics} />
@@ -209,7 +228,7 @@ export default function NodesPage() {
               </tr>
               {metricsNode?.id === n.id && (
                 <tr>
-                  <td colSpan={11} style={{ padding: 0, border: 'none' }}>
+                  <td colSpan={12} style={{ padding: 0, border: 'none' }}>
                     <NodeMetricsPanel
                       nodeId={n.id}
                       nodeName={n.name}
@@ -223,5 +242,52 @@ export default function NodesPage() {
         </tbody>
       </table>
     </>
+  );
+}
+
+// GroupCell inline-edits a node's routing label. Blank renders a muted
+// "any" hint (wildcard node). Same click-to-edit/blur-Enter-commit pattern
+// as the Series page TagCell.
+function GroupCell({ group, onSave }: { group: string; onSave: (g: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(group);
+
+  if (!editing) {
+    return (
+      <span
+        className="muted"
+        style={{ cursor: 'pointer' }}
+        title="Click to set this node's group (blank = accepts jobs from any series)"
+        onClick={() => {
+          setValue(group);
+          setEditing(true);
+        }}
+      >
+        {group || <em>any</em>}
+      </span>
+    );
+  }
+  return (
+    <input
+      type="text"
+      style={{ width: 90 }}
+      value={value}
+      placeholder="any"
+      autoFocus
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={() => {
+        setEditing(false);
+        if (value.trim() !== group) onSave(value.trim());
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+          setEditing(false);
+          if (value.trim() !== group) onSave(value.trim());
+        }
+        if (e.key === 'Escape') {
+          setEditing(false);
+        }
+      }}
+    />
   );
 }

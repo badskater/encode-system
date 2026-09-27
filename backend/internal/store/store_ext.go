@@ -329,14 +329,14 @@ func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Ser
 // SeriesByName loads a series by exact folder name.
 func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, created_at, updated_at FROM series WHERE name = ?`, name)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE name = ?`, name)
 	return scanSeries(row)
 }
 
 // GetSeries loads a series by ID.
 func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, created_at, updated_at FROM series WHERE id = ?`, id)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE id = ?`, id)
 	return scanSeries(row)
 }
 
@@ -344,7 +344,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 	var sr model.Series
 	var enabled, notify, paused int
 	var createdAt, updatedAt string
-	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	sr.Enabled = enabled == 1
@@ -358,7 +358,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 // ListSeries returns all series ordered by name.
 func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, created_at, updated_at FROM series ORDER BY name`)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +368,7 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 		var sr model.Series
 		var enabled, notify, paused int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		sr.Enabled = enabled == 1
@@ -428,6 +428,15 @@ func (s *Store) SetSeriesNotify(ctx context.Context, id int64, notify bool) erro
 func (s *Store) SetSeriesPaused(ctx context.Context, id int64, paused bool) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE series SET paused=?, updated_at=datetime('now') WHERE id=?`, boolToInt(paused), id)
+	return err
+}
+
+// SetSeriesWebhook sets the per-series Discord webhook override (” = use
+// the global webhook). Field-scoped like SetSeriesNotify so a concurrent
+// scanner upsert can't clobber it.
+func (s *Store) SetSeriesWebhook(ctx context.Context, id int64, webhookURL string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE series SET webhook_url=?, updated_at=datetime('now') WHERE id=?`, webhookURL, id)
 	return err
 }
 

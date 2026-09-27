@@ -538,10 +538,15 @@ func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName st
 	// Per-series mute: resolve the series row and skip when Notify is false.
 	// This runs BEFORE the digest check so a muted series is never buffered.
 	// A lookup miss (unknown series) falls through to notify — muting is
-	// opt-in per series, never a default.
-	if sr, err := s.Store.SeriesByName(ctx, j.Series); err == nil && sr != nil && !sr.Notify {
-		s.Log.Debug("series muted — skipping notify", "job", jobID, "series", j.Series)
-		return
+	// opt-in per series, never a default. The row also carries the optional
+	// per-series webhook override used on the direct-alert path below.
+	var seriesHook string
+	if sr, err := s.Store.SeriesByName(ctx, j.Series); err == nil && sr != nil {
+		if !sr.Notify {
+			s.Log.Debug("series muted — skipping notify", "job", jobID, "series", j.Series)
+			return
+		}
+		seriesHook = sr.WebhookURL
 	}
 	st := s.currentSettings(ctx)
 	// Digest mode: buffer the outcome for an hourly summary instead of
@@ -564,7 +569,14 @@ func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName st
 		s.Notifier.JobFinished(ctx, j, nodeName)
 		return
 	}
-	notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).JobFinished(ctx, j, nodeName)
+	// Per-series webhook override wins over the global one (routed alerts
+	// go to that series' channel). The injected s.Notifier above still
+	// takes precedence so tests keep a single recording seam.
+	hook := st.DiscordWebhook
+	if seriesHook != "" {
+		hook = seriesHook
+	}
+	notify.NewDiscordWithLink(hook, st.ControllerURL, s.Log).JobFinished(ctx, j, nodeName)
 }
 
 // discordWebhook returns the effective Discord webhook. The persisted

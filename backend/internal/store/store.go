@@ -198,6 +198,12 @@ func (s *Store) migrateV2() error {
 			return fmt.Errorf("migrate v2 series.node_group: %w", err)
 		}
 	}
+	// series: webhook_url (per-series Discord channel override; '' = global)
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN webhook_url TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate series.webhook_url: %w", err)
+		}
+	}
 	// node_metrics: rolling resource samples (one row per heartbeat) for
 	// the observability dashboard. Index on (node_id, ts) supports the
 	// "latest N samples for node" query shape.

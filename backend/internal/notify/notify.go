@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -139,6 +140,12 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 	if j.StartedAt != nil && j.FinishedAt != nil && !j.StartedAt.IsZero() && !j.FinishedAt.IsZero() {
 		fmt.Fprintf(&b, "\nduration: %s", j.FinishedAt.Sub(*j.StartedAt).Round(time.Second))
 	}
+	// Quality/output stats for done jobs (ENCODE_METRIC pairs): VMAF plus
+	// bitrate/size comparisons let a bad encode be spotted straight from
+	// the phone alert. Failures carry no meaningful output stats.
+	if j.Status == model.JobDone && len(j.Metrics) > 0 {
+		b.WriteString(formatMetricsBlock(j.Metrics))
+	}
 
 	// Deep link to the Jobs page (opt-in via ControllerURL). The link is
 	// reserved from the cap and appended AFTER truncation so it always
@@ -202,4 +209,67 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// formatMetricsBlock renders the ENCODE_METRIC stats appended to a done-job
+// alert. Only known keys are rendered, in fixed order; unknown keys are
+// ignored here (the UI shows them all). Non-finite values are skipped so a
+// corrupt report can never put "NaN" in an alert.
+func formatMetricsBlock(m map[string]float64) string {
+	var b strings.Builder
+	if v, ok := m["vmaf"]; ok && isFinite(v) {
+		fmt.Fprintf(&b, "\nvmaf: **%.2f**", v)
+	}
+	if out, ok := m["output_bitrate_kbps"]; ok && isFinite(out) {
+		fmt.Fprintf(&b, "\nbitrate: %s kb/s", groupThousands(out))
+		if src, ok2 := m["source_bitrate_kbps"]; ok2 && isFinite(src) && src > 0 {
+			fmt.Fprintf(&b, " (src %s)", groupThousands(src))
+		}
+	}
+	if out, ok := m["output_size_mb"]; ok && isFinite(out) {
+		fmt.Fprintf(&b, "\nsize: %s MB", groupThousands(out))
+		if src, ok2 := m["source_size_mb"]; ok2 && isFinite(src) && src > 0 {
+			fmt.Fprintf(&b, " (src %s MB)", groupThousands(src))
+		}
+	}
+	if dur, ok := m["duration_sec"]; ok && isFinite(dur) && dur > 0 {
+		d := time.Duration(dur * float64(time.Second))
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) - mins*60
+		fmt.Fprintf(&b, "\nlength: %dm %ds", mins, secs)
+	}
+	return b.String()
+}
+
+// groupThousands formats a float with comma thousands separators and no
+// decimals beyond one ("8,123" / "3,450.5") for compact alert text.
+func groupThousands(v float64) string {
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	intPart := int64(v)
+	frac := v - float64(intPart)
+	s := fmt.Sprintf("%d", intPart)
+	// insert commas from the right
+	if len(s) > 3 {
+		var parts []string
+		for len(s) > 3 {
+			parts = append([]string{s[len(s)-3:]}, parts...)
+			s = s[:len(s)-3]
+		}
+		parts = append([]string{s}, parts...)
+		s = strings.Join(parts, ",")
+	}
+	if frac >= 0.05 {
+		s = fmt.Sprintf("%s.%d", s, int(frac*10+0.5))
+	}
+	if neg {
+		return "-" + s
+	}
+	return s
+}
+
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }

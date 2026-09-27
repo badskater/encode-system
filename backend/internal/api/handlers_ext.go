@@ -128,12 +128,13 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FlowID    *int64  `json:"flow_id"`
-		Enabled   *bool   `json:"enabled"`
-		Notify    *bool   `json:"notify"`
-		Paused    *bool   `json:"paused"`
-		NodeGroup *string `json:"node_group"`
-		Tag       *string `json:"tag"`
+		FlowID     *int64  `json:"flow_id"`
+		Enabled    *bool   `json:"enabled"`
+		Notify     *bool   `json:"notify"`
+		Paused     *bool   `json:"paused"`
+		NodeGroup  *string `json:"node_group"`
+		Tag        *string `json:"tag"`
+		WebhookURL *string `json:"webhook_url"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -185,6 +186,20 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if req.NodeGroup != nil {
 		if err := s.Store.SetSeriesNodeGroup(ctx, id, *req.NodeGroup); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series node_group")
+			return
+		}
+	}
+	if req.WebhookURL != nil {
+		hook := strings.TrimSpace(*req.WebhookURL)
+		// Only accept https URLs (Discord webhooks are always https) or an
+		// empty string to clear the override. http:// would leak alert
+		// content unencrypted; anything else is a typo.
+		if hook != "" && !strings.HasPrefix(hook, "https://") {
+			writeErr(w, http.StatusBadRequest, "webhook_url must be https:// or empty")
+			return
+		}
+		if err := s.Store.SetSeriesWebhook(ctx, id, hook); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series webhook")
 			return
 		}
 	}

@@ -322,9 +322,14 @@ type Series struct {
 	// Notify controls whether job outcomes for this series emit Discord
 	// alerts. Defaults true (matches pre-v2 behavior where every job
 	// alerted) so a silent series is an opt-in, not an opt-out.
-	Notify    bool      `json:"notify"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Notify bool `json:"notify"`
+	// WebhookURL overrides the global Discord webhook for this series'
+	// job-outcome alerts (per-series channels). Empty = use the global
+	// webhook. Only honored on the direct-alert path; digest mode batches
+	// everything into the global channel by design.
+	WebhookURL string    `json:"webhook_url,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // StepTemplate is one controllable pipeline section: metadata plus its own

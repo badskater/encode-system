@@ -410,7 +410,7 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 
 	jobDir := filepath.Join(a.Cfg.DataDir, "jobs", fmt.Sprintf("%d", job.ID))
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "", "", nil)
+		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
 	scriptPath := filepath.Join(jobDir, "job.ps1")
@@ -420,11 +420,11 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	// pwsh (7+) and PS 5.1 both honor it identically.
 	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(job.Script)...)
 	if err := os.WriteFile(scriptPath, scriptBytes, 0o644); err != nil {
-		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil)
+		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
 	if _, err := os.Stat(a.Cfg.LibPath); err != nil {
-		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil)
+		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
 		return
 	}
 
@@ -434,7 +434,7 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	// picks the newest active job's log). Per-job slot in the registry;
 	// cleared with the job on completion.
 	r.setRunLog(job.ID, runLog)
-	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog, aj.prog)
+	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
 
 	status := "done"
 	errMsg := ""
@@ -469,7 +469,11 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		log.Warn("full log capture failed; sending empty", "err", capErr)
 		fullLog = ""
 	}
-	a.completeJob(job.ID, status, exitCode, errMsg, outputs, tail, fullLog, timings.finish(time.Now()))
+	var metricMap map[string]float64
+	if aj != nil {
+		metricMap = aj.metrics.snapshot()
+	}
+	a.completeJob(job.ID, status, exitCode, errMsg, outputs, tail, fullLog, timings.finish(time.Now()), metricMap)
 	a.bumpCounter()
 	log.Info("job finished", "status", status, "exit_code", exitCode, "tasks_since_boot", a.TasksSinceBoot())
 }
@@ -503,7 +507,7 @@ func (a *Agent) findPowerShell() string {
 // arrival time, time.Now()), not a post-hoc single-timestamp pass after
 // cmd.Wait. The full output is still accumulated for tail extraction and the
 // ENCODE_STEP_FAILED scan, which run unchanged.
-func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
 
@@ -515,6 +519,11 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 	}
 	observer.prog = prog // per-job live heartbeat step/pct/tail feed
 	prog.reset()         // fresh state per job — never inherit the previous run
+	if metrics == nil {
+		metrics = newMetricTracker() // defensive: direct test callers
+	}
+	observer.metrics = metrics // ENCODE_METRIC accumulator (vmaf, sizes…)
+	metrics.reset()
 	f, err := os.Create(runLog)
 	if err == nil {
 		defer f.Close()
@@ -561,7 +570,7 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 // last-1-MiB run.log snapshot; stepTimings is the per-step wall-clock record.
 // Both are added as new JSON keys ("log_full", "step_timings") alongside the
 // legacy fields; old controllers ignore unknown keys, so adding them is safe.
-func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string, outputs []string, tail, fullLog string, stepTimings []model.StepTiming) {
+func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string, outputs []string, tail, fullLog string, stepTimings []model.StepTiming, metrics map[string]float64) {
 	// Normalize a nil slice to []model.StepTiming{} so the wire shape is
 	// always "step_timings":[] (never null). The three early-failure call
 	// sites pass nil; without this the controller would unmarshal null into a
@@ -569,6 +578,9 @@ func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string
 	// array, not null, for both code paths.
 	if stepTimings == nil {
 		stepTimings = []model.StepTiming{}
+	}
+	if metrics == nil {
+		metrics = map[string]float64{}
 	}
 	rep := map[string]any{
 		"status": status, "exit_code": exitCode, "error": errMsg,
@@ -579,6 +591,9 @@ func (a *Agent) completeJob(id int64, status string, exitCode int, errMsg string
 		// step_timings: per-step wall-clock samples for the observability
 		// dashboard. Empty slice when no ENCODE_STEP markers were emitted.
 		"step_timings": stepTimings,
+		// metrics: ENCODE_METRIC key=value pairs (vmaf, output sizes,
+		// bitrates). Empty map when the script reported none.
+		"metrics": metrics,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

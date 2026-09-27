@@ -248,6 +248,11 @@ type Job struct {
 	// queue will not pick it up until this time. nil = immediately ready.
 	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
 
+	// Metrics holds ENCODE_METRIC key=value pairs reported by the job
+	// script (vmaf, output_bitrate_kbps, duration_sec, sizes…). Unmarshaled
+	// from metrics_json; nil/empty when the script reported none.
+	Metrics map[string]float64 `json:"metrics,omitempty"`
+
 	// LastFailedNodeID is the node that most recently failed this job (0 =
 	// never failed). The dispatcher steers re-queued retries to a different
 	// node when one is available — a node-local fault (disk, GPU, corrupt

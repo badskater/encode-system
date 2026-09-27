@@ -307,3 +307,49 @@ func TestLatestNodeMetricReturnsMostRecent(t *testing.T) {
 		t.Fatalf("want nil for node with no metrics, got %+v", none)
 	}
 }
+
+// TestJobMetricsRoundTrip verifies ENCODE_METRIC pairs survive the
+// finish→read cycle through metrics_json, and that a nil map round-trips
+// as empty (never a parse error, never a "{}" ghost in the API payload).
+func TestJobMetricsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, "jm-node", "h")
+	fl, _ := s.CreateFlow(ctx, &model.Flow{Name: "jm-flow"})
+	j, err := s.CreateJob(ctx, &model.Job{
+		Series: "M Show", Episode: "01", EpisodeDir: "M Show/Ep 01",
+		ScriptType: "avs", FlowID: fl.ID, Status: model.JobPending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AssignJob(ctx, j.ID, n.ID); err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]float64{"vmaf": 94.21, "output_bitrate_kbps": 8123, "duration_sec": 1440.5}
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", []string{"o.mkv"}, "tail", "log", nil, m); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetJob(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Metrics) != 3 || got.Metrics["vmaf"] != 94.21 ||
+		got.Metrics["output_bitrate_kbps"] != 8123 || got.Metrics["duration_sec"] != 1440.5 {
+		t.Fatalf("metrics = %v, want the three reported pairs", got.Metrics)
+	}
+
+	// nil metrics → empty on read.
+	j2, _ := s.CreateJob(ctx, &model.Job{
+		Series: "M Show", Episode: "02", EpisodeDir: "M Show/Ep 02",
+		ScriptType: "avs", FlowID: fl.ID, Status: model.JobPending})
+	if err := s.AssignJob(ctx, j2.ID, n.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishJobWithReport(ctx, j2.ID, model.JobDone, 0, "", nil, "t", "l", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := s.GetJob(ctx, j2.ID)
+	if len(got2.Metrics) != 0 {
+		t.Fatalf("nil metrics round-tripped as %v, want empty", got2.Metrics)
+	}
+}

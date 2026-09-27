@@ -149,6 +149,7 @@ func (s *Store) migrateV2() error {
 	jobAlters := []string{
 		`ALTER TABLE jobs ADD COLUMN full_log TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE jobs ADD COLUMN step_timings_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE jobs ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN next_retry_at TEXT`,
@@ -596,7 +597,7 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -604,13 +605,13 @@ func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 func scanJob(row *sql.Row) (*model.Job, error) {
 	var j model.Job
 	var status string
-	var outputsJSON, timingsJSON string
+	var outputsJSON, timingsJSON, metricsJSON string
 	var started, finished, nextRetry sql.NullString
 	var createdAt string
 	err := row.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished,
-		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
+		&j.FullLog, &timingsJSON, &metricsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -621,6 +622,11 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 	}
 	if err := json.Unmarshal([]byte(timingsJSON), &j.StepTimings); err != nil {
 		return nil, fmt.Errorf("job %d: step_timings_json: %w", j.ID, err)
+	}
+	if metricsJSON != "" {
+		if err := json.Unmarshal([]byte(metricsJSON), &j.Metrics); err != nil {
+			return nil, fmt.Errorf("job %d: metrics_json: %w", j.ID, err)
+		}
 	}
 	if started.Valid {
 		j.StartedAt = ptrTime(started.String)
@@ -638,7 +644,7 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int) ([]*model.Job, error) {
 	q := `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id FROM jobs`
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id FROM jobs`
 	args := []any{}
 	if status != "" {
 		q += ` WHERE status = ?`
@@ -670,13 +676,13 @@ func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int)
 func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	var j model.Job
 	var status string
-	var outputsJSON, timingsJSON string
+	var outputsJSON, timingsJSON, metricsJSON string
 	var started, finished, nextRetry sql.NullString
 	var createdAt string
 	err := rows.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished,
-		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
+		&j.FullLog, &timingsJSON, &metricsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -687,6 +693,11 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	}
 	if err := json.Unmarshal([]byte(timingsJSON), &j.StepTimings); err != nil {
 		return nil, fmt.Errorf("job %d: step_timings_json: %w", j.ID, err)
+	}
+	if metricsJSON != "" {
+		if err := json.Unmarshal([]byte(metricsJSON), &j.Metrics); err != nil {
+			return nil, fmt.Errorf("job %d: metrics_json: %w", j.ID, err)
+		}
 	}
 	if started.Valid {
 		j.StartedAt = ptrTime(started.String)
@@ -915,6 +926,20 @@ func marshalStepTimings(timings []model.StepTiming) []byte {
 	return b
 }
 
+// marshalMetrics serializes ENCODE_METRIC key=value pairs to the JSON shape
+// stored in metrics_json. nil/empty maps marshal to '{}' (never null) so the
+// column default and the wire shape agree.
+func marshalMetrics(m map[string]float64) []byte {
+	if len(m) == 0 {
+		return []byte("{}")
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
 // ErrJobNotFinishable is returned by FinishJobWithReport when the job is no
 // longer in an assignable/running state — a concurrent cancel (or a prior
 // completion that raced the Terminal() pre-check) already moved the job out
@@ -940,12 +965,13 @@ var ErrJobNotFinishable = errors.New("job is not in a finishable state (already 
 // don't notify or retry) instead of 500-ing. The handler's Terminal()
 // pre-check remains the fast path; this guard closes the narrow window
 // between that check and this write.
-func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.JobStatus, exitCode int, errMsg string, outputs []string, logTail string, fullLog string, timings []model.StepTiming) error {
+func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.JobStatus, exitCode int, errMsg string, outputs []string, logTail string, fullLog string, timings []model.StepTiming, metrics map[string]float64) error {
 	if outputs == nil {
 		outputs = []string{}
 	}
 	b, _ := json.Marshal(outputs)
 	timingsJSON := marshalStepTimings(timings)
+	metricsJSON := marshalMetrics(metrics)
 	capped := capFullLog(fullLog)
 	// progress=100 only for done jobs; a failed/cancelled job keeps its last
 	// progress so dashboards don't render failure as completion.
@@ -957,7 +983,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 	// node; done clears it. The guard below already restricts the UPDATE to
 	// the assigned/running owner, so the subselect reads the right node.
 	steer := ", last_failed_node_id=(SELECT node_id FROM jobs WHERE id=?)"
-	args := []any{string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON)}
+	args := []any{string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON), string(metricsJSON)}
 	if status == model.JobDone {
 		steer = ", last_failed_node_id=0"
 	} else {
@@ -965,7 +991,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 	}
 	args = append(args, id)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+steer+` WHERE id=? AND status IN ('assigned','running')`,
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, metrics_json=?, finished_at=datetime('now')`+progress+steer+` WHERE id=? AND status IN ('assigned','running')`,
 		args...)
 	if err != nil {
 		return err
@@ -984,7 +1010,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id LIMIT 1`, nodeID)
 	if err != nil {
 		return nil, err
@@ -1015,7 +1041,7 @@ func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
 func (s *Store) ActiveJobsForNode(ctx context.Context, nodeID int64) ([]*model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id`, nodeID)
 	if err != nil {
 		return nil, err
@@ -1117,7 +1143,7 @@ func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
   AND NOT EXISTS (SELECT 1 FROM series sr WHERE sr.name = jobs.series AND sr.paused = 1)
   ORDER BY priority DESC, id ASC LIMIT 1`)
@@ -1146,7 +1172,7 @@ func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*mo
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
   AND NOT EXISTS (SELECT 1 FROM series sr WHERE sr.name = jobs.series AND sr.paused = 1)
   AND NOT EXISTS (

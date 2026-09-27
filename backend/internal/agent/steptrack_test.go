@@ -185,7 +185,7 @@ func TestCompleteReportStepTimingsNilNormalizesToEmptySlice(t *testing.T) {
 	}, "v", testLog())
 
 	// nil stepTimings — simulates an early completeJob failure path.
-	a.completeJob(7, "failed", -1, "early failure", nil, "", "", nil)
+	a.completeJob(7, "failed", -1, "early failure", nil, "", "", nil, nil)
 
 	if capturedBody == nil {
 		t.Fatal("no completion body captured")
@@ -328,7 +328,7 @@ func TestCompleteReportIncludesFullLogAndStepTimings(t *testing.T) {
 		LibPath: filepath.Join(dir, "EncodeLib.ps1"),
 	}, "v", testLog())
 
-	a.completeJob(42, "done", 0, "", []string{"out.mkv"}, "tail-line", fullLog, timings)
+	a.completeJob(42, "done", 0, "", []string{"out.mkv"}, "tail-line", fullLog, timings, nil)
 
 	if capturedBody == nil {
 		t.Fatal("no completion body captured")

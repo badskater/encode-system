@@ -259,6 +259,9 @@ export interface Job {
   log_tail?: string;
   outputs?: string[];
   step_timings?: StepTiming[];
+  // ENCODE_METRIC key=value pairs from the job script (vmaf, bitrates,
+  // sizes, durations). Absent/empty for jobs whose scripts report none.
+  metrics?: Record<string, number>;
   // Phase D2: priority (0=Normal, 1=High) settable on PENDING jobs only.
   // retry_count + next_retry_at reflect the backend's auto-retry state.
   priority?: number;

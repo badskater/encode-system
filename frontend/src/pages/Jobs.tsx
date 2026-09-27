@@ -334,6 +334,7 @@ export default function JobsPage() {
           jobLabel={`${logJob.series} Ep ${logJob.episode}`}
           stepTimings={logJob.step_timings}
           jobStatus={logJob.status}
+          metrics={logJob.metrics}
           onClose={() => setLogJob(null)}
         />
       )}

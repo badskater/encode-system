@@ -8,6 +8,9 @@
 # Progress protocol (parsed by the agent):
 #   ENCODE_STEP <name> <pct>        progress update (0-100)
 #   ENCODE_STEP_FAILED <name> <msg>
+#   ENCODE_METRIC <key>=<value>     numeric quality/output metric (vmaf,
+#                                   output_bitrate_kbps, duration_sec, ...)
+#                                   stored on the job; last value per key wins
 #   ENCODE_JOB_DONE
 #
 # Step function convention (see Docs/md/Architecture.md):
@@ -103,4 +106,20 @@ function Assert-SafeName {
     if ($Value -match '[\\/:*?"<>|]' -or $Value.Contains('..') -or $Value.Trim() -eq '') {
         throw "unsafe $What value: '$Value' (path separators, '..' or reserved characters are not allowed)"
     }
+}
+
+# Write-EncodeMetric emits one ENCODE_METRIC key=value line for the agent to
+# capture on the job record (quality/output stats: vmaf, bitrate, duration…).
+# The value must be numeric; keys should be snake_case identifiers. Later
+# calls with the same key override earlier ones (last wins), so a refined
+# second-pass measurement safely supersedes a preview value.
+function Write-EncodeMetric {
+    param(
+        [Parameter(Mandatory)] [string] $Key,
+        [Parameter(Mandatory)] [double] $Value
+    )
+    if ($Key -notmatch '^[A-Za-z_][A-Za-z0-9_.]*$') {
+        throw "invalid metric key '$Key' (letters, digits, _ and . only; must start with a letter or _)"
+    }
+    Write-Output "ENCODE_METRIC $Key=$Value"
 }

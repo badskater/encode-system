@@ -19,7 +19,8 @@ const maxLocalJobs = 8
 type activeJob struct {
 	payload *model.JobPayload
 	prog    *progressTracker
-	runLog  string // this job's run.log path (FPS parsing picks the newest)
+	metrics *metricTracker // ENCODE_METRIC accumulator (vmaf, sizes, rates)
+	runLog  string         // this job's run.log path (FPS parsing picks the newest)
 }
 
 // jobRegistry is the concurrency-safe multi-job bookkeeping that replaces
@@ -53,6 +54,7 @@ func (r *jobRegistry) accept(payloads []*model.JobPayload) []*model.JobPayload {
 		r.jobs[p.ID] = &activeJob{
 			payload: p,
 			prog:    newProgressTracker(progressRingLines),
+			metrics: newMetricTracker(),
 		}
 		ok = append(ok, p)
 	}

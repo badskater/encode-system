@@ -387,6 +387,7 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 		LogTail     string             `json:"log_tail"`
 		LogFull     string             `json:"log_full"`     // v2: full captured run.log (agent omits on old builds → "")
 		StepTimings []model.StepTiming `json:"step_timings"` // v2: per-step start/duration (old agents → nil)
+		Metrics     map[string]float64 `json:"metrics"`      // v3: ENCODE_METRIC pairs (old agents → nil)
 	}
 	if err := decodeJSONLimit(r, &rep, maxCompleteBodyBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid completion report")
@@ -412,7 +413,7 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 	if rep.Status != "done" {
 		status = model.JobFailed
 	}
-	if err := s.Store.FinishJobWithReport(ctx, jobID, status, rep.ExitCode, rep.Error, rep.Outputs, rep.LogTail, rep.LogFull, rep.StepTimings); err != nil {
+	if err := s.Store.FinishJobWithReport(ctx, jobID, status, rep.ExitCode, rep.Error, rep.Outputs, rep.LogTail, rep.LogFull, rep.StepTimings, rep.Metrics); err != nil {
 		// FinishJobWithReport is guarded by status IN ('assigned','running').
 		// A zero-rows match means the job left the live state between the
 		// Terminal() pre-check above and this write (concurrent cancel, or a

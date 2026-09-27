@@ -176,6 +176,7 @@ type lineObserver struct {
 	log       *slog.Logger // agent logger for progress (may be nil in tests)
 	timings   *stepTimingTracker
 	prog      *progressTracker // live heartbeat progress; nil in unit tests
+	metrics   *metricTracker   // ENCODE_METRIC accumulator; nil in unit tests
 	buf       bytes.Buffer     // accumulates ALL output verbatim
 	remainder string           // trailing partial line from the last Write
 }
@@ -226,6 +227,9 @@ func (o *lineObserver) processLine(line string) {
 	// step/pct update happens inside the tracker on marker lines only.
 	if o.prog != nil {
 		o.prog.observe(line)
+	}
+	if o.metrics != nil {
+		o.metrics.observe(line)
 	}
 	m := stepLine.FindStringSubmatch(line)
 	if m == nil {

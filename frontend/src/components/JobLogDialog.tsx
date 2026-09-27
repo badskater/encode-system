@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { JobLogStreamEvent, JobStatus, StepTiming } from '../types';
 import StepTimingsView from './StepTimingsView';
+import JobMetricsView from './JobMetricsView';
 
 // terminalStatuses mirrors the backend JobStatus.Terminal() set: for these,
 // the captured full log (GET /log) is the only content — no live stream.
@@ -26,12 +27,14 @@ export default function JobLogDialog({
   onClose,
   stepTimings,
   jobStatus,
+  metrics,
 }: {
   jobId: number;
   jobLabel: string;
   onClose: () => void;
   stepTimings?: StepTiming[];
   jobStatus?: JobStatus;
+  metrics?: Record<string, number>;
 }) {
   const [log, setLog] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -141,6 +144,7 @@ export default function JobLogDialog({
         {stepTimings && stepTimings.length > 0 && (
           <StepTimingsView timings={stepTimings} />
         )}
+        <JobMetricsView metrics={metrics} />
         {live && live.type === 'progress' && (
           <>
             <h4>

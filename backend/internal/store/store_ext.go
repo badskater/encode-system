@@ -970,3 +970,25 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keepTokenH
 		"DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", userID, keepTokenHash)
 	return err
 }
+
+// PruneOldJobs deletes terminal job rows finished more than days ago and
+// returns the number deleted. days <= 0 is a hard no-op (0 = retention
+// disabled in settings — a misconfigured row must never wipe history).
+// Only rows with a stamped finished_at qualify: a pending/running job has
+// finished_at NULL and survives no matter how old it is (the queue is never
+// pruned out from under the dispatcher). Deletion is permanent — the row
+// carries the full log and timings, so this is the retention policy's whole
+// purpose (bounding SQLite growth), not a soft archive.
+func (s *Store) PruneOldJobs(ctx context.Context, days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at < ?`,
+		cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

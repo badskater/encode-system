@@ -169,6 +169,13 @@ func main() {
 	// ctx as the scanner so SIGTERM stops both cleanly.
 	srv.StartDigestLoop(ctx)
 
+	// Retention loop: hourly pass that deletes terminal jobs older than
+	// settings.JobRetentionDays (0 = keep forever, the default). Each tick
+	// reads live settings, so enabling/adjusting retention on the Settings
+	// page applies on the next tick without a restart. Bound to the same
+	// ctx as the scanner/digest loops so SIGTERM stops all of them cleanly.
+	srv.StartRetentionLoop(ctx)
+
 	// Serve UI static files (built frontend) if present, then the API.
 	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes
 	// the SPA into /app/ui, keeping it out of the persistent volume).

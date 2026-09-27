@@ -141,8 +141,15 @@ type Settings struct {
 	// NotifyDigest collapses per-job outcome alerts into a periodic digest
 	// when true; false keeps the immediate per-job alert behavior. Persisted
 	// in the settings JSON blob (not a SQL column).
-	NotifyDigest bool       `json:"notify_digest"`
-	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
+	NotifyDigest bool `json:"notify_digest"`
+
+	// JobRetentionDays bounds job history: terminal jobs (done/failed/
+	// cancelled) finished more than this many days ago are pruned by the
+	// hourly retention loop. 0 = keep forever (the default, and the zero
+	// value old settings rows unmarshal to). Validated 0 or 1-3650.
+	JobRetentionDays int `json:"job_retention_days"`
+
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // Session is an issued management session (token stored hashed at rest).

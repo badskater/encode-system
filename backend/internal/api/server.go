@@ -365,6 +365,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/jobs", s.withAdmin(s.handleListJobs))
 	mux.HandleFunc("POST /api/jobs", s.withAdmin(s.handleCreateJob))
 	mux.HandleFunc("POST /api/jobs/bulk", s.withAdmin(s.handleBulkJobs))
+	mux.HandleFunc("POST /api/jobs/prune", s.withAdmin(s.handlePruneJobs))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
 	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
 	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))

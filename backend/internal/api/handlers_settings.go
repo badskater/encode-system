@@ -102,6 +102,12 @@ func validateSettings(st *model.Settings) error {
 	if st.TasksBeforeReboot < 1 || st.TasksBeforeReboot > 1000 {
 		return errSettings("tasks_before_reboot must be 1-1000")
 	}
+	// Retention: 0 disables pruning (keep forever); anything else must be
+	// at least a day and at most ~10 years. Negative or absurd values would
+	// either delete everything on the next tick or never match.
+	if st.JobRetentionDays < 0 || st.JobRetentionDays > 3650 {
+		return errSettings("job_retention_days must be 0 (keep forever) or 1-3650")
+	}
 	if st.Group == "" {
 		return errSettings("group is required")
 	}

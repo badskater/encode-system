@@ -42,6 +42,18 @@ export default function SeriesPage() {
       setActionError(String(e instanceof Error ? e.message : e));
     }
   }
+  // changeWebhook sets the per-series Discord webhook override; blank
+  // returns the series to the global channel.
+  async function changeWebhook(sr: Series, url: string) {
+    try {
+      await api.patchSeries(sr.id, { webhook_url: url });
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
 
   async function toggle(sr: Series) {
     try {
@@ -112,6 +124,7 @@ export default function SeriesPage() {
             <th>Accepting work</th>
             <th>Paused</th>
             <th>Notify</th>
+            <th>Channel</th>
           </tr>
         </thead>
         <tbody>
@@ -192,11 +205,17 @@ export default function SeriesPage() {
                   {sr.notify === false ? '🔕' : '🔔'}
                 </button>
               </td>
+              <td>
+                <WebhookCell
+                  url={sr.webhook_url ?? ''}
+                  onSave={(u) => changeWebhook(sr, u)}
+                />
+              </td>
             </tr>
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>
@@ -311,5 +330,56 @@ function ProgressCell({
       <span>{done}/{total}</span>
       {extra.length > 0 && <div className="muted">{extra.join(' · ')}</div>}
     </div>
+  );
+}
+
+// WebhookCell shows the per-series alert-channel state ("global" when no
+// override) and expands to a URL input on click. https-only is enforced
+// server-side; the client mirrors the rule so typos fail fast with a
+// visible reason instead of a 400 toast.
+function WebhookCell({ url, onSave }: { url: string; onSave: (u: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(url);
+
+  if (!editing) {
+    return (
+      <span
+        className="muted"
+        style={{ cursor: 'pointer' }}
+        title={url ? `Own channel: ${url}` : 'Alerts go to the global webhook — click to set a per-series channel'}
+        onClick={() => {
+          setValue(url);
+          setEditing(true);
+        }}
+      >
+        {url ? '📣 own' : <em>global</em>}
+      </span>
+    );
+  }
+  return (
+    <input
+      type="url"
+      aria-label="Series webhook URL"
+      style={{ width: 180 }}
+      value={value}
+      placeholder="https://discord.com/api/webhooks/…"
+      autoFocus
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={() => {
+        setEditing(false);
+        const v = value.trim();
+        if (v !== url && (v === '' || v.startsWith('https://'))) onSave(v);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+          setEditing(false);
+          const v = value.trim();
+          if (v !== url && (v === '' || v.startsWith('https://'))) onSave(v);
+        }
+        if (e.key === 'Escape') {
+          setEditing(false);
+        }
+      }}
+    />
   );
 }

@@ -341,3 +341,43 @@ describe('Series page node-group cell', () => {
     expect(screen.getByText('any node')).toBeInTheDocument();
   });
 });
+
+describe('Series page webhook channel cell', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows global when no override and own when set', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ id: 1, name: 'A', webhook_url: '' }),
+      seriesFixture({ id: 2, name: 'B', webhook_url: 'https://discord.com/api/webhooks/1/x' }),
+    ]);
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('A')).toBeInTheDocument());
+    expect(screen.getByText('global')).toBeInTheDocument();
+    expect(screen.getByText('📣 own')).toBeInTheDocument();
+  });
+
+  it('PATCHes webhook_url on save and rejects non-https silently', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture({ id: 1, name: 'A', webhook_url: '' })]);
+    const patchSpy = vi.spyOn(api, 'patchSeries').mockResolvedValue(seriesFixture({ id: 1 }));
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('global')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('global'));
+    const input = screen.getByLabelText(/series webhook url/i);
+    fireEvent.change(input, { target: { value: 'https://discord.com/api/webhooks/9/abc' } });
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { webhook_url: 'https://discord.com/api/webhooks/9/abc' }),
+    );
+    // non-https value must NOT be sent. The mocked api.series still
+    // returns webhook_url:'' after refresh, so the cell shows "global".
+    patchSpy.mockClear();
+    await waitFor(() => expect(screen.getByText('global')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('global'));
+    const input2 = screen.getByLabelText(/series webhook url/i);
+    fireEvent.change(input2, { target: { value: 'http://evil.example/hook' } });
+    fireEvent.keyDown(input2, { key: 'Enter', code: 'Enter' });
+    expect(patchSpy).not.toHaveBeenCalled();
+  });
+});

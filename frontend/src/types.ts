@@ -54,6 +54,9 @@ export interface Series {
   // scanner AND their already-queued pending jobs hold at dispatch until
   // unpause; queue position is preserved. Absent/false = running.
   paused?: boolean;
+  // Per-series Discord webhook override for job-outcome alerts. Empty or
+  // absent = use the global webhook from Settings.
+  webhook_url?: string;
   // Routing label: non-empty restricts this series' jobs to nodes with a
   // matching group (wildcard nodes still accept them). '' = any node.
   node_group?: string;

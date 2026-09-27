@@ -74,6 +74,7 @@ func (s *Server) handleBulkJobs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.Log.Info("bulk job action", "action", req.Action, "affected", affected, "skipped", len(skipped))
+	s.audit(r, "jobs.bulk", req.Action, map[string]any{"ids": req.IDs, "affected": affected, "skipped": skipped})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"action":   req.Action,
 		"affected": affected,

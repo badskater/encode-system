@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS series (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL DEFAULT (datetime('now')),
+  actor TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  object TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS step_templates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT NOT NULL UNIQUE,
@@ -1019,4 +1028,39 @@ func (s *Store) PruneOldJobs(ctx context.Context, days int) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// AppendAudit records one audit event. Fire-and-forget by contract: the
+// caller logs errors but never fails the audited operation because the
+// audit write failed.
+func (s *Store) AppendAudit(ctx context.Context, actor, action, object, detail string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO audit_events (actor, action, object, detail) VALUES (?, ?, ?, ?)`,
+		actor, action, object, detail)
+	return err
+}
+
+// ListAudit returns the newest audit events (up to limit; 0 = default 200).
+// Always returns a non-nil slice so JSON renders [] not null.
+func (s *Store) ListAudit(ctx context.Context, limit int) ([]*model.AuditEvent, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, at, actor, action, object, detail FROM audit_events ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*model.AuditEvent{}
+	for rows.Next() {
+		var ev model.AuditEvent
+		var at string
+		if err := rows.Scan(&ev.ID, &at, &ev.Actor, &ev.Action, &ev.Object, &ev.Detail); err != nil {
+			return nil, err
+		}
+		ev.At = parseTime(at)
+		out = append(out, &ev)
+	}
+	return out, rows.Err()
 }

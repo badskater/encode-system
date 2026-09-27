@@ -427,6 +427,18 @@ type JobPayload struct {
 	Flow   string            `json:"flow"`   // flow name, informational
 }
 
+// AuditEvent is one row of the audit log: who did what to which object.
+// Written fire-and-forget by mutating handlers; Detail carries a small
+// JSON snippet of the change (never secrets or full bodies).
+type AuditEvent struct {
+	ID     int64     `json:"id"`
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`  // session username or "api-token:<name>"
+	Action string    `json:"action"` // e.g. "settings.update", "node.delete"
+	Object string    `json:"object"` // e.g. "node:3", "series:5", "settings"
+	Detail string    `json:"detail"` // small JSON snippet, "" when nothing to add
+}
+
 // UpdateManifest describes the agent/lib/bin versions the controller wants
 // deployed. Agents compare each field against what they run and sync what
 // differs (lib first, then the bin folder, then the agent binary itself).

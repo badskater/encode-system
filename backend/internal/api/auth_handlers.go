@@ -225,6 +225,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.Log.Info("admin password changed", "username", user.Username)
+	s.audit(r, "auth.password_change", "user:"+user.Username, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
 }
 

@@ -376,6 +376,7 @@ func (s *Server) Routes() http.Handler {
 	// Prometheus scrape endpoint: unauthenticated by design (aggregate
 	// operational numbers only; scrapers authenticate at network layer).
 	mux.HandleFunc("GET /metrics", s.handlePrometheus)
+	mux.HandleFunc("GET /api/audit", s.withAdmin(s.handleListAudit))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
 	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
 	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))

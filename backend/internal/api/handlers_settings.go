@@ -73,6 +73,18 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Log.Info("settings updated via UI", "scripts_root", req.ScriptsRoot,
 		"node_bin_dir", req.NodeBinDir, "scan_interval_s", req.ScanIntervalSeconds)
+	// Audit a secret-free subset: the webhook URL and any future credential
+	// fields must never land in the audit table — only the operational
+	// knobs plus a boolean for whether a webhook is set.
+	s.audit(r, "settings.update", "settings", map[string]any{
+		"scan_interval_seconds": req.ScanIntervalSeconds,
+		"tasks_before_reboot":   req.TasksBeforeReboot,
+		"drain_mode":            req.DrainMode,
+		"notify_digest":         req.NotifyDigest,
+		"job_retention_days":    req.JobRetentionDays,
+		"disk_alert_gb":         req.DiskAlertGB,
+		"webhook_set":           req.DiscordWebhook != "",
+	})
 	writeJSON(w, http.StatusOK, s.currentSettings(r.Context()))
 }
 

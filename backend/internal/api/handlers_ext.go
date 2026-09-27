@@ -214,6 +214,11 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "series not found")
 		return
 	}
+	s.audit(r, "series.update", auditObject("series", id), map[string]any{
+		"name": sr.Name, "flow_id": req.FlowID, "enabled": req.Enabled,
+		"notify": req.Notify, "paused": req.Paused, "node_group": req.NodeGroup,
+		"tag": req.Tag, "webhook_set": req.WebhookURL != nil && *req.WebhookURL != "",
+	})
 	writeJSON(w, http.StatusOK, sr)
 }
 

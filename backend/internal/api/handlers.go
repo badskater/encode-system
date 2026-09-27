@@ -678,6 +678,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("node registered", "node", req.Name)
+	s.audit(r, "node.create", auditObject("node", node.ID), map[string]any{"name": req.Name})
 	writeJSON(w, http.StatusCreated, map[string]any{"node": node, "token": token})
 }
 
@@ -730,6 +731,11 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 		}
 		node.MaxConcurrentJobs = *req.MaxConcurrentJobs
 	}
+	if req.Enabled != nil || req.Group != nil || req.MaxConcurrentJobs != nil {
+		s.audit(r, "node.update", auditObject("node", id), map[string]any{
+			"enabled": req.Enabled, "group": req.Group, "max_concurrent_jobs": req.MaxConcurrentJobs,
+		})
+	}
 	if err := s.Store.UpdateNode(r.Context(), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "update node")
 		return
@@ -764,6 +770,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("node deleted", "node", node.Name, "id", id)
+	s.audit(r, "node.delete", auditObject("node", id), map[string]any{"name": node.Name})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -822,6 +829,7 @@ func (s *Server) handleRebootNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("manual reboot requested", "node", node.Name)
+	s.audit(r, "node.reboot", auditObject("node", id), map[string]any{"name": node.Name})
 	writeJSON(w, http.StatusOK, node)
 }
 
@@ -955,6 +963,7 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
 	}
+	s.audit(r, "job.retry", auditObject("job", id), map[string]any{"episode_dir": job.EpisodeDir})
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -1015,6 +1024,7 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
 	}
+	s.audit(r, "job.patch", auditObject("job", id), map[string]any{"flow_id": req.FlowID, "priority": req.Priority})
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -1054,6 +1064,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.audit(r, "job.cancel", auditObject("job", id), map[string]any{"episode_dir": job.EpisodeDir})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
@@ -1092,6 +1103,7 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "flow name taken")
 		return
 	}
+	s.audit(r, "flow.create", auditObject("flow", fl.ID), map[string]any{"name": fl.Name, "steps": len(fl.Steps)})
 	writeJSON(w, http.StatusCreated, fl)
 }
 
@@ -1132,6 +1144,7 @@ func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "update flow")
 		return
 	}
+	s.audit(r, "flow.update", auditObject("flow", id), map[string]any{"name": existing.Name, "steps": len(existing.Steps)})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -1155,6 +1168,7 @@ func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "delete flow")
 		return
 	}
+	s.audit(r, "flow.delete", auditObject("flow", id), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 

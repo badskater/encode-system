@@ -70,6 +70,7 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("agent binary published from UI", "version", version, "bytes", hdr.Size)
+	s.audit(r, "update.publish_agent", "agent:"+version, map[string]any{"bytes": hdr.Size})
 	writeJSON(w, http.StatusOK, s.Update.Manifest())
 }
 
@@ -332,5 +333,6 @@ func (s *Server) handleRollbackAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Warn("agent release rolled back", "now_current", m.AgentVersion, "now_prev", m.PrevAgentVersion)
+	s.audit(r, "update.rollback_agent", "agent:"+m.AgentVersion, map[string]any{"prev": m.PrevAgentVersion})
 	writeJSON(w, http.StatusOK, m)
 }

@@ -74,5 +74,6 @@ func (s *Server) handlePruneJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("manual job prune", "deleted", n, "days", *req.Days)
+	s.audit(r, "jobs.prune", "jobs", map[string]any{"deleted": n, "days": *req.Days})
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": n, "days": *req.Days})
 }

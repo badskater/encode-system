@@ -255,8 +255,20 @@ func readTailBytes(path string, max int) ([]byte, error) {
 
 // runLogGuard holds the current job's run.log path, guarded for concurrent
 // heartbeat reads while executeJob sets/clears it.
-func (a *Agent) setRunLogPath(p string)    { a.rlGuard.set(p) }
-func (a *Agent) currentRunLogPath() string { return a.rlGuard.get() }
+// setRunLogPath is the legacy single-path setter, kept for tests that
+// exercise the guard directly. The live path now comes from the job
+// registry (per-job run.log slots); see currentRunLogPath.
+func (a *Agent) setRunLogPath(p string) { a.rlGuard.set(p) }
+
+// currentRunLogPath resolves the run.log the FPS parser should read: the
+// newest active job's log when jobs are running (registry), else the
+// legacy guard value (set/cleared by direct callers and tests).
+func (a *Agent) currentRunLogPath() string {
+	if p := a.registry().newestRunLog(); p != "" {
+		return p
+	}
+	return a.rlGuard.get()
+}
 
 // --- collection orchestrator ---
 

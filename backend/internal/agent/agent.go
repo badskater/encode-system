@@ -53,9 +53,12 @@ type Agent struct {
 	LibVersion int64  // EncodeLib version on disk
 	BinVersion int64  // bin-package version on disk (persisted in data_dir)
 
-	mu         sync.Mutex
-	currentJob *model.JobPayload
-	syncing    bool // update sync in progress: job assignment must wait
+	mu sync.Mutex
+	// reg is the multi-job registry (per-node concurrency). It replaces
+	// the old single currentJob pointer; lazy-initialized by registry()
+	// so struct-literal Agents in tests work without New().
+	reg     *jobRegistry
+	syncing bool // update sync in progress: job assignment must wait
 
 	// rlGuard holds the current job's run.log path, guarded for concurrent
 	// heartbeat reads while executeJob sets/clears it. Separate from a.mu so
@@ -112,6 +115,7 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 		Client:  &http.Client{},
 		Version: version,
 		prog:    newProgressTracker(progressRingLines),
+		reg:     newJobRegistry(),
 		stopCh:  make(chan struct{}),
 	}
 	// Default metrics exec seam: only Windows has PowerShell; on other
@@ -256,10 +260,16 @@ func (a *Agent) Run(ctx context.Context) error {
 // heartbeat sends the status report and acts on the controller's instruction.
 func (a *Agent) heartbeat(ctx context.Context) error {
 	a.mu.Lock()
-	job := a.currentJob
 	libVer, binVer := a.LibVersion, a.BinVersion
 	syncing := a.syncing
 	a.mu.Unlock()
+
+	// Per-job live progress: each active job carries its OWN tracker (a
+	// shared one would interleave concurrent encodes' lines). The Jobs
+	// array is the new wire shape; the legacy single-job fields mirror
+	// Jobs[0] so an old controller still tracks one job during a rolling
+	// upgrade.
+	reports := a.jobReports()
 
 	hb := model.Heartbeat{
 		Node:           a.Cfg.NodeName,
@@ -273,23 +283,14 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		// The pointer is always non-nil: zero values are meaningful
 		// (0 = not yet sampled, -1 = no GPU).
 		Metrics: a.collectMetrics(ctx),
+		Jobs:    reports,
 	}
-	if job != nil {
-		hb.JobID = job.ID
-		hb.JobStatus = "running"
-		// Live progress: latest ENCODE_STEP marker + bounded log tail fed
-		// by the lineObserver as PowerShell output arrives. The controller
-		// persists these on every heartbeat (UpdateJobStatus) and pushes
-		// them to SSE log-stream subscribers, so the UI sees encode
-		// progress without waiting for the completion report.
-		var step, tail string
-		var pct float64
-		if a.prog != nil { // nil only for struct-literal agents that never ran a job
-			step, pct, tail = a.prog.snapshot()
-		}
-		hb.Step = step
-		hb.StepProgress = pct
-		hb.LogTail = tail
+	if len(reports) > 0 {
+		hb.JobID = reports[0].JobID
+		hb.JobStatus = reports[0].JobStatus
+		hb.Step = reports[0].Step
+		hb.StepProgress = reports[0].StepProgress
+		hb.LogTail = reports[0].LogTail
 	}
 
 	var reply model.HeartbeatReply
@@ -302,18 +303,12 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		if reply.Job == nil {
 			return fmt.Errorf("job instruction without payload")
 		}
-		a.mu.Lock()
-		if a.currentJob != nil {
-			// Defense in depth: the controller enforces one job per node,
-			// but the agent must never run two encodes even if it receives
-			// a double dispatch (bug or stale instruction).
-			a.mu.Unlock()
-			a.Log.Warn("rejected job while busy", "new_job", reply.Job.ID, "running", a.currentJob.ID)
-			return nil
+		a.spawnJobs([]*model.JobPayload{reply.Job})
+	case "jobs":
+		if len(reply.Jobs) == 0 {
+			return fmt.Errorf("jobs instruction without payloads")
 		}
-		a.mu.Unlock()
-		a.wg.Add(1)
-		go func() { defer a.wg.Done(); a.executeJob(reply.Job) }()
+		a.spawnJobs(reply.Jobs)
 	case "reboot":
 		a.handleReboot(reply.RebootDelay)
 	case "update":
@@ -324,6 +319,30 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 	case "none", "":
 	}
 	return nil
+}
+
+// spawnJobs registers payloads (dedupe + hard cap inside the registry) and
+// launches one executeJob goroutine per ACCEPTED payload. A refused payload
+// (duplicate id or beyond maxLocalJobs) is logged and skipped — the agent
+// must never run the same job twice even on a double dispatch.
+func (a *Agent) spawnJobs(payloads []*model.JobPayload) {
+	accepted := a.registry().accept(payloads)
+	for _, skipped := range payloads {
+		found := false
+		for _, got := range accepted {
+			if got.ID == skipped.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			a.Log.Warn("refused job assignment", "job", skipped.ID, "active", a.activeCount())
+		}
+	}
+	for _, p := range accepted {
+		a.wg.Add(1)
+		go func(job *model.JobPayload) { defer a.wg.Done(); a.executeJob(job) }(p)
+	}
 }
 
 // postJSON sends body to the controller API and decodes the reply.
@@ -379,14 +398,12 @@ var stepLine = regexp.MustCompile(`ENCODE_STEP (\w+) (\d+(?:\.\d+)?)`)
 // executeJob runs one job: write the rendered script, invoke PowerShell,
 // parse progress lines, and report completion.
 func (a *Agent) executeJob(job *model.JobPayload) {
-	a.mu.Lock()
-	a.currentJob = job
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.currentJob = nil
-		a.mu.Unlock()
-	}()
+	// Register if not already (direct test calls bypass acceptJobs); the
+	// registry dedupes by id so a double-register is impossible.
+	r := a.registry()
+	r.accept([]*model.JobPayload{job})
+	aj := r.get(job.ID)
+	defer a.finishJob(job.ID)
 
 	log := a.Log.With("job", job.ID)
 	log.Info("executing job", "flow", job.Flow, "episode", job.Vars["episode_dir"])
@@ -413,12 +430,11 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 
 	ps := a.findPowerShell()
 	runLog := filepath.Join(jobDir, "run.log")
-	// Expose the run.log path to the heartbeat goroutine so FPS can be
-	// parsed from the live log tail. Set before the job starts and
-	// cleared after completion; concurrent reads are safe via rlGuard.
-	a.setRunLogPath(runLog)
-	defer a.setRunLogPath("")
-	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog)
+	// Expose this job's run.log to the heartbeat goroutine (FPS parsing
+	// picks the newest active job's log). Per-job slot in the registry;
+	// cleared with the job on completion.
+	r.setRunLog(job.ID, runLog)
+	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog, aj.prog)
 
 	status := "done"
 	errMsg := ""
@@ -487,18 +503,18 @@ func (a *Agent) findPowerShell() string {
 // arrival time, time.Now()), not a post-hoc single-timestamp pass after
 // cmd.Wait. The full output is still accumulated for tail extraction and the
 // ENCODE_STEP_FAILED scan, which run unchanged.
-func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
 
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
-	if a.prog == nil {
-		// Struct-literal agents in tests bypass New; give them a tracker
-		// so the observer feed and heartbeat snapshot never nil-panic.
-		a.prog = newProgressTracker(progressRingLines)
+	if prog == nil {
+		// Defensive: direct runPowerShell callers without a tracker get a
+		// throwaway one so the observer feed never nil-panics.
+		prog = newProgressTracker(progressRingLines)
 	}
-	observer.prog = a.prog // live heartbeat step/pct/tail feed
-	a.prog.reset()         // fresh state per job — never inherit the previous run
+	observer.prog = prog // per-job live heartbeat step/pct/tail feed
+	prog.reset()         // fresh state per job — never inherit the previous run
 	f, err := os.Create(runLog)
 	if err == nil {
 		defer f.Close()
@@ -653,12 +669,49 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 	a.syncAgent(ctx, m)
 }
 
-// busy reports whether a job is currently running (updates must wait).
-func (a *Agent) busy() bool {
+// registry returns the job registry, lazily initializing it so struct-literal
+// Agents built in tests (bypassing New) work without a nil panic.
+func (a *Agent) registry() *jobRegistry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.currentJob != nil
+	if a.reg == nil {
+		a.reg = newJobRegistry()
+	}
+	return a.reg
 }
+
+// activeCount reports how many jobs are in flight.
+func (a *Agent) activeCount() int { return a.registry().count() }
+
+// acceptJobs registers payloads up to capacity and returns whether all were
+// accepted (false when at least one was refused: duplicate or hard cap). The
+// caller spawns an executeJob goroutine per returned payload.
+func (a *Agent) acceptJobs(payloads []*model.JobPayload) bool {
+	got := a.registry().accept(payloads)
+	return len(got) == len(payloads)
+}
+
+// jobProg returns a job's progress tracker, registering a bare entry if the
+// job was never accepted (tests call executeJob directly). Never nil.
+func (a *Agent) jobProg(id int64) *progressTracker {
+	r := a.registry()
+	if aj := r.get(id); aj != nil {
+		return aj.prog
+	}
+	// Register a payload-less stub so a direct executeJob call in a test
+	// still has a per-job tracker.
+	r.accept([]*model.JobPayload{{ID: id}})
+	return r.get(id).prog
+}
+
+// jobReports snapshots every in-flight job for the heartbeat.
+func (a *Agent) jobReports() []model.HeartbeatJobReport { return a.registry().reports() }
+
+// finishJob drops a completed job from the registry.
+func (a *Agent) finishJob(id int64) { a.registry().remove(id) }
+
+// busy reports whether any job is currently running (updates must wait).
+func (a *Agent) busy() bool { return a.activeCount() > 0 }
 
 // syncLib updates EncodeLib.ps1 when the controller's version is newer. The
 // manifest MUST carry a checksum — an update without one is refused outright.

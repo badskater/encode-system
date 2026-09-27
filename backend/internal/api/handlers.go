@@ -62,24 +62,32 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// An in-flight update sync (lib/bin/agent download+install) counts as
 	// busy: assigning a job now could run it against a half-swapped toolchain.
 	hasActiveJob := hb.Syncing
-	if hb.JobID > 0 {
-		if job, err := s.Store.GetJob(ctx, hb.JobID); err == nil && job != nil && !job.Status.Terminal() {
-			// Ownership check: a node may only report on its own job. Without
-			// this, one node could overwrite or terminate another node's job.
-			if job.NodeID != node.ID {
-				s.Log.Warn("heartbeat reported foreign job", "node", node.Name,
-					"job", job.ID, "owner", job.NodeID)
-			} else {
-				hasActiveJob = true
-				if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(hb.JobStatus), hb.Step, hb.StepProgress, hb.LogTail); err != nil {
-					s.Log.Warn("update job status", "err", err, "job", job.ID)
-				} else {
-					// DB write landed: fan the live snapshot out to SSE
-					// log-stream subscribers. Publish AFTER the store write
-					// so stream events never run ahead of persisted state.
-					s.publishProgress(job.ID, hb.Step, hb.StepProgress, hb.LogTail)
-				}
-			}
+	// Per-node concurrency: process EVERY reported job, not just the
+	// legacy single field. JobReports() normalizes old agents (legacy
+	// fields) and new ones (Jobs array) into one list. reportedIDs feeds
+	// the set-based orphan recovery below.
+	reportedIDs := map[int64]bool{}
+	for _, rep := range hb.JobReports() {
+		job, err := s.Store.GetJob(ctx, rep.JobID)
+		if err != nil || job == nil || job.Status.Terminal() {
+			continue
+		}
+		// Ownership check: a node may only report on its own job. Without
+		// this, one node could overwrite or terminate another node's job.
+		if job.NodeID != node.ID {
+			s.Log.Warn("heartbeat reported foreign job", "node", node.Name,
+				"job", job.ID, "owner", job.NodeID)
+			continue
+		}
+		reportedIDs[job.ID] = true
+		hasActiveJob = true
+		if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(rep.JobStatus), rep.Step, rep.StepProgress, rep.LogTail); err != nil {
+			s.Log.Warn("update job status", "err", err, "job", job.ID)
+		} else {
+			// DB write landed: fan the live snapshot out to SSE
+			// log-stream subscribers. Publish AFTER the store write
+			// so stream events never run ahead of persisted state.
+			s.publishProgress(job.ID, rep.Step, rep.StepProgress, rep.LogTail)
 		}
 	}
 
@@ -111,40 +119,51 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// controller-detected failure gets identical treatment to an agent-reported
 	// one. When the orphan is auto-retried, notify is skipped (the helper already
 	// scheduled the retry); otherwise it notifies as before.
-	if !hasActiveJob {
-		if orphan, err := s.Store.ActiveJobForNode(ctx, node.ID); err == nil && orphan != nil &&
-			orphan.Status == model.JobRunning {
+	// Set-based orphan recovery for per-node concurrency: every DB-active
+	// job this node owns that is NOT in the heartbeat's reported set and
+	// has already been acknowledged (status running) died silently — fail
+	// it so retry/steering can act. Assigned-but-unreported jobs are left
+	// alone (fresh assignment race, same as the single-job rule).
+	// activeCount below is derived from this same DB snapshot AFTER the
+	// orphan finishes, so a node that just lost every job to orphaning is
+	// correctly seen as empty.
+	activeCount := 0
+	if active, err := s.Store.ActiveJobsForNode(ctx, node.ID); err == nil {
+		for _, orphan := range active {
+			if orphan.Status != model.JobRunning || reportedIDs[orphan.ID] {
+				continue
+			}
 			if err := s.Store.FinishJob(ctx, orphan.ID, model.JobFailed, -1,
 				"node stopped reporting the job (reboot/restart) — orphaned; retry it", nil, ""); err != nil {
 				s.Log.Warn("orphan job cleanup", "err", err, "job", orphan.ID)
-			} else {
-				// Re-read the job so shouldAutoRetry sees the just-stamped
-				// failed state (RetryCount etc. from the DB row).
-				failed, err := s.Store.GetJob(ctx, orphan.ID)
-				if err != nil {
-					// Transient DB error reading back the just-failed job. Log
-					// ERROR (not WARN) so the operator sees it in the controller
-					// logs — the job row itself is already 'failed' and visible
-					// in the UI, so this does NOT strand the job. Skip retry
-					// and notify for this cycle: retry needs the job row to
-					// read RetryCount/the flow's policy, and notify would just
-					// re-read the same failing DB; both would add nothing
-					// against the same transient error. The next heartbeat's
-					// orphan check will re-evaluate (the job is terminal now,
-					// so it won't be re-orphaned, but an operator can retry
-					// it manually from the UI).
-					s.Log.Error("orphan recovery: GetJob after finish failed (job is already failed+visible in UI; skipped retry/notify this cycle)",
-						"job", orphan.ID, "err", err)
-				} else if s.shouldAutoRetry(ctx, failed, orphan.ID) {
-					s.Log.Info("orphaned job auto-retried (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
-				} else {
-					s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
-					// Terminal SSE event for the orphan (mirrors the
-					// completion path so open log streams close).
-					s.publishFinal(orphan.ID, string(model.JobFailed), failed.Error, failed.ExitCode, failed.FullLog != "")
-					s.notifyJobFinished(ctx, orphan.ID, "controller")
-				}
+				continue
 			}
+			// Re-read the job so shouldAutoRetry sees the just-stamped
+			// failed state (RetryCount etc. from the DB row).
+			failed, err := s.Store.GetJob(ctx, orphan.ID)
+			if err != nil {
+				// Transient DB error reading back the just-failed job: the
+				// row is already 'failed' and visible in the UI, so the job
+				// is not stranded — an operator can retry it manually.
+				s.Log.Error("orphan recovery: GetJob after finish failed (job is already failed+visible in UI; skipped retry/notify this cycle)",
+					"job", orphan.ID, "err", err)
+			} else if s.shouldAutoRetry(ctx, failed, orphan.ID) {
+				s.Log.Info("orphaned job auto-retried (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+			} else {
+				s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+				// Terminal SSE event for the orphan (mirrors the
+				// completion path so open log streams close).
+				s.publishFinal(orphan.ID, string(model.JobFailed), failed.Error, failed.ExitCode, failed.FullLog != "")
+				s.notifyJobFinished(ctx, orphan.ID, "controller")
+			}
+		}
+		// Survivors (still-running or freshly assigned) occupy slots.
+		for _, j := range active {
+			if !reportedIDs[j.ID] && j.Status == model.JobRunning {
+				// Just failed as an orphan above — no longer active.
+				continue
+			}
+			activeCount++
 		}
 	}
 
@@ -159,7 +178,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		s.Log.Warn("reboot attempt expired, resetting", "node", node.Name,
 			"tasks", node.TasksSinceBoot)
 	}
-	if hasActiveJob {
+	// Node status under per-node concurrency: busy only AT capacity (or
+	// syncing). A node with free slots stays idle so the UI and the
+	// stale-node heuristics treat it as available.
+	maxConc := node.MaxConcurrentJobs
+	if maxConc < 1 {
+		maxConc = 1
+	}
+	atCapacity := hb.Syncing || activeCount >= maxConc
+	if atCapacity {
 		node.Status = model.NodeBusy
 	} else if node.RebootPending {
 		node.Status = model.NodeReboot
@@ -222,8 +249,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		return
 	}
 
-	// 4. Assign a pending job if the node is idle and under the limit.
-	if hasActiveJob || node.RebootPending || node.TasksSinceBoot >= s.Cfg.TasksBeforeReboot {
+	// 4. Assign pending jobs while the node has free slots (per-node
+	//    concurrency). max=1 reproduces the historical one-job rule.
+	freeSlots := maxConc - activeCount
+	if hb.Syncing || freeSlots <= 0 || node.RebootPending || node.TasksSinceBoot >= s.Cfg.TasksBeforeReboot {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
@@ -251,34 +280,49 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// NextAssignableJobForNode gates on next_retry_at (a backoff-pending
 	// job is not ready yet), orders by priority DESC then id ASC so urgent
 	// jobs dispatch first and, within a priority tier, the oldest job wins
-	// (true FIFO), and steers away from jobs this node most recently failed
-	// (node-local faults re-fail identically on retry) while any other
-	// candidate exists. ListJobs stays for the UI, which must still show
-	// retry-pending jobs.
-	job, err := s.Store.NextAssignableJobForNode(ctx, node.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "list pending jobs")
-		return
+	// (true FIFO), steers away from jobs this node most recently failed,
+	// and honors group routing + series pause. The loop fills every free
+	// slot in one heartbeat reply; AssignJob re-checks capacity inside its
+	// transaction, so concurrent heartbeats can never overshoot the cap.
+	var payloads []*model.JobPayload
+	for i := 0; i < freeSlots; i++ {
+		job, err := s.Store.NextAssignableJobForNode(ctx, node.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "list pending jobs")
+			return
+		}
+		if job == nil {
+			break // queue drained
+		}
+		payload, err := s.renderJob(ctx, job)
+		if err != nil {
+			s.Log.Error("render job failed", "job", job.ID, "err", err)
+			s.Store.FinishJob(ctx, job.ID, model.JobFailed, -1, "render failed: "+err.Error(), nil, "")
+			s.notifyJobFinished(ctx, job.ID, "controller")
+			continue // try the next candidate with the remaining slots
+		}
+		if err := s.Store.AssignJob(ctx, job.ID, node.ID); err != nil {
+			// Lost a race (another heartbeat took the slot or the node
+			// filled up) — stop assigning; the next heartbeat re-evaluates.
+			s.Log.Warn("assign job", "err", err, "job", job.ID, "node", node.Name)
+			break
+		}
+		s.Log.Info("assigned job", "job", job.ID, "node", node.Name, "episode", job.EpisodeDir)
+		payloads = append(payloads, payload)
 	}
-	if job == nil {
+	if len(payloads) == 0 {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
-	payload, err := s.renderJob(ctx, job)
-	if err != nil {
-		s.Log.Error("render job failed", "job", job.ID, "err", err)
-		s.Store.FinishJob(ctx, job.ID, model.JobFailed, -1, "render failed: "+err.Error(), nil, "")
-		s.notifyJobFinished(ctx, job.ID, "controller")
-		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
-		return
+	reply := model.HeartbeatReply{Instruction: "job", Job: payloads[0]}
+	if len(payloads) > 1 {
+		// Multi-slot agents read Jobs; Job is still set (payloads[0]) so
+		// an old agent that somehow has free slots (impossible at max=1)
+		// would still run exactly one job.
+		reply.Instruction = "jobs"
+		reply.Jobs = payloads
 	}
-	if err := s.Store.AssignJob(ctx, job.ID, node.ID); err != nil {
-		s.Log.Warn("assign job", "err", err, "job", job.ID, "node", node.Name)
-		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
-		return
-	}
-	s.Log.Info("assigned job", "job", job.ID, "node", node.Name, "episode", job.EpisodeDir)
-	writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "job", Job: payload})
+	writeJSON(w, http.StatusOK, reply)
 }
 
 // renderJob builds the PowerShell payload for a job from its flow.
@@ -632,8 +676,9 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Enabled *bool   `json:"enabled"`
-		Group   *string `json:"group"`
+		Enabled           *bool   `json:"enabled"`
+		Group             *string `json:"group"`
+		MaxConcurrentJobs *int    `json:"max_concurrent_jobs"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -658,6 +703,19 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node.Group = *req.Group
+	}
+	// Concurrency cap: validated here (1-8) before the field-scoped write;
+	// the store clamps too (defense in depth for direct callers).
+	if req.MaxConcurrentJobs != nil {
+		if *req.MaxConcurrentJobs < 1 || *req.MaxConcurrentJobs > 8 {
+			writeErr(w, http.StatusBadRequest, "max_concurrent_jobs must be 1-8")
+			return
+		}
+		if err := s.Store.SetNodeMaxConcurrent(r.Context(), id, *req.MaxConcurrentJobs); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update node concurrency")
+			return
+		}
+		node.MaxConcurrentJobs = *req.MaxConcurrentJobs
 	}
 	if err := s.Store.UpdateNode(r.Context(), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "update node")
@@ -965,17 +1023,23 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	case model.JobAssigned:
 		// Assigned but not yet running: cancel and free the node. A late
 		// completion from the agent is absorbed by the idempotency guard.
-		if err := s.Store.ReleaseNode(r.Context(), job.NodeID); err != nil {
-			writeErr(w, http.StatusInternalServerError, "release node")
-			return
-		}
+		// Order matters under per-node concurrency: ReleaseNode recomputes
+		// idle/busy from the remaining active jobs, so the job must leave
+		// 'assigned' state BEFORE the node is released.
 	default:
 		writeErr(w, http.StatusConflict, "only pending/assigned jobs can be cancelled (running jobs must finish)")
 		return
 	}
-	if _, err := s.Store.CancelJob(r.Context(), id); err != nil {
+	n, err := s.Store.CancelJob(r.Context(), id)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "cancel job")
 		return
+	}
+	if job.Status == model.JobAssigned && n > 0 {
+		if err := s.Store.ReleaseNode(r.Context(), job.NodeID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "release node")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }

@@ -177,7 +177,15 @@ type Node struct {
 	// Group is a free-form routing label. Jobs whose series has a matching
 	// node_group route to this node; an empty group is a wildcard that
 	// accepts any job. Set via PATCH /api/nodes/{id} {group}.
-	Group          string `json:"group"`
+	Group string `json:"group"`
+	// MaxConcurrentJobs is how many jobs this node may run at once
+	// (default 1 = the historical one-job-per-node rule). Light steps
+	// (audio, mux) benefit from overlap; heavy x265 encodes usually want 1.
+	// Clamped 1-8 by SetNodeMaxConcurrent.
+	MaxConcurrentJobs int `json:"max_concurrent_jobs"`
+	// ActiveJobs is a transient count of assigned/running jobs, filled by
+	// ListNodes for the UI ("1/2 slots" display). Never persisted.
+	ActiveJobs     int    `json:"active_jobs"`
 	AgentVersion   string `json:"agent_version"`
 	LibVersion     int64  `json:"lib_version"`
 	BinVersion     int64  `json:"bin_version"` // bin package version on node (0 = none)
@@ -350,6 +358,17 @@ type PairingCode struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// HeartbeatJobReport is one in-flight job's live state within a heartbeat.
+// A concurrent-capable agent reports one entry per running job; the
+// controller updates each job's status/progress and fans it to SSE.
+type HeartbeatJobReport struct {
+	JobID        int64   `json:"job_id"`
+	JobStatus    string  `json:"job_status,omitempty"`
+	Step         string  `json:"step,omitempty"`
+	StepProgress float64 `json:"step_progress,omitempty"`
+	LogTail      string  `json:"log_tail,omitempty"`
+}
+
 // Heartbeat is the periodic agent status report.
 type Heartbeat struct {
 	Node           string  `json:"node"`
@@ -358,14 +377,36 @@ type Heartbeat struct {
 	BinVersion     int64   `json:"bin_version"` // bin package version on disk (0 = none)
 	Syncing        bool    `json:"syncing"`     // update sync in flight: treat node as busy
 	TasksSinceBoot int     `json:"tasks_since_boot"`
+	// Legacy single-job fields, still sent by concurrency-capable agents
+	// for their FIRST active job so an old controller keeps working during
+	// a rolling upgrade. Prefer Jobs when non-empty.
 	JobID          int64   `json:"job_id,omitempty"`
 	JobStatus      string  `json:"job_status,omitempty"`
 	Step           string  `json:"step,omitempty"`
 	StepProgress   float64 `json:"step_progress,omitempty"`
 	LogTail        string  `json:"log_tail,omitempty"`
+	// Jobs carries every in-flight job (per-node concurrency). Empty for
+	// old agents; the controller falls back to the legacy single fields.
+	Jobs []HeartbeatJobReport `json:"jobs,omitempty"`
 	// Metrics is the agent's latest resource sample. nil for old agents
 	// that do not report metrics — callers must nil-check before use.
 	Metrics *NodeMetrics `json:"metrics,omitempty"`
+}
+
+// jobReports normalizes the heartbeat into a per-job list: the Jobs array
+// when present (new agents), else the legacy single-job fields (old agents).
+// The controller and tests share one code path via this method.
+func (h *Heartbeat) JobReports() []HeartbeatJobReport {
+	if len(h.Jobs) > 0 {
+		return h.Jobs
+	}
+	if h.JobID > 0 {
+		return []HeartbeatJobReport{{
+			JobID: h.JobID, JobStatus: h.JobStatus, Step: h.Step,
+			StepProgress: h.StepProgress, LogTail: h.LogTail,
+		}}
+	}
+	return nil
 }
 
 // JobPayload is what the controller hands to an agent to run a job.
@@ -400,8 +441,15 @@ type UpdateManifest struct {
 
 // HeartbeatReply is the controller's instruction channel to the agent.
 type HeartbeatReply struct {
-	Instruction string          `json:"instruction"` // none | job | reboot | update
-	Job         *JobPayload     `json:"job,omitempty"`
+	Instruction string `json:"instruction"` // none | job | jobs | reboot | update
+	// Job carries a single assignment. Kept for old agents: when the
+	// controller assigns to an old agent (no Jobs reported) only Job is
+	// set. New agents prefer the Jobs array.
+	Job *JobPayload `json:"job,omitempty"`
+	// Jobs carries one or more assignments for concurrency-capable agents
+	// (the agent's reported free slots). Job is ALSO set to Jobs[0] so an
+	// old agent receiving this reply still runs exactly one job.
+	Jobs        []*JobPayload   `json:"jobs,omitempty"`
 	RebootDelay int             `json:"reboot_delay_seconds,omitempty"`
 	Update      *UpdateManifest `json:"update,omitempty"`
 }

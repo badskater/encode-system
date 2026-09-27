@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   enabled INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'idle',
   "group" TEXT NOT NULL DEFAULT '',
+  max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
   agent_version TEXT NOT NULL DEFAULT '',
   lib_version INTEGER NOT NULL DEFAULT 0,
   bin_version INTEGER NOT NULL DEFAULT 0,
@@ -183,6 +184,12 @@ func (s *Store) migrateV2() error {
 	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN "group" TEXT NOT NULL DEFAULT ''`); err != nil {
 		if !isDuplicateColumnErr(err) {
 			return fmt.Errorf("migrate v2 nodes.group: %w", err)
+		}
+	}
+	// nodes.max_concurrent_jobs: per-node job slots (1 = historical rule).
+	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN max_concurrent_jobs INTEGER NOT NULL DEFAULT 1`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 nodes.max_concurrent_jobs: %w", err)
 		}
 	}
 	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN node_group TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -332,14 +339,14 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
@@ -349,7 +356,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	var enabled, reboot int
 	var lastSeen, issuedAt sql.NullString
 	var createdAt string
-	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.AgentVersion,
+	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.MaxConcurrentJobs, &n.AgentVersion,
 		&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt)
 	if err != nil {
 		return nil, err
@@ -368,7 +375,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -380,7 +387,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		var enabled, reboot int
 		var lastSeen, issuedAt sql.NullString
 		var createdAt string
-		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.AgentVersion,
+		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.MaxConcurrentJobs, &n.AgentVersion,
 			&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt); err != nil {
 			return nil, err
 		}
@@ -395,7 +402,33 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		n.CreatedAt = parseTime(createdAt)
 		out = append(out, &n)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Transient per-node active-job counts for the UI ("1/2 slots").
+	// One grouped query, not one per node — the fleet list must not do
+	// N+1 round trips on a 4s poll.
+	counts := map[int64]int{}
+	crows, err := s.db.QueryContext(ctx,
+		`SELECT node_id, COUNT(*) FROM jobs WHERE status IN ('assigned','running') GROUP BY node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer crows.Close()
+	for crows.Next() {
+		var id, cnt int
+		if err := crows.Scan(&id, &cnt); err != nil {
+			return nil, err
+		}
+		counts[int64(id)] = cnt
+	}
+	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	for _, n := range out {
+		n.ActiveJobs = counts[n.ID]
+	}
+	return out, nil
 }
 
 // UpdateNode persists mutable node fields after a heartbeat or UI action.
@@ -422,7 +455,7 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
@@ -734,23 +767,28 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	}
 	defer tx.Rollback()
 
-	var active int
+	// Capacity check inside the transaction: the count AND the row flip
+	// must be atomic or two concurrent heartbeats could both pass the
+	// guard and overshoot max_concurrent_jobs.
+	var active, maxConc, enabled int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT enabled, max_concurrent_jobs FROM nodes WHERE id = ?`, nodeID).Scan(&enabled, &maxConc); err != nil {
+		return fmt.Errorf("assign to unknown node %d: %w", nodeID, err)
+	}
+	// The node must exist and be enabled; otherwise the job would be handed
+	// to a box that never runs it and the node row could be wrongly flipped.
+	if enabled == 0 {
+		return fmt.Errorf("node %d is disabled", nodeID)
+	}
+	if maxConc < 1 {
+		maxConc = 1 // legacy rows pre-migration; never allow 0 slots
+	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status IN ('assigned','running')`, nodeID).Scan(&active); err != nil {
 		return err
 	}
-	if active > 0 {
-		return fmt.Errorf("node %d already has an active job", nodeID)
-	}
-
-	// The node must exist and be enabled; otherwise the job would be handed
-	// to a box that never runs it and the node row could be wrongly flipped.
-	var enabled int
-	if err := tx.QueryRowContext(ctx, `SELECT enabled FROM nodes WHERE id = ?`, nodeID).Scan(&enabled); err != nil {
-		return fmt.Errorf("assign to unknown node %d: %w", nodeID, err)
-	}
-	if enabled == 0 {
-		return fmt.Errorf("node %d is disabled", nodeID)
+	if active >= maxConc {
+		return fmt.Errorf("node %d already has %d active job(s) (max %d)", nodeID, active, maxConc)
 	}
 
 	res, err := tx.ExecContext(ctx,
@@ -766,8 +804,13 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		return fmt.Errorf("job %d not pending (rows affected %d)", jobID, n)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET status='busy' WHERE id=?`, nodeID); err != nil {
-		return err
+	// Flip to busy only when this assignment fills the last slot — a node
+	// with spare capacity stays 'idle' so the UI and stale-node heuristics
+	// keep treating it as available.
+	if active+1 >= maxConc {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET status='busy' WHERE id=?`, nodeID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -953,9 +996,53 @@ func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job,
 	return nil, nil
 }
 
-// ReleaseNode sets the node back to idle after a job finishes.
+// ReleaseNode recomputes the node's busy/idle flag after a job finishes:
+// idle when a slot is free (active < max_concurrent_jobs), busy while the
+// node is still at capacity. Finishing one of N jobs must not mark a
+// still-full node idle, and freeing the last slot of a capped node must
+// make it available again.
 func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='idle' WHERE id=?`, nodeID)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE nodes SET status='idle' WHERE id=? AND (
+			SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status IN ('assigned','running')
+		) < max_concurrent_jobs`,
+		nodeID, nodeID)
+	return err
+}
+
+// ActiveJobsForNode returns all assigned/running jobs for a node (the set
+// the controller needs for multi-job orphan recovery).
+func (s *Store) ActiveJobsForNode(ctx context.Context, nodeID int64) ([]*model.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Job
+	for rows.Next() {
+		j, err := scanJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// SetNodeMaxConcurrent updates the per-node job-slot cap, clamped to 1-8
+// (defense in depth: the API validates too, but a direct store caller must
+// never be able to write 0 slots — that would strand the node).
+func (s *Store) SetNodeMaxConcurrent(ctx context.Context, id int64, maxJobs int) error {
+	if maxJobs < 1 {
+		maxJobs = 1
+	}
+	if maxJobs > 8 {
+		maxJobs = 8
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET max_concurrent_jobs=? WHERE id=?`, maxJobs, id)
 	return err
 }
 

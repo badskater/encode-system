@@ -58,3 +58,32 @@ describe('Nodes page group cell', () => {
     await waitFor(() => expect(patchSpy).toHaveBeenCalledWith(1, 'gpu'));
   });
 });
+
+describe('Nodes page concurrency slots', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'pairingCodes').mockResolvedValue([]);
+  });
+
+  it('shows active/max slots and defaults max to 1', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([
+      nodeFixture({ max_concurrent_jobs: 2, active_jobs: 1 }),
+    ]);
+
+    render(<NodesPage />);
+    await waitFor(() => expect(screen.getByText('1/2')).toBeInTheDocument());
+  });
+
+  it('PATCHes max_concurrent_jobs when the select changes', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([nodeFixture({ max_concurrent_jobs: 1 })]);
+    const patchSpy = vi
+      .spyOn(api, 'setNodeConcurrency')
+      .mockResolvedValue(nodeFixture({ max_concurrent_jobs: 3 }));
+
+    render(<NodesPage />);
+    const select = await screen.findByLabelText(/max concurrent jobs/i);
+    fireEvent.change(select, { target: { value: '3' } });
+
+    await waitFor(() => expect(patchSpy).toHaveBeenCalledWith(1, 3));
+  });
+});

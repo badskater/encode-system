@@ -179,6 +179,10 @@ export interface Node {
   // Routing label matched against series.node_group; '' = wildcard node
   // that accepts jobs from any series.
   group?: string;
+  // Per-node job slots (1 = historical one-job rule). ActiveJobs is the
+  // transient count of assigned/running jobs for the "1/2 slots" display.
+  max_concurrent_jobs?: number;
+  active_jobs?: number;
   agent_version: string;
   lib_version: number;
   bin_version?: number;

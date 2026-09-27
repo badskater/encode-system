@@ -45,6 +45,18 @@ export default function NodesPage() {
     }
   }
 
+  // changeConcurrency sets the per-node job-slot cap (1-8). Light steps
+  // (audio/mux) overlap well; heavy x265 encodes usually want 1.
+  async function changeConcurrency(n: Node, maxJobs: number) {
+    try {
+      await api.setNodeConcurrency(n.id, maxJobs);
+      setActionError(null);
+      refreshNodes();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
   // changeGroup sets the routing label; blank = wildcard node that accepts
   // jobs from any series (series.node_group matching happens at dispatch).
   async function changeGroup(n: Node, group: string) {
@@ -172,6 +184,7 @@ export default function NodesPage() {
           <tr>
             <th>Name</th>
             <th>Status</th>
+            <th>Slots</th>
             <th>Enabled</th>
             <th>Group</th>
             <th>Metrics</th>
@@ -193,6 +206,24 @@ export default function NodesPage() {
               <tr>
                 <td>{n.name}</td>
                 <td>{nodeBadge(n.status, !!n.online)}</td>
+                <td>
+                  {/* active/max slot display; the select sets the cap
+                      (1 = one job at a time, the historical rule). */}
+                  <span className="muted" style={{ marginRight: 6 }}>
+                    {n.active_jobs ?? 0}/{n.max_concurrent_jobs ?? 1}
+                  </span>
+                  <select
+                    value={n.max_concurrent_jobs ?? 1}
+                    aria-label="Max concurrent jobs"
+                    onChange={(e) => changeConcurrency(n, Number(e.target.value))}
+                  >
+                    {[1, 2, 3, 4, 5, 6, 7, 8].map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                  </select>
+                </td>
                 <td>
                   <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
                 </td>
@@ -231,7 +262,7 @@ export default function NodesPage() {
               </tr>
               {metricsNode?.id === n.id && (
                 <tr>
-                  <td colSpan={12} style={{ padding: 0, border: 'none' }}>
+                  <td colSpan={13} style={{ padding: 0, border: 'none' }}>
                     <NodeMetricsPanel
                       nodeId={n.id}
                       nodeName={n.name}

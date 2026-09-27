@@ -371,20 +371,20 @@ type HeartbeatJobReport struct {
 
 // Heartbeat is the periodic agent status report.
 type Heartbeat struct {
-	Node           string  `json:"node"`
-	AgentVersion   string  `json:"agent_version"`
-	LibVersion     int64   `json:"lib_version"`
-	BinVersion     int64   `json:"bin_version"` // bin package version on disk (0 = none)
-	Syncing        bool    `json:"syncing"`     // update sync in flight: treat node as busy
-	TasksSinceBoot int     `json:"tasks_since_boot"`
+	Node           string `json:"node"`
+	AgentVersion   string `json:"agent_version"`
+	LibVersion     int64  `json:"lib_version"`
+	BinVersion     int64  `json:"bin_version"` // bin package version on disk (0 = none)
+	Syncing        bool   `json:"syncing"`     // update sync in flight: treat node as busy
+	TasksSinceBoot int    `json:"tasks_since_boot"`
 	// Legacy single-job fields, still sent by concurrency-capable agents
 	// for their FIRST active job so an old controller keeps working during
 	// a rolling upgrade. Prefer Jobs when non-empty.
-	JobID          int64   `json:"job_id,omitempty"`
-	JobStatus      string  `json:"job_status,omitempty"`
-	Step           string  `json:"step,omitempty"`
-	StepProgress   float64 `json:"step_progress,omitempty"`
-	LogTail        string  `json:"log_tail,omitempty"`
+	JobID        int64   `json:"job_id,omitempty"`
+	JobStatus    string  `json:"job_status,omitempty"`
+	Step         string  `json:"step,omitempty"`
+	StepProgress float64 `json:"step_progress,omitempty"`
+	LogTail      string  `json:"log_tail,omitempty"`
 	// Jobs carries every in-flight job (per-node concurrency). Empty for
 	// old agents; the controller falls back to the legacy single fields.
 	Jobs []HeartbeatJobReport `json:"jobs,omitempty"`

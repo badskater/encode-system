@@ -182,6 +182,8 @@ export const api = {
     request<Node>('PATCH', `/api/nodes/${id}`, { enabled }),
   setNodeGroup: (id: number, group: string) =>
     request<Node>('PATCH', `/api/nodes/${id}`, { group }),
+  setNodeConcurrency: (id: number, maxJobs: number) =>
+    request<Node>('PATCH', `/api/nodes/${id}`, { max_concurrent_jobs: maxJobs }),
   rebootNode: (id: number) => request<Node>('POST', `/api/nodes/${id}/reboot`),
   deleteNode: (id: number) => request<void>('DELETE', `/api/nodes/${id}`),
 

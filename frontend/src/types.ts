@@ -134,6 +134,18 @@ export interface ProvisionRun {
   finished_at?: string;
 }
 
+// AuditEvent is one row of the audit log (GET /api/audit): who did what to
+// which object. Detail is a small JSON snippet (already secret-scrubbed
+// server-side). At is a server timestamp string.
+export interface AuditEvent {
+  id: number;
+  at: string;
+  actor: string;
+  action: string;
+  object: string;
+  detail: string;
+}
+
 // JobETA is the response of GET /api/jobs/{id}/eta: a remaining-time
 // prediction from the average duration of done jobs on the same flow.
 // eta_sec < 0 means "no estimate" (insufficient history).

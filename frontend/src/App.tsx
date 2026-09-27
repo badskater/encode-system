@@ -8,11 +8,12 @@ import StepsPage from './pages/Steps';
 import SettingsPage from './pages/Settings';
 import ProvisionPage from './pages/Provision';
 import StatsPage from './pages/Stats';
+import AuditPage from './pages/Audit';
 import TokenGate from './components/TokenGate';
 import ChangePasswordDialog from './components/ChangePasswordDialog';
 import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './api/client';
 
-type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'stats' | 'settings' | 'provision';
+type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'stats' | 'audit' | 'settings' | 'provision';
 
 const PAGES: { id: Page; label: string }[] = [
   { id: 'dashboard', label: 'Dashboard' },
@@ -22,6 +23,7 @@ const PAGES: { id: Page; label: string }[] = [
   { id: 'flows', label: 'Flows' },
   { id: 'steps', label: 'Steps' },
   { id: 'stats', label: 'Stats' },
+  { id: 'audit', label: 'Audit' },
   { id: 'provision', label: 'Provision' },
   { id: 'settings', label: 'Settings' },
 ];
@@ -109,6 +111,7 @@ export default function App() {
         {page === 'flows' && <FlowsPage />}
         {page === 'steps' && <StepsPage />}
         {page === 'stats' && <StatsPage />}
+        {page === 'audit' && <AuditPage />}
         {page === 'settings' && <SettingsPage />}
         {page === 'provision' && <ProvisionPage />}
       </main>

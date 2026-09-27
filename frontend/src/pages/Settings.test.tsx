@@ -152,3 +152,37 @@ describe('Settings job retention', () => {
     expect(sent.job_retention_days).toBe(3650);
   });
 });
+
+describe('Settings agent rollback', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+  });
+
+  it('hides the rollback button when no previous release exists', async () => {
+    vi.spyOn(api, 'manifest').mockResolvedValue({ ...manifest });
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    expect(screen.queryByRole('button', { name: /rollback/i })).not.toBeInTheDocument();
+  });
+
+  it('shows and runs the rollback when a previous release exists', async () => {
+    vi.spyOn(api, 'manifest').mockResolvedValue({
+      ...manifest,
+      agent_version: '1.1.0',
+      prev_agent_version: '1.0.0',
+    });
+    const rollbackSpy = vi.spyOn(api, 'rollbackAgent').mockResolvedValue({
+      ...manifest,
+      agent_version: '1.0.0',
+      prev_agent_version: '1.1.0',
+    });
+    render(<SettingsPage />);
+    const btn = await screen.findByRole('button', { name: /rollback to 1\.0\.0/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect(rollbackSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByText(/rolled back to agent 1\.0\.0/i)).toBeInTheDocument(),
+    );
+  });
+});

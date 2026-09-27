@@ -193,6 +193,25 @@ export default function SettingsPage() {
     }
   }
 
+  // rollback promotes the previous agent release back to current. The
+  // server keeps exactly one release of history (rotated on each publish);
+  // with no rollback slot the endpoint 409s and the message surfaces in
+  // the error box. Nodes self-downgrade on their next idle heartbeat.
+  async function rollback() {
+    setError(null);
+    setNotice(null);
+    setPublishing('rollback');
+    try {
+      const m = await api.rollbackAgent();
+      setNotice(`Rolled back to agent ${m.agent_version} — idle nodes adopt it on their next heartbeat.`);
+      await refreshManifest();
+    } catch (e) {
+      setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
+    } finally {
+      setPublishing('');
+    }
+  }
+
   const field = (label: string, hint: string, key: StringSettingKey, placeholder = '') => (
     <label style={{ display: 'block', marginBottom: 12 }}>
       <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
@@ -389,6 +408,16 @@ export default function SettingsPage() {
           <button className="btn primary" disabled={publishing !== '' || !agentFile || !agentVersion.trim()} onClick={() => publish('agent')}>
             {publishing === 'agent' ? 'Publishing…' : 'Publish agent'}
           </button>
+          {manifest?.prev_agent_version && (
+            <button
+              className="btn danger"
+              disabled={publishing !== ''}
+              onClick={rollback}
+              title={`Promote the previous release (${manifest.prev_agent_version}) back to current; nodes self-downgrade on their next idle heartbeat`}
+            >
+              {publishing === 'rollback' ? 'Rolling back…' : `Rollback to ${manifest.prev_agent_version}`}
+            </button>
+          )}
         </div>
 
         <div className="toolbar" style={{ alignItems: 'flex-end' }}>

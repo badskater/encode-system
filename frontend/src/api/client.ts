@@ -146,6 +146,10 @@ export const api = {
   // ---------- Update publishing (agent / EncodeLib / bin package) ----------
   manifest: () => request<UpdateManifest>('GET', '/api/updates/manifest'),
   publishAgent: (version: string, file: File) => publishUpload('/api/updates/agent', version, file),
+  // rollbackAgent promotes the previous agent release back to current
+  // (POST /api/updates/agent/rollback). Nodes self-downgrade on their next
+  // idle heartbeat via the normal sync; returns the post-rollback manifest.
+  rollbackAgent: () => request<UpdateManifest>('POST', '/api/updates/agent/rollback'),
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
   publishBinFromURL: (url: string, version: number, sha256?: string) =>

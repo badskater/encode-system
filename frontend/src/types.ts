@@ -124,6 +124,10 @@ export interface ProvisionRun {
 export interface UpdateManifest {
   agent_version: string;
   agent_sha256: string;
+  // Previous agent release kept for one-click rollback (empty until a
+  // second publish has rotated a payload into the rollback slot).
+  prev_agent_version?: string;
+  prev_agent_sha256?: string;
   lib_version: number;
   lib_sha256: string;
   bin_version: number;

@@ -69,6 +69,11 @@ type Server struct {
 	// heartbeat/completion paths publish unconditionally; in-memory only —
 	// subscribers reconnect and re-snapshot after a controller restart.
 	logHub *logHub
+	// diskGuard tracks per-node disk-alert cooldowns so a node hovering at
+	// the threshold alerts once per window instead of every heartbeat.
+	// Built in New (never nil). In-memory only — a restart resets cooldowns
+	// (acceptable: worst case one extra alert after a restart).
+	diskGuard *diskGuardState
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -98,8 +103,9 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
-		digest: &digestState{buf: notify.NewDigestBuffer()},
-		logHub: newLogHub(),
+		digest:    &digestState{buf: notify.NewDigestBuffer()},
+		logHub:    newLogHub(),
+		diskGuard: &diskGuardState{last: map[int64]time.Time{}},
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")

@@ -134,6 +134,12 @@ type Settings struct {
 	// job-outcome alerts and the discord_notify flow step (as the fallback
 	// when a flow omits its own webhook param). Empty = notifications off.
 	DiscordWebhook string `json:"discord_webhook"`
+	// DiskAlertGB is the free-disk threshold (GB) on the drive the agent
+	// measures. A heartbeat reporting less free space (1) fires a Discord
+	// alert with a per-node cooldown and (2) soft-drains the node: no new
+	// job is assigned until it recovers above the threshold. 0 = disabled
+	// (default) — no alert, no drain, old behavior.
+	DiskAlertGB int64 `json:"disk_alert_gb"`
 	// DrainMode stops the queue from assigning new jobs to nodes — used to
 	// safely drain the farm for maintenance without cancelling in-flight
 	// encodes. Persisted in the settings JSON blob (not a SQL column).

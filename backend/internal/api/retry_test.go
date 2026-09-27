@@ -20,10 +20,12 @@ import (
 // whether a notification fired (the auto-retry path must be silent). It
 // implements notify.Notifier.
 type recordingNotifier struct {
-	mu      sync.Mutex
-	calls   []recordedCall
-	fired   int
-	payload []map[string]string // contents for Discord-style assertion
+	mu         sync.Mutex
+	calls      []recordedCall
+	fired      int
+	payload    []map[string]string // contents for Discord-style assertion
+	alertCount int
+	alertTexts []string
 }
 
 type recordedCall struct {
@@ -37,6 +39,21 @@ func (r *recordingNotifier) JobFinished(_ context.Context, j *model.Job, nodeNam
 	defer r.mu.Unlock()
 	r.fired++
 	r.calls = append(r.calls, recordedCall{JobID: j.ID, Status: j.Status, NodeName: nodeName})
+}
+
+// Alert records operational alerts (disk-space threshold) separately from
+// job-outcome notifications.
+func (r *recordingNotifier) Alert(_ context.Context, content string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.alertCount++
+	r.alertTexts = append(r.alertTexts, content)
+}
+
+func (r *recordingNotifier) alerts() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.alertCount
 }
 
 func (r *recordingNotifier) count() int {

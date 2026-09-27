@@ -22,6 +22,8 @@ import (
 type Notifier interface {
 	// JobFinished reports a terminal job outcome (done or failed).
 	JobFinished(ctx context.Context, j *model.Job, nodeName string)
+	// Alert posts a free-form operational alert (disk space, etc).
+	Alert(ctx context.Context, content string)
 }
 
 // Nop is the zero notifier used when nothing is configured.
@@ -29,6 +31,9 @@ type Nop struct{}
 
 // JobFinished does nothing.
 func (Nop) JobFinished(context.Context, *model.Job, string) {}
+
+// Alert does nothing.
+func (Nop) Alert(context.Context, string) {}
 
 // sharedHTTP backs every Discord notifier. Notifiers may be built per call
 // (the webhook is a live setting), so the client must not be per-instance —
@@ -155,6 +160,12 @@ func (d *Discord) JobFinished(ctx context.Context, j *model.Job, nodeName string
 	}
 	content := truncate(b.String(), discordCap)
 	d.post(ctx, content)
+}
+
+// Alert posts a pre-formatted operational alert (disk space, etc). Shares
+// the post transport with JobFinished; content is capped by the caller.
+func (d *Discord) Alert(ctx context.Context, content string) {
+	d.post(ctx, truncate(content, discordCap))
 }
 
 // post sends a single pre-formatted content string to the webhook. Shared by

@@ -227,6 +227,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
+	// Disk-space soft drain: a node below settings.DiskAlertGB free space
+	// gets no new assignments (the alert itself fires inside checkDisk with
+	// a per-node cooldown). Running jobs continue — they may still fit, and
+	// a genuinely full disk fails the encode which retries elsewhere.
+	// Sits next to the drain check: both hold assignment, neither cancels.
+	if s.checkDisk(ctx, node, &hb) {
+		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
+		return
+	}
 	// Drain mode: a live settings flag (editable in the UI, no restart)
 	// that pauses ALL job assignment fleet-wide. Running jobs keep running
 	// to completion — nothing here cancels in-flight work — but no new job

@@ -108,6 +108,11 @@ func validateSettings(st *model.Settings) error {
 	if st.JobRetentionDays < 0 || st.JobRetentionDays > 3650 {
 		return errSettings("job_retention_days must be 0 (keep forever) or 1-3650")
 	}
+	// Disk alert: 0 disables the check; otherwise 1 GB - 100 TB is the
+	// sane range for a threshold on an encode farm.
+	if st.DiskAlertGB < 0 || st.DiskAlertGB > 100000 {
+		return errSettings("disk_alert_gb must be 0 (disabled) or 1-100000")
+	}
 	if st.Group == "" {
 		return errSettings("group is required")
 	}

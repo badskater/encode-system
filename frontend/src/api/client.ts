@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { CreateSeriesResponse, Flow, FlowExport, Job, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -150,6 +150,8 @@ export const api = {
   // (POST /api/updates/agent/rollback). Nodes self-downgrade on their next
   // idle heartbeat via the normal sync; returns the post-rollback manifest.
   rollbackAgent: () => request<UpdateManifest>('POST', '/api/updates/agent/rollback'),
+  // jobETA fetches the remaining-time prediction for a live job.
+  jobETA: (id: number) => request<JobETA>('GET', `/api/jobs/${id}/eta`),
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
   publishBinFromURL: (url: string, version: number, sha256?: string) =>

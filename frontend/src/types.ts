@@ -134,6 +134,17 @@ export interface ProvisionRun {
   finished_at?: string;
 }
 
+// JobETA is the response of GET /api/jobs/{id}/eta: a remaining-time
+// prediction from the average duration of done jobs on the same flow.
+// eta_sec < 0 means "no estimate" (insufficient history).
+export interface JobETA {
+  avg_sec: number;
+  samples: number;
+  elapsed_sec: number;
+  eta_sec: number;
+  progress?: number;
+}
+
 // UpdateManifest: the agent/lib/bin versions the controller wants deployed.
 export interface UpdateManifest {
   agent_version: string;

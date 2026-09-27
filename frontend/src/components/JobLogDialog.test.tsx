@@ -7,6 +7,11 @@ import type { StepTiming } from '../types';
 describe('JobLogDialog', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // ETA is fetched best-effort on each progress event; default to
+    // "no estimate" so live-tail tests don't need to care about it.
+    vi.spyOn(api, 'jobETA').mockResolvedValue({
+      avg_sec: 0, samples: 0, elapsed_sec: 0, eta_sec: -1,
+    });
   });
 
   it('renders a loading state then the log text', async () => {
@@ -175,6 +180,42 @@ describe('JobLogDialog', () => {
     // The final event triggers a refetch of the captured log.
     pushEvent!({ type: 'final', status: 'done', exit_code: 0, full_log: true });
     await waitFor(() => expect(screen.getByText('captured full log')).toBeInTheDocument());
+  });
+
+  it('shows the ETA line when the stream reports progress and history exists', async () => {
+    vi.spyOn(api, 'getJobLog').mockRejectedValue(new Error('404: no log'));
+    vi.spyOn(api, 'jobETA').mockResolvedValue({
+      avg_sec: 1200, samples: 5, elapsed_sec: 300, eta_sec: 900, progress: 25,
+    });
+    let pushEvent: ((ev: unknown) => void) | null = null;
+    vi.spyOn(api, 'streamJobLog').mockImplementation(async (_id, onEvent) => {
+      pushEvent = onEvent as (ev: unknown) => void;
+      await new Promise<void>(() => {});
+    });
+
+    render(<JobLogDialog jobId={11} jobLabel="x" onClose={() => {}} jobStatus="running" />);
+    pushEvent!({ type: 'progress', step: 'encode', progress: 25, log_tail: 'frame 1' });
+
+    // ~15m left, avg 20m over 5 runs
+    await waitFor(() => expect(screen.getByText(/~15m left/)).toBeInTheDocument());
+    expect(screen.getByText(/avg 20m over 5 runs/)).toBeInTheDocument();
+  });
+
+  it('hides the ETA line when there is insufficient history', async () => {
+    vi.spyOn(api, 'getJobLog').mockRejectedValue(new Error('404: no log'));
+    // samples < 2 → no estimate shown even though eta_sec >= 0
+    vi.spyOn(api, 'jobETA').mockResolvedValue({
+      avg_sec: 600, samples: 1, elapsed_sec: 0, eta_sec: 600,
+    });
+    let pushEvent: ((ev: unknown) => void) | null = null;
+    vi.spyOn(api, 'streamJobLog').mockImplementation(async (_id, onEvent) => {
+      pushEvent = onEvent as (ev: unknown) => void;
+      await new Promise<void>(() => {});
+    });
+    render(<JobLogDialog jobId={12} jobLabel="x" onClose={() => {}} jobStatus="running" />);
+    pushEvent!({ type: 'progress', step: 'encode', progress: 10, log_tail: 'frame 1' });
+    await waitFor(() => expect(screen.getByText('frame 1')).toBeInTheDocument());
+    expect(screen.queryByText(/left/)).not.toBeInTheDocument();
   });
 
   it('does not open a stream for a terminal job', async () => {

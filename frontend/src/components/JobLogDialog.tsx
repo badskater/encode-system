@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { JobLogStreamEvent, JobStatus, StepTiming } from '../types';
+import type { JobETA, JobLogStreamEvent, JobStatus, StepTiming } from '../types';
 import StepTimingsView from './StepTimingsView';
 import JobMetricsView from './JobMetricsView';
 
@@ -40,6 +40,9 @@ export default function JobLogDialog({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [live, setLive] = useState<JobLogStreamEvent | null>(null);
+  // ETA for live jobs, refreshed with each heartbeat-driven stream event.
+  // null = not fetched (terminal job) or no estimate yet.
+  const [eta, setEta] = useState<JobETA | null>(null);
   const preRef = useRef<HTMLPreElement>(null);
 
   // fetchFullLog is shared between initial load and the post-final refetch.
@@ -80,6 +83,11 @@ export default function JobLogDialog({
           if (ev.type === 'final') {
             setBusy(true);
             fetchFullLog();
+            setEta(null);
+          } else {
+            // Refresh the ETA with each progress event (heartbeat cadence).
+            // Best-effort: a failed fetch keeps the previous estimate.
+            api.jobETA(jobId).then(setEta).catch(() => undefined);
           }
         },
         ac.signal,
@@ -152,6 +160,11 @@ export default function JobLogDialog({
               {typeof live.progress === 'number' && live.progress > 0
                 ? ` (${live.progress.toFixed(0)}%)`
                 : ''}
+              {eta && eta.eta_sec >= 0 && eta.samples >= 2 && (
+                <span className="muted" style={{ fontWeight: 'normal', fontSize: '0.85em' }}>
+                  {' '}— ~{humanizeEta(eta.eta_sec)} left (avg {humanizeEta(eta.avg_sec)} over {eta.samples} runs)
+                </span>
+              )}
             </h4>
             <pre className="job-log-pre" ref={preRef}>
               {live.log_tail ?? ''}
@@ -185,4 +198,13 @@ export default function JobLogDialog({
       </div>
     </div>
   );
+}
+
+// humanizeEta formats seconds as a compact "1h 23m" / "45m" / "30s" label.
+function humanizeEta(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }

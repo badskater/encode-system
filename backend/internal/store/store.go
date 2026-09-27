@@ -599,6 +599,26 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 	return s.GetJob(ctx, id)
 }
 
+// AvgFlowDuration returns the average wall-clock duration (seconds) and
+// sample count of DONE jobs on a flow — the ETA basis. Only done jobs
+// count: failed/cancelled runs have partial durations that would skew the
+// average low. (0, 0, nil) means no history yet; callers gate confidence
+// on the sample count.
+func (s *Store) AvgFlowDuration(ctx context.Context, flowID int64) (avgSec float64, samples int, err error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT AVG(strftime('%s', finished_at) - strftime('%s', started_at)), COUNT(*)
+		 FROM jobs WHERE flow_id=? AND status='done'
+		   AND started_at IS NOT NULL AND finished_at IS NOT NULL`, flowID)
+	var avg sql.NullFloat64
+	if err := row.Scan(&avg, &samples); err != nil {
+		return 0, 0, err
+	}
+	if avg.Valid {
+		avgSec = avg.Float64
+	}
+	return avgSec, samples, nil
+}
+
 // GetJob loads a job by ID.
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,

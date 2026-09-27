@@ -168,6 +168,15 @@ func (s *Store) migrateV2() error {
 			return fmt.Errorf("migrate v2 series.notify: %w", err)
 		}
 	}
+	// series.paused: the "stop the presses" hold. Stronger than
+	// enabled=false (which only stops the scanner): paused series also
+	// keep their already-queued jobs from dispatching. Default 0 so old
+	// rows unmarshal to unpaused.
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 series.paused: %w", err)
+		}
+	}
 	// node_metrics: rolling resource samples (one row per heartbeat) for
 	// the observability dashboard. Index on (node_id, ts) supports the
 	// "latest N samples for node" query shape.
@@ -1003,6 +1012,7 @@ func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+  AND NOT EXISTS (SELECT 1 FROM series sr WHERE sr.name = jobs.series AND sr.paused = 1)
   ORDER BY priority DESC, id ASC LIMIT 1`)
 	j, err := scanJob(row)
 	if err != nil {
@@ -1031,6 +1041,7 @@ func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*mo
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+  AND NOT EXISTS (SELECT 1 FROM series sr WHERE sr.name = jobs.series AND sr.paused = 1)
   ORDER BY priority DESC, (last_failed_node_id = ?) ASC, id ASC LIMIT 1`, nodeID)
 	j, err := scanJob(row)
 	if err != nil {

@@ -90,8 +90,8 @@ func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaul
 			log.Warn("series registration failed", "series", c.Series, "err", err)
 			continue
 		}
-		if !sr.Enabled {
-			continue // operator paused this series; folder stays unprocessed
+		if !sr.Enabled || sr.Paused {
+			continue // operator disabled/paused this series; folder stays unprocessed
 		}
 		exists, err := st.JobExistsForEpisode(ctx, c.EpisodeDir)
 		if err != nil {

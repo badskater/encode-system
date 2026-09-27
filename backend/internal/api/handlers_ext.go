@@ -131,6 +131,7 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		FlowID  *int64  `json:"flow_id"`
 		Enabled *bool   `json:"enabled"`
 		Notify  *bool   `json:"notify"`
+		Paused  *bool   `json:"paused"`
 		Tag     *string `json:"tag"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -171,6 +172,12 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		if err := s.Store.SetSeriesEnabled(ctx, id, *req.Enabled); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series enabled")
+			return
+		}
+	}
+	if req.Paused != nil {
+		if err := s.Store.SetSeriesPaused(ctx, id, *req.Paused); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series paused")
 			return
 		}
 	}

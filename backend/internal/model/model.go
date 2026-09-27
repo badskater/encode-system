@@ -287,6 +287,11 @@ type Series struct {
 	FlowID  int64  `json:"flow_id"` // 0 = use the default flow
 	Tag     string `json:"tag"`     // quality tag override; "" = global settings tag
 	Enabled bool   `json:"enabled"`
+	// Paused is a stronger hold than Enabled=false: the scanner skips the
+	// series AND already-queued pending jobs do not dispatch until it is
+	// lifted. Enabled=false only stops new job creation; queued jobs still
+	// run. Pausing is for "stop the presses" without losing queue position.
+	Paused bool `json:"paused"`
 	// Notify controls whether job outcomes for this series emit Discord
 	// alerts. Defaults true (matches pre-v2 behavior where every job
 	// alerted) so a silent series is an opt-in, not an opt-out.

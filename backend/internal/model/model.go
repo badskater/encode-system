@@ -222,6 +222,13 @@ type Job struct {
 	// NextRetryAt gates re-dispatch of a failed-then-retried job: the
 	// queue will not pick it up until this time. nil = immediately ready.
 	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
+
+	// LastFailedNodeID is the node that most recently failed this job (0 =
+	// never failed). The dispatcher steers re-queued retries to a different
+	// node when one is available — a node-local fault (disk, GPU, corrupt
+	// toolchain) would otherwise re-fail every retry on the same box.
+	// Cleared on success; preserved across retries (that's the point).
+	LastFailedNodeID int64 `json:"last_failed_node_id,omitempty"`
 }
 
 // StepTiming is one per-step wall-clock sample on a job. The controller

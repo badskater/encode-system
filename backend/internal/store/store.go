@@ -150,6 +150,9 @@ func (s *Store) migrateV2() error {
 		`ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN next_retry_at TEXT`,
+		// v2.1: node that most recently failed this job (0 = never). Lets
+		// the dispatcher steer retries away from a node-local fault.
+		`ALTER TABLE jobs ADD COLUMN last_failed_node_id INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, alt := range jobAlters {
 		if _, err := s.db.Exec(alt); err != nil {
@@ -531,7 +534,7 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -545,7 +548,7 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 	err := row.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished,
-		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry)
+		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +576,7 @@ func scanJob(row *sql.Row) (*model.Job, error) {
 func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int) ([]*model.Job, error) {
 	q := `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at FROM jobs`
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id FROM jobs`
 	args := []any{}
 	if status != "" {
 		q += ` WHERE status = ?`
@@ -611,7 +614,7 @@ func scanJobRow(rows *sql.Rows) (*model.Job, error) {
 	err := rows.Scan(&j.ID, &j.Series, &j.Episode, &j.EpisodeDir, &j.ScriptType, &j.ScriptFile, &j.FlowID, &status,
 		&j.NodeID, &j.Step, &j.Progress, &j.ExitCode, &j.Error, &j.LogTail, &outputsJSON,
 		&createdAt, &started, &finished,
-		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry)
+		&j.FullLog, &timingsJSON, &j.Priority, &j.RetryCount, &nextRetry, &j.LastFailedNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -762,9 +765,20 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 	if status == model.JobDone {
 		progress = ", progress=100"
 	}
+	// Node steering stamp: a failed finish records the owning node so a
+	// re-queued retry is dispatched to a different node when available; a
+	// successful finish clears the stamp (the node proved healthy).
+	steer := ", last_failed_node_id=(SELECT node_id FROM jobs WHERE id=?)"
+	args := []any{string(status), exitCode, errMsg, string(b), logTail}
+	if status == model.JobDone {
+		steer = ", last_failed_node_id=0"
+	} else {
+		args = append(args, id)
+	}
+	args = append(args, id)
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now')`+progress+` WHERE id=?`,
-		string(status), exitCode, errMsg, string(b), logTail, id)
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now')`+progress+steer+` WHERE id=?`,
+		args...)
 	return err
 }
 
@@ -867,9 +881,20 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 	if status == model.JobDone {
 		progress = ", progress=100"
 	}
+	// Node steering stamp (mirrors FinishJob): failed records the owning
+	// node; done clears it. The guard below already restricts the UPDATE to
+	// the assigned/running owner, so the subselect reads the right node.
+	steer := ", last_failed_node_id=(SELECT node_id FROM jobs WHERE id=?)"
+	args := []any{string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON)}
+	if status == model.JobDone {
+		steer = ", last_failed_node_id=0"
+	} else {
+		args = append(args, id)
+	}
+	args = append(args, id)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+` WHERE id=? AND status IN ('assigned','running')`,
-		string(status), exitCode, errMsg, string(b), logTail, capped, string(timingsJSON), id)
+		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, finished_at=datetime('now')`+progress+steer+` WHERE id=? AND status IN ('assigned','running')`,
+		args...)
 	if err != nil {
 		return err
 	}
@@ -887,7 +912,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id LIMIT 1`, nodeID)
 	if err != nil {
 		return nil, err
@@ -976,9 +1001,37 @@ func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
-  full_log, step_timings_json, priority, retry_count, next_retry_at
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
   ORDER BY priority DESC, id ASC LIMIT 1`)
+	j, err := scanJob(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return j, nil
+}
+
+// NextAssignableJobForNode returns the best pending job for a specific
+// node. Same backoff gate as NextAssignableJob; ordering is priority DESC
+// (operator intent first), then steering — a job whose last failure was on
+// THIS node sorts after an equally-prioritized job that failed elsewhere or
+// never failed — then id ASC (true FIFO within a tier). Why steering: a job
+// that failed from a node-local fault (full disk, dead GPU, corrupt
+// toolchain) re-fails identically on retry; another node gets it first.
+// Steering is only a tie-break WITHIN a priority tier: a high-priority job
+// that failed here still outranks a normal-priority fresh job, and when the
+// steered-away job is the only candidate it is still returned — a
+// single-node farm must never starve.
+func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+  node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
+  full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
+  FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+  ORDER BY priority DESC, (last_failed_node_id = ?) ASC, id ASC LIMIT 1`, nodeID)
 	j, err := scanJob(row)
 	if err != nil {
 		if err == sql.ErrNoRows {

@@ -239,12 +239,14 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})
 		return
 	}
-	// NextAssignableJob gates on next_retry_at (a backoff-pending job is
-	// not ready yet) and orders by priority DESC then id ASC so urgent jobs
-	// dispatch first and, within a priority tier, the oldest job wins
-	// (true FIFO). ListJobs stays for the UI, which must still show
+	// NextAssignableJobForNode gates on next_retry_at (a backoff-pending
+	// job is not ready yet), orders by priority DESC then id ASC so urgent
+	// jobs dispatch first and, within a priority tier, the oldest job wins
+	// (true FIFO), and steers away from jobs this node most recently failed
+	// (node-local faults re-fail identically on retry) while any other
+	// candidate exists. ListJobs stays for the UI, which must still show
 	// retry-pending jobs.
-	job, err := s.Store.NextAssignableJob(ctx)
+	job, err := s.Store.NextAssignableJobForNode(ctx, node.ID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list pending jobs")
 		return

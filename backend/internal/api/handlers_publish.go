@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/agent"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/update"
 )
 
 // ---------- Agent payload publishing (WebUI → controller → nodes) ----------
@@ -310,4 +312,25 @@ func (s *Server) handleDownloadBin(w http.ResponseWriter, r *http.Request, _ *mo
 // shows what is currently published).
 func (s *Server) handleManifestAdmin(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Update.Manifest())
+}
+
+// handleRollbackAgent promotes the previous agent release back to current
+// (POST /api/updates/agent/rollback). Nodes self-downgrade through the
+// normal sync path — syncAgent triggers on any version difference — so no
+// agent-side change is needed. 409 when no previous release exists (single
+// publish so far, or the rollback slot payload vanished); 500 only on real
+// store faults. The response is the post-rollback manifest so the UI can
+// refresh its version display in one round-trip.
+func (s *Server) handleRollbackAgent(w http.ResponseWriter, r *http.Request) {
+	m, err := s.Update.RollbackAgent()
+	if err != nil {
+		if errors.Is(err, update.ErrNoRollback) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "rollback agent")
+		return
+	}
+	s.Log.Warn("agent release rolled back", "now_current", m.AgentVersion, "now_prev", m.PrevAgentVersion)
+	writeJSON(w, http.StatusOK, m)
 }

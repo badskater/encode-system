@@ -363,8 +363,15 @@ type JobPayload struct {
 type UpdateManifest struct {
 	AgentVersion string `json:"agent_version"`
 	AgentSHA256  string `json:"agent_sha256"`
-	LibVersion   int64  `json:"lib_version"`
-	LibSHA256    string `json:"lib_sha256"`
+	// Previous agent release kept for rollback: PublishAgent rotates the
+	// outgoing payload into encode-agent.exe.prev and records its identity
+	// here. Empty until a second publish has happened. Agents never read
+	// these — rollback promotes prev to current server-side, and nodes
+	// self-downgrade because AgentVersion then differs from what they run.
+	PrevAgentVersion string `json:"prev_agent_version,omitempty"`
+	PrevAgentSHA256  string `json:"prev_agent_sha256,omitempty"`
+	LibVersion       int64  `json:"lib_version"`
+	LibSHA256        string `json:"lib_sha256"`
 	// Bin folder package: a zip of the node tools dir (C:\bin). Version is a
 	// publish counter; agents extract it over their bin dir when it differs.
 	BinVersion int64  `json:"bin_version"`

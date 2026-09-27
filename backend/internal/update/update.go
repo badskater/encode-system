@@ -39,6 +39,14 @@ func NewStore(dir string) (*Store, error) {
 
 func (s *Store) agentPath() string { return filepath.Join(s.dir, "encode-agent.exe") }
 
+// prevAgentPath is the rollback slot: the payload that was current before
+// the most recent publish. Rotated on every PublishAgent; promoted back by
+// RollbackAgent (which demotes the rolled-back release into this slot, so
+// a rollback is itself reversible).
+func (s *Store) prevAgentPath() string {
+	return filepath.Join(s.dir, "encode-agent.exe.prev")
+}
+
 // Dir returns the payload directory (used by the provisioner to stage
 // published artifacts for ansible win_copy).
 func (s *Store) Dir() string     { return s.dir }
@@ -73,6 +81,17 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 		m.AgentVersion = ""
 		m.AgentSHA256 = ""
 	}
+	// Rollback slot: recover prev identity the same way — a vanished prev
+	// payload clears the entry so RollbackAgent errors cleanly instead of
+	// promoting a missing file.
+	if _, err := os.Stat(s.prevAgentPath()); err == nil {
+		if h, err := fileSHA256(s.prevAgentPath()); err == nil {
+			m.PrevAgentSHA256 = h
+		}
+	} else {
+		m.PrevAgentVersion = ""
+		m.PrevAgentSHA256 = ""
+	}
 	// EncodeLib payload (often never published — that is fine).
 	if _, err := os.Stat(s.libPath()); err == nil {
 		if h, err := fileSHA256(s.libPath()); err == nil {
@@ -105,11 +124,32 @@ func (s *Store) Manifest() model.UpdateManifest {
 // PublishAgent stores a new agent binary and bumps the manifest version.
 // The whole write-hash-rename-persist sequence runs under the lock so two
 // concurrent publishes cannot interleave on the same temp path.
+//
+// Before installing the new payload, the CURRENT one is rotated into the
+// rollback slot (encode-agent.exe.prev) and its identity recorded in the
+// manifest — one release of history, enough to undo a bad publish without
+// re-uploading. The rotation is best-effort: a failure to copy the old
+// payload aside (e.g. first publish, or a vanished file) must not block the
+// new release.
 func (s *Store) PublishAgent(version string, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if version == s.manifest.AgentVersion {
 		return fmt.Errorf("agent version %s is already published", version)
+	}
+	// Rotate the outgoing release into the rollback slot BEFORE overwriting
+	// it. Only when the current payload actually exists on disk (first
+	// publish has nothing to keep) and a version is recorded.
+	prevVersion, prevSHA := "", ""
+	if s.manifest.AgentVersion != "" {
+		if cur, err := os.Open(s.agentPath()); err == nil {
+			if err := writeFileHashing(s.prevAgentPath(), cur); err == nil {
+				if h, err := fileSHA256(s.prevAgentPath()); err == nil {
+					prevVersion, prevSHA = s.manifest.AgentVersion, h
+				}
+			}
+			cur.Close()
+		}
 	}
 	hash, err := installPayload(s.agentPath(), r)
 	if err != nil {
@@ -117,7 +157,59 @@ func (s *Store) PublishAgent(version string, r io.Reader) error {
 	}
 	s.manifest.AgentVersion = version
 	s.manifest.AgentSHA256 = hash
+	// Always overwrite the prev entry (even with empties) so the manifest
+	// never advertises a rollback slot that this publish didn't produce.
+	s.manifest.PrevAgentVersion = prevVersion
+	s.manifest.PrevAgentSHA256 = prevSHA
+	if prevVersion == "" {
+		os.Remove(s.prevAgentPath()) // stale slot from an older release
+	}
 	return s.persistLocked()
+}
+
+// ErrNoRollback is returned by RollbackAgent when no previous release is
+// available (single publish so far, or the prev payload vanished).
+var ErrNoRollback = fmt.Errorf("no previous agent release to roll back to")
+
+// RollbackAgent promotes the rollback slot to current and demotes the
+// just-rolled-back release into the slot, so the operation is symmetric:
+// rolling back twice returns to the original state. Nodes pick the change
+// up through the normal sync — syncAgent triggers on ANY version
+// difference, so a downgrade propagates exactly like an upgrade (staged
+// .exe.new + swap on restart). Returns the updated manifest.
+func (s *Store) RollbackAgent() (model.UpdateManifest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.manifest.PrevAgentVersion == "" {
+		return s.manifest, ErrNoRollback
+	}
+	if _, err := os.Stat(s.prevAgentPath()); err != nil {
+		return s.manifest, ErrNoRollback
+	}
+	// Swap payloads: current -> prev slot, prev slot -> current. Use a
+	// temp name because os.Rename onto an existing file is fine on Unix
+	// but the two-step swap keeps both files intact if either rename
+	// fails halfway (the manifest only flips after both succeed).
+	swap := s.prevAgentPath() + ".swap"
+	if err := os.Rename(s.agentPath(), swap); err != nil {
+		return s.manifest, fmt.Errorf("rollback agent: %w", err)
+	}
+	if err := os.Rename(s.prevAgentPath(), s.agentPath()); err != nil {
+		os.Rename(swap, s.agentPath()) // restore on failure
+		return s.manifest, fmt.Errorf("rollback agent: %w", err)
+	}
+	if err := os.Rename(swap, s.prevAgentPath()); err != nil {
+		return s.manifest, fmt.Errorf("rollback agent: %w", err)
+	}
+	// Flip the manifest identities to match the swapped payloads.
+	s.manifest.AgentVersion, s.manifest.PrevAgentVersion =
+		s.manifest.PrevAgentVersion, s.manifest.AgentVersion
+	s.manifest.AgentSHA256, s.manifest.PrevAgentSHA256 =
+		s.manifest.PrevAgentSHA256, s.manifest.AgentSHA256
+	if err := s.persistLocked(); err != nil {
+		return s.manifest, err
+	}
+	return s.manifest, nil
 }
 
 // PublishLib stores a new EncodeLib.ps1 and bumps its version counter.

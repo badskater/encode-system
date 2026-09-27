@@ -413,6 +413,7 @@ func (s *Server) Routes() http.Handler {
 	// Publishing: upload new agent/lib/bin payloads from the UI.
 	mux.HandleFunc("GET /api/updates/manifest", s.withAdmin(s.handleManifestAdmin))
 	mux.HandleFunc("POST /api/updates/agent", s.withAdmin(s.handlePublishAgent))
+	mux.HandleFunc("POST /api/updates/agent/rollback", s.withAdmin(s.handleRollbackAgent))
 	mux.HandleFunc("POST /api/updates/lib", s.withAdmin(s.handlePublishLib))
 	mux.HandleFunc("POST /api/updates/bin", s.withAdmin(s.handlePublishBin))
 	mux.HandleFunc("POST /api/updates/bin/url", s.withAdmin(s.handlePublishBinFromURL))

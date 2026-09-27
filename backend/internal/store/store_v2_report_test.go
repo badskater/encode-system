@@ -45,7 +45,7 @@ func TestFinishJobWithReportPersistsLogAndTimings(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", outputs, "ENCODE_JOB_DONE", fullLog, wantTimings); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", outputs, "ENCODE_JOB_DONE", fullLog, wantTimings, nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestFinishJobWithReportNilTimingsStoresEmpty(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt2")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", "log", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", "log", nil, nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
 
@@ -157,7 +157,7 @@ func TestFinishJobWithReportCapsFullLogOverOneMiB(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt3")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", sb.String(), nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", sb.String(), nil, nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestFinishJobWithReportFailedJobKeepsProgress(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, mustCreateNode(t, s, "enc-frt4")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 9, "encode failed", nil, "tail", "log", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 9, "encode failed", nil, "tail", "log", nil, nil); err != nil {
 		t.Fatalf("FinishJobWithReport: %v", err)
 	}
 	got, err := s.GetJob(ctx, j.ID)

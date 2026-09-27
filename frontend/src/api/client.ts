@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { AuditEvent, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { APIToken, AuditEvent, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -154,6 +154,12 @@ export const api = {
   jobETA: (id: number) => request<JobETA>('GET', `/api/jobs/${id}/eta`),
   // listAudit fetches the newest audit events (default 200, max 1000).
   listAudit: (limit = 200) => request<AuditEvent[]>('GET', `/api/audit?limit=${limit}`),
+  // API tokens for external automation. createToken returns the plaintext
+  // token exactly once — the UI must surface it immediately.
+  listTokens: () => request<APIToken[]>('GET', '/api/tokens'),
+  createToken: (name: string, scope: 'admin' | 'read') =>
+    request<APIToken & { token: string }>('POST', '/api/tokens', { name, scope }),
+  deleteToken: (id: number) => request<void>('DELETE', `/api/tokens/${id}`),
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
   publishBinFromURL: (url: string, version: number, sha256?: string) =>

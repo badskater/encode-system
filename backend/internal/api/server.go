@@ -377,6 +377,9 @@ func (s *Server) Routes() http.Handler {
 	// operational numbers only; scrapers authenticate at network layer).
 	mux.HandleFunc("GET /metrics", s.handlePrometheus)
 	mux.HandleFunc("GET /api/audit", s.withAdmin(s.handleListAudit))
+	mux.HandleFunc("GET /api/tokens", s.withAdmin(s.handleListAPITokens))
+	mux.HandleFunc("POST /api/tokens", s.withAdmin(s.handleCreateAPIToken))
+	mux.HandleFunc("DELETE /api/tokens/{id}", s.withAdmin(s.handleDeleteAPIToken))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
 	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
 	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))

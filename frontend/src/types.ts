@@ -134,6 +134,17 @@ export interface ProvisionRun {
   finished_at?: string;
 }
 
+// APIToken is a scoped token for external automation. The plaintext token
+// is only returned by the create call (shown once); list responses carry
+// metadata only.
+export interface APIToken {
+  id: number;
+  name: string;
+  scope: 'admin' | 'read';
+  last_used_at?: string;
+  created_at?: string;
+}
+
 // AuditEvent is one row of the audit log (GET /api/audit): who did what to
 // which object. Detail is a small JSON snippet (already secret-scrubbed
 // server-side). At is a server timestamp string.

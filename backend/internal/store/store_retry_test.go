@@ -203,7 +203,7 @@ func TestScheduleJobRetryClearsStaleRunState(t *testing.T) {
 	}
 	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 9, "encode crashed",
 		[]string{"stale.mkv"}, "final tail", "full log body",
-		[]model.StepTiming{{Step: "encode", DurationSec: 120}}); err != nil {
+		[]model.StepTiming{{Step: "encode", DurationSec: 120}}, nil); err != nil {
 		t.Fatalf("finish with report: %v", err)
 	}
 	// Confirm the stale state is present before retry.

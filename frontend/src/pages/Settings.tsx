@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Settings, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
+import APITokensCard from '../components/APITokensCard';
 
 // StringSettingKey = the Settings keys whose values are strings — the only
 // keys the free-text field() helper may edit. Number fields go through their
@@ -404,6 +405,11 @@ export default function SettingsPage() {
           <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
         )}
       </div>
+
+      {/* API tokens: scoped Bearer credentials for external automation
+          (Sonarr-style triggers, Grafana, scripts). Managed independently of
+          the settings blob — create/revoke take effect immediately. */}
+      <APITokensCard />
 
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Push to nodes</h3>

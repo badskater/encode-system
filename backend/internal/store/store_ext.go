@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS series (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  scope TEXT NOT NULL DEFAULT 'read',
+  token_hash TEXT NOT NULL UNIQUE,
+  last_used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1063,4 +1072,91 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]*model.AuditEvent, 
 		out = append(out, &ev)
 	}
 	return out, rows.Err()
+}
+
+// ---------- API tokens ----------
+
+// CreateAPIToken inserts a token row and fills ID/CreatedAt. Name and hash
+// uniqueness are enforced by the table constraints (duplicate name returns
+// an error so callers can 409).
+func (s *Store) CreateAPIToken(ctx context.Context, tok *model.APIToken) error {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO api_tokens (name, scope, token_hash) VALUES (?, ?, ?)`,
+		tok.Name, tok.Scope, tok.TokenHash)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	tok.ID = id
+	created := time.Now().UTC()
+	tok.CreatedAt = &created
+	return nil
+}
+
+// APITokenByHash looks a token up by its hash. Returns (nil, nil) when
+// unknown so callers can treat it as an auth failure without an error path.
+func (s *Store) APITokenByHash(ctx context.Context, hash string) (*model.APIToken, error) {
+	var tok model.APIToken
+	var lastUsed, createdAt sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, scope, token_hash, last_used_at, created_at FROM api_tokens WHERE token_hash = ?`, hash).
+		Scan(&tok.ID, &tok.Name, &tok.Scope, &tok.TokenHash, &lastUsed, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastUsed.Valid {
+		t := parseTime(lastUsed.String)
+		tok.LastUsedAt = &t
+	}
+	if createdAt.Valid {
+		t := parseTime(createdAt.String)
+		tok.CreatedAt = &t
+	}
+	return &tok, nil
+}
+
+// ListAPITokens returns all tokens (hashes omitted via json:"-" anyway).
+func (s *Store) ListAPITokens(ctx context.Context) ([]*model.APIToken, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, scope, token_hash, last_used_at, created_at FROM api_tokens ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*model.APIToken{}
+	for rows.Next() {
+		var tok model.APIToken
+		var lastUsed, createdAt sql.NullString
+		if err := rows.Scan(&tok.ID, &tok.Name, &tok.Scope, &tok.TokenHash, &lastUsed, &createdAt); err != nil {
+			return nil, err
+		}
+		if lastUsed.Valid {
+			t := parseTime(lastUsed.String)
+			tok.LastUsedAt = &t
+		}
+		if createdAt.Valid {
+			t := parseTime(createdAt.String)
+			tok.CreatedAt = &t
+		}
+		out = append(out, &tok)
+	}
+	return out, rows.Err()
+}
+
+// DeleteAPIToken removes a token. Deleting an unknown ID is not an error
+// (idempotent), so a double-click in the UI doesn't surface a failure.
+func (s *Store) DeleteAPIToken(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM api_tokens WHERE id = ?`, id)
+	return err
+}
+
+// TouchAPIToken stamps last_used_at (best-effort bookkeeping; callers
+// ignore errors).
+func (s *Store) TouchAPIToken(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	return err
 }

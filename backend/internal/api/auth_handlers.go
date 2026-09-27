@@ -240,27 +240,38 @@ func sessionFromCtx(r *http.Request) *model.Session {
 	return nil
 }
 
-// withAdmin requires a valid management session (Bearer token). Sessions are
-// looked up by hash and renewed on each successful request (sliding expiry).
+// withAdmin requires a valid management credential (Bearer): either an
+// interactive session (renewed on each request — sliding expiry) or a
+// scoped API token. Read-scope tokens may only use safe methods (GET/HEAD);
+// everything else requires an admin-scope token or a session. Agent
+// endpoints have their own token auth and never go through this wrapper.
 func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := bearer(r)
-		if tok == "" {
-			writeErr(w, http.StatusUnauthorized, "not authenticated — log in first")
-			return
-		}
-		hash := auth.HashToken(tok)
-		sess, err := s.Store.SessionByTokenHash(r.Context(), hash)
-		if err != nil || sess == nil {
+		sess, apiTok, ok := s.authenticateBearer(r)
+		if !ok {
 			writeErr(w, http.StatusUnauthorized, "invalid or expired session")
 			return
 		}
-		// Sliding expiry: keep active sessions alive.
-		if err := s.Store.SlideSession(r.Context(), hash, time.Now().UTC().Add(sessionTTL)); err != nil {
-			s.Log.Warn("slide session", "err", err)
+		if apiTok != nil {
+			// Scope gate: read tokens are GET/HEAD only.
+			if apiTok.Scope == model.TokenScopeRead && r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeErr(w, http.StatusForbidden, "read-scope token cannot perform "+r.Method)
+				return
+			}
+			// Best-effort last-used stamp; never blocks the request.
+			if err := s.Store.TouchAPIToken(r.Context(), apiTok.ID); err != nil {
+				s.Log.Warn("touch api token", "err", err)
+			}
+			h(w, contextWithAPIToken(r, apiTok))
+			return
 		}
 		h(w, contextWithSession(r, sess))
 	}
+}
+
+// contextWithAPIToken marks the request as API-token authenticated.
+func contextWithAPIToken(r *http.Request, tok *model.APIToken) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), apiTokenCtxKey{}, tok))
 }
 
 func contextWithSession(r *http.Request, sess *model.Session) *http.Request {

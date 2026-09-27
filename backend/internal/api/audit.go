@@ -20,6 +20,8 @@ func (s *Server) audit(r *http.Request, action, object string, detail any) {
 	actor := "unknown"
 	if sess := sessionFromCtx(r); sess != nil && sess.Username != "" {
 		actor = sess.Username
+	} else if tok := apiTokenFromCtx(r); tok != nil {
+		actor = "api-token:" + tok.Name
 	}
 	detailStr := ""
 	if detail != nil {

@@ -38,7 +38,7 @@ func TestFinishJobWithReportGuardedAgainstConcurrentCancel(t *testing.T) {
 	}
 
 	// Now FinishJobWithReport must hit zero rows and return the sentinel.
-	err = s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", "log", nil)
+	err = s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", nil, "tail", "log", nil, nil)
 	if !errors.Is(err, ErrJobNotFinishable) {
 		t.Fatalf("expected ErrJobNotFinishable for concurrently-cancelled job, got %v", err)
 	}

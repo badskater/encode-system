@@ -46,7 +46,7 @@ func TestFinishFailureRecordsNode(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, n1.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 1, "boom", nil, "tail", "", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 1, "boom", nil, "tail", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetJob(ctx, j.ID)
@@ -64,7 +64,7 @@ func TestFinishFailureRecordsNode(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, n1.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", []string{"o.mkv"}, "tail", "", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobDone, 0, "", []string{"o.mkv"}, "tail", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetJob(ctx, j.ID)
@@ -117,7 +117,7 @@ func TestNextAssignableJobForNodeSteersFromFailedNode(t *testing.T) {
 	if err := s.AssignJob(ctx, j1.ID, nA.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j1.ID, model.JobFailed, 1, "boom", nil, "", "", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j1.ID, model.JobFailed, 1, "boom", nil, "", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RetryJob(ctx, j1.ID); err != nil {
@@ -167,7 +167,7 @@ func TestNextAssignableJobForNodeRespectsBackoff(t *testing.T) {
 	if err := s.AssignJob(ctx, j.ID, nA.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 1, "boom", nil, "", "", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j.ID, model.JobFailed, 1, "boom", nil, "", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	future := time.Now().Add(time.Hour)
@@ -198,7 +198,7 @@ func TestPriorityBeatsSteering(t *testing.T) {
 	if err := s.AssignJob(ctx, j1.ID, nA.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishJobWithReport(ctx, j1.ID, model.JobFailed, 1, "boom", nil, "", "", nil); err != nil {
+	if err := s.FinishJobWithReport(ctx, j1.ID, model.JobFailed, 1, "boom", nil, "", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RetryJob(ctx, j1.ID); err != nil {

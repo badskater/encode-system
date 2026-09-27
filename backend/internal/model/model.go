@@ -427,6 +427,25 @@ type JobPayload struct {
 	Flow   string            `json:"flow"`   // flow name, informational
 }
 
+// APIToken is a scoped token for external automation (Sonarr-style
+// triggers, dashboards, scripts). Only TokenHash is stored; the plaintext
+// token is shown once at creation. Scope "admin" grants full management
+// API access; "read" is restricted to GET endpoints.
+type APIToken struct {
+	ID         int64      `json:"id"`
+	Name       string     `json:"name"`
+	Scope      string     `json:"scope"`
+	TokenHash  string     `json:"-"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+}
+
+// Token scopes.
+const (
+	TokenScopeAdmin = "admin"
+	TokenScopeRead  = "read"
+)
+
 // AuditEvent is one row of the audit log: who did what to which object.
 // Written fire-and-forget by mutating handlers; Detail carries a small
 // JSON snippet of the change (never secrets or full bodies).

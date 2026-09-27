@@ -88,18 +88,16 @@ func (r *jobRegistry) get(id int64) *activeJob {
 func (r *jobRegistry) reports() []model.HeartbeatJobReport {
 	r.mu.Lock()
 	ids := make([]int64, 0, len(r.jobs))
-	jobs := make([]*activeJob, 0, len(r.jobs))
+	byID := make(map[int64]*activeJob, len(r.jobs))
 	for id, j := range r.jobs {
 		ids = append(ids, id)
-		jobs = append(jobs, j)
+		byID[id] = j // pair under the lock — sorting ids alone and zipping
+		// with a parallel slice mismatches whenever map iteration order
+		// isn't already ascending (Go map order is random).
 	}
 	r.mu.Unlock()
 
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	byID := map[int64]*activeJob{}
-	for i, id := range ids {
-		byID[id] = jobs[i]
-	}
 	out := make([]model.HeartbeatJobReport, 0, len(ids))
 	for _, id := range ids {
 		j := byID[id]

@@ -200,6 +200,11 @@ func main() {
 		spa := spaHandler(uiDir)
 		mux.Handle("/", spa)
 	}
+	// /metrics lives OUTSIDE the /api/ prefix (Prometheus convention) — mount
+	// it explicitly BEFORE the SPA catch-all, or "/" would serve index.html
+	// to scrapers. Routes() contains the "GET /metrics" pattern, and a mux
+	// mounted at "/metrics" still sees the full path, so it matches.
+	mux.Handle("/metrics", srv.Routes())
 	mux.Handle("/api/", srv.Routes())
 
 	httpSrv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}

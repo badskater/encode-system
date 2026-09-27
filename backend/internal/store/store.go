@@ -619,6 +619,26 @@ func (s *Store) AvgFlowDuration(ctx context.Context, flowID int64) (avgSec float
 	return avgSec, samples, nil
 }
 
+// CountJobsByStatus returns the job count per status in one grouped query
+// (Prometheus exposition + dashboards). Keys are the raw status strings.
+func (s *Store) CountJobsByStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM jobs GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[st] = n
+	}
+	return out, rows.Err()
+}
+
 // GetJob loads a job by ID.
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,

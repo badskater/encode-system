@@ -163,16 +163,20 @@ type Session struct {
 
 // Node is one Windows encode machine.
 type Node struct {
-	ID             int64      `json:"id"`
-	Name           string     `json:"name"`
-	TokenHash      string     `json:"-"`
-	Enabled        bool       `json:"enabled"`
-	Status         NodeStatus `json:"status"`
-	AgentVersion   string     `json:"agent_version"`
-	LibVersion     int64      `json:"lib_version"`
-	BinVersion     int64      `json:"bin_version"` // bin package version on node (0 = none)
-	TasksSinceBoot int        `json:"tasks_since_boot"`
-	RebootPending  bool       `json:"reboot_pending"`
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	TokenHash string     `json:"-"`
+	Enabled   bool       `json:"enabled"`
+	Status    NodeStatus `json:"status"`
+	// Group is a free-form routing label. Jobs whose series has a matching
+	// node_group route to this node; an empty group is a wildcard that
+	// accepts any job. Set via PATCH /api/nodes/{id} {group}.
+	Group          string `json:"group"`
+	AgentVersion   string `json:"agent_version"`
+	LibVersion     int64  `json:"lib_version"`
+	BinVersion     int64  `json:"bin_version"` // bin package version on node (0 = none)
+	TasksSinceBoot int    `json:"tasks_since_boot"`
+	RebootPending  bool   `json:"reboot_pending"`
 	// RebootIssuedAtTasks snapshots the counter when the reboot instruction
 	// was issued. A heartbeat reporting fewer tasks proves the node rebooted.
 	RebootIssuedAtTasks int `json:"-"`
@@ -292,6 +296,10 @@ type Series struct {
 	// lifted. Enabled=false only stops new job creation; queued jobs still
 	// run. Pausing is for "stop the presses" without losing queue position.
 	Paused bool `json:"paused"`
+	// NodeGroup is a free-form routing label. When non-empty, the series'
+	// jobs only dispatch to nodes whose Group matches; nodes with an empty
+	// Group (wildcard) still accept them. Set via PATCH /api/series/{id}.
+	NodeGroup string `json:"node_group"`
 	// Notify controls whether job outcomes for this series emit Discord
 	// alerts. Defaults true (matches pre-v2 behavior where every job
 	// alerted) so a silent series is an opt-in, not an opt-out.

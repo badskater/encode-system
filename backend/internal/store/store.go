@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   token_hash TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'idle',
+  "group" TEXT NOT NULL DEFAULT '',
   agent_version TEXT NOT NULL DEFAULT '',
   lib_version INTEGER NOT NULL DEFAULT 0,
   bin_version INTEGER NOT NULL DEFAULT 0,
@@ -175,6 +176,18 @@ func (s *Store) migrateV2() error {
 	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`); err != nil {
 		if !isDuplicateColumnErr(err) {
 			return fmt.Errorf("migrate v2 series.paused: %w", err)
+		}
+	}
+	// nodes."group" and series.node_group: routing labels. A job dispatches
+	// when the labels match OR either side is empty (wildcard).
+	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN "group" TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 nodes.group: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN node_group TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 series.node_group: %w", err)
 		}
 	}
 	// node_metrics: rolling resource samples (one row per heartbeat) for
@@ -319,14 +332,14 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
@@ -336,7 +349,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	var enabled, reboot int
 	var lastSeen, issuedAt sql.NullString
 	var createdAt string
-	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
+	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.AgentVersion,
 		&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt)
 	if err != nil {
 		return nil, err
@@ -355,7 +368,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -367,7 +380,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		var enabled, reboot int
 		var lastSeen, issuedAt sql.NullString
 		var createdAt string
-		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.AgentVersion,
+		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.AgentVersion,
 			&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &createdAt); err != nil {
 			return nil, err
 		}
@@ -394,6 +407,13 @@ func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	return err
 }
 
+// SetNodeGroup updates ONLY the routing label — field-scoped SQL so a
+// concurrent status/enabled change isn't clobbered. ” = wildcard node.
+func (s *Store) SetNodeGroup(ctx context.Context, id int64, group string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET "group"=? WHERE id=?`, group, id)
+	return err
+}
+
 // DeleteNode removes a node row (used to roll back failed pairing).
 func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
@@ -402,7 +422,7 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, agent_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
@@ -1042,7 +1062,11 @@ func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*mo
   full_log, step_timings_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
   AND NOT EXISTS (SELECT 1 FROM series sr WHERE sr.name = jobs.series AND sr.paused = 1)
-  ORDER BY priority DESC, (last_failed_node_id = ?) ASC, id ASC LIMIT 1`, nodeID)
+  AND NOT EXISTS (
+    SELECT 1 FROM series sg JOIN nodes nd ON nd.id = ?
+    WHERE sg.name = jobs.series
+      AND sg.node_group != '' AND nd."group" != '' AND sg.node_group != nd."group")
+  ORDER BY priority DESC, (last_failed_node_id = ?) ASC, id ASC LIMIT 1`, nodeID, nodeID)
 	j, err := scanJob(row)
 	if err != nil {
 		if err == sql.ErrNoRows {

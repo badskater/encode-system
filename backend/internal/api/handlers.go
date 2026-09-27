@@ -623,7 +623,8 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Enabled *bool `json:"enabled"`
+		Enabled *bool   `json:"enabled"`
+		Group   *string `json:"group"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -639,6 +640,15 @@ func (s *Server) handlePatchNode(w http.ResponseWriter, r *http.Request) {
 		if !node.Enabled {
 			node.RebootPending = false // cancel pending reboot when paused
 		}
+	}
+	// Group is field-scoped (SetNodeGroup) so a concurrent heartbeat's
+	// UpdateNode (status/last_seen) can't clobber it and vice versa.
+	if req.Group != nil {
+		if err := s.Store.SetNodeGroup(r.Context(), id, *req.Group); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update node group")
+			return
+		}
+		node.Group = *req.Group
 	}
 	if err := s.Store.UpdateNode(r.Context(), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "update node")

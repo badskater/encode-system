@@ -128,11 +128,12 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FlowID  *int64  `json:"flow_id"`
-		Enabled *bool   `json:"enabled"`
-		Notify  *bool   `json:"notify"`
-		Paused  *bool   `json:"paused"`
-		Tag     *string `json:"tag"`
+		FlowID    *int64  `json:"flow_id"`
+		Enabled   *bool   `json:"enabled"`
+		Notify    *bool   `json:"notify"`
+		Paused    *bool   `json:"paused"`
+		NodeGroup *string `json:"node_group"`
+		Tag       *string `json:"tag"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -178,6 +179,12 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if req.Paused != nil {
 		if err := s.Store.SetSeriesPaused(ctx, id, *req.Paused); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series paused")
+			return
+		}
+	}
+	if req.NodeGroup != nil {
+		if err := s.Store.SetSeriesNodeGroup(ctx, id, *req.NodeGroup); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series node_group")
 			return
 		}
 	}

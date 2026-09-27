@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { Settings, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
 import APITokensCard from '../components/APITokensCard';
+import BackupsCard from '../components/BackupsCard';
 
 // StringSettingKey = the Settings keys whose values are strings — the only
 // keys the free-text field() helper may edit. Number fields go through their
@@ -410,6 +411,11 @@ export default function SettingsPage() {
           (Sonarr-style triggers, Grafana, scripts). Managed independently of
           the settings blob — create/revoke take effect immediately. */}
       <APITokensCard />
+
+      {/* Controller DB backups: scheduled VACUUM INTO snapshots with
+          manual trigger + download. Formalizes the pre-deploy `cp
+          encode.db` habit. */}
+      <BackupsCard />
 
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Push to nodes</h3>

@@ -134,6 +134,24 @@ export interface ProvisionRun {
   finished_at?: string;
 }
 
+// BackupInfo is one DB snapshot in <dataDir>/backups.
+export interface BackupInfo {
+  name: string;
+  size_bytes: number;
+  created_at: string;
+  scheduled: boolean;
+}
+
+// BackupStatus is the scheduler state (GET /api/backup → status).
+export interface BackupStatus {
+  enabled: boolean;
+  every_seconds: number;
+  max_backups: number;
+  last_run?: string;
+  last_error?: string;
+  next_run?: string;
+}
+
 // APIToken is a scoped token for external automation. The plaintext token
 // is only returned by the create call (shown once); list responses carry
 // metadata only.

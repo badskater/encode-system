@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -160,6 +160,21 @@ export const api = {
   createToken: (name: string, scope: 'admin' | 'read') =>
     request<APIToken & { token: string }>('POST', '/api/tokens', { name, scope }),
   deleteToken: (id: number) => request<void>('DELETE', `/api/tokens/${id}`),
+  // DB backups: status+list, manual snapshot, schedule settings, download
+  // (blob — the Authorization header rules out a plain <a href>), delete.
+  backupStatus: () =>
+    request<{ status: BackupStatus; snapshots: BackupInfo[] }>('GET', '/api/backup'),
+  backupNow: () => request<BackupInfo>('POST', '/api/backup'),
+  backupSettings: (enabled: boolean, everySeconds: number) =>
+    request<BackupStatus>('PUT', '/api/backup/settings', { enabled, every_seconds: everySeconds }),
+  deleteBackup: (name: string) => request<void>('DELETE', `/api/backup/${encodeURIComponent(name)}`),
+  downloadBackup: async (name: string): Promise<Blob> => {
+    const res = await fetch(`/api/backup/${encodeURIComponent(name)}`, {
+      headers: { Authorization: AUTH_PREFIX + sessionValue() },
+    });
+    if (!res.ok) throw new Error(`${res.status}: download failed`);
+    return res.blob();
+  },
   publishLib: (version: number, file: File) => publishUpload('/api/updates/lib', String(version), file),
   publishBin: (version: number, file: File) => publishUpload('/api/updates/bin', String(version), file),
   publishBinFromURL: (url: string, version: number, sha256?: string) =>

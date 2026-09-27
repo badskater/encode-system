@@ -175,8 +175,9 @@ func (t *stepTimingTracker) finish(finish time.Time) []model.StepTiming {
 type lineObserver struct {
 	log       *slog.Logger // agent logger for progress (may be nil in tests)
 	timings   *stepTimingTracker
-	buf       bytes.Buffer // accumulates ALL output verbatim
-	remainder string       // trailing partial line from the last Write
+	prog      *progressTracker // live heartbeat progress; nil in unit tests
+	buf       bytes.Buffer     // accumulates ALL output verbatim
+	remainder string           // trailing partial line from the last Write
 }
 
 // newLineObserver creates a live-scanning writer. log may be nil (unit tests
@@ -220,6 +221,12 @@ func (o *lineObserver) flush() {
 // on match, logs progress and feeds the timing tracker at time.Now() (the
 // line's arrival instant).
 func (o *lineObserver) processLine(line string) {
+	// Live progress feed runs on EVERY line (not just markers): the
+	// heartbeat tail is meant to show raw encoder output, while the
+	// step/pct update happens inside the tracker on marker lines only.
+	if o.prog != nil {
+		o.prog.observe(line)
+	}
 	m := stepLine.FindStringSubmatch(line)
 	if m == nil {
 		return

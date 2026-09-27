@@ -73,6 +73,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 				hasActiveJob = true
 				if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(hb.JobStatus), hb.Step, hb.StepProgress, hb.LogTail); err != nil {
 					s.Log.Warn("update job status", "err", err, "job", job.ID)
+				} else {
+					// DB write landed: fan the live snapshot out to SSE
+					// log-stream subscribers. Publish AFTER the store write
+					// so stream events never run ahead of persisted state.
+					s.publishProgress(job.ID, hb.Step, hb.StepProgress, hb.LogTail)
 				}
 			}
 		}
@@ -134,6 +139,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 					s.Log.Info("orphaned job auto-retried (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
 				} else {
 					s.Log.Info("orphaned job failed (node stopped reporting it)", "job", orphan.ID, "node", node.Name)
+					// Terminal SSE event for the orphan (mirrors the
+					// completion path so open log streams close).
+					s.publishFinal(orphan.ID, string(model.JobFailed), failed.Error, failed.ExitCode, failed.FullLog != "")
 					s.notifyJobFinished(ctx, orphan.ID, "controller")
 				}
 			}
@@ -386,9 +394,14 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node 
 	// scan, and a job that failed legitimately would be re-dispatched into
 	// the same failure. The manual retry path (RetryJob) recovers it.
 	if status == model.JobFailed && s.shouldAutoRetry(ctx, job, jobID) {
+		// Auto-retried: NOT terminal — the stream stays open and will keep
+		// relaying progress when the retry is re-assigned. No final event.
 		writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 		return
 	}
+	// Terminal SSE event: closes any open log streams for this job. Only
+	// fires on the no-retry outcome (the auto-retry branch above returned).
+	s.publishFinal(jobID, string(status), rep.Error, rep.ExitCode, rep.LogFull != "")
 	s.notifyJobFinished(ctx, jobID, node.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }

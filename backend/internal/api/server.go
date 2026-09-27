@@ -64,6 +64,11 @@ type Server struct {
 	// loses pending events (acceptable: observability data, not state; the
 	// jobs table is the source of truth).
 	digest *digestState
+	// logHub fans out live job-progress events to SSE subscribers of
+	// GET /api/jobs/{id}/log/stream. Built in New (never nil) so the
+	// heartbeat/completion paths publish unconditionally; in-memory only —
+	// subscribers reconnect and re-snapshot after a controller restart.
+	logHub *logHub
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -94,6 +99,7 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
 		digest: &digestState{buf: notify.NewDigestBuffer()},
+		logHub: newLogHub(),
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
@@ -360,6 +366,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs", s.withAdmin(s.handleCreateJob))
 	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
 	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
+	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))
 	mux.HandleFunc("POST /api/jobs/{id}/retry", s.withAdmin(s.handleRetryJob))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.withAdmin(s.handleCancelJob))
 	mux.HandleFunc("PATCH /api/jobs/{id}", s.withAdmin(s.handlePatchJob))
@@ -420,6 +427,15 @@ type statusRecorder struct {
 func (sr *statusRecorder) WriteHeader(code int) {
 	sr.status = code
 	sr.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards http.Flusher to the wrapped writer so streaming handlers
+// (SSE log stream) survive the logging middleware. A wrapper without this
+// hides the capability and w.(http.Flusher) fails at the handler.
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // logRequests emits one structured log line per request with the status.

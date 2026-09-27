@@ -62,6 +62,12 @@ type Agent struct {
 	// FPS tail-reads do not couple to job-state mutations.
 	rlGuard runLogGuard
 
+	// prog holds the current job's live step/percentage/log tail, fed by
+	// the lineObserver as PowerShell output arrives and snapshotted by the
+	// heartbeat goroutine so the controller (and its SSE log stream) sees
+	// progress between completions. Own mutex — never couples to a.mu.
+	prog *progressTracker
+
 	// Injectable exec seams for metrics collectors. nil → production
 	// defaults (runPSDefault, gpuProbeDefault). Tests inject fakes to
 	// verify parsing without shelling out to PowerShell or nvidia-smi.
@@ -105,6 +111,7 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 		// client-wide cap would contradict the download windows.
 		Client:  &http.Client{},
 		Version: version,
+		prog:    newProgressTracker(progressRingLines),
 		stopCh:  make(chan struct{}),
 	}
 	// Default metrics exec seam: only Windows has PowerShell; on other
@@ -270,6 +277,19 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 	if job != nil {
 		hb.JobID = job.ID
 		hb.JobStatus = "running"
+		// Live progress: latest ENCODE_STEP marker + bounded log tail fed
+		// by the lineObserver as PowerShell output arrives. The controller
+		// persists these on every heartbeat (UpdateJobStatus) and pushes
+		// them to SSE log-stream subscribers, so the UI sees encode
+		// progress without waiting for the completion report.
+		var step, tail string
+		var pct float64
+		if a.prog != nil { // nil only for struct-literal agents that never ran a job
+			step, pct, tail = a.prog.snapshot()
+		}
+		hb.Step = step
+		hb.StepProgress = pct
+		hb.LogTail = tail
 	}
 
 	var reply model.HeartbeatReply
@@ -472,6 +492,13 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string) (exitCode int, tail
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
 
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
+	if a.prog == nil {
+		// Struct-literal agents in tests bypass New; give them a tracker
+		// so the observer feed and heartbeat snapshot never nil-panic.
+		a.prog = newProgressTracker(progressRingLines)
+	}
+	observer.prog = a.prog // live heartbeat step/pct/tail feed
+	a.prog.reset()         // fresh state per job — never inherit the previous run
 	f, err := os.Create(runLog)
 	if err == nil {
 		defer f.Close()

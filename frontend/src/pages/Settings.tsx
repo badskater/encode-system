@@ -4,6 +4,7 @@ import type { Settings, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
 import APITokensCard from '../components/APITokensCard';
 import BackupsCard from '../components/BackupsCard';
+import SharesCard from '../components/SharesCard';
 
 // StringSettingKey = the Settings keys whose values are strings — the only
 // keys the free-text field() helper may edit. Number fields go through their
@@ -410,6 +411,11 @@ export default function SettingsPage() {
       {/* API tokens: scoped Bearer credentials for external automation
           (Sonarr-style triggers, Grafana, scripts). Managed independently of
           the settings blob — create/revoke take effect immediately. */}
+      {/* Storage shares: nfs/smb/s3 sources per pipeline role. Replaces
+          the legacy NFS settings fields (which the backend migrates into
+          share rows on boot). */}
+      <SharesCard />
+
       <APITokensCard />
 
       {/* Controller DB backups: scheduled VACUUM INTO snapshots with

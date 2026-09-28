@@ -152,6 +152,33 @@ export interface BackupStatus {
   next_run?: string;
 }
 
+// ShareKind is the transport backing a share mount.
+export type ShareKind = 'nfs' | 'smb' | 's3';
+// ShareRole is what the share provides to the pipeline.
+export type ShareRole = 'scripts' | 'release';
+
+// Share is a storage source (mounted for nfs/smb, per-job transfer for s3).
+// The password is write-only: the API returns has_password instead of any
+// credential material, so the edit form treats password as "replace only".
+export interface Share {
+  id: number;
+  name: string;
+  kind: ShareKind;
+  role: ShareRole;
+  server: string;
+  path: string;
+  port?: number;
+  username?: string;
+  region?: string;
+  use_tls?: boolean;
+  endpoint?: string;
+  enabled: boolean;
+  mount_path?: string;
+  has_password?: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 // APIToken is a scoped token for external automation. The plaintext token
 // is only returned by the create call (shown once); list responses carry
 // metadata only.

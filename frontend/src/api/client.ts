@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, BackupInfo, BackupStatus, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -162,6 +162,14 @@ export const api = {
   deleteToken: (id: number) => request<void>('DELETE', `/api/tokens/${id}`),
   // DB backups: status+list, manual snapshot, schedule settings, download
   // (blob — the Authorization header rules out a plain <a href>), delete.
+  // Shares: storage sources (nfs/smb/s3) per pipeline role. Passwords are
+  // write-only — never returned by the API (has_password flag instead).
+  shares: () => request<Share[]>('GET', '/api/shares'),
+  createShare: (body: Partial<Share> & { password?: string }) =>
+    request<Share>('POST', '/api/shares', body),
+  updateShare: (id: number, body: Partial<Share> & { password?: string }) =>
+    request<Share>('PUT', `/api/shares/${id}`, body),
+  deleteShare: (id: number) => request<void>('DELETE', `/api/shares/${id}`),
   backupStatus: () =>
     request<{ status: BackupStatus; snapshots: BackupInfo[] }>('GET', '/api/backup'),
   backupNow: () => request<BackupInfo>('POST', '/api/backup'),

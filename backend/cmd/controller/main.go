@@ -17,6 +17,7 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/api"
 	"github.com/badskater/encode-system/backend/internal/auth"
+	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/scanner"
 	"github.com/badskater/encode-system/backend/internal/store"
@@ -158,6 +159,13 @@ func main() {
 			if st2.ScanIntervalSeconds >= 5 && st2.ScanIntervalSeconds <= 3600 {
 				interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
 			}
+		}
+		// An s3 share owning the scripts role means there is no filesystem
+		// root to walk — jobs arrive via the API; return "" so the scanner
+		// skips cleanly instead of stat-ing a possibly-absent mount.
+		if sh, err := st.ShareForRole(scanCtx, model.ShareRoleScripts); err == nil &&
+			sh != nil && sh.Kind == model.ShareS3 {
+			root = ""
 		}
 		return root, interval, defaultFlow
 	})

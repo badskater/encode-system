@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -349,6 +350,32 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 		Tag:            tag,
 		DiscordWebhook: s.discordWebhook(ctx),
 	}
+	// S3-backed roles: the agent stages per job (download sources →
+	// encode → upload outputs) instead of reading mounts. Scripts/Release
+	// vars point INTO the per-job staging dir via the {{JOBDIR}}
+	// placeholder (the controller never knows node-local paths; the agent
+	// expands it against its jobDir). Mount-backed roles keep settings
+	// dirs untouched, so mixed farms work per-role.
+	var s3spec *model.S3Transfer
+	scriptsShare, _ := s.Store.ShareForRole(ctx, model.ShareRoleScripts)
+	releaseShare, _ := s.Store.ShareForRole(ctx, model.ShareRoleRelease)
+	if scriptsShare != nil && scriptsShare.Kind == model.ShareS3 {
+		vars.ScriptsDir = "{{JOBDIR}}/scripts"
+		s3spec = newS3SpecFromShare(s3spec, scriptsShare)
+		s3spec.Downloads = append(s3spec.Downloads, model.S3Download{
+			Bucket: scriptsShare.Path, Prefix: job.EpisodeDir,
+			LocalDir: "{{JOBDIR}}/scripts",
+		})
+	}
+	if releaseShare != nil && releaseShare.Kind == model.ShareS3 {
+		vars.ReleaseDir = "{{JOBDIR}}/release"
+		// A release share without a scripts share still needs a spec.
+		s3spec = newS3SpecFromShare(s3spec, releaseShare)
+		s3spec.Uploads = append(s3spec.Uploads, model.S3Upload{
+			Bucket: releaseShare.Path, Prefix: job.EpisodeDir,
+			LocalDir: "{{JOBDIR}}/release",
+		})
+	}
 	script, err := flow.Render(fl, job, vars, s.storeResolver())
 	if err != nil {
 		return nil, err
@@ -368,7 +395,39 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 			"expected_output": flow.OutputName(job.Series, episode, vars.Tag),
 		},
 		Flow: fl.Name,
+		S3:   s3spec,
 	}, nil
+}
+
+// newS3SpecFromShare returns spec (creating it from the share's connection
+// fields when nil) — both roles usually point at one MinIO/RGW instance,
+// so the first s3 share seen supplies endpoint/creds.
+func newS3SpecFromShare(spec *model.S3Transfer, sh *model.Share) *model.S3Transfer {
+	if spec != nil {
+		return spec
+	}
+	return &model.S3Transfer{
+		Endpoint:  s3Endpoint(sh),
+		Region:    sh.Region,
+		AccessKey: sh.Username,
+		SecretKey: sh.Password,
+		UseTLS:    sh.UseTLS,
+	}
+}
+
+// s3Endpoint normalizes a share's endpoint to host[:port] (minio-go wants
+// no scheme): a full URL in Endpoint wins, else Server[:Port].
+func s3Endpoint(sh *model.Share) string {
+	ep := strings.TrimSpace(sh.Endpoint)
+	ep = strings.TrimPrefix(strings.TrimPrefix(ep, "https://"), "http://")
+	ep = strings.TrimSuffix(ep, "/")
+	if ep != "" {
+		return ep
+	}
+	if sh.Port > 0 {
+		return fmt.Sprintf("%s:%d", sh.Server, sh.Port)
+	}
+	return sh.Server
 }
 
 // handleJobComplete records the agent's final job report.

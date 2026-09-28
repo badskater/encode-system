@@ -418,7 +418,14 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	// mangles any non-ASCII content — with anime series names that is a
 	// data-corruption bug, not a cosmetic one. Always write UTF-8 with BOM;
 	// pwsh (7+) and PS 5.1 both honor it identically.
-	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(job.Script)...)
+	// Expand the controller's {{JOBDIR}} placeholder (s3-staged jobs point
+	// $ScriptsDir/$ReleaseDir into the per-job dir; the controller never
+	// knows node-local paths).
+	expanded := strings.ReplaceAll(job.Script, "{{JOBDIR}}", jobDir)
+	if job.S3 != nil {
+		expandS3Paths(job.S3, jobDir)
+	}
+	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
 	if err := os.WriteFile(scriptPath, scriptBytes, 0o644); err != nil {
 		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil, nil)
 		return
@@ -426,6 +433,23 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	if _, err := os.Stat(a.Cfg.LibPath); err != nil {
 		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
 		return
+	}
+
+	// S3-backed shares: pull the job's source objects into the local
+	// staging dir BEFORE the script runs (the rendered script reads from
+	// $ScriptsDir paths; for s3 roles the controller points those vars at
+	// the staging dirs). Failure = job failed, no point running blind.
+	if job.S3 != nil && len(job.S3.Downloads) > 0 {
+		store, err := newObjectStore(job.S3)
+		if err != nil {
+			a.completeJob(job.ID, "failed", -1, err.Error(), nil, "", "", nil, nil)
+			return
+		}
+		log.Info("downloading s3 sources", "downloads", len(job.S3.Downloads))
+		if err := runS3Downloads(context.Background(), store, job.S3); err != nil {
+			a.completeJob(job.ID, "failed", -1, "s3 download: "+err.Error(), nil, "", "", nil, nil)
+			return
+		}
 	}
 
 	ps := a.findPowerShell()
@@ -468,6 +492,20 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	if capErr != nil {
 		log.Warn("full log capture failed; sending empty", "err", capErr)
 		fullLog = ""
+	}
+	// S3-backed releases: push outputs after a SUCCESSFUL run only — a
+	// failed encode must not publish partial artifacts. Upload failure
+	// downgrades the job to failed (the encode itself worked, but the
+	// release never landed).
+	if status == "done" && job.S3 != nil && len(job.S3.Uploads) > 0 {
+		store, err := newObjectStore(job.S3)
+		if err == nil {
+			log.Info("uploading s3 outputs", "uploads", len(job.S3.Uploads))
+			err = runS3Uploads(context.Background(), store, job.S3)
+		}
+		if err != nil {
+			status, exitCode, errMsg = "failed", -1, "s3 upload: "+err.Error()
+		}
 	}
 	var metricMap map[string]float64
 	if aj != nil {

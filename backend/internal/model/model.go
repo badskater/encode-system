@@ -471,6 +471,47 @@ type JobPayload struct {
 	Script string            `json:"script"` // rendered PowerShell
 	Vars   map[string]string `json:"vars"`   // job variables for logging/context
 	Flow   string            `json:"flow"`   // flow name, informational
+	// S3 carries per-job object-store transfers when a scripts/release
+	// role is backed by an s3 share instead of a mount: the agent
+	// downloads every Transfer.Download prefix into its local dir BEFORE
+	// running the script and uploads each Upload dir AFTER a successful
+	// run. Nil for mount-backed jobs (the common case).
+	S3 *S3Transfer `json:"s3,omitempty"`
+}
+
+// S3Transfer is the per-job object-store work order. Credentials are
+// short-lived in the sense that they ride one dispatch reply over the
+// node-authenticated channel; the controller never logs the struct.
+type S3Transfer struct {
+	Endpoint  string       `json:"endpoint"` // host:port (no scheme)
+	Region    string       `json:"region,omitempty"`
+	AccessKey string       `json:"access_key"`
+	SecretKey string       `json:"secret_key"`
+	UseTLS    bool         `json:"use_tls,omitempty"`
+	Downloads []S3Download `json:"downloads,omitempty"`
+	Uploads   []S3Upload   `json:"uploads,omitempty"`
+}
+
+// S3Object is one listed object (key + size) from a bucket prefix scan.
+type S3Object struct {
+	Key  string `json:"key"`
+	Size int64  `json:"size"`
+}
+
+// S3Download pulls bucket/prefix/** into LocalDir (created if missing)
+// before the job script runs.
+type S3Download struct {
+	Bucket   string `json:"bucket"`
+	Prefix   string `json:"prefix"` // e.g. "4k-test/Ep 02" (no leading slash)
+	LocalDir string `json:"local_dir"`
+}
+
+// S3Upload pushes every file under LocalDir to bucket/prefix after a
+// successful run (recursive, relative paths preserved).
+type S3Upload struct {
+	Bucket   string `json:"bucket"`
+	Prefix   string `json:"prefix"`
+	LocalDir string `json:"local_dir"`
 }
 
 // APIToken is a scoped token for external automation (Sonarr-style

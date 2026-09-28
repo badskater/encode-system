@@ -76,6 +76,10 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfi
 // auto-registered on first sight; disabled series are skipped; each series'
 // flow selection wins over the default flow.
 func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaultFlow string) {
+	if root == "" {
+		return // no filesystem scripts root (e.g. s3-backed scripts role:
+		// jobs arrive via the API instead of folder scanning)
+	}
 	cands, skipped, err := Scan(root, SourceStableFor)
 	if err != nil {
 		log.Warn("scan failed", "root", root, "err", err)

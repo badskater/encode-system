@@ -63,8 +63,11 @@ func TestRenderJobS3Staging(t *testing.T) {
 	if d.Bucket != "scripts-bucket" || d.Prefix != "4k-test/Ep 02" {
 		t.Fatalf("download = %+v", d)
 	}
-	if !strings.Contains(d.LocalDir, "{{JOBDIR}}") {
-		t.Fatalf("download LocalDir = %q, want {{JOBDIR}} placeholder", d.LocalDir)
+	// The rendered script computes $EpisodeDir = Join-Path $ScriptsDir
+	// <episode_dir>, and downloads strip the bucket prefix — so sources
+	// must land under scripts/<episode_dir>, not the scripts root.
+	if d.LocalDir != "{{JOBDIR}}/scripts/4k-test/Ep 02" {
+		t.Fatalf("download LocalDir = %q, want {{JOBDIR}}/scripts/4k-test/Ep 02", d.LocalDir)
 	}
 	if len(payload.S3.Uploads) != 1 {
 		t.Fatalf("uploads = %+v, want 1", payload.S3.Uploads)

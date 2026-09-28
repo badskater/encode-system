@@ -362,9 +362,13 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 	if scriptsShare != nil && scriptsShare.Kind == model.ShareS3 {
 		vars.ScriptsDir = "{{JOBDIR}}/scripts"
 		s3spec = newS3SpecFromShare(s3spec, scriptsShare)
+		// LocalDir must mirror the mounted-share layout: the rendered
+		// script computes $EpisodeDir = Join-Path $ScriptsDir <episode_dir>,
+		// and downloads strip the bucket prefix — so land them under
+		// scripts/<episode_dir>, not the scripts root.
 		s3spec.Downloads = append(s3spec.Downloads, model.S3Download{
 			Bucket: scriptsShare.Path, Prefix: job.EpisodeDir,
-			LocalDir: "{{JOBDIR}}/scripts",
+			LocalDir: "{{JOBDIR}}/scripts/" + job.EpisodeDir,
 		})
 	}
 	if releaseShare != nil && releaseShare.Kind == model.ShareS3 {

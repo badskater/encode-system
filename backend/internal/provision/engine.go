@@ -36,13 +36,18 @@ type Request struct {
 	NodeName      string
 	// Options.
 	InstallToolchain bool // MediaInfo, AviSynth+, Python, VapourSynth
-	MountNFS         bool // NFS client + share mounts (needs settings.NFSServer)
+	MountNFS         bool // legacy: NFS client + mounts from Settings (kept for API compat)
+	MountShares      bool // mount the enabled shares (smb/nfs rows in the shares table)
 	PushBin          bool // extract the published bin package into the bin dir
 }
 
 // Store is the persistence surface the engine needs (narrow for tests).
 type Store interface {
 	GetSettings(ctx context.Context) (*model.Settings, error)
+	// ShareForRole returns the enabled share serving a role (smb preferred
+	// over nfs over s3), or nil when none — provisioning then falls back to
+	// the legacy NFS Settings fields for that role.
+	ShareForRole(ctx context.Context, role model.ShareRole) (*model.Share, error)
 	CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error)
 	GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error)
 	ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error)
@@ -176,8 +181,8 @@ func (e *Engine) Start(ctx context.Context, req Request) (*model.ProvisionRun, e
 		Host: req.Host, Port: req.Port, Scheme: req.Scheme,
 		WinRMUser: req.WinRMUser, NodeName: req.NodeName,
 		Status: "queued",
-		OptionsJSON: fmt.Sprintf(`{"install_toolchain":%v,"mount_nfs":%v,"push_bin":%v}`,
-			req.InstallToolchain, req.MountNFS, req.PushBin),
+		OptionsJSON: fmt.Sprintf(`{"install_toolchain":%v,"mount_nfs":%v,"mount_shares":%v,"push_bin":%v}`,
+			req.InstallToolchain, req.MountNFS, req.MountShares, req.PushBin),
 	})
 	if err != nil {
 		return nil, err
@@ -227,6 +232,16 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	if strings.TrimSpace(settings.ControllerURL) == "" {
 		return fmt.Errorf("settings.controller_url is empty — set it on the Settings page (nodes must be able to reach this URL)")
 	}
+	// Resolve the enabled share per role (nil = fall back to legacy NFS
+	// Settings for that role). ShareForRole prefers smb over nfs over s3.
+	scriptsShare, err := e.Store.ShareForRole(ctx, model.ShareRoleScripts)
+	if err != nil {
+		return fmt.Errorf("resolve scripts share: %w", err)
+	}
+	releaseShare, err := e.Store.ShareForRole(ctx, model.ShareRoleRelease)
+	if err != nil {
+		return fmt.Errorf("resolve release share: %w", err)
+	}
 
 	dir, err := os.MkdirTemp("", "provision-*")
 	if err != nil {
@@ -270,7 +285,7 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	if err := os.WriteFile(filepath.Join(dir, "inventory.yml"), []byte(inv), 0o600); err != nil {
 		return err
 	}
-	vars := buildVars(settings, req, code, libOK, binOK)
+	vars := buildVars(settings, req, code, libOK, binOK, scriptsShare, releaseShare)
 	if err := os.WriteFile(filepath.Join(dir, "vars.yml"), []byte(vars), 0o600); err != nil {
 		return err
 	}
@@ -450,18 +465,42 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 }
 
 // buildVars renders the ansible extra-vars file from live settings + the
-// request. The WinRM password and pairing code are the only secrets and
-// live nowhere else.
-func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK bool) string {
+// request + the resolved per-role shares (nil = fall back to the legacy NFS
+// Settings fields for that role). The WinRM password, pairing code and any
+// share credentials are the only secrets; the file is written 0600 and
+// deleted after the run.
+func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK bool,
+	scriptsShare, releaseShare *model.Share) string {
+	// Mounting is requested by either flag: MountShares (shares table) or
+	// the legacy MountNFS (Settings NFS). A share owning a role SUPPRESSES
+	// the legacy NFS export for that role — one transport per role.
+	mount := req.MountShares || req.MountNFS
 	nfsScripts := ""
 	nfsRelease := ""
-	if req.MountNFS && strings.TrimSpace(s.NFSServer) != "" {
-		server := strings.TrimSpace(s.NFSServer)
-		if sp := strings.TrimSpace(s.ScriptsShare); sp != "" {
+	server := strings.TrimSpace(s.NFSServer)
+	if mount && server != "" {
+		if sp := strings.TrimSpace(s.ScriptsShare); sp != "" && !shareOwnsRole(scriptsShare) {
 			nfsScripts = server + ":" + sp
 		}
-		if rp := strings.TrimSpace(s.ReleaseShare); rp != "" {
+		if rp := strings.TrimSpace(s.ReleaseShare); rp != "" && !shareOwnsRole(releaseShare) {
 			nfsRelease = server + ":" + rp
+		}
+	}
+	// SMB vars: only a smb-kind share renders them (s3 shares have no
+	// mount — the agent transfers per job).
+	smbScriptsUNC, smbScriptsUser, smbScriptsPass := "", "", ""
+	smbReleaseUNC, smbReleaseUser, smbReleasePass := "", "", ""
+	mountSMB := false
+	if mount {
+		if sh := scriptsShare; sh != nil && sh.Kind == model.ShareSMB {
+			smbScriptsUNC = smbUNC(sh)
+			smbScriptsUser, smbScriptsPass = sh.Username, sh.Password
+			mountSMB = true
+		}
+		if sh := releaseShare; sh != nil && sh.Kind == model.ShareSMB {
+			smbReleaseUNC = smbUNC(sh)
+			smbReleaseUser, smbReleasePass = sh.Username, sh.Password
+			mountSMB = true
 		}
 	}
 	var b strings.Builder
@@ -475,7 +514,14 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "encode_heartbeat_seconds: 15\n")
 	fmt.Fprintf(&b, "encode_nfs_scripts_export: %s\n", yamlQuote(nfsScripts))
 	fmt.Fprintf(&b, "encode_nfs_release_export: %s\n", yamlQuote(nfsRelease))
-	fmt.Fprintf(&b, "encode_mount_nfs: %v\n", req.MountNFS && nfsScripts != "")
+	fmt.Fprintf(&b, "encode_mount_nfs: %v\n", mount && (nfsScripts != "" || nfsRelease != ""))
+	fmt.Fprintf(&b, "encode_smb_scripts_unc: %s\n", yamlQuote(smbScriptsUNC))
+	fmt.Fprintf(&b, "encode_smb_release_unc: %s\n", yamlQuote(smbReleaseUNC))
+	fmt.Fprintf(&b, "encode_smb_scripts_user: %s\n", yamlQuote(smbScriptsUser))
+	fmt.Fprintf(&b, "encode_smb_scripts_pass: %s\n", yamlQuote(smbScriptsPass))
+	fmt.Fprintf(&b, "encode_smb_release_user: %s\n", yamlQuote(smbReleaseUser))
+	fmt.Fprintf(&b, "encode_smb_release_pass: %s\n", yamlQuote(smbReleasePass))
+	fmt.Fprintf(&b, "encode_mount_smb: %v\n", mountSMB)
 	fmt.Fprintf(&b, "encode_install_toolchain: %v\n", req.InstallToolchain)
 	fmt.Fprintf(&b, "encode_push_bin: %v\n", binOK)
 	fmt.Fprintf(&b, "encode_has_lib: %v\n", libOK)
@@ -490,6 +536,16 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "ansible_winrm_read_timeout_sec: 150\n")
 	fmt.Fprintf(&b, "ansible_winrm_operation_timeout_sec: 120\n")
 	return b.String()
+}
+
+// shareOwnsRole reports whether a resolved share (any kind) owns a role —
+// used to suppress the legacy NFS export for that role.
+func shareOwnsRole(sh *model.Share) bool { return sh != nil }
+
+// smbUNC renders \\server\share from a share row (path may use either
+// slash direction; backslashes are canonical for UNC).
+func smbUNC(sh *model.Share) string {
+	return `\\` + sh.Server + `\` + strings.ReplaceAll(strings.Trim(sh.Path, "/\\"), "/", "\\")
 }
 
 // yamlQuote single-quotes a scalar, escaping embedded single quotes. Keeps

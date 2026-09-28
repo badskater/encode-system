@@ -189,6 +189,12 @@ func main() {
 		Enabled: env("ENCODE_BACKUP_ENABLED", "false") == "true",
 		Every:   time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
 	}
+	// One-time migration: legacy flat NFS Settings fields become share rows
+	// (idempotent; never touches existing shares).
+	if n := st.MigrateSettingsShares(ctx); n > 0 {
+		log.Info("migrated NFS settings into shares", "count", n)
+	}
+
 	go srv.Backup.Run(ctx)
 
 	// Serve UI static files (built frontend) if present, then the API.

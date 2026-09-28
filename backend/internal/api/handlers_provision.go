@@ -20,7 +20,8 @@ type provisionRequest struct {
 	WinRMPassword    string `json:"winrm_password"`
 	NodeName         string `json:"node_name"`
 	InstallToolchain bool   `json:"install_toolchain"`
-	MountNFS         bool   `json:"mount_nfs"`
+	MountNFS         bool   `json:"mount_nfs"`    // legacy: Settings NFS fields
+	MountShares      bool   `json:"mount_shares"` // shares table (smb/nfs rows)
 	PushBin          bool   `json:"push_bin"`
 }
 
@@ -39,7 +40,7 @@ func (s *Server) handleStartProvision(w http.ResponseWriter, r *http.Request) {
 		Host: req.Host, Port: req.Port, Scheme: req.Scheme,
 		WinRMUser: req.WinRMUser, WinRMPassword: req.WinRMPassword,
 		NodeName: req.NodeName, InstallToolchain: req.InstallToolchain,
-		MountNFS: req.MountNFS, PushBin: req.PushBin,
+		MountNFS: req.MountNFS, MountShares: req.MountShares, PushBin: req.PushBin,
 	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

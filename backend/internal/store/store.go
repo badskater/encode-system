@@ -4,6 +4,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,13 @@ import (
 // Store wraps the SQLite database with typed operations.
 type Store struct {
 	db *sql.DB
+	// dbPath is the database file location, kept for the share-credential
+	// key file (<dbPath>.shares-key) and BackupTo.
+	dbPath string
+	// aead is the lazily-created cipher protecting share passwords (see
+	// store_share.go). Guarded by nothing: only touched from store methods
+	// which the sqlite pool serializes (MaxOpenConns=1).
+	aead cipher.AEAD
 }
 
 // Open opens (creating if needed) the SQLite database at path and applies
@@ -39,7 +47,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // SQLite: single writer avoids lock contention
-	s := &Store{db: db}
+	s := &Store{db: db, dbPath: path}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -113,6 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	}
 	if err := s.migrateExt(); err != nil {
 		return err
+	}
+	if err := s.ensureSharesTable(context.Background()); err != nil {
+		return fmt.Errorf("migrate shares: %w", err)
 	}
 	if err := s.migrateAuth(context.Background()); err != nil {
 		return err

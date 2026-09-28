@@ -8,8 +8,11 @@
 #   encode_controller_url, encode_node_name, encode_bin_dir,
 #   encode_scripts_mount, encode_release_mount, encode_agent_dir,
 #   encode_heartbeat_seconds, encode_nfs_scripts_export,
-#   encode_nfs_release_export, encode_mount_nfs, encode_install_toolchain,
-#   encode_push_bin, encode_has_lib, encode_pairing_code
+#   encode_nfs_release_export, encode_mount_nfs, encode_smb_scripts_unc,
+#   encode_smb_release_unc, encode_smb_scripts_user, encode_smb_scripts_pass,
+#   encode_smb_release_user, encode_smb_release_pass, encode_mount_smb,
+#   encode_install_toolchain, encode_push_bin, encode_has_lib,
+#   encode_pairing_code
 #
 # Everything is idempotent: re-running only fixes what is missing.
 ---
@@ -79,6 +82,72 @@
           register: remount_task
           changed_when: "'task registered' in remount_task.stdout"
           failed_when: remount_task.rc != 0
+
+    # --------------------------------------------------------------- SMB
+    # Windows-native: New-SmbMapping over the UNC (no client feature to
+    # install). Credentials come from the share row; the remount script
+    # re-establishes mappings at startup (mappings don't survive reboot
+    # for SYSTEM-context services otherwise).
+    - name: SMB share mounts
+      when: encode_mount_smb | bool
+      no_log: true
+      block:
+        - name: Create mount point directories (SMB)
+          ansible.windows.win_file:
+            path: "{{ item }}"
+            state: directory
+          loop:
+            - "{{ encode_scripts_mount }}"
+            - "{{ encode_release_mount }}"
+
+        - name: Ensure agent directory exists (remount script home)
+          ansible.windows.win_file:
+            path: "{{ encode_agent_dir }}"
+            state: directory
+
+        # win_copy content is Jinja-templated, so the share table is
+        # rendered directly — one file, no post-processing. The script
+        # holds plaintext creds (like remount-nfs.ps1 holds exports); the
+        # playbook dir is 0700 and no_log keeps them out of ansible output.
+        - name: Write SMB remount script
+          ansible.windows.win_copy:
+            dest: "{{ encode_agent_dir }}\\remount-smb.ps1"
+            content: |
+              # Remount encode-system SMB shares. Idempotent.
+              $maps = @(
+                @('{{ encode_smb_scripts_unc }}','{{ encode_smb_scripts_user }}','{{ encode_smb_scripts_pass }}','{{ encode_scripts_mount }}'),
+                @('{{ encode_smb_release_unc }}','{{ encode_smb_release_user }}','{{ encode_smb_release_pass }}','{{ encode_release_mount }}')
+              )
+              foreach ($m in $maps) {
+                $unc = $m[0]; $user = $m[1]; $pass = $m[2]; $local = $m[3]
+                if ([string]::IsNullOrWhiteSpace($unc)) { continue }
+                $existing = Get-SmbMapping -LocalPath $local -ErrorAction SilentlyContinue
+                if ($existing) { Write-Output "already mapped: $local"; continue }
+                New-SmbMapping -LocalPath $local -RemotePath $unc -UserName $user -Password $pass -Persistent $true | Out-Null
+                if ($?) { Write-Output "mapped: $unc -> $local" } else { Write-Error "map failed: $unc"; exit 1 }
+              }
+
+        - name: Mount SMB shares now
+          ansible.windows.win_shell: |
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{{ encode_agent_dir }}\remount-smb.ps1"
+          no_log: true
+          register: smb_mount_now
+          changed_when: "'mapped:' in smb_mount_now.stdout and 'already mapped:' not in smb_mount_now.stdout"
+          failed_when: smb_mount_now.rc != 0
+
+        - name: Register startup task to remount SMB after reboot
+          ansible.windows.win_shell: |
+            $existing = Get-ScheduledTask -TaskName "encode-system-remount-smb" -ErrorAction SilentlyContinue
+            if ($existing) { Write-Output "task exists"; exit 0 }
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -File '{{ encode_agent_dir }}\remount-smb.ps1'"
+            $trigger = New-ScheduledTaskTrigger -AtStartup
+            Register-ScheduledTask -TaskName "encode-system-remount-smb" `
+              -Action $action -Trigger $trigger -RunLevel Highest -User SYSTEM -Force
+            Write-Output "task registered"
+          register: smb_remount_task
+          changed_when: "'task registered' in smb_remount_task.stdout"
+          failed_when: smb_remount_task.rc != 0
 
     # ----------------------------------------------------------- Toolchain
     - name: Install encode toolchain

@@ -104,6 +104,52 @@ type ProvisionRun struct {
 	FinishedAt  *time.Time `json:"finished_at,omitempty"`
 }
 
+// ShareKind is the transport backing a share mount.
+type ShareKind string
+
+const (
+	ShareNFS  ShareKind = "nfs"
+	ShareSMB  ShareKind = "smb"
+	ShareS3   ShareKind = "s3"
+	ShareNone ShareKind = ""
+)
+
+// ShareRole is what the share provides to the pipeline.
+type ShareRole string
+
+const (
+	ShareRoleScripts ShareRole = "scripts" // job scripts + sources
+	ShareRoleRelease ShareRole = "release" // finished outputs
+)
+
+// Share is a storage source mounted (nfs/smb) or accessed (s3) by nodes.
+// Replaces the flat NFS Settings fields: one row per role+kind, so a farm
+// can mix transports (SMB on Windows nodes, S3 for distributed pulls).
+// Password/secret are encrypted at rest (AES-GCM, key file beside the DB)
+// and never serialized to API responses.
+type Share struct {
+	ID     int64     `json:"id"`
+	Name   string    `json:"name"`
+	Kind   ShareKind `json:"kind"` // nfs | smb | s3
+	Role   ShareRole `json:"role"` // scripts | release
+	Server string    `json:"server"`
+	Path   string    `json:"path"` // export path (nfs), share name (smb), bucket (s3)
+	Port   int       `json:"port,omitempty"`
+	// Credentials: smb user/password, s3 access/secret key. Empty for nfs.
+	Username string `json:"username,omitempty"`
+	Password string `json:"-"` // write-only over the API; never marshaled out
+	// S3 extras.
+	Region   string `json:"region,omitempty"`
+	UseTLS   bool   `json:"use_tls,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"` // s3: full URL override (minio/RGW)
+	Enabled  bool   `json:"enabled"`
+	// MountPath is where provisioning mounts it on the node (nfs/smb).
+	// S3 shares have no mount — the agent pulls per job.
+	MountPath string    `json:"mount_path,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // Settings is the operator-editable runtime configuration (NFS shares,
 // controller roots, node path mapping, scan cadence, release naming). Stored
 // in the database as a JSON blob in a single-row table; environment variables

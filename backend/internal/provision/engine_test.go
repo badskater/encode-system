@@ -67,7 +67,7 @@ func TestBuildVars(t *testing.T) {
 		WinRMUser: "Administrator", WinRMPassword: "s3cret!pass",
 		NodeName: "enc-03", MountNFS: true, InstallToolchain: true,
 	}
-	vars := buildVars(settings, req, "deadbeefpairingcode", true, true)
+	vars := buildVars(settings, req, "deadbeefpairingcode", true, true, nil, nil)
 
 	for _, want := range []string{
 		"encode_controller_url: 'http://172.24.92.232:8080'",
@@ -91,7 +91,7 @@ func TestBuildVars(t *testing.T) {
 func TestBuildVarsNFSDisabledWithoutServer(t *testing.T) {
 	settings := &model.Settings{ControllerURL: "http://c:8080", NodeBinDir: `C:\bin`}
 	req := Request{Host: "h", WinRMUser: "u", WinRMPassword: "p", NodeName: "n", MountNFS: true}
-	vars := buildVars(settings, req, "code", false, false)
+	vars := buildVars(settings, req, "code", false, false, nil, nil)
 	if !strings.Contains(vars, "encode_mount_nfs: false") {
 		t.Errorf("NFS must stay off without a server configured:\n%s", vars)
 	}
@@ -119,6 +119,9 @@ type fakeProvStore struct {
 
 func (f *fakeProvStore) GetSettings(ctx context.Context) (*model.Settings, error) {
 	return &model.Settings{ControllerURL: "http://c:8080"}, nil
+}
+func (f *fakeProvStore) ShareForRole(ctx context.Context, role model.ShareRole) (*model.Share, error) {
+	return nil, nil
 }
 func (f *fakeProvStore) CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error) {
 	pr.ID = 1

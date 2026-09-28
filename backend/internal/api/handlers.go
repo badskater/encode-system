@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/s3"
 	"github.com/badskater/encode-system/backend/internal/store"
 )
 
@@ -420,19 +420,8 @@ func newS3SpecFromShare(spec *model.S3Transfer, sh *model.Share) *model.S3Transf
 }
 
 // s3Endpoint normalizes a share's endpoint to host[:port] (minio-go wants
-// no scheme): a full URL in Endpoint wins, else Server[:Port].
-func s3Endpoint(sh *model.Share) string {
-	ep := strings.TrimSpace(sh.Endpoint)
-	ep = strings.TrimPrefix(strings.TrimPrefix(ep, "https://"), "http://")
-	ep = strings.TrimSuffix(ep, "/")
-	if ep != "" {
-		return ep
-	}
-	if sh.Port > 0 {
-		return fmt.Sprintf("%s:%d", sh.Server, sh.Port)
-	}
-	return sh.Server
-}
+// no scheme). Shared with the scanner via internal/s3.
+func s3Endpoint(sh *model.Share) string { return s3.EndpointFromShare(sh) }
 
 // handleJobComplete records the agent's final job report.
 func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, node *model.Node) {

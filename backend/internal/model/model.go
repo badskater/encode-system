@@ -494,8 +494,9 @@ type S3Transfer struct {
 
 // S3Object is one listed object (key + size) from a bucket prefix scan.
 type S3Object struct {
-	Key  string `json:"key"`
-	Size int64  `json:"size"`
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified,omitempty"`
 }
 
 // S3Download pulls bucket/prefix/** into LocalDir (created if missing)

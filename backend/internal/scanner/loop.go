@@ -9,6 +9,7 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/s3"
 )
 
 // JobCreator is the subset of store the loop needs (kept narrow for tests).
@@ -27,11 +28,20 @@ type JobCreator interface {
 // last bytes land.
 const SourceStableFor = 2 * time.Minute
 
+// Target is where one scan cycle reads episodes from. Exactly one mode is
+// set: Root walks a mounted filesystem share; S3 lists a bucket via the
+// controller's object store. Neither set = scanning disabled.
+type Target struct {
+	Root     string // filesystem scripts root (mounted nfs/smb share)
+	S3Bucket string // s3 scripts bucket (full autonomy: no mount)
+	S3Store  s3.ObjectStore
+}
+
 // LiveConfig supplies the scanner's runtime parameters on every cycle so
-// Settings-page edits (watch root, cadence) apply without restarting the
-// controller. Returns the scripts root, the scan interval, and the default
-// flow name.
-type LiveConfig func(ctx context.Context) (root string, interval time.Duration, defaultFlow string)
+// Settings-page edits (watch root/share choice, cadence) apply without
+// restarting the controller. Returns the scan target, the scan interval,
+// and the default flow name.
+type LiveConfig func(ctx context.Context) (target Target, interval time.Duration, defaultFlow string)
 
 // RunLoop scans on the live-configured interval until ctx is cancelled. It
 // logs each created job and skips folders that already have a job (any
@@ -52,7 +62,7 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfi
 		}
 	}()
 	for {
-		root, interval, defaultFlow := cfg(ctx)
+		target, interval, defaultFlow := cfg(ctx)
 		if interval <= 0 {
 			interval = 30 * time.Second
 		}
@@ -67,7 +77,7 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfi
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			scanOnce(ctx, log, st, root, defaultFlow)
+			scanOnce(ctx, log, st, target, defaultFlow)
 		}
 	}
 }
@@ -75,18 +85,28 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfi
 // scanOnce performs a single scan + job creation pass. Series are
 // auto-registered on first sight; disabled series are skipped; each series'
 // flow selection wins over the default flow.
-func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, root, defaultFlow string) {
-	if root == "" {
-		return // no filesystem scripts root (e.g. s3-backed scripts role:
-		// jobs arrive via the API instead of folder scanning)
-	}
-	cands, skipped, err := Scan(root, SourceStableFor)
-	if err != nil {
-		log.Warn("scan failed", "root", root, "err", err)
-		return
-	}
-	if skipped > 0 {
-		log.Warn("scan skipped unreadable dirs", "count", skipped, "root", root)
+func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, target Target, defaultFlow string) {
+	var cands []Candidate
+	switch {
+	case target.S3Bucket != "" && target.S3Store != nil:
+		scanned, err := ScanS3(ctx, target.S3Store, target.S3Bucket, SourceStableFor)
+		if err != nil {
+			log.Warn("s3 scan failed", "bucket", target.S3Bucket, "err", err)
+			return
+		}
+		cands = scanned
+	case target.Root != "":
+		scanned, skipped, err := Scan(target.Root, SourceStableFor)
+		if err != nil {
+			log.Warn("scan failed", "root", target.Root, "err", err)
+			return
+		}
+		if skipped > 0 {
+			log.Warn("scan skipped unreadable dirs", "count", skipped, "root", target.Root)
+		}
+		cands = scanned
+	default:
+		return // no target configured
 	}
 	for _, c := range cands {
 		sr, err := st.UpsertSeriesByName(ctx, c.Series)

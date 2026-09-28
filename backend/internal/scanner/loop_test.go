@@ -76,7 +76,7 @@ func TestScanOnceCreatesJobsForNewEpisodesOnly(t *testing.T) {
 		flow:     &model.Flow{ID: 9, Name: "default-1080"},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	scanOnce(context.Background(), log, st, root, "default-1080")
+	scanOnce(context.Background(), log, st, Target{Root: root}, "default-1080")
 
 	if len(st.created) != 1 {
 		t.Fatalf("want 1 new job (Ep 02), got %d: %+v", len(st.created), st.created)
@@ -101,7 +101,7 @@ func TestLoopUsesFlowEpisodeNumber(t *testing.T) {
 
 	st := &fakeStore{existing: map[string]bool{}, flow: &model.Flow{ID: 1, Name: "default-1080"}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	scanOnce(context.Background(), log, st, root, "default-1080")
+	scanOnce(context.Background(), log, st, Target{Root: root}, "default-1080")
 
 	if len(st.created) != 1 {
 		t.Fatalf("want 1 job, got %d", len(st.created))
@@ -126,11 +126,11 @@ func TestRunLoopLiveConfigAndCancellation(t *testing.T) {
 	var mu sync.Mutex
 	calls := 0
 	interval := 30 * time.Millisecond
-	cfg := func(ctx context.Context) (string, time.Duration, string) {
+	cfg := func(ctx context.Context) (Target, time.Duration, string) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
-		return root, interval, "default-1080"
+		return Target{Root: root}, interval, "default-1080"
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

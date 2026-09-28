@@ -9,64 +9,16 @@ import (
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/badskater/encode-system/backend/internal/s3"
 )
 
-// ObjectStore is the narrow object-storage surface the job pipeline needs
-// (list/get/put). Production uses minioClientStore (minio-go, S3 API —
-// works against MinIO, Ceph RGW, AWS); tests use an in-memory fake.
-type ObjectStore interface {
-	List(ctx context.Context, bucket, prefix string) ([]model.S3Object, error)
-	Get(ctx context.Context, bucket, key, dest string) error
-	Put(ctx context.Context, bucket, key, src string) error
-}
-
-// minioClientStore adapts a minio.Client to ObjectStore.
-type minioClientStore struct{ c *minio.Client }
+// ObjectStore aliases the shared s3 package surface (list/get/put) so the
+// agent and the controller scanner speak the same protocol. Tests use an
+// in-memory fake implementing it.
+type ObjectStore = s3.ObjectStore
 
 // newObjectStore builds the production store from a transfer spec.
-// Endpoint is host[:port] without scheme (minio-go convention); UseTLS
-// selects https.
-func newObjectStore(t *model.S3Transfer) (ObjectStore, error) {
-	c, err := minio.New(t.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(t.AccessKey, t.SecretKey, ""),
-		Secure: t.UseTLS,
-		Region: t.Region,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("s3 client: %w", err)
-	}
-	return &minioClientStore{c: c}, nil
-}
-
-func (m *minioClientStore) List(ctx context.Context, bucket, prefix string) ([]model.S3Object, error) {
-	var out []model.S3Object
-	for obj := range m.c.ListObjects(ctx, bucket, minio.ListObjectsOptions{
-		Prefix: prefix, Recursive: true,
-	}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		if obj.Key == "" || strings.HasSuffix(obj.Key, "/") {
-			continue // directory markers carry no content
-		}
-		out = append(out, model.S3Object{Key: obj.Key, Size: obj.Size})
-	}
-	return out, nil
-}
-
-func (m *minioClientStore) Get(ctx context.Context, bucket, key, dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
-	}
-	return m.c.FGetObject(ctx, bucket, key, dest, minio.GetObjectOptions{})
-}
-
-func (m *minioClientStore) Put(ctx context.Context, bucket, key, src string) error {
-	_, err := m.c.FPutObject(ctx, bucket, key, src, minio.PutObjectOptions{})
-	return err
-}
+func newObjectStore(t *model.S3Transfer) (ObjectStore, error) { return s3.New(t) }
 
 // expandS3Paths replaces the {{JOBDIR}} placeholder in every LocalDir of
 // the transfer spec with the agent's real per-job directory. The

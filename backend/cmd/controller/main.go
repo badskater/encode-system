@@ -19,6 +19,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/provision"
+	"github.com/badskater/encode-system/backend/internal/s3"
 	"github.com/badskater/encode-system/backend/internal/scanner"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -146,7 +147,7 @@ func main() {
 	// Scanner loop: watch the scripts share for new episode folders. The
 	// root, cadence, and default flow come from the LIVE settings store so
 	// Settings-page edits apply on the next cycle without a restart.
-	go scanner.RunLoop(ctx, log, st, func(scanCtx context.Context) (string, time.Duration, string) {
+	go scanner.RunLoop(ctx, log, st, func(scanCtx context.Context) (scanner.Target, time.Duration, string) {
 		root := cfg.ScriptsRoot
 		interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
 		defaultFlow := cfg.DefaultFlowName
@@ -160,14 +161,26 @@ func main() {
 				interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
 			}
 		}
-		// An s3 share owning the scripts role means there is no filesystem
-		// root to walk — jobs arrive via the API; return "" so the scanner
-		// skips cleanly instead of stat-ing a possibly-absent mount.
+		// An enabled s3 share owning the scripts role switches discovery to
+		// bucket listing (full s3 autonomy: no mount on the controller).
+		// Client construction is per-cycle so credential rotation applies
+		// without restart; it is cheap (no network round-trip).
 		if sh, err := st.ShareForRole(scanCtx, model.ShareRoleScripts); err == nil &&
 			sh != nil && sh.Kind == model.ShareS3 {
-			root = ""
+			store, serr := s3.New(&model.S3Transfer{
+				Endpoint:  s3.EndpointFromShare(sh),
+				Region:    sh.Region,
+				AccessKey: sh.Username,
+				SecretKey: sh.Password,
+				UseTLS:    sh.UseTLS,
+			})
+			if serr != nil {
+				log.Warn("s3 scanner client failed; scanning disabled", "share", sh.Name, "err", serr)
+				return scanner.Target{}, interval, defaultFlow
+			}
+			return scanner.Target{S3Bucket: sh.Path, S3Store: store}, interval, defaultFlow
 		}
-		return root, interval, defaultFlow
+		return scanner.Target{Root: root}, interval, defaultFlow
 	})
 
 	// Digest loop: when settings.NotifyDigest is ON, buffer job-outcome

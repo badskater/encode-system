@@ -13,6 +13,88 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (release pipeline + one-command installs, 2026-09-29)
+
+- Release workflow now publishes a complete offline bundle
+  (encode-system-<ver>-deploy.tar.gz: binaries, ui/, provision/,
+  Dockerfile.runtime, compose, .env.example, installers, SHA256SUMS), pushes
+  ghcr.io/badskater/encode-system:<ver>+latest, and attaches loose
+  install.sh / install-agent.ps1. Assets publicly downloadable despite the
+  private repo. Fixes along the way: gh needs explicit GH_TOKEN in
+  workflows; notes via API + --notes-file; @vitejs/plugin-react bumped to v5
+  (vite-8 peer range — stale v4 lockfile broke npm ci in the image build).
+- docker/install.sh (controller host): resolves the release, verifies
+  checksums, installs /opt/encode-system (ENCODE_HOME), preserves .env,
+  snapshots the DB, compose pull || build, health-check. install-agent.ps1
+  (node): downloads the agent, writes agent.json (pairing code or token),
+  registers the service.
+- Isolated-test-deploy support: ENCODE_CONTAINER_NAME override + a
+  compose-project guard that reads it (refuses to touch a container owned by
+  a different project). Gotcha paid for in production once: both composes
+  defaulted to project name encode-system and a test `docker compose up`
+  recreated the LIVE controller.
+- Fresh-volume boot crash fixed: /data must be chowned to the runtime user
+  BEFORE VOLUME /data in Dockerfile.runtime (else SQLite "out of memory
+  (14)"). v1.17.4+.
+
+## Done (storage shares + full S3 autonomy, 2026-09-28)
+
+- shares table + CRUD (GET|POST /api/shares, PUT|DELETE /api/shares/{id}),
+  {kind: nfs|smb|s3, role: scripts|release}. Passwords write-only
+  (has_password in responses), AES-GCM encrypted with a key file beside the
+  DB (backup downloads never carry secrets); mutations audit as share.*.
+  Provisioning resolves one enabled share per role (smb > nfs > s3); SMB
+  mounts via Ansible encode_smb_* vars, gated by the mount_shares option.
+  Frontend Shares card on Settings.
+- S3-backed roles don't mount: renderJob points $ScriptsDir/$ReleaseDir at a
+  {{JOBDIR}} staging placeholder + attaches an S3Transfer spec; the agent
+  downloads scripts/<episode_dir> (staging mirrors the episode subdir)
+  before the run and uploads outputs only after success. Works against any
+  plain-S3 endpoint (MinIO, Ceph RGW, AWS) via minio-go; shared client in
+  internal/s3 (EndpointFromShare normalizer).
+- Full S3 autonomy: an enabled s3 scripts share switches the scanner to
+  bucket listing (scanner.ScanS3, depth-2 <series>/<episode>/ keys, same
+  source+script rules, LastModified stability gate 2m). Episodes
+  auto-enqueue with no mount anywhere. Farm-smoked on 232 against a local
+  s3mock server (seeded episode + touch -d '2 hours ago' to clear the
+  stability gate; shares created via API; jobs enqueued within ~2 scan
+  cycles).
+
+## Done (queue control & admin plane, 2026-09-27)
+
+- Live job log streaming: GET /api/jobs/{id}/log/stream (SSE, admin) —
+  snapshot → heartbeat-fed progress events → final event; 15s pings.
+  JobLogDialog tails live. Old agents = snapshot-only streams.
+- Bulk job retry/cancel: POST /api/jobs/bulk (max 500, per-id guarded —
+  wrong-state/missing ids return skipped, never fail the batch) + Jobs-page
+  checkbox selection.
+- Job history retention: settings.job_retention_days (0 = forever) with an
+  hourly prune loop + POST /api/jobs/prune {days:1-3650}; terminal jobs only.
+- Dispatch steering: jobs.last_failed_node_id — retries prefer a different
+  node within the same priority tier (priority outranks steering).
+- Agent release rollback: POST /api/updates/agent/rollback (one .prev slot;
+  409 when none) + Settings publish-card button; nodes self-downgrade
+  through the normal version-diff sync.
+- Per-series pause (series.paused): scanner AND dispatch hold for queued
+  jobs; UI pause/resume toggle (distinct from the enable flag).
+- Node-group routing: nodes.group + series.node_group (empty group =
+  wildcard) + UI on both pages.
+- Per-node job concurrency: nodes.max_concurrent_jobs (1-8, default 1),
+  store-enforced slot cap, active_jobs in /api/nodes, slots UI.
+- Disk-space alert + soft drain: settings.disk_alert_gb — below-threshold
+  heartbeat fires a cooldown-guarded Discord alert and holds new jobs until
+  recovery; UI threshold setting + warn chip.
+- ENCODE_METRIC quality/output stats per job (agent-collected →
+  jobs.metrics_json → UI); per-series webhooks (series.webhook_url, direct
+  alerts only) + stats context in Discord alerts; job ETA
+  (GET /api/jobs/{id}/eta, flow-history average, ≥2 samples); Prometheus
+  GET /metrics mounted outside the SPA; audit log (GET /api/audit + Audit
+  page); scoped API tokens (/api/tokens, admin|read, hashed, last_used_at);
+  scheduled DB backups (GET|POST /api/backup, PUT /api/backup/settings,
+  download/delete by name + Settings card).
+- Fix found live during heartbeat work: job reports mixed up steps when
+  multiple jobs share a heartbeat window (2663dad).
+
 ## Done (observability & queue control, 2026-08-30)
 
 - Full job logs: agent completion report carries log_full (last 1 MiB of

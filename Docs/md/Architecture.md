@@ -2,46 +2,51 @@
 
 ## Objectives and NFRs
 
-- Queue-driven encode farm: detect new episode material on NFS shares, run one job per node, monitor everything from one web UI.
+- Queue-driven encode farm: detect new episode material on storage shares, run jobs on a fleet of nodes, monitor everything from one web UI.
+- Storage is pluggable: **NFS**, **SMB**, or **S3-compatible object storage** (MinIO, Ceph RGW, AWS). S3 needs no mounts anywhere — the controller lists the bucket and agents stage episodes per job.
 - Windows Server 2025 nodes with Nvidia GPUs; encode tooling unchanged (DGIndexNV, x265 fork, mkvmerge), audio migrated from FLAC/eac3to-only to Opus (eac3to → WAV → opusenc).
-- NFRs: single source of truth (controller DB), at-most-one job per node, node reboot after 10 tasks, agent auto-update without touching each box, structured logs with job IDs.
+- NFRs: single source of truth (controller DB), bounded concurrency per node, node reboot after 10 tasks, agent auto-update without touching each box, structured logs with job IDs, audit trail for admin mutations.
 
 ## System overview
 
 ```text
-                     +-----------------------------+
- NFS shares <------> | Controller (Linux container)|
- scripts/            |  Go HTTP + SQLite           |
- ReleaseFolders/     |  scanner, queue, renderer   |
-                     |  React SPA (dashboard)      |
-                     +--------------+--------------+
-                                    | HTTPS (agent poll / heartbeat)
-                     +--------------+--------------+
-                     |                             |
-              +------+------+               +------+------+
-              | Win node A  |   ...         | Win node N  |
-              | encode-agent|               | encode-agent|
-              | + PS encod  |               | + PS encod  |
-              +-------------+               +-------------+
+  NFS / SMB / S3                 +-----------------------------+
+  scripts/  <------------------> | Controller (Linux container)|
+  ReleaseFolders/                |  Go HTTP + SQLite           |
+  (S3: no mount — API/listing)   |  scanner, queue, renderer   |
+                                 |  React SPA (dashboard)      |
+                                 +--------------+--------------+
+                                                | HTTPS (agent poll / heartbeat)
+                                 +--------------+--------------+
+                                 |                             |
+                          +------+------+               +------+------+
+                          | Win node A  |   ...         | Win node N  |
+                          | encode-agent|               | encode-agent|
+                          | + PS encod  |               | + PS encod  |
+                          +-------------+               +-------------+
 ```
+
+Storage transport per role is chosen from the **shares table** (`nfs|smb|s3`);
+the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 
 ## Components
 
 ### Controller (`backend/cmd/controller`)
 
-- **Scanner** polls the mounted `scripts/` share; an episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs.
-- **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`). Exactly one active job per node enforced in the store.
-- **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained PowerShell script. The generated script calls functions from `EncodeLib.ps1`.
+- **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
+- **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
+- **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained PowerShell script. The generated script calls functions from `EncodeLib.ps1`. For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
-- **UI API** under `/api/*` for the SPA: nodes, jobs, flows, scanner config, settings. Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle).
+- **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel, prune, SSE log stream), flows, step templates, series, shares, scanner config, settings, stats, metrics, audit log, API tokens, DB backups, updates (agent/lib/bin + rollback). Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session. A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA).
 
 ### Agent (`backend/cmd/agent` → `encode-agent.exe`)
 
-- Runs as a Windows service (or foreground for debugging). Config file + flags: controller URL, node token, data dir.
-- Loop: heartbeat (status JSON: current job, step, tasks_since_boot, agent version) → controller response carries instructions: `job` (rendered script + vars), `reboot`, `update`.
-- Executes jobs by writing the generated `.ps1`, invoking `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`, streaming stdout/stderr to the controller, tracking exit code.
+- Runs as a Windows scheduled task (`EncodeAgentDist`, restart-safe) or service/foreground for debugging. Config file + flags: controller URL, node token, data dir.
+- Loop: heartbeat (status JSON: current job(s), step, tasks_since_boot, agent version, metrics) → controller response carries instructions: `job` (rendered script + vars), `reboot`, `update`.
+- Executes jobs by writing the generated `.ps1`, invoking `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`, streaming stdout/stderr to the controller, tracking exit code. Reports per-step timings and `ENCODE_METRIC key=value` quality/output stats (vmaf, bitrate, durations, sizes) in the completion payload.
+- S3-backed jobs: downloads `scripts/<episode_dir>` into the job staging dir before the run (mirroring the subdir layout the rendered script joins) and uploads outputs after success only.
 - Reboot: on `reboot` instruction with no running job, schedules `shutdown /r /t 30` and reports; counter resets naturally on next boot.
-- Auto-update: on `update` instruction, downloads new `encode-agent.exe` + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary on next service restart (self-replace via sidecar restart command).
+- Auto-update: on `update` instruction, downloads new `encode-agent.exe` + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary via the swap sidecar (task relaunch). The controller keeps one `.prev` agent slot; `POST /api/updates/agent/rollback` re-promotes it and nodes self-downgrade through the same version-diff sync.
 
 ### Step templates — every flow section owns its PowerShell
 
@@ -55,7 +60,8 @@ node-side install.
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
-  `crc32_rename`, `release_copy`, `keyframes`, `discord_notify`.
+  `verify_output`, `crc32_rename`, `release_copy`, `keyframes`,
+  `discord_notify`.
 - **Discord notification step**: `discord_notify` posts an episode-progress
   message to a Discord webhook when the flow reaches it (e.g. after mux or
   release copy). Webhook resolution: flow param first, then the controller's
@@ -129,12 +135,22 @@ The scanner auto-registers every series folder it sees. Each series has:
   the global settings tag. The renderer uses it for output names
   (`<Series> - <Ep> [<Tag>].mkv`) and the release folder
   (`[<Group>] <Series> - Raws [<Tag>]`);
-- **enabled flag** — a paused series is skipped by the scanner (no new jobs),
-  without affecting other series.
+- **enabled flag** — a disabled series is skipped by the scanner (no new jobs),
+  without affecting other series;
+- **paused flag** — a stronger hold than `enabled=false`: the scanner skips the
+  series AND already-queued pending jobs do not dispatch until it is lifted
+  (queue position preserved; UI toggle on the Series page);
+- **node_group** — free-form routing label; when non-empty, the series' jobs
+  only dispatch to nodes whose `group` matches (nodes with an empty group are
+  wildcards and still accept them);
+- **notify / webhook_url** — per-series Discord mute toggle, and an optional
+  per-series webhook override so alerts for one series go to its own channel
+  (direct alerts only; digest mode batches into the global channel by design).
 
 Jobs carry the flow fixed at creation time; operators can change a *pending*
 job's flow via `PATCH /api/jobs/{id}` before it starts. Episodes distribute
-across all enabled idle nodes naturally (one job per node).
+across enabled idle nodes per the dispatch rules (concurrency slots, groups,
+priority, steering).
 
 ### Create series (scaffolding)
 
@@ -151,6 +167,27 @@ Idempotent: re-running adds missing episode folders (extend a series by
 raising the count), never duplicates. Names are validated against the
 Windows-reserved characters before any filesystem touch; episode folders pad
 to three digits for 100+ episode shows (`Ep 001`).
+
+## Storage shares
+
+`GET|POST /api/shares`, `PUT|DELETE /api/shares/{id}` — one row per
+source, `{kind: nfs|smb|s3, role: scripts|release}` (UI: Settings → Storage
+shares card).
+
+- **Credentials are write-only**: the API returns `has_password`, never the
+  value; omit/blank the password on PUT to keep the stored credential.
+  Secrets are AES-GCM encrypted with a key file beside the DB, so backup
+  downloads never carry them. Mutations audit as `share.create/update/delete`.
+- **Provisioning** resolves one enabled share per role (preference
+  smb > nfs > s3). SMB mounts on nodes go through Ansible `encode_smb_*`
+  vars (`New-SmbMapping` + a startup remount task), gated by the
+  `mount_shares` provision option.
+- **S3** works against any plain-S3 endpoint (MinIO, Ceph RGW, AWS) via
+  minio-go; the shared client lives in `internal/s3`. S3-backed roles never
+  mount: the controller lists the bucket for the scanner, and the agent
+  stages episodes per job (download before the run, upload outputs after
+  success). An enabled s3 share on the scripts role switches the scanner to
+  bucket listing automatically — full autonomy with no mounts anywhere.
 
 ## Flows: multiple sequences, one default
 
@@ -203,15 +240,18 @@ Response:
 
 ### Job completion
 
-`POST /api/agent/job/<id>/complete` with `{ "status": "done|failed", "exit_code": n, "outputs": [paths], "log_tail": "...", "log_full": "...", "step_timings": [...] }`.
+`POST /api/agent/job/<id>/complete` with `{ "status": "done|failed", "exit_code": n, "outputs": [paths], "log_tail": "...", "log_full": "...", "step_timings": [...], "metrics": {...} }`.
 
 `log_full` carries the last 1 MiB of the job's `run.log` (cut on a line
-boundary aligned to a UTF-8 rune boundary, `[…truncated…]` marker when cut);
-`step_timings` carries per-step wall-clock durations derived live from the
-`ENCODE_STEP` markers as output arrives (first-seen timestamp per step; a
-step's duration ends when the next step starts, the last step ends at job
-finish). Both fields are optional — old agents omit them, and the controller
-re-caps `log_full` at 1 MiB defensively.
+boundary aligned to a UTF-8 rune boundary, `[…truncated…]` marker when cut;
+the completion route accepts a 4 MiB body because JSON escaping inflates a
+1 MiB log past the general cap); `step_timings` carries per-step wall-clock
+durations derived live from the `ENCODE_STEP` markers as output arrives
+(first-seen timestamp per step; a step's duration ends when the next step
+starts, the last step ends at job finish); `metrics` carries `ENCODE_METRIC
+key=value` pairs emitted by the flow script (vmaf, bitrate, durations,
+sizes…). All three fields are optional — old agents omit them, and the
+controller re-caps `log_full` at 1 MiB defensively.
 
 ## Observability and queue control (2026-08-30 feature set)
 
@@ -255,27 +295,94 @@ re-caps `log_full` at 1 MiB defensively.
   against the source media via MediaInfo (±2s) when discoverable, else a
   sanity floor (>60s). Factory text is byte-guarded like the other built-ins.
 
+## Queue control, storage & admin features (2026-09 feature set)
+
+- **Live job log streaming (SSE)** — `GET /api/jobs/{id}/log/stream`
+  (admin-auth): snapshot → progress events fed by heartbeats → `final` event
+  closes the stream; `: ping` keepalives every 15s. Live step/progress/log
+  tail require an agent new enough to populate heartbeat progress; older
+  agents get snapshot-only streams. UI: JobLogDialog tails live.
+- **Bulk job actions** — `POST /api/jobs/bulk {action:"retry"|"cancel",
+  ids:[…]}`, per-id guarded (max 500); wrong-state/missing ids come back in
+  `skipped`, never fail the batch. UI: checkbox selection + Retry/Cancel.
+- **Job history retention** — `POST /api/jobs/prune {days:N}` (1–3650) and
+  live `settings.job_retention_days` (0 = keep forever) with an hourly prune
+  loop; terminal jobs only — pending/running never pruned.
+- **Dispatch steering** — jobs carry `last_failed_node_id`; retries prefer a
+  different node within the same priority tier (priority always outranks
+  steering; single-node farms still dispatch the steered job).
+- **Agent release rollback** — `POST /api/updates/agent/rollback` swaps the
+  previous published agent back to current (409 when no prev; publishing
+  keeps exactly one `.prev` slot). Nodes self-downgrade through the normal
+  version-diff sync. UI: rollback button on the Settings publish card.
+- **Per-series pause** — `series.paused` holds BOTH scanning and dispatch of
+  already-queued jobs (vs `enabled=false`, which only stops new job
+  creation). UI pause/resume toggle per row.
+- **Node-group routing** — free-form `nodes.group` + `series.node_group`;
+  matching jobs only dispatch to matching nodes, empty group = wildcard.
+  PATCH `/api/nodes/{id} {group}` / `/api/series/{id} {node_group}`; UI on
+  Nodes and Series pages.
+- **Per-node job concurrency** — `nodes.max_concurrent_jobs` (default 1,
+  clamped 1–8); the store enforces active-jobs ≤ slots and `/api/nodes`
+  reports `active_jobs` ("1/2 slots" in the UI). Light steps can overlap;
+  heavy x265 encodes usually want 1.
+- **Disk-space alert + soft drain** — `settings.disk_alert_gb`: a heartbeat
+  reporting less free space fires a Discord alert (per-node cooldown) and
+  soft-drains that node (no new jobs until it recovers). 0 = disabled.
+- **Job metrics (`ENCODE_METRIC`)** — flow scripts emit
+  `ENCODE_METRIC key=value` lines (vmaf, output_bitrate_kbps, duration_sec,
+  sizes…); the agent collects them into the completion report →
+  `jobs.metrics_json` → UI job detail.
+- **Per-series webhooks + alert stats** — `series.webhook_url` overrides the
+  global Discord webhook per series (direct alerts; digest stays global);
+  alerts include fleet stats context.
+- **Job ETA** — `GET /api/jobs/{id}/eta`: average done-duration for the same
+  flow (≥2 samples) minus elapsed, never negative, `-1` = no estimate; the
+  UI blends it with reported progress.
+- **Prometheus `/metrics`** — mounted outside the SPA at `GET /metrics`
+  (unauthenticated, LAN scrape): `encode_jobs_pending/assigned/running`,
+  `encode_jobs_done_total/failed_total/cancelled_total`,
+  `encode_node_online/enabled/active_jobs/max_concurrent_jobs` per node.
+- **Audit log** — mutating admin actions write an audit row (actor = session
+  username or `api-token:<name>`, action like `settings.update`, object like
+  `node:3`, small JSON detail — never secrets). `GET /api/audit?limit=N`;
+  UI Audit page.
+- **Scoped API tokens** — `GET|POST /api/tokens`, `DELETE /api/tokens/{id}`;
+  scopes `admin` | `read`, hashed at rest, `last_used_at` tracked; bearer
+  auth alongside session cookies for external automation.
+- **Controller DB backups** — scheduled SQLite snapshots (VACUUM INTO) with
+  retention, `GET /api/backup` (status/list), `POST /api/backup` (backup
+  now), `GET|DELETE /api/backup/{name}` (download/delete),
+  `PUT /api/backup/settings` (enabled + interval, live). Secrets encrypted
+  beside the DB stay out of downloads. UI: Settings → DB backups card.
+- **Storage shares CRUD** — see "Storage shares" above (nfs/smb/s3,
+  encrypted write-only credentials, S3 scanner autonomy).
+
 ## Runtime flows
 
-1. User drops `Ep 05/` with `src.m2ts` + `1080.vpy` into `scripts/<Series>/`.
-2. Scanner detects it next cycle (sources younger than 2 minutes are deferred, so mid-copy NFS uploads don't trigger jobs) → job `pending` with default flow (or UI-assigned).
-3. Node `enc-02` heartbeats idle → controller assigns job, response carries rendered script.
+1. User drops `Ep 05/` with `src.m2ts` + `1080.vpy` into `scripts/<Series>/` (or uploads the same keys to an S3 scripts bucket).
+2. Scanner detects it next cycle (sources younger than 2 minutes are deferred, so mid-copy uploads don't trigger jobs) → job `pending` with default flow (or UI-assigned).
+3. Node `enc-02` heartbeats with a free slot (and matching group, series not paused, retry gate open) → controller assigns the job, response carries the rendered script (plus the `S3Transfer` spec for s3-backed roles).
 4. Agent executes step by step; heartbeats carry progress; UI live-updates.
 5. Job completes → controller verifies output path exists on the share → `done`.
 6. After the node's 10th completed task, controller responds with `reboot`; the instruction is re-issued on every idle heartbeat until the node's counter drops (proof of reboot), so a missed packet self-heals. Agent defers until idle, reboots; node comes back with counter 0 and rejoins the pool. A reboot attempt expires after a 10-minute grace period so no node can be locked out by a stuck flag.
 
 ## Safety invariants enforced by the store/API
 
-- At most one active (assigned/running) job per node; `AssignJob` verifies rows-affected and node enabled-state before marking a node busy.
+- Active (assigned/running) jobs per node are capped by `max_concurrent_jobs` (default 1 = the historical one-job rule); `AssignJob` verifies rows-affected and node enabled-state before marking a slot busy.
 - A node may only report progress/completion for jobs assigned to it.
-- Terminal jobs cannot regress via heartbeats; completion is idempotent.
+- Terminal jobs cannot regress via heartbeats; completion is idempotent and guarded against concurrent cancel (`ErrJobNotFinishable`).
 - The configured default flow is protected from deletion; flows with job history refuse deletion (FK).
+- Bulk job actions are per-id guarded: wrong-state or missing ids are returned as `skipped`, never failing the batch.
+- Retention/prune only ever touches terminal jobs.
 
 ## Security and observability
 
-- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). Management plane: session tokens issued at login, stored SHA-256-hashed at rest, sliding 24h expiry. TLS optional behind reverse proxy.
-- Auto-update payloads (agent binary + EncodeLib.ps1) are SHA-256 verified by the agent against the manifest before install; downloads are size-capped. Request bodies are capped at 1 MiB.
-- Structured JSON logs (`slog`) with `job_id` / `node` fields on both sides; agent log tails retained per job for post-mortem.
+- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). Management plane: session tokens issued at login, stored SHA-256-hashed at rest, sliding 24h expiry; scoped API tokens (`admin`/`read`) hashed at rest for automation. TLS optional behind reverse proxy.
+- Auto-update payloads (agent binary + EncodeLib.ps1) are SHA-256 verified by the agent against the manifest before install; downloads are size-capped. Request bodies are capped at 1 MiB (job completion reports at 4 MiB — JSON escaping inflates a 1 MiB log past the general cap).
+- Share credentials (SMB password, S3 secret key) are AES-GCM encrypted with a key file beside the DB and never serialized in API responses (`has_password` only).
+- Mutating admin actions write to the audit log (actor, action, object, small JSON detail — never secrets or full bodies).
+- Structured JSON logs (`slog`) with `job_id` / `node` fields on both sides; agent log tails retained per job for post-mortem; Prometheus `GET /metrics` for external scraping.
 
 ## Open decisions
 

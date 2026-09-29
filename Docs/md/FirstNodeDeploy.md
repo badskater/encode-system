@@ -198,10 +198,11 @@ Check the release share gained `[OldFartsSubs] Smoke Test - Raws [1080p]/`.
 
 ## 7. Add more nodes
 
-Repeat steps 3–5 per node. Episodes distribute across all enabled idle nodes
-automatically (one job per node at a time). Use the **Series** page to give
-individual series their own flow; **Flows** to create more sequences and mark
-the default.
+Repeat steps 3–5 per node — or provision straight from the browser (section
+8). Episodes distribute across all enabled nodes automatically (one job per
+node by default; raise **concurrency slots** per node in the UI for light
+pipelines). Use the **Series** page to give individual series their own flow
+or node group; **Flows** to create more sequences and mark the default.
 
 > **Cloned-VM hazard.** If you add a node by cloning a VM that already ran an
 > agent, the clone inherits node 1's identity (persisted credential +
@@ -248,11 +249,16 @@ sections 2–6 remains available for air-gapped or workstation-driven deploys.
 ## Rollback & recovery
 
 - **Controller:** `docker compose down` never touches the state volume; the
-  DB survives. Snapshot `encode-state` (`docker run --rm -v
+  DB survives. Snapshot before major upgrades — easiest is the built-in
+  scheduled backups (Settings → **DB backups**: enable + interval, download
+  any snapshot), or manual: `docker run --rm -v
   encode-state:/data -v $(pwd):/backup alpine tar czf /backup/db-backup.tgz
-  /data/encode.db`) before major upgrades.
-- **Agent:** the update store holds every published version; revert the
-  manifest in the DB to downgrade all nodes on their next heartbeat.
+  /data/encode.db`. Restore = stop the container, replace `encode.db` in the
+  volume, start.
+- **Agent:** Settings → Push to nodes → **Rollback**
+  (`POST /api/updates/agent/rollback`) re-promotes the previous published
+  agent; nodes self-downgrade through the normal version-diff sync on their
+  next heartbeat.
 - **Ansible:** plays are idempotent — re-run after fixing config; there is
   no destructive teardown path.
 
@@ -260,8 +266,9 @@ sections 2–6 remains available for air-gapped or workstation-driven deploys.
 
 | Symptom | First check |
 | --- | --- |
-| Node never appears | `C:\encode-agent\agent.log` — pairing/401 means credential issue; connection refused means `encode_controller_url` is wrong |
+| Node never appears | `<data_dir>\agent.log` (`C:\encode-agent` service / `C:\encode-agent-dist` task) — pairing/401 means credential issue; connection refused means `encode_controller_url` is wrong |
+| Node offline after a self-update | Restart the agent task: `Start-ScheduledTask -TaskName EncodeAgentDist` (WinRM). It stages the pending `.exe.new`, exits once more, and returns on the new version (~1 min). If TWO `encode-agent.exe` PIDs run, kill the older one. |
 | Job stuck `assigned` | Agent claimed but PowerShell failed — job's log tail in the UI shows the failing step and tool |
-| `required tool not found` | Tool missing from `C:\bin` on that node — re-run `site.yml` |
-| Scanner doesn't create jobs | Folder needs a source media file **and** a `.avs`/`.vpy`; check controller logs for skip reasons |
+| `required tool not found` | Tool missing from `C:\bin` on that node — re-run `site.yml` or push a bin package from Settings |
+| Scanner doesn't create jobs | Folder needs a source media file **and** a `.avs`/`.vpy`; series paused/disabled; drain mode on; check controller logs for skip reasons. S3: keys must be `<series>/<episode>/…` and ≥2 min old |
 | Agent warns "plain HTTP" | Expected on trusted LANs; put a reverse proxy with TLS in front for anything else |

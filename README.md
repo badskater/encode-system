@@ -5,11 +5,13 @@ Distributed encode farm: a Linux control plane queues and monitors encoding jobs
 ## What it does
 
 - Watches storage shares (`scripts/`, `ReleaseFolders/`) for new episode material (source video + authored `.avs`/`.vpy` filter scripts). Storage is pluggable: **NFS**, **SMB**, or **S3-compatible object storage** (MinIO, Ceph RGW, AWS) — S3 needs no mounts at all: the controller lists the bucket and agents stage each episode locally per job.
-- Renders an episode's job from a selectable **flow** (ordered pipeline steps: DGIndexNV index → eac3to+opusenc audio → x265 encode → mkvmerge mux → release-folder copy → SCXvid keyframes).
-- Assigns exactly **one job per enabled node**; agents report status every heartbeat.
+- Renders an episode's job from a selectable **flow** (ordered pipeline steps: DGIndexNV index → eac3to+opusenc audio → x265 encode → mkvmerge mux → output verification → release-folder copy → SCXvid keyframes).
+- Dispatches jobs across the fleet with per-node concurrency slots, node-group routing, priorities, auto-retry with backoff (steered away from the node that failed), drain mode, and disk-space soft-drain.
+- Monitors everything from the web UI: live SSE log tails, per-step timings, node telemetry (CPU/RAM/disk/GPU/fps), fleet stats, job ETAs, audit log, Discord alerts (per-series channels, digest mode) — plus a Prometheus `GET /metrics` endpoint.
 - Enforces **reboot after 10 tasks**: the controller watches each node's `tasks_since_boot` and issues a reboot instruction when the limit is reached.
-- **Auto-updates** agents: controller pushes new `encode-agent.exe` and `EncodeLib.ps1` versions; agents swap on next idle heartbeat.
+- **Auto-updates** agents: controller pushes new `encode-agent.exe` and `EncodeLib.ps1` versions (with one-click rollback to the previous release); agents swap on next idle heartbeat.
 - Visual flow builder in the web UI: reorder steps, set parameters (CRF, preset, Opus bitrate, x265 extra args), save named flows, pick a flow per job.
+- Operator conveniences: scheduled DB backups, scoped API tokens, bulk job retry/cancel, job-history retention, one-command installers for controller and nodes.
 
 ## Components
 

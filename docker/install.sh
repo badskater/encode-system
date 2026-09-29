@@ -109,6 +109,15 @@ sed -i "s/^ENCODE_VERSION=.*/ENCODE_VERSION=${VERSION#v}/" "$HOME_DIR/.env" 2>/d
 
 # --- deploy -----------------------------------------------------------------
 cd "$HOME_DIR"
+# Explicit project name so the compose project is stable regardless of the
+# install directory name.
+export COMPOSE_PROJECT_NAME="${ENCODE_COMPOSE_PROJECT:-encode-system}"
+# Safety: refuse to recreate a container that belongs to a DIFFERENT compose
+# project (e.g. a hand-rolled production deployment on this host).
+existing=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' encode-controller 2>/dev/null || true)
+if [ -n "$existing" ] && [ "$existing" != "$COMPOSE_PROJECT_NAME" ]; then
+    die "container 'encode-controller' exists but belongs to compose project '$existing' (not '$COMPOSE_PROJECT_NAME'). Refusing to touch it — set ENCODE_COMPOSE_PROJECT=$existing to manage that deployment, or remove the container first."
+fi
 # Private GHCR image: log in when a token is available.
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${GITHUB_USER:-$USER}" --password-stdin >/dev/null 2>&1 \

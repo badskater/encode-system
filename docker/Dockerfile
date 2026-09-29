@@ -18,7 +18,8 @@ RUN npm run build
 
 FROM alpine:3.20
 RUN addgroup -S encode && adduser -S encode -G encode \
-    && apk add --no-cache ca-certificates nfs-utils
+    && apk add --no-cache ca-certificates nfs-utils wget \
+    && mkdir -p /data && chown encode:encode /data
 WORKDIR /app
 COPY --from=backend /out/controller /app/controller
 COPY --from=frontend /src/dist /app/ui
@@ -26,6 +27,9 @@ COPY powershell/EncodeLib.ps1 /app/seed/EncodeLib.ps1
 
 # Data dir: SQLite db + update payloads (persistent). The SPA is baked into
 # /app/ui and served via ENCODE_UI_DIR, so it stays out of the data volume.
+# /data must be owned by the runtime user BEFORE VOLUME: fresh named volumes
+# inherit the image dir's ownership, and a root-owned /data makes the SQLite
+# open fail with a misleading "out of memory (14)".
 ENV ENCODE_DATA=/data
 ENV ENCODE_UI_DIR=/app/ui
 VOLUME /data

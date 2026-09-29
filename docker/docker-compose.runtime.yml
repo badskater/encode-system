@@ -20,7 +20,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.runtime
-    container_name: encode-controller
+    container_name: ${ENCODE_CONTAINER_NAME:-encode-controller}
     restart: unless-stopped
     ports:
       - "${ENCODE_PORT:-8080}:8080"

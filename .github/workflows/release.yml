@@ -1,13 +1,21 @@
-# Continuous delivery: tagged releases produce the deploy bundle.
+# Continuous delivery: tagged releases produce the deploy bundle + GHCR image.
 #
-# The fleet's deployment model is bundle-based (docker/Dockerfile.runtime):
-# a pre-built controller binary + built SPA + provision playbook are copied
-# to the Docker host, then `docker compose build && up -d`. The Docker host
-# sits on a private LAN unreachable from GitHub runners, so CD stops at
-# publishing verified artifacts — deployment stays an explicit operator
-# action (or Hermes on request), never an automated push to production.
+# Outputs per tag (v*):
+#   1. GitHub release assets:
+#      - encode-system-<ver>-deploy.tar.gz  (complete offline deploy bundle:
+#        controller, agent, ui/, provision/, Dockerfile.runtime,
+#        docker-compose.runtime.yml, .env.example, install.sh,
+#        install-agent.ps1, EncodeLib.ps1, SHA256SUMS)
+#      - controller, encode-agent.exe, install.sh, install-agent.ps1,
+#        SHA256SUMS (loose files for direct one-liner installs)
+#   2. Container image: ghcr.io/<owner>/encode-system:<ver> + :latest
+#      (built from docker/Dockerfile — Go controller + SPA + provision).
 #
-# Trigger: push a version tag (v*), e.g. `git tag v1.4.0 && git push origin v1.4.0`.
+# The fleet's Docker host sits on a private LAN; pulling the GHCR image is an
+# explicit operator action (install.sh does `compose pull || build`), never an
+# automated push to production.
+#
+# Trigger: push a version tag, e.g. `git tag v1.17.0 && git push origin v1.17.0`.
 name: Release
 
 on:
@@ -17,10 +25,15 @@ on:
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   release:
-    name: Build release bundle
+    name: Build release bundle + image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,26 +76,66 @@ jobs:
           npm run build
           cp -r dist ../dist/ui
 
-      # Provision playbook (the controller copies provision.yml per run).
-      - name: Stage provision playbook
+      # --- complete deploy bundle -------------------------------------------
+      - name: Assemble bundle
         run: |
           mkdir -p dist/provision
           cp infra/ansible/provision.yml dist/provision/
+          cp docker/Dockerfile.runtime dist/
+          cp docker/docker-compose.runtime.yml dist/
+          cp docker/.env.example dist/
+          cp docker/install.sh dist/
+          cp docker/install-agent.ps1 dist/
+          cp powershell/EncodeLib.ps1 dist/
+          # Checksums cover the binaries (install.sh verifies these).
+          (cd dist && sha256sum controller encode-agent.exe > SHA256SUMS)
 
-      # Checksums so a deploy can verify integrity out-of-band.
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum controller encode-agent.exe > SHA256SUMS
+      - name: Pack bundle tarball
+        run: |
+          tar -czf "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz" -C dist \
+            controller encode-agent.exe ui provision \
+            Dockerfile.runtime docker-compose.runtime.yml .env.example \
+            install.sh install-agent.ps1 EncodeLib.ps1 SHA256SUMS
 
+      # --- GHCR image ---------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          build-args: |
+            AGENT_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- publish -------------------------------------------------------------
       # gh is pre-authenticated on GitHub runners via the automatic token.
       - name: Create GitHub release
         run: >
           gh release create "$GITHUB_REF_NAME"
           --title "$GITHUB_REF_NAME"
           --generate-notes
+          "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz"
           dist/controller
           dist/encode-agent.exe
+          dist/install.sh
+          dist/install-agent.ps1
           dist/SHA256SUMS
+          --notes "Container image: \`ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}\` and \`:latest\` (private repo — \`docker login ghcr.io\` with a PAT that has \`read:packages\` first). Controller host quick start: download \`install.sh\` from this release and run \`./install.sh ${GITHUB_REF_NAME}\`. Windows nodes: run \`install-agent.ps1\` elevated with \`-ControllerUrl\` and a pairing code from UI → Nodes."
 
       - name: Upload UI bundle artifact
         uses: actions/upload-artifact@v4

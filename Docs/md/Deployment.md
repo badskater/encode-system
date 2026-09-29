@@ -12,6 +12,32 @@
 
 ## Controller
 
+### Install from a GitHub release (recommended)
+
+Every `v*` tag publishes a complete deploy bundle and a GHCR image:
+
+```bash
+# Controller host (Docker + compose required)
+curl -fsSL -o install.sh \
+  https://github.com/badskater/encode-system/releases/latest/download/install.sh
+sudo GITHUB_TOKEN=<pat> ./install.sh        # private repo; omit token if public
+```
+
+`install.sh` installs to `/opt/encode-system`, preserves `.env` and state
+across upgrades, snapshots the DB, pulls `ghcr.io/badskater/encode-system:<ver>`
+(or builds `Dockerfile.runtime` from the bundle when the registry is
+unreachable), starts compose, and health-checks. Storage shares (NFS/SMB/S3)
+are then configured from the UI — S3 needs no host mounts.
+
+Windows nodes install with one elevated PowerShell command using a pairing
+code from UI → Nodes:
+
+```powershell
+.\install-agent.ps1 -ControllerUrl http://<controller>:8080 -PairingCode <CODE>
+```
+
+### Manual compose (build from source)
+
 ```bash
 cd docker
 cp .env.example .env   # set ADMIN_TOKEN, NODE CIDR/allowed names if needed

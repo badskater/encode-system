@@ -123,19 +123,32 @@ jobs:
           cache-to: type=gha,mode=max
 
       # --- publish -------------------------------------------------------------
-      # gh is pre-authenticated on GitHub runners via the automatic token.
       - name: Create GitHub release
-        run: >
-          gh release create "$GITHUB_REF_NAME"
-          --title "$GITHUB_REF_NAME"
-          --generate-notes
-          "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz"
-          dist/controller
-          dist/encode-agent.exe
-          dist/install.sh
-          dist/install-agent.ps1
-          dist/SHA256SUMS
-          --notes "Container image: \`ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}\` and \`:latest\` (private repo — \`docker login ghcr.io\` with a PAT that has \`read:packages\` first). Controller host quick start: download \`install.sh\` from this release and run \`./install.sh ${GITHUB_REF_NAME}\`. Windows nodes: run \`install-agent.ps1\` elevated with \`-ControllerUrl\` and a pairing code from UI → Nodes."
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES_FILE=$(mktemp)
+          {
+            echo "Container image: \`ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}\` and \`:latest\` (private repo — \`docker login ghcr.io\` with a PAT that has \`read:packages\` first)."
+            echo
+            echo "Controller host quick start: download \`install.sh\` from this release and run \`sudo GITHUB_TOKEN=<pat> ./install.sh $GITHUB_REF_NAME\`."
+            echo
+            echo "Windows nodes: run \`install-agent.ps1\` elevated with \`-ControllerUrl\` and a pairing code from UI → Nodes."
+            echo
+            echo "---"
+            echo
+          } > "$NOTES_FILE"
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" -q .body >> "$NOTES_FILE" || true
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$NOTES_FILE" \
+            "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz" \
+            dist/controller \
+            dist/encode-agent.exe \
+            dist/install.sh \
+            dist/install-agent.ps1 \
+            dist/SHA256SUMS
 
       - name: Upload UI bundle artifact
         uses: actions/upload-artifact@v4

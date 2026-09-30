@@ -35,13 +35,12 @@ func TestLogRingEmptyTail(t *testing.T) {
 }
 
 // TestLogRingByteCap asserts a pathological fat line cannot exceed the
-// wire cap and the front cut lands on a line boundary — the first entry
-// of the tail is always a COMPLETE line, never a mid-line fragment.
+// wire cap, the newest lines always survive, and the front cut lands on a
+// line boundary — the first entry of the tail is a COMPLETE line, never a
+// mid-line fragment.
 func TestLogRingByteCap(t *testing.T) {
 	r := NewLogRing()
 	fat := strings.Repeat("x", logRingBytes) // one line at the cap by itself
-	// Push known complete lines AFTER the fat one; they must survive and
-	// the tail must start at one of their boundaries.
 	fmt.Fprintf(r, "%s\nfirst-after-fat\nsecond\nrecent\n", fat)
 	tail := r.Tail()
 	if len(tail) > logRingBytes {
@@ -50,13 +49,22 @@ func TestLogRingByteCap(t *testing.T) {
 	if !strings.HasSuffix(tail, "recent") {
 		t.Fatalf("newest line must survive truncation: %q", tail[max(0, len(tail)-40):])
 	}
-	// Line-boundary contract: every entry must be one of the complete
-	// lines pushed (the fat line may be dropped whole; partial "x…"
-	// fragments are allowed ONLY as the fat line itself being cut, so
-	// assert the tail either starts with a known line or with the fat
-	// run truncated — and that known-good lines appear intact).
-	if !strings.Contains(tail, "first-after-fat") && strings.Count(tail, "\n") > 1 {
-		t.Fatalf("expected intact post-fat lines in tail: %q", tail[:80])
+	// Line-boundary contract, directly: the FIRST line of the tail must be
+	// one of the complete lines we pushed. If the cut left a fragment of
+	// the fat line, the first entry would be an all-x string that is
+	// shorter than the fat line we pushed — reject that explicitly.
+	first := tail[:strings.IndexByte(tail, '\n')]
+	switch first {
+	case "first-after-fat", "second", "recent":
+		// a complete known line — correct boundary cut
+	default:
+		if strings.Trim(first, "x") == "" && first != fat {
+			t.Fatalf("front cut left a mid-line fragment as first entry: %d x-chars", len(first))
+		}
+		t.Fatalf("unexpected first tail line: %q", first)
+	}
+	if !strings.Contains(tail, "first-after-fat") {
+		t.Fatalf("intact post-fat lines missing from tail: %q", tail[:80])
 	}
 }
 

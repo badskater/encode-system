@@ -798,3 +798,77 @@ func TestHeartbeatAgentLogPersistedAndServed(t *testing.T) {
 		t.Fatalf("empty tail blanked stored log: %q", n.AgentLog)
 	}
 }
+
+// TestHeartbeatToleratesUnknownFields verifies the rolling-upgrade contract:
+// a NEW agent sending fields an OLD controller does not know must NOT 400
+// (which would orphan its running jobs via the sweeper). The heartbeat
+// decoder is deliberately tolerant, unlike the strict admin routes.
+func TestHeartbeatToleratesUnknownFields(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	// Raw JSON with a field that does not exist on model.Heartbeat.
+	raw := []byte(`{"node":"enc-01","agent_version":"9.9.9","tasks_since_boot":1,
+		"some_future_field":{"nested":true},"another_future":"x"}`)
+	req, _ := http.NewRequest("POST", ts.URL+"/api/agent/heartbeat", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+e.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat with unknown fields: want 200, got %d (%s)", resp.StatusCode, body)
+	}
+	// The known fields still applied.
+	n, err := e.server.Store.GetNode(ctxBg(), e.node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if n.AgentVersion != "9.9.9" {
+		t.Fatalf("agent_version not persisted: %q", n.AgentVersion)
+	}
+
+	// Malformed JSON must still 400 (tolerance ≠ sloppiness).
+	req2, _ := http.NewRequest("POST", ts.URL+"/api/agent/heartbeat", bytes.NewReader([]byte(`{broken`)))
+	req2.Header.Set("Authorization", "Bearer "+e.token)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 400 {
+		t.Fatalf("malformed heartbeat: want 400, got %d", resp2.StatusCode)
+	}
+}
+
+// TestHeartbeatAgentLogServerCap verifies the server-side bound: an agent
+// shipping an oversized agent_log (rogue/buggy) has it trimmed to
+// maxAgentLogBytes on a line boundary before persistence.
+func TestHeartbeatAgentLogServerCap(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	huge := strings.Repeat("y", maxAgentLogBytes) // one fat line
+	hb := heartbeat("enc-01", 1, 0)
+	hb.AgentLog = huge + "\nlast-good-line"
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, hb)
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat: %d %s", resp.StatusCode, body)
+	}
+	n, err := e.server.Store.GetNode(ctxBg(), e.node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if len(n.AgentLog) > maxAgentLogBytes {
+		t.Fatalf("stored log exceeds server cap: %d bytes", len(n.AgentLog))
+	}
+	if !strings.HasSuffix(n.AgentLog, "last-good-line") {
+		t.Fatalf("newest line must survive the cap: %q", n.AgentLog[max(0, len(n.AgentLog)-30):])
+	}
+	if strings.HasPrefix(n.AgentLog, "y") {
+		t.Fatalf("cap cut must land on a line boundary, got mid-line fragment start")
+	}
+}

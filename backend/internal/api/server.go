@@ -507,6 +507,16 @@ func decodeJSONLimit(r *http.Request, v any, limit int64) error {
 	return dec.Decode(v)
 }
 
+// decodeJSONTolerant is decodeJSONLimit WITHOUT DisallowUnknownFields. Used
+// by the agent-wire routes (heartbeat) where a newer agent may send fields
+// an older controller does not know yet: rejecting those with a 400 would
+// break rolling upgrades in the direction new-agent → old-controller, while
+// unknown keys are harmless. The body cap still applies.
+func decodeJSONTolerant(r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
 // ---------- Auth middleware ----------
 
 type ctxKey string

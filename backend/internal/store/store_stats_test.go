@@ -328,7 +328,10 @@ func TestJobStatsSpeedupRatio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stats: %v", err)
 	}
-	want := 5.0 / 3.0 // 1.666…
+	// Duration-WEIGHTED: sum(media)/sum(wall) = (1800+1800+600)/(900+900+600)
+	// = 4200/2400 = 1.75. An unweighted mean of per-job ratios (2+2+1)/3
+	// would be 1.666… — the weighted figure is the contract.
+	want := 1.75
 	if got.Totals.AvgSpeedup < want-0.01 || got.Totals.AvgSpeedup > want+0.01 {
 		t.Fatalf("totals avg_speedup: want ~%.3f, got %v", want, got.Totals.AvgSpeedup)
 	}
@@ -491,5 +494,41 @@ func TestJobStatsRepeatFailuresRangeExcluded(t *testing.T) {
 	}
 	if len(all.RepeatFailures) != 1 {
 		t.Fatalf("want 1 row in all-time, got %d", len(all.RepeatFailures))
+	}
+}
+
+// TestJobStatsSpeedupIsDurationWeighted pins the weighting contract: one
+// long 1x job must dominate many tiny fast jobs. Unweighted per-job ratios
+// would report ~50x here; the weighted sum reports (6000+60+60)/
+// (6000+1+1) ≈ 1.018.
+func TestJobStatsSpeedupIsDurationWeighted(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	fin := time.Now().UTC().Add(-1 * time.Hour)
+	finStr := fin.Format("2006-01-02 15:04:05")
+	// One 100-minute media / 100-minute wall job = 1.0x (weight 6000s).
+	long := fin.Add(-100 * time.Minute).Format("2006-01-02 15:04:05")
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":6000}`, long, finStr)
+	// Two 1-minute media / 1-second wall jobs = 60x each (weight 1s each).
+	tiny := fin.Add(-1 * time.Second).Format("2006-01-02 15:04:05")
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":60}`, tiny, finStr)
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":60}`, tiny, finStr)
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	// Weighted: (6000+60+60)/(6000+1+1) = 6120/6002 ≈ 1.0197.
+	want := 6120.0 / 6002.0
+	if got.Totals.AvgSpeedup < want-0.02 || got.Totals.AvgSpeedup > want+0.02 {
+		t.Fatalf("weighted avg_speedup: want ~%.3f, got %v", want, got.Totals.AvgSpeedup)
+	}
+	// Sanity: an unweighted mean would be (1+60+60)/3 ≈ 40.3 — make sure
+	// we are nowhere near that.
+	if got.Totals.AvgSpeedup > 5 {
+		t.Fatalf("speedup looks unweighted: %v", got.Totals.AvgSpeedup)
 	}
 }

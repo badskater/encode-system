@@ -82,7 +82,7 @@ func (s *Store) statsTotals(ctx context.Context, out *model.Stats, cutoff string
     COUNT(CASE WHEN status='failed' THEN 1 END),
     COUNT(CASE WHEN status='cancelled' THEN 1 END),
     COALESCE(AVG((julianday(finished_at) - julianday(started_at)) * 86400), 0),
-    COALESCE(AVG(` + speedupExpr("") + `), 0)
+    ` + speedupAgg("") + `
   FROM jobs` +
 		whereFinishedAt("finished_at", cutoff)
 	var avg sql.NullFloat64
@@ -106,7 +106,7 @@ func (s *Store) statsPerNode(ctx context.Context, out *model.Stats, cutoff strin
     COUNT(CASE WHEN j.status='done' THEN 1 END),
     COUNT(CASE WHEN j.status='failed' THEN 1 END),
     COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0),
-    COALESCE(AVG(` + speedupExpr("j.") + `), 0)
+    ` + speedupAgg("j.") + `
   FROM jobs j LEFT JOIN nodes n ON n.id = j.node_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.node_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
@@ -134,7 +134,7 @@ func (s *Store) statsPerFlow(ctx context.Context, out *model.Stats, cutoff strin
     COUNT(CASE WHEN j.status='done' THEN 1 END),
     COUNT(CASE WHEN j.status='failed' THEN 1 END),
     COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0),
-    COALESCE(AVG(` + speedupExpr("j.") + `), 0)
+    ` + speedupAgg("j.") + `
   FROM jobs j LEFT JOIN flows f ON f.id = j.flow_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.flow_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
@@ -243,29 +243,33 @@ func whereFinishedAt(col, cutoff string) string {
 	return " WHERE " + col + " >= ?"
 }
 
-// speedupExpr builds the SQL CASE expression for one job's encode speedup
-// ratio: media duration (the duration_sec ENCODE_METRIC the encode script
-// reports, stored in metrics_json) divided by the wall-clock encode seconds
-// (started_at → finished_at). pfx qualifies the columns for joined queries
-// ("j." in per-node/per-flow, "" in totals).
-//
-// The expression returns NULL for every non-qualifying row — non-done jobs,
-// missing/zero duration_sec, missing timestamps, or zero/negative wall time
-// — because SQL AVG ignores NULLs: the average is then taken over exactly
-// the jobs that carry usable data, and an all-NULL group averages to NULL,
-// which the COALESCE at each call site turns into 0 ("no data").
+// speedupQual is the WHERE-style boolean qualifying a row for the speedup
+// aggregate: a done job with both timestamps, positive wall time, and a
+// positive duration_sec metric. pfx qualifies the columns for joined
+// queries ("j." in per-node/per-flow, "" in totals).
 //
 // json_extract returns NULL (not 0) when the key is absent, so a single
 // > 0 comparison covers both the missing-key and explicit-zero cases.
-func speedupExpr(pfx string) string {
-	return `CASE
-      WHEN ` + pfx + `status='done'
+func speedupQual(pfx string) string {
+	return pfx + `status='done'
        AND ` + pfx + `started_at IS NOT NULL AND ` + pfx + `finished_at IS NOT NULL
        AND (julianday(` + pfx + `finished_at) - julianday(` + pfx + `started_at)) * 86400 > 0
-       AND json_extract(` + pfx + `metrics_json, '$.duration_sec') > 0
-      THEN json_extract(` + pfx + `metrics_json, '$.duration_sec')
-           / ((julianday(` + pfx + `finished_at) - julianday(` + pfx + `started_at)) * 86400)
-    END`
+       AND json_extract(` + pfx + `metrics_json, '$.duration_sec') > 0`
+}
+
+// speedupAgg builds the DURATION-WEIGHTED speedup aggregate for a group:
+// SUM(media seconds) / SUM(wall seconds) over qualifying rows, NULL-safe to
+// 0 when no row qualifies. Weighted sums — not AVG(per-job ratio) — so a
+// 5-second job with a noisy ratio cannot outweigh a 3-hour encode; the
+// result reads as "media seconds produced per wall second on this
+// node/flow/fleet", which is the comparison that matters (GPU vs CPU).
+func speedupAgg(pfx string) string {
+	return `COALESCE(
+      SUM(CASE WHEN ` + speedupQual(pfx) + `
+           THEN json_extract(` + pfx + `metrics_json, '$.duration_sec') END)
+      / NULLIF(SUM(CASE WHEN ` + speedupQual(pfx) + `
+           THEN (julianday(` + pfx + `finished_at) - julianday(` + pfx + `started_at)) * 86400 END), 0),
+    0)`
 }
 
 // andFinishedAt returns " AND finished_at >= ?" for queries that already have

@@ -19,6 +19,12 @@ import (
 // ctxBg returns a background context for startup seeding operations.
 func ctxBg() context.Context { return context.Background() }
 
+// maxAgentLogBytes is the server-side cap on the agent_log tail stored on
+// a node row. The agent's own ring caps at 8 KiB; this is 16 KiB to allow
+// headroom for a legitimate agent while still bounding storage (and the
+// /api/nodes payload that carries the field) against a rogue agent.
+const maxAgentLogBytes = 16 * 1024
+
 // handleHeartbeat processes an agent status report and decides the
 // instruction to send back. Decision order matters:
 //
@@ -30,7 +36,14 @@ func ctxBg() context.Context { return context.Background() }
 //  4. Job assignment happens only for enabled, idle, below-threshold nodes.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *model.Node) {
 	var hb model.Heartbeat
-	if err := decodeJSON(r, &hb); err != nil {
+	// Tolerant decode: heartbeats use a decoder WITHOUT
+	// DisallowUnknownFields so a NEW agent talking to an OLD controller
+	// during a rolling upgrade does not 400 every heartbeat (which would
+	// orphan its running jobs via the heartbeat sweeper). Heartbeat fields
+	// are additive by contract (metrics, agent_log…); strictness here
+	// buys nothing and breaks the upgrade path. Body stays capped by
+	// maxBodyBytes.
+	if err := decodeJSONTolerant(r, &hb); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid heartbeat: "+err.Error())
 		return
 	}
@@ -53,7 +66,20 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// tail (old agent, or no lines yet) keeps the previous value rather
 	// than blanking it — a rolling upgrade shouldn't wipe evidence. The
 	// column write rides the existing UpdateNode below.
+	//
+	// Server-side cap: the agent bounds its ring at 8 KiB, but a buggy or
+	// malicious agent could ship up to maxBodyBytes. Store at most
+	// maxAgentLogBytes so the nodes table (and every /api/nodes poll that
+	// carries it) stays bounded regardless of what arrives on the wire.
 	if hb.AgentLog != "" {
+		if len(hb.AgentLog) > maxAgentLogBytes {
+			hb.AgentLog = hb.AgentLog[len(hb.AgentLog)-maxAgentLogBytes:]
+			// Drop the partial first line: the cut must land on a line
+			// boundary so the UI never shows mid-line garbage.
+			if i := strings.IndexByte(hb.AgentLog, '\n'); i >= 0 {
+				hb.AgentLog = hb.AgentLog[i+1:]
+			}
+		}
 		node.AgentLog = hb.AgentLog
 	}
 

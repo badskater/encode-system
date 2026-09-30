@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -389,5 +390,75 @@ func TestAgentRefusesBootWithoutCredential(t *testing.T) {
 	cfg := Config{ControllerURL: "http://x", NodeName: "n", DataDir: t.TempDir()}
 	if _, err := New(cfg, "v", testLog()); err == nil {
 		t.Fatal("agent without token or pairing code must be rejected")
+	}
+}
+
+// TestHeartbeatShipsAgentLog verifies the full wiring: a LogRing attached
+// via SetLogRing, log lines written through it, and the real heartbeat POST
+// carrying them in the agent_log field. Guards the seam the isolated
+// LogRing tests and the controller-side persistence test cannot see.
+func TestHeartbeatShipsAgentLog(t *testing.T) {
+	want := "Bearer " + nodeTok()
+	var got atomic.Value // string
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agent/heartbeat" {
+			if r.Header.Get("Authorization") != want {
+				w.WriteHeader(401)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			got.Store(string(body))
+			w.Write([]byte(`{"instruction":"none"}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer controller.Close()
+
+	a, _ := New(Config{ControllerURL: controller.URL, NodeName: "n", Token: nodeTok(), DataDir: t.TempDir(), HeartbeatEvery: 1}, "v", testLog())
+	ring := NewLogRing()
+	a.SetLogRing(ring)
+	fmt.Fprintf(ring, "{\"level\":\"WARN\",\"msg\":\"sentinel log line\"}\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := got.Load().(string); ok && v != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	body, _ := got.Load().(string)
+	if !strings.Contains(body, `"agent_log"`) {
+		t.Fatalf("heartbeat body missing agent_log field: %s", body)
+	}
+	if !strings.Contains(body, "sentinel log line") {
+		t.Fatalf("heartbeat body missing ring content: %s", body)
+	}
+
+	// And without a ring attached, the field is omitted entirely.
+	a2, _ := New(Config{ControllerURL: controller.URL, NodeName: "n", Token: nodeTok(), DataDir: t.TempDir(), HeartbeatEvery: 1}, "v", testLog())
+	got.Store("")
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- a2.Run(ctx2) }()
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := got.Load().(string); ok && v != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel2()
+	<-done2
+	body2, _ := got.Load().(string)
+	if strings.Contains(body2, "agent_log") {
+		t.Fatalf("ring-less agent must omit agent_log: %s", body2)
 	}
 }

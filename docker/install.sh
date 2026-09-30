@@ -103,9 +103,15 @@ if [ ! -f "$HOME_DIR/.env" ]; then
 else
     log "keeping existing $HOME_DIR/.env"
 fi
-# Keep the runtime compose pointed at the installed version.
-sed -i "s/^ENCODE_VERSION=.*/ENCODE_VERSION=${VERSION#v}/" "$HOME_DIR/.env" 2>/dev/null \
-    || echo "ENCODE_VERSION=${VERSION#v}" >> "$HOME_DIR/.env"
+# Keep the runtime compose pointed at the installed version. sed alone is
+# not enough: it exits 0 when the pattern does not match, so a legacy .env
+# WITHOUT an ENCODE_VERSION key would silently keep no version pin (compose
+# would resolve :latest). Append when the key is absent, rewrite when present.
+if grep -q '^ENCODE_VERSION=' "$HOME_DIR/.env" 2>/dev/null; then
+    sed -i "s/^ENCODE_VERSION=.*/ENCODE_VERSION=${VERSION#v}/" "$HOME_DIR/.env"
+else
+    echo "ENCODE_VERSION=${VERSION#v}" >> "$HOME_DIR/.env"
+fi
 
 # --- deploy -----------------------------------------------------------------
 cd "$HOME_DIR"
@@ -114,7 +120,10 @@ cd "$HOME_DIR"
 export COMPOSE_PROJECT_NAME="${ENCODE_COMPOSE_PROJECT:-encode-system}"
 # Safety: refuse to recreate a container that belongs to a DIFFERENT compose
 # project (e.g. a hand-rolled production deployment on this host).
-CONTAINER_NAME="$(grep -E '^ENCODE_CONTAINER_NAME=' .env 2>/dev/null | cut -d= -f2)"
+# `|| true`: grep exits 1 when the key is absent (legacy .env predating the
+# ENCODE_CONTAINER_NAME override) and under set -euo pipefail that would
+# abort the whole script silently — the default below is the intended path.
+CONTAINER_NAME="$(grep -E '^ENCODE_CONTAINER_NAME=' .env 2>/dev/null | cut -d= -f2 || true)"
 CONTAINER_NAME="${CONTAINER_NAME:-encode-controller}"
 existing=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$CONTAINER_NAME" 2>/dev/null || true)
 if [ -n "$existing" ] && [ "$existing" != "$COMPOSE_PROJECT_NAME" ]; then
@@ -130,7 +139,9 @@ compose -f docker-compose.runtime.yml pull controller 2>/dev/null \
 compose -f docker-compose.runtime.yml up -d
 
 # --- health check -----------------------------------------------------------
-PORT=$(grep -E '^ENCODE_PORT=' .env 2>/dev/null | cut -d= -f2); PORT="${PORT:-8080}"
+# `|| true`: same legacy-.env guard as the container-name read above — a
+# missing ENCODE_PORT key must fall through to the 8080 default, not abort.
+PORT=$(grep -E '^ENCODE_PORT=' .env 2>/dev/null | cut -d= -f2 || true); PORT="${PORT:-8080}"
 for i in $(seq 1 30); do
     if curl -fsS "http://localhost:$PORT/api/health" >/dev/null 2>&1; then
         log "controller healthy on port $PORT"

@@ -98,7 +98,7 @@ export default function StatsPage() {
                 </tr>
               </thead>
               <tbody>
-                {stats.repeat_failures.map((r) => (
+                {(stats.repeat_failures ?? []).map((r) => (
                   <tr key={r.job_id}>
                     <td>
                       {r.series} Ep {r.episode}
@@ -114,7 +114,7 @@ export default function StatsPage() {
                     <td className="muted">{r.finished_at || '—'}</td>
                   </tr>
                 ))}
-                {stats.repeat_failures.length === 0 && (
+                {(stats.repeat_failures ?? []).length === 0 && (
                   <tr>
                     <td colSpan={6} className="muted">
                       No episodes failed more than once in this range.
@@ -319,8 +319,10 @@ function humanizeSeconds(sec: number): string {
 
 // formatSpeedup renders an encode-speedup ratio as "2.3×". The backend
 // reports 0 when no job in range carried a usable duration_sec metric —
-// that is "no data", never "0.0×".
+// that is "no data", never "0.0×". Sub-0.1 ratios (very slow 4K encodes)
+// get two decimals so a real slow node never displays as "0.0×".
 function formatSpeedup(x: number): string {
   if (!Number.isFinite(x) || x <= 0) return '—';
+  if (x < 0.1) return `${x.toFixed(2)}×`;
   return `${x.toFixed(x >= 10 ? 0 : 1)}×`;
 }

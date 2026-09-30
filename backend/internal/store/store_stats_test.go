@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -530,5 +531,43 @@ func TestJobStatsSpeedupIsDurationWeighted(t *testing.T) {
 	// we are nowhere near that.
 	if got.Totals.AvgSpeedup > 5 {
 		t.Fatalf("speedup looks unweighted: %v", got.Totals.AvgSpeedup)
+	}
+}
+
+// TestJobStatsRepeatFailuresCapAndErrorTruncation pins the payload-bound
+// contract: at most 25 rows even with more qualifying jobs, and the error
+// text truncated to 200 characters server-side.
+func TestJobStatsRepeatFailuresCapAndErrorTruncation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	fin := time.Now().UTC().Add(-1 * time.Hour)
+	finStr := fin.Format("2006-01-02 15:04:05")
+	start := fin.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// 30 qualifying failures — the list must cap at 25.
+	for i := 0; i < 30; i++ {
+		seedStatsRetryJob(t, s, flow.ID, node.ID, 2, "boom", start, finStr)
+	}
+	// One with a 500-char error — must come back trimmed to 200.
+	long := strings.Repeat("e", 500)
+	seedStatsRetryJob(t, s, flow.ID, node.ID, 9, long, start, finStr)
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if len(got.RepeatFailures) != 25 {
+		t.Fatalf("repeat_failures cap: want 25 rows, got %d", len(got.RepeatFailures))
+	}
+	// The 9-retry job is worst-first, so it is row 0; its error must be
+	// exactly 200 chars of the original.
+	if got.RepeatFailures[0].Attempts != 10 {
+		t.Fatalf("worst-first ordering: want attempts=10, got %+v", got.RepeatFailures[0])
+	}
+	if len(got.RepeatFailures[0].Error) != 200 {
+		t.Fatalf("error truncation: want 200 chars, got %d", len(got.RepeatFailures[0].Error))
 	}
 }

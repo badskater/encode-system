@@ -74,3 +74,37 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// TestLogRingPartialWritesAssemble verifies the io.Writer contract: a line
+// split across multiple Writes lands in the ring as ONE entry, and an
+// unterminated fragment surfaces in Tail() as the newest (pending) entry.
+func TestLogRingPartialWritesAssemble(t *testing.T) {
+	r := NewLogRing()
+	fmt.Fprint(r, `{"level":"INFO","ms`)
+	fmt.Fprint(r, `g":"split line"}`)
+	fmt.Fprint(r, "\n")
+	fmt.Fprint(r, "unterminated-tail")
+
+	tail := r.Tail()
+	lines := strings.Split(tail, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 entries (1 assembled line + 1 pending), got %d: %q", len(lines), tail)
+	}
+	if lines[0] != `{"level":"INFO","msg":"split line"}` {
+		t.Fatalf("split write must assemble into one entry: %q", lines[0])
+	}
+	if lines[1] != "unterminated-tail" {
+		t.Fatalf("pending fragment must surface as newest entry: %q", lines[1])
+	}
+}
+
+// TestLogRingPendingCap verifies an unterminated pending buffer cannot grow
+// without bound (writer that never emits a newline).
+func TestLogRingPendingCap(t *testing.T) {
+	r := NewLogRing()
+	fmt.Fprint(r, strings.Repeat("z", logRingBytes*3))
+	tail := r.Tail()
+	if len(tail) > logRingBytes {
+		t.Fatalf("pending overflowed the wire cap: %d bytes", len(tail))
+	}
+}

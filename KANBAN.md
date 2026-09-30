@@ -13,6 +13,38 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (observability + production on the release pipeline, 2026-09-30)
+
+- Encode speedup ratio in `GET /api/stats`: `avg_speedup` on totals +
+  per-node + per-flow = duration-WEIGHTED SUM(media duration_sec)/
+  SUM(wall seconds) over done jobs reporting the metric (0 = no data; UI
+  renders "—"; sub-0.1 shows two decimals). Weighted so a 5s job cannot
+  outweigh a 3h encode. Stats page: Avg speedup card + Speedup columns.
+- Stuck-episode surfacing: `stats.repeat_failures` — failed jobs with
+  retry_count ≥ 1, worst-first, cap 25, error SUBSTR'd to 200 in SQL —
+  rendered as the "Stuck episodes" triage card (attempts badge, node,
+  step, error). Frontend null-guards the section for old controllers.
+- Agent log shipping: agent LogRing (40 lines / 8 KiB wire cap, partial-
+  write assembly, pending buffer capped) tees slog → heartbeat `agent_log`
+  → persisted on `nodes.agent_log` (server cap 16 KiB, line-boundary trim,
+  empty tail never blanks) → Nodes page **Log** button + AgentLogDialog
+  (JSON pretty-print, live-refresh from poll). Node diagnostics without
+  WinRM. Heartbeat decode is now TOLERANT of unknown fields (rolling
+  upgrade new-agent→old-controller no longer 400s every heartbeat).
+- Production migrated onto the release pipeline: 232 now runs
+  docker-compose.runtime.yml + GHCR image (v1.18.1) with named volumes;
+  DB + shares-key + scripts/release carried over from the hand-rolled
+  stack (tarball rollback: /opt/encode-system-premigration-20260930-005444).
+  Carried volumes need chown to the image's non-root encode user (uid 100)
+  or SQLite fails "readonly database (8)".
+- install.sh legacy-.env fixes (v1.18.1): missing ENCODE_CONTAINER_NAME/
+  ENCODE_PORT keys aborted the script silently under set -euo pipefail
+  (grep exit 1 through pipefail); ENCODE_VERSION stamp now appends when
+  absent (sed exits 0 on no-match, so `sed || echo` never fired).
+- Adversarial review (2 rounds, GLM+DeepSeek): findings fixed — unweighted
+  speedup semantics, DisallowUnknownFields rolling-upgrade break, client-
+  only agent_log bound, LogRing partial-write contract + weak tests.
+
 ## Done (release pipeline + one-command installs, 2026-09-29)
 
 - Release workflow now publishes a complete offline bundle

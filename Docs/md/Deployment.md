@@ -165,6 +165,18 @@ Release-workflow operational notes:
 - The Docker host sits on a private LAN that GitHub runners cannot reach, so
   deployment stays an explicit operator step — but it is one command now:
   `curl -fsSL <release>/install.sh | sudo ENCODE_HOME=/opt/encode-system bash -s v<ver>`.
+- **The farm controller (172.24.92.232) runs the release pipeline as of
+  v1.18.1** (migrated 2026-09-30 from the hand-rolled bind-mount compose):
+  `docker-compose.runtime.yml`, GHCR image, named volumes
+  (`encode-system_encode-{state,scripts,release}`). Upgrades are now
+  `install.sh vX.Y.Z` with data preserved. Migration carry-over recipe
+  (state volume → `encode-state` incl. `encode.db` + `encode.db.shares-key`,
+  bind dirs → the scripts/release volumes) plus one manual step: the image
+  runs as non-root `encode` (uid 100), so a root-owned carried volume needs
+  `docker run --rm -u root --entrypoint sh -v <vol>:/data <image> -c 'chown -R encode:encode /data'`
+  before the controller can open SQLite (fails as "readonly database (8)"
+  otherwise). install.sh v1.18.1+ tolerates legacy `.env` files missing
+  `ENCODE_VERSION`/`ENCODE_CONTAINER_NAME`/`ENCODE_PORT`.
 
 The SQLite driver is pure Go (`modernc.org/sqlite`), so CI needs no system
 libraries. Frontend lockfile hygiene matters: after bumping a major build

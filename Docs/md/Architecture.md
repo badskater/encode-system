@@ -264,9 +264,25 @@ controller re-caps `log_full` at 1 MiB defensively.
   index); `GET /api/nodes/{id}/metrics?range=1h|6h|24h` downsamples to
   ≤500 points; `GET /api/nodes` embeds each node's latest sample as
   `last_metrics`. UI renders chips, sparklines, and a fleet strip.
+- **Agent log shipping** — the agent tees its own slog output through a
+  bounded in-memory ring (40 lines, 8 KiB wire cap, partial-write safe)
+  and attaches the tail to each heartbeat (`agent_log`). The controller
+  persists it on `nodes.agent_log` (server-side cap 16 KiB, line-boundary
+  trim; an empty tail never blanks the stored value) and serves it on
+  `GET /api/nodes` — the Nodes page's **Log** button opens it without a
+  WinRM session. Heartbeat decoding is tolerant of unknown fields
+  (no `DisallowUnknownFields`) so a new agent talking to an old controller
+  during a rolling upgrade does not 400 every heartbeat.
 - **Fleet stats** — `GET /api/stats?range=24h|7d|30d|all` aggregates job
   history in SQL (totals, avg duration, per-node/per-flow breakdowns,
   failures-by-step, done-per-day). No dedicated storage — derived columns.
+  `avg_speedup` (totals + per-node + per-flow) is the duration-weighted
+  encode speedup — SUM(media `duration_sec` metric) / SUM(wall seconds)
+  over done jobs reporting the metric, 0 when none qualify (UI renders
+  "—"). Weighted sums, not a mean of per-job ratios, so a 5-second job
+  cannot outweigh a 3-hour encode. `repeat_failures` lists stuck episodes:
+  failed jobs in range with `retry_count >= 1`, worst-first, capped at 25,
+  error truncated to 200 chars in SQL.
 - **Retry policy** — per-flow `options_json` (`max_retries`,
   `retry_backoff_minutes`; zero retries = off). Failed jobs under a policy
   re-queue silently (`retry_count+1`, `next_retry_at = now + backoff`,

@@ -54,7 +54,9 @@
 | Roll back a bad agent release | Settings → Push to nodes → **Rollback** (`POST /api/updates/agent/rollback`) — the previous published agent becomes current again; nodes self-downgrade through the same version-diff sync. One `.prev` slot only (409 when there is none). |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
 | Read a job's full log | UI → Jobs → **Log** on a finished job (monospace viewer + download); step timings render in the same dialog. Note `GET /api/jobs/{id}/log` returns raw text, not JSON. |
-| See where jobs fail / how long they take | UI → Stats (24h/7d/30d): totals, per-node/per-flow durations, failures-by-step, episodes per day. |
+| See where jobs fail / how long they take | UI → Stats (24h/7d/30d): totals, per-node/per-flow durations, failures-by-step, episodes per day. The **Avg speedup** card and per-node/per-flow Speedup columns show duration-weighted media-seconds per encode-second ("—" = no jobs reported a duration metric). |
+| Spot stuck episodes | UI → Stats → **Stuck episodes (repeated failures)**: failed jobs that burned ≥1 auto-retry, worst-first (cap 25) with attempts, node, step, and error. |
+| Read a node's agent log without WinRM | UI → Nodes → **Log**: the tail the agent ships in its heartbeat (last ~40 lines, pretty-printed). Empty until the node runs agent ≥1.18. |
 | Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, bitrate, durations, sizes) reported by the flow script. |
 | Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
 | Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs`. |

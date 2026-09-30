@@ -13,14 +13,14 @@ import type { Stats } from '../types';
 function fullStats(overrides: Partial<Stats> = {}): Stats {
   return {
     range_days: 7,
-    totals: { done: 10, failed: 2, cancelled: 1, avg_duration_sec: 3600 },
+    totals: { done: 10, failed: 2, cancelled: 1, avg_duration_sec: 3600, avg_speedup: 2.5 },
     per_node: [
-      { node_id: 1, name: 'enc-01', done: 6, failed: 1, avg_duration_sec: 1800 },
-      { node_id: 2, name: 'enc-02', done: 4, failed: 1, avg_duration_sec: 5400 },
+      { node_id: 1, name: 'enc-01', done: 6, failed: 1, avg_duration_sec: 1800, avg_speedup: 3.1 },
+      { node_id: 2, name: 'enc-02', done: 4, failed: 1, avg_duration_sec: 5400, avg_speedup: 0 },
     ],
     per_flow: [
-      { flow_id: 1, name: 'hevc', done: 8, failed: 1, avg_duration_sec: 3000 },
-      { flow_id: 2, name: 'av1', done: 2, failed: 1, avg_duration_sec: 7200 },
+      { flow_id: 1, name: 'hevc', done: 8, failed: 1, avg_duration_sec: 3000, avg_speedup: 2.2 },
+      { flow_id: 2, name: 'av1', done: 2, failed: 1, avg_duration_sec: 7200, avg_speedup: 12.4 },
     ],
     failures_by_step: [
       { step: 'encode', count: 1 },
@@ -29,6 +29,12 @@ function fullStats(overrides: Partial<Stats> = {}): Stats {
     per_day: [
       { date: '2026-08-29', count: 4 },
       { date: '2026-08-30', count: 6 },
+    ],
+    repeat_failures: [
+      {
+        job_id: 42, series: 'Some Show', episode: '07', node_id: 9, node_name: 'enc-77',
+        step: 'dgindex', attempts: 5, error: 'x265 crashed', finished_at: '2026-08-30 12:00:00',
+      },
     ],
     ...overrides,
   };
@@ -39,11 +45,12 @@ function fullStats(overrides: Partial<Stats> = {}): Stats {
 function emptyStats(): Stats {
   return {
     range_days: 7,
-    totals: { done: 0, failed: 0, cancelled: 0, avg_duration_sec: 0 },
+    totals: { done: 0, failed: 0, cancelled: 0, avg_duration_sec: 0, avg_speedup: 0 },
     per_node: [],
     per_flow: [],
     failures_by_step: [],
     per_day: [],
+    repeat_failures: [],
   };
 }
 
@@ -109,5 +116,51 @@ describe('Stats page', () => {
     expect(screen.getByText(/No finished jobs by flow/i)).toBeInTheDocument();
     expect(screen.getByText(/No failures in this range/i)).toBeInTheDocument();
     expect(screen.getByText(/No completed jobs in this range/i)).toBeInTheDocument();
+  });
+});
+
+describe('Stats page — speedup + stuck episodes', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders the avg speedup card and per-node/per-flow speedup columns', async () => {
+    vi.spyOn(api, 'getStats').mockResolvedValue(fullStats());
+
+    render(<StatsPage />);
+
+    // Totals card: 2.5 -> "2.5×".
+    await screen.findByText('Avg speedup');
+    expect(screen.getByText('2.5×')).toBeInTheDocument();
+    // Per-node: 3.1 -> "3.1×"; a 0 row renders the no-data placeholder.
+    expect(screen.getByText('3.1×')).toBeInTheDocument();
+    // Per-flow: 12.4 rounds to a whole number at >=10 -> "12×".
+    expect(screen.getByText('12×')).toBeInTheDocument();
+    expect(screen.getByText('2.2×')).toBeInTheDocument();
+    // No-data cells render an em dash, never "0.0×".
+    const dashes = screen.getAllByText('—');
+    expect(dashes.length).toBeGreaterThan(0);
+    expect(screen.queryByText('0.0×')).not.toBeInTheDocument();
+  });
+
+  it('renders the stuck-episodes card with attempts and error text', async () => {
+    vi.spyOn(api, 'getStats').mockResolvedValue(fullStats());
+
+    render(<StatsPage />);
+
+    await screen.findByText(/Stuck episodes/i);
+    expect(screen.getByText('Some Show Ep 07')).toBeInTheDocument();
+    // Attempts badge shows retry_count+1 (5).
+    expect(screen.getByText('5')).toBeInTheDocument();
+    expect(screen.getByText('x265 crashed')).toBeInTheDocument();
+    expect(screen.getByText('enc-77')).toBeInTheDocument();
+  });
+
+  it('shows the empty-state row when no episode failed repeatedly', async () => {
+    vi.spyOn(api, 'getStats').mockResolvedValue(emptyStats());
+
+    render(<StatsPage />);
+
+    await screen.findByText(/No episodes failed more than once/i);
   });
 });

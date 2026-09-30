@@ -5,6 +5,7 @@ import { usePolling } from '../hooks/usePolling';
 import { nodeBadge, timeAgo } from '../components/helpers';
 import NodeMetricChips from '../components/NodeMetricChips';
 import NodeMetricsPanel from '../components/NodeMetricsPanel';
+import AgentLogDialog from '../components/AgentLogDialog';
 
 // NodesPage manages the fleet: register nodes (showing the one-time token),
 // enable/disable for work, and force reboots.
@@ -22,6 +23,10 @@ export default function NodesPage() {
   // none). Only one panel open at a time; opening another closes the first,
   // matching the single-detail-card pattern on the Jobs page.
   const [metricsNode, setMetricsNode] = useState<Node | null>(null);
+  // logNode is the node whose shipped agent-log dialog is open (null =
+  // none). The dialog renders the nodes.agent_log tail carried by the
+  // poll — no extra fetch.
+  const [logNode, setLogNode] = useState<Node | null>(null);
 
   async function register() {
     const name = newName.trim();
@@ -252,6 +257,14 @@ export default function NodesPage() {
                   >
                     Metrics
                   </button>{' '}
+                  <button
+                    className="btn"
+                    onClick={() => setLogNode(logNode?.id === n.id ? null : n)}
+                    title="Show the agent log tail shipped in this node's last heartbeat"
+                    disabled={!n.agent_log}
+                  >
+                    Log
+                  </button>{' '}
                   <button className="btn" onClick={() => reboot(n)}>
                     Reboot
                   </button>{' '}
@@ -275,6 +288,15 @@ export default function NodesPage() {
           ))}
         </tbody>
       </table>
+
+      {logNode && (
+        <AgentLogDialog
+          nodeName={logNode.name}
+          // Re-resolve from the latest poll so the dialog refreshes while open.
+          log={(nodes ?? []).find((n) => n.id === logNode.id)?.agent_log ?? logNode.agent_log ?? ''}
+          onClose={() => setLogNode(null)}
+        />
+      )}
     </>
   );
 }

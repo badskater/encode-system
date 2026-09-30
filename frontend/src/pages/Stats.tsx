@@ -75,6 +75,54 @@ export default function StatsPage() {
               value={humanizeSeconds(stats.totals.avg_duration_sec)}
               title="Average wall-clock duration of finished jobs (started_at → finished_at) in range"
             />
+            <Stat
+              label="Avg speedup"
+              value={formatSpeedup(stats.totals.avg_speedup)}
+              title="Media seconds encoded per wall-clock second (jobs reporting a duration_sec metric). Higher = faster than realtime."
+            />
+          </div>
+
+          {/* Stuck episodes: failed jobs that burned at least one auto-retry.
+              Triage list — worst-first, capped at 25 server-side. */}
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>Stuck episodes (repeated failures)</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Episode</th>
+                  <th>Attempts</th>
+                  <th>Node</th>
+                  <th>Step</th>
+                  <th>Error</th>
+                  <th>Failed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.repeat_failures.map((r) => (
+                  <tr key={r.job_id}>
+                    <td>
+                      {r.series} Ep {r.episode}
+                    </td>
+                    <td>
+                      <span className={`badge ${r.attempts >= 3 ? 'blue' : 'gray'}`}>{r.attempts}</span>
+                    </td>
+                    <td>{r.node_name || '—'}</td>
+                    <td className="muted">{r.step || '—'}</td>
+                    <td className="muted" title={r.error} style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {r.error || '—'}
+                    </td>
+                    <td className="muted">{r.finished_at || '—'}</td>
+                  </tr>
+                ))}
+                {stats.repeat_failures.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="muted">
+                      No episodes failed more than once in this range.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
 
           {/* Per-node breakdown: name, done, failed, avg duration. */}
@@ -87,6 +135,7 @@ export default function StatsPage() {
                   <th>Done</th>
                   <th>Failed</th>
                   <th>Avg duration</th>
+                  <th>Speedup</th>
                 </tr>
               </thead>
               <tbody>
@@ -96,11 +145,12 @@ export default function StatsPage() {
                     <td>{r.done}</td>
                     <td>{r.failed}</td>
                     <td className="muted">{humanizeSeconds(r.avg_duration_sec)}</td>
+                    <td className="muted" title="Media seconds per encode second">{formatSpeedup(r.avg_speedup)}</td>
                   </tr>
                 ))}
                 {stats.per_node.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="muted">
+                    <td colSpan={5} className="muted">
                       No finished jobs by node in this range.
                     </td>
                   </tr>
@@ -119,6 +169,7 @@ export default function StatsPage() {
                   <th>Done</th>
                   <th>Failed</th>
                   <th>Avg duration</th>
+                  <th>Speedup</th>
                 </tr>
               </thead>
               <tbody>
@@ -128,11 +179,12 @@ export default function StatsPage() {
                     <td>{r.done}</td>
                     <td>{r.failed}</td>
                     <td className="muted">{humanizeSeconds(r.avg_duration_sec)}</td>
+                    <td className="muted" title="Media seconds per encode second">{formatSpeedup(r.avg_speedup)}</td>
                   </tr>
                 ))}
                 {stats.per_flow.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="muted">
+                    <td colSpan={5} className="muted">
                       No finished jobs by flow in this range.
                     </td>
                   </tr>
@@ -263,4 +315,12 @@ function humanizeSeconds(sec: number): string {
   const h = Math.floor(m / 60);
   const rm = m % 60;
   return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+
+// formatSpeedup renders an encode-speedup ratio as "2.3×". The backend
+// reports 0 when no job in range carried a usable duration_sec metric —
+// that is "no data", never "0.0×".
+function formatSpeedup(x: number): string {
+  if (!Number.isFinite(x) || x <= 0) return '—';
+  return `${x.toFixed(x >= 10 ? 0 : 1)}×`;
 }

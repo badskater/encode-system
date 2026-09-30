@@ -17,8 +17,8 @@ func isWindows() bool { return true }
 
 // runService registers with the Windows Service Control Manager and runs the
 // agent loop, stopping cleanly on service stop requests.
-func runService(configPath, version string, log *slog.Logger) error {
-	handler := &agentSvc{configPath: configPath, version: version, log: log}
+func runService(configPath, version string, log *slog.Logger, logRing *agent.LogRing) error {
+	handler := &agentSvc{configPath: configPath, version: version, log: log, logRing: logRing}
 	return svc.Run(serviceName, handler)
 }
 
@@ -26,6 +26,7 @@ type agentSvc struct {
 	configPath string
 	version    string
 	log        *slog.Logger
+	logRing    *agent.LogRing
 }
 
 // Execute implements svc.Handler. It starts the agent, then bridges SCM
@@ -46,6 +47,7 @@ func (s *agentSvc) Execute(args []string, r <-chan svc.ChangeRequest, changes ch
 		changes <- svc.Status{State: svc.StopPending}
 		return false, 1
 	}
+	a.SetLogRing(s.logRing)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

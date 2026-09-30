@@ -71,6 +71,11 @@ type Agent struct {
 	// progress between completions. Own mutex — never couples to a.mu.
 	prog *progressTracker
 
+	// logRing tees the agent's own slog output (attached by main via
+	// SetLogRing before Run) so each heartbeat can ship a bounded tail to
+	// the controller. nil = log shipping off (old callers, unit tests).
+	logRing *LogRing
+
 	// Injectable exec seams for metrics collectors. nil → production
 	// defaults (runPSDefault, gpuProbeDefault). Tests inject fakes to
 	// verify parsing without shelling out to PowerShell or nvidia-smi.
@@ -156,6 +161,11 @@ func (a *Agent) TasksSinceBoot() int {
 // counterPath stores the per-boot task counter. The OS clears it implicitly:
 // the agent resets it to zero after executing a reboot instruction.
 func (a *Agent) counterPath() string { return filepath.Join(a.Cfg.DataDir, "tasks_since_boot") }
+
+// SetLogRing attaches the agent-log ring whose Tail() each heartbeat ships
+// to the controller. Called once by main before Run; a nil ring disables
+// shipping (default for struct-literal Agents in tests).
+func (a *Agent) SetLogRing(r *LogRing) { a.logRing = r }
 
 // tokenPath stores the permanent bearer credential obtained via pairing, so
 // the one-shot code never needs to survive on disk.
@@ -284,6 +294,11 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		// (0 = not yet sampled, -1 = no GPU).
 		Metrics: a.collectMetrics(ctx),
 		Jobs:    reports,
+	}
+	// Ship the agent-log tail when the ring is attached (main wires it via
+	// SetLogRing). Bounded by the ring itself (≤8 KiB); "" omits the field.
+	if a.logRing != nil {
+		hb.AgentLog = a.logRing.Tail()
 	}
 	if len(reports) > 0 {
 		hb.JobID = reports[0].JobID

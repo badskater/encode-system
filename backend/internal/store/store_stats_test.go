@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -273,5 +274,222 @@ func TestJobStatsFailuresByStepCapAt10(t *testing.T) {
 	}
 	if len(got.FailuresByStep) != 10 {
 		t.Fatalf("failures_by_step cap: want 10, got %d", len(got.FailuresByStep))
+	}
+}
+
+// seedStatsJobMetrics inserts a terminal job with an explicit metrics_json
+// payload plus started/finished timestamps, so speedup-ratio tests can
+// assert exact media-duration/wall-time divisions.
+func seedStatsJobMetrics(t *testing.T, s *Store, flowID, nodeID int64, status, metricsJSON, started, finished string) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO jobs (series, episode, episode_dir, script_type, flow_id, status, node_id, metrics_json, started_at, finished_at)
+		 VALUES ('S', '01', 'S/Ep 01', 'vpy', ?, ?, ?, ?, ?, ?)`,
+		flowID, status, nodeID, metricsJSON, started, finished)
+	if err != nil {
+		t.Fatalf("seed metrics job: %v", err)
+	}
+}
+
+// TestJobStatsSpeedupRatio asserts the encode-speedup aggregate:
+// media duration_sec / wall-clock encode seconds, averaged over done jobs
+// that carry the metric. Non-qualifying rows (failed jobs, missing
+// duration_sec, zero wall time) must be excluded from the average — not
+// counted as zero — and a fleet with no qualifying jobs reports 0.
+func TestJobStatsSpeedupRatio(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	fin := time.Now().UTC().Add(-1 * time.Hour)
+	finStr := fin.Format("2006-01-02 15:04:05")
+	// 2x: 30 min media encoded in 15 min wall = 2.0x speedup each.
+	start2x := fin.Add(-15 * time.Minute).Format("2006-01-02 15:04:05")
+	// 1x: 10 min media in 10 min wall = 1.0x.
+	start1x := fin.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+	// 4x: 20 min media in 5 min wall = 4.0x.
+	start4x := fin.Add(-5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Qualifying: two 2.0x jobs and one 1.0x job → avg (2+2+1)/3 = 1.666…
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":1800}`, start2x, finStr)
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":1800}`, start2x, finStr)
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":600}`, start1x, finStr)
+	// Non-qualifying: failed job with a duration metric (excluded — speedup
+	// only measures completed encodes).
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "failed", `{"duration_sec":9999}`, start4x, finStr)
+	// Non-qualifying: done job with NO duration_sec (old agents/scripts).
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{}`, start4x, finStr)
+	// Non-qualifying: done job with duration_sec=0.
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":0}`, start4x, finStr)
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	want := 5.0 / 3.0 // 1.666…
+	if got.Totals.AvgSpeedup < want-0.01 || got.Totals.AvgSpeedup > want+0.01 {
+		t.Fatalf("totals avg_speedup: want ~%.3f, got %v", want, got.Totals.AvgSpeedup)
+	}
+	if len(got.PerNode) != 1 {
+		t.Fatalf("per_node: want 1 row, got %d", len(got.PerNode))
+	}
+	if n := got.PerNode[0]; n.AvgSpeedup < want-0.01 || n.AvgSpeedup > want+0.01 {
+		t.Fatalf("per_node avg_speedup: want ~%.3f, got %v", want, n.AvgSpeedup)
+	}
+	if len(got.PerFlow) != 1 {
+		t.Fatalf("per_flow: want 1 row, got %d", len(got.PerFlow))
+	}
+	if f := got.PerFlow[0]; f.AvgSpeedup < want-0.01 || f.AvgSpeedup > want+0.01 {
+		t.Fatalf("per_flow avg_speedup: want ~%.3f, got %v", want, f.AvgSpeedup)
+	}
+}
+
+// TestJobStatsSpeedupNoQualifyingJobsIsZero asserts the empty-data contract:
+// done jobs without duration_sec metrics average to 0 (rendered as
+// "no data" in the UI), never NULL/NaN.
+func TestJobStatsSpeedupNoQualifyingJobsIsZero(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	fin := time.Now().UTC().Add(-1 * time.Hour)
+	finStr := fin.Format("2006-01-02 15:04:05")
+	start := fin.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{}`, start, finStr)
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got.Totals.AvgSpeedup != 0 {
+		t.Fatalf("totals avg_speedup: want 0, got %v", got.Totals.AvgSpeedup)
+	}
+	if got.PerNode[0].AvgSpeedup != 0 || got.PerFlow[0].AvgSpeedup != 0 {
+		t.Fatalf("row speedups: want 0, got node=%v flow=%v",
+			got.PerNode[0].AvgSpeedup, got.PerFlow[0].AvgSpeedup)
+	}
+}
+
+// TestJobStatsSpeedupRangeBoundaryExcludesOldJobs asserts the speedup
+// average respects the same finished_at range window as every other
+// aggregate: an ancient 100x job must not skew the 7d figure.
+func TestJobStatsSpeedupRangeBoundaryExcludesOldJobs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	now := time.Now().UTC()
+	// In-range: 10 min media / 10 min wall = 1.0x.
+	fin := now.Add(-1 * time.Hour)
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":600}`,
+		fin.Add(-10*time.Minute).Format("2006-01-02 15:04:05"), fin.Format("2006-01-02 15:04:05"))
+	// Out-of-range (30 days old): 100 min media / 1 min wall = 100x.
+	old := now.Add(-30 * 24 * time.Hour)
+	seedStatsJobMetrics(t, s, flow.ID, node.ID, "done", `{"duration_sec":6000}`,
+		old.Add(-1*time.Minute).Format("2006-01-02 15:04:05"), old.Format("2006-01-02 15:04:05"))
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got.Totals.AvgSpeedup < 0.99 || got.Totals.AvgSpeedup > 1.01 {
+		t.Fatalf("avg_speedup: want ~1.0 (old job excluded), got %v", got.Totals.AvgSpeedup)
+	}
+}
+
+// seedStatsRetryJob inserts a failed job with an explicit retry_count and
+// error text, for the stuck-episode (repeat_failures) triage tests.
+func seedStatsRetryJob(t *testing.T, s *Store, flowID, nodeID int64, retryCount int, errMsg, started, finished string) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO jobs (series, episode, episode_dir, script_type, flow_id, status, node_id, retry_count, error, step, started_at, finished_at)
+		 VALUES ('S', ?, 'S/Ep 01', 'vpy', ?, 'failed', ?, ?, ?, 'encode', ?, ?)`,
+		fmt.Sprintf("%02d", retryCount), flowID, nodeID, retryCount, errMsg, started, finished)
+	if err != nil {
+		t.Fatalf("seed retry job: %v", err)
+	}
+}
+
+// TestJobStatsRepeatFailures asserts the stuck-episode triage list: failed
+// jobs with retry_count >= 1 appear with attempts = retry_count+1, ordered
+// worst-first; a first-try failure (retry_count=0) never appears.
+func TestJobStatsRepeatFailures(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	fin := time.Now().UTC().Add(-1 * time.Hour)
+	finStr := fin.Format("2006-01-02 15:04:05")
+	start := fin.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// One 3-retry failure, one 1-retry failure, one first-try failure.
+	seedStatsRetryJob(t, s, flow.ID, node.ID, 3, "boom x3", start, finStr)
+	seedStatsRetryJob(t, s, flow.ID, node.ID, 1, "boom x1", start, finStr)
+	seedStatsRetryJob(t, s, flow.ID, node.ID, 0, "first try", start, finStr)
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if len(got.RepeatFailures) != 2 {
+		t.Fatalf("repeat_failures: want 2 rows, got %d (%+v)", len(got.RepeatFailures), got.RepeatFailures)
+	}
+	worst := got.RepeatFailures[0]
+	if worst.Attempts != 4 || worst.Error != "boom x3" {
+		t.Fatalf("worst row: want attempts=4 error=boom x3, got %+v", worst)
+	}
+	if worst.NodeName != "enc-01" {
+		t.Fatalf("node name not joined: %+v", worst)
+	}
+	if got.RepeatFailures[1].Attempts != 2 {
+		t.Fatalf("second row: want attempts=2, got %+v", got.RepeatFailures[1])
+	}
+}
+
+// TestJobStatsRepeatFailuresEmptyShape asserts a clean fleet marshals the
+// section as [] (never null) so the frontend needs no null guard.
+func TestJobStatsRepeatFailuresEmptyShape(t *testing.T) {
+	s := newTestStore(t)
+	got, err := s.JobStats(context.Background(), 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got.RepeatFailures == nil {
+		t.Fatal("repeat_failures must be non-nil empty slice")
+	}
+}
+
+// TestJobStatsRepeatFailuresRangeExcluded asserts an ancient retried failure
+// outside the window is not listed.
+func TestJobStatsRepeatFailuresRangeExcluded(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	flow, _ := s.CreateFlow(ctx, &model.Flow{Name: "f1", Steps: []model.Step{{Type: "encode"}}})
+	node, _ := s.CreateNode(ctx, "enc-01", "h1")
+
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	seedStatsRetryJob(t, s, flow.ID, node.ID, 5, "ancient",
+		old.Add(-10*time.Minute).Format("2006-01-02 15:04:05"), old.Format("2006-01-02 15:04:05"))
+
+	got, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if len(got.RepeatFailures) != 0 {
+		t.Fatalf("want 0 rows in range, got %+v", got.RepeatFailures)
+	}
+	// "all" must see it.
+	all, err := s.JobStats(ctx, 0)
+	if err != nil {
+		t.Fatalf("stats all: %v", err)
+	}
+	if len(all.RepeatFailures) != 1 {
+		t.Fatalf("want 1 row in all-time, got %d", len(all.RepeatFailures))
 	}
 }

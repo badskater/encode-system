@@ -276,6 +276,10 @@ export interface Node {
   // Most recent metric snapshot the agent reported in its heartbeat (C3
   // phase). Absent for old agents and never-reported/offline nodes.
   last_metrics?: NodeMetrics;
+  // Tail of the agent's own log as shipped in its latest heartbeat
+  // (≤8 KiB, newest last). Absent/empty for old agents — gate the
+  // "Agent log" UI on a non-empty value.
+  agent_log?: string;
 }
 
 // NodeMetrics: the 8 live counters an encode agent reports each heartbeat.
@@ -375,6 +379,9 @@ export interface StatsTotals {
   failed: number;
   cancelled: number;
   avg_duration_sec: number;
+  // Media-seconds per encode-second over done jobs reporting duration_sec.
+  // 0 = no qualifying jobs — render as "—", never "0.0×".
+  avg_speedup: number;
 }
 
 export interface StatsNodeRow {
@@ -383,6 +390,7 @@ export interface StatsNodeRow {
   done: number;
   failed: number;
   avg_duration_sec: number;
+  avg_speedup: number;
 }
 
 export interface StatsFlowRow {
@@ -391,6 +399,7 @@ export interface StatsFlowRow {
   done: number;
   failed: number;
   avg_duration_sec: number;
+  avg_speedup: number;
 }
 
 export interface StatsStepRow {
@@ -403,6 +412,21 @@ export interface StatsDayRow {
   count: number;
 }
 
+// StatsRepeatRow: one stuck episode (failed job that burned ≥1 auto-retry).
+// attempts = retry_count + 1 (initial run + retries). error is capped at
+// 200 chars server-side.
+export interface StatsRepeatRow {
+  job_id: number;
+  series: string;
+  episode: string;
+  node_id: number;
+  node_name: string;
+  step: string;
+  attempts: number;
+  error: string;
+  finished_at: string;
+}
+
 export interface Stats {
   range_days: number; // 1|7|30|0(all)
   totals: StatsTotals;
@@ -410,4 +434,5 @@ export interface Stats {
   per_flow: StatsFlowRow[];
   failures_by_step: StatsStepRow[];
   per_day: StatsDayRow[];
+  repeat_failures: StatsRepeatRow[];
 }

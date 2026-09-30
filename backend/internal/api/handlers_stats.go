@@ -53,5 +53,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if stats.PerDay == nil {
 		stats.PerDay = []model.StatsDayRow{}
 	}
+	if stats.RepeatFailures == nil {
+		stats.RepeatFailures = []model.StatsRepeatRow{}
+	}
 	writeJSON(w, http.StatusOK, stats)
 }

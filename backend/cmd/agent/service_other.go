@@ -16,7 +16,7 @@ func isWindows() bool { return false }
 
 // runService on non-Windows hosts runs a plain foreground loop (used for
 // development and testing of the agent on Linux).
-func runService(configPath, version string, log *slog.Logger) error {
+func runService(configPath, version string, log *slog.Logger, logRing *agent.LogRing) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
@@ -25,6 +25,7 @@ func runService(configPath, version string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	a.SetLogRing(logRing)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return a.Run(ctx)

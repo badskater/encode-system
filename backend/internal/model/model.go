@@ -249,10 +249,16 @@ type Node struct {
 	// sample; the restart-safe last-known sample is served from the DB via
 	// Store.LatestNodeMetric on the ListNodes path (see last_metrics there).
 	// nil for old agents that do not report metrics yet.
-	Metrics   *NodeMetrics `json:"metrics,omitempty"`
-	LastSeen  *time.Time   `json:"last_seen,omitempty"`
-	LastError string       `json:"last_error,omitempty"`
-	CreatedAt time.Time    `json:"created_at"`
+	Metrics *NodeMetrics `json:"metrics,omitempty"`
+	// AgentLog is the tail of the agent's own slog output as reported in
+	// its latest heartbeat (bounded ≤8 KiB, newest last). Persisted on the
+	// nodes row so it survives a controller restart and is served by
+	// GET /api/nodes — the UI's "Agent log" dialog reads it without a
+	// WinRM session. Empty for old agents that do not ship logs.
+	AgentLog  string     `json:"agent_log,omitempty"`
+	LastSeen  *time.Time `json:"last_seen,omitempty"`
+	LastError string     `json:"last_error,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // Job is one episode encode assignment.
@@ -447,6 +453,11 @@ type Heartbeat struct {
 	// Metrics is the agent's latest resource sample. nil for old agents
 	// that do not report metrics — callers must nil-check before use.
 	Metrics *NodeMetrics `json:"metrics,omitempty"`
+	// AgentLog carries the tail of the agent's OWN slog output (bounded
+	// ring, ≤8 KiB) so the controller can surface node-side diagnostics
+	// without a WinRM session. Empty for old agents and before the first
+	// log line — treat "" as "no data", never as "healthy".
+	AgentLog string `json:"agent_log,omitempty"`
 }
 
 // jobReports normalizes the heartbeat into a per-job list: the Jobs array
@@ -598,6 +609,11 @@ type Stats struct {
 	PerFlow        []StatsFlowRow `json:"per_flow"`         // per-flow throughput/duration
 	FailuresByStep []StatsStepRow `json:"failures_by_step"` // top-10 steps where jobs died
 	PerDay         []StatsDayRow  `json:"per_day"`          // day buckets for throughput trend
+	// RepeatFailures lists stuck episodes: failed jobs in range that
+	// burned at least one auto-retry (retry_count >= 1), worst-first.
+	// Capped at 25 — it is a triage list, not a full failure history
+	// (the Jobs page already filters by status).
+	RepeatFailures []StatsRepeatRow `json:"repeat_failures"`
 }
 
 // StatsTotals aggregates the fleet-wide terminal counts and the average
@@ -609,6 +625,11 @@ type StatsTotals struct {
 	Failed         int     `json:"failed"`
 	Cancelled      int     `json:"cancelled"`
 	AvgDurationSec float64 `json:"avg_duration_sec"`
+	// AvgSpeedup is the fleet-wide average encode speedup ratio
+	// (media duration_sec / wall-clock encode seconds) over done jobs in
+	// range that reported a duration_sec metric. 0 when no job qualifies
+	// — callers must render 0 as "no data", never as "0×".
+	AvgSpeedup float64 `json:"avg_speedup"`
 }
 
 // StatsNodeRow is one per-node aggregate row: the node's display name (LEFT
@@ -622,6 +643,9 @@ type StatsNodeRow struct {
 	Done           int     `json:"done"`
 	Failed         int     `json:"failed"`
 	AvgDurationSec float64 `json:"avg_duration_sec"`
+	// AvgSpeedup: media-seconds per encode-second on this node (0 = no
+	// qualifying jobs). Makes GPU vs CPU nodes directly comparable.
+	AvgSpeedup float64 `json:"avg_speedup"`
 }
 
 // StatsFlowRow is one per-flow aggregate row (LEFT JOIN flows for the name).
@@ -631,6 +655,9 @@ type StatsFlowRow struct {
 	Done           int     `json:"done"`
 	Failed         int     `json:"failed"`
 	AvgDurationSec float64 `json:"avg_duration_sec"`
+	// AvgSpeedup: media-seconds per encode-second for this flow (0 = no
+	// qualifying jobs).
+	AvgSpeedup float64 `json:"avg_speedup"`
 }
 
 // StatsStepRow is one row of failures-by-step attribution: the step column
@@ -646,4 +673,20 @@ type StatsStepRow struct {
 type StatsDayRow struct {
 	Date  string `json:"date"`
 	Count int    `json:"count"`
+}
+
+// StatsRepeatRow is one stuck-episode triage row: a failed job that burned
+// at least one auto-retry. Attempts is retry_count+1 (initial run +
+// retries); Error is the recorded failure message, truncated to 200 chars
+// so a pathological multi-KB error cannot bloat the stats payload.
+type StatsRepeatRow struct {
+	JobID      int64  `json:"job_id"`
+	Series     string `json:"series"`
+	Episode    string `json:"episode"`
+	NodeID     int64  `json:"node_id"`
+	NodeName   string `json:"node_name"`
+	Step       string `json:"step"`
+	Attempts   int    `json:"attempts"`
+	Error      string `json:"error"`
+	FinishedAt string `json:"finished_at"`
 }

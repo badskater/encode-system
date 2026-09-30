@@ -48,6 +48,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	node.LastSeen = &now
 	node.LastError = ""
 
+	// Agent-log shipping: persist the tail the agent attached so the UI
+	// can show node-side diagnostics without a WinRM session. An empty
+	// tail (old agent, or no lines yet) keeps the previous value rather
+	// than blanking it — a rolling upgrade shouldn't wipe evidence. The
+	// column write rides the existing UpdateNode below.
+	if hb.AgentLog != "" {
+		node.AgentLog = hb.AgentLog
+	}
+
 	// Persist the agent's latest resource sample into the node_metrics ring
 	// table (24h retention, ≤500-point downsample on read). Old agents send
 	// nil Metrics — skip entirely so the ring stays empty for them. A write

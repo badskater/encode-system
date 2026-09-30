@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -26,7 +27,7 @@ func main() {
 	foreground := flag.Bool("foreground", false, "run in foreground instead of as a service")
 	flag.Parse()
 
-	log := newLogger(*foreground)
+	log, logRing := newLogger(*foreground)
 
 	if *foreground {
 		cfg, err := loadConfig(*configPath)
@@ -39,6 +40,7 @@ func main() {
 			log.Error("init agent", "err", err)
 			os.Exit(1)
 		}
+		a.SetLogRing(logRing)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := a.Run(ctx); err != nil && ctx.Err() == nil {
@@ -49,7 +51,7 @@ func main() {
 	}
 
 	// Service mode is platform-specific (Windows SCM vs. plain loop).
-	if err := runService(*configPath, Version, log); err != nil {
+	if err := runService(*configPath, Version, log, logRing); err != nil {
 		log.Error("service error", "err", err)
 		os.Exit(1)
 	}
@@ -87,8 +89,12 @@ func loadConfig(path string) (agent.Config, error) {
 }
 
 // newLogger configures JSON logging; foreground also logs to stderr for
-// interactive debugging while the service relies on its log file.
-func newLogger(foreground bool) *slog.Logger {
+// interactive debugging while the service relies on its log file. It also
+// returns the in-memory LogRing that tees every log line: the heartbeat
+// ships its tail to the controller so node diagnostics are visible from
+// the UI without a WinRM session.
+func newLogger(foreground bool) (*slog.Logger, *agent.LogRing) {
 	var w *os.File = os.Stdout
-	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ring := agent.NewLogRing()
+	return slog.New(slog.NewJSONHandler(io.MultiWriter(w, ring), &slog.HandlerOptions{Level: slog.LevelInfo})), ring
 }

@@ -45,6 +45,7 @@ func (s *Store) JobStats(ctx context.Context, rng time.Duration) (*model.Stats, 
 		PerFlow:        []model.StatsFlowRow{},
 		FailuresByStep: []model.StatsStepRow{},
 		PerDay:         []model.StatsDayRow{},
+		RepeatFailures: []model.StatsRepeatRow{},
 	}
 
 	if err := s.statsTotals(ctx, out, cutoff); err != nil {
@@ -62,6 +63,9 @@ func (s *Store) JobStats(ctx context.Context, rng time.Duration) (*model.Stats, 
 	if err := s.statsPerDay(ctx, out, cutoff); err != nil {
 		return nil, err
 	}
+	if err := s.statsRepeatFailures(ctx, out, cutoff); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -77,11 +81,13 @@ func (s *Store) statsTotals(ctx context.Context, out *model.Stats, cutoff string
     COUNT(CASE WHEN status='done' THEN 1 END),
     COUNT(CASE WHEN status='failed' THEN 1 END),
     COUNT(CASE WHEN status='cancelled' THEN 1 END),
-    COALESCE(AVG((julianday(finished_at) - julianday(started_at)) * 86400), 0)
-  FROM jobs` + whereFinishedAt("finished_at", cutoff)
+    COALESCE(AVG((julianday(finished_at) - julianday(started_at)) * 86400), 0),
+    COALESCE(AVG(` + speedupExpr("") + `), 0)
+  FROM jobs` +
+		whereFinishedAt("finished_at", cutoff)
 	var avg sql.NullFloat64
 	if err := s.db.QueryRowContext(ctx, q, rangeArgs(cutoff)...).Scan(
-		&out.Totals.Done, &out.Totals.Failed, &out.Totals.Cancelled, &avg); err != nil {
+		&out.Totals.Done, &out.Totals.Failed, &out.Totals.Cancelled, &avg, &out.Totals.AvgSpeedup); err != nil {
 		return fmt.Errorf("stats totals: %w", err)
 	}
 	out.Totals.AvgDurationSec = avg.Float64
@@ -99,7 +105,8 @@ func (s *Store) statsPerNode(ctx context.Context, out *model.Stats, cutoff strin
 	q := `SELECT j.node_id, COALESCE(n.name, ''),
     COUNT(CASE WHEN j.status='done' THEN 1 END),
     COUNT(CASE WHEN j.status='failed' THEN 1 END),
-    COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0)
+    COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0),
+    COALESCE(AVG(` + speedupExpr("j.") + `), 0)
   FROM jobs j LEFT JOIN nodes n ON n.id = j.node_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.node_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
@@ -111,7 +118,7 @@ func (s *Store) statsPerNode(ctx context.Context, out *model.Stats, cutoff strin
 	for rows.Next() {
 		var r model.StatsNodeRow
 		var avg sql.NullFloat64
-		if err := rows.Scan(&r.NodeID, &r.Name, &r.Done, &r.Failed, &avg); err != nil {
+		if err := rows.Scan(&r.NodeID, &r.Name, &r.Done, &r.Failed, &avg, &r.AvgSpeedup); err != nil {
 			return err
 		}
 		r.AvgDurationSec = avg.Float64
@@ -126,7 +133,8 @@ func (s *Store) statsPerFlow(ctx context.Context, out *model.Stats, cutoff strin
 	q := `SELECT j.flow_id, COALESCE(f.name, ''),
     COUNT(CASE WHEN j.status='done' THEN 1 END),
     COUNT(CASE WHEN j.status='failed' THEN 1 END),
-    COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0)
+    COALESCE(AVG((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0),
+    COALESCE(AVG(` + speedupExpr("j.") + `), 0)
   FROM jobs j LEFT JOIN flows f ON f.id = j.flow_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.flow_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
@@ -138,7 +146,7 @@ func (s *Store) statsPerFlow(ctx context.Context, out *model.Stats, cutoff strin
 	for rows.Next() {
 		var r model.StatsFlowRow
 		var avg sql.NullFloat64
-		if err := rows.Scan(&r.FlowID, &r.Name, &r.Done, &r.Failed, &avg); err != nil {
+		if err := rows.Scan(&r.FlowID, &r.Name, &r.Done, &r.Failed, &avg, &r.AvgSpeedup); err != nil {
 			return err
 		}
 		r.AvgDurationSec = avg.Float64
@@ -194,6 +202,37 @@ func (s *Store) statsPerDay(ctx context.Context, out *model.Stats, cutoff string
 	return rows.Err()
 }
 
+// statsRepeatFailures fills the stuck-episode triage list: failed jobs in
+// range whose retry_count >= 1 (they burned at least one auto-retry attempt
+// and still failed). Ordered worst-first (most attempts, then most recent)
+// and capped at 25 — this is a "look at these" list, not a full failure
+// history. The status predicate seeks idx_jobs_status; the retry_count
+// filter is a cheap scan over the matched failed rows. The error text is
+// SUBSTR-capped in SQL so a pathological multi-KB message cannot bloat the
+// payload.
+func (s *Store) statsRepeatFailures(ctx context.Context, out *model.Stats, cutoff string) error {
+	q := `SELECT j.id, j.series, j.episode, j.node_id, COALESCE(n.name, ''),
+    j.step, j.retry_count + 1, SUBSTR(j.error, 1, 200), COALESCE(j.finished_at, '')
+  FROM jobs j LEFT JOIN nodes n ON n.id = j.node_id
+  WHERE j.status='failed' AND j.retry_count >= 1` +
+		andFinishedAt(cutoff) +
+		` ORDER BY j.retry_count DESC, j.finished_at DESC LIMIT 25`
+	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	if err != nil {
+		return fmt.Errorf("stats repeat failures: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r model.StatsRepeatRow
+		if err := rows.Scan(&r.JobID, &r.Series, &r.Episode, &r.NodeID, &r.NodeName,
+			&r.Step, &r.Attempts, &r.Error, &r.FinishedAt); err != nil {
+			return err
+		}
+		out.RepeatFailures = append(out.RepeatFailures, r)
+	}
+	return rows.Err()
+}
+
 // whereFinishedAt returns " WHERE <col> >= ?" (qualified for joined queries)
 // or "" when cutoff is empty ("all"). Every aggregate applies the identical
 // range predicate so all sections agree on the window.
@@ -202,6 +241,31 @@ func whereFinishedAt(col, cutoff string) string {
 		return ""
 	}
 	return " WHERE " + col + " >= ?"
+}
+
+// speedupExpr builds the SQL CASE expression for one job's encode speedup
+// ratio: media duration (the duration_sec ENCODE_METRIC the encode script
+// reports, stored in metrics_json) divided by the wall-clock encode seconds
+// (started_at → finished_at). pfx qualifies the columns for joined queries
+// ("j." in per-node/per-flow, "" in totals).
+//
+// The expression returns NULL for every non-qualifying row — non-done jobs,
+// missing/zero duration_sec, missing timestamps, or zero/negative wall time
+// — because SQL AVG ignores NULLs: the average is then taken over exactly
+// the jobs that carry usable data, and an all-NULL group averages to NULL,
+// which the COALESCE at each call site turns into 0 ("no data").
+//
+// json_extract returns NULL (not 0) when the key is absent, so a single
+// > 0 comparison covers both the missing-key and explicit-zero cases.
+func speedupExpr(pfx string) string {
+	return `CASE
+      WHEN ` + pfx + `status='done'
+       AND ` + pfx + `started_at IS NOT NULL AND ` + pfx + `finished_at IS NOT NULL
+       AND (julianday(` + pfx + `finished_at) - julianday(` + pfx + `started_at)) * 86400 > 0
+       AND json_extract(` + pfx + `metrics_json, '$.duration_sec') > 0
+      THEN json_extract(` + pfx + `metrics_json, '$.duration_sec')
+           / ((julianday(` + pfx + `finished_at) - julianday(` + pfx + `started_at)) * 86400)
+    END`
 }
 
 // andFinishedAt returns " AND finished_at >= ?" for queries that already have

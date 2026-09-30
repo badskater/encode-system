@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -745,5 +746,55 @@ func TestRebootFlagHeldWithinGracePeriod(t *testing.T) {
 	n2, _ := e.server.Store.GetNode(ctx, e.node.ID)
 	if !n2.RebootPending {
 		t.Fatal("fresh reboot flag must persist")
+	}
+}
+
+// TestHeartbeatAgentLogPersistedAndServed confirms a heartbeat carrying an
+// agent_log tail persists it on the nodes row and GET /api/nodes serves it;
+// a later heartbeat WITHOUT a tail keeps the previous value (rolling
+// upgrade / pre-first-line window must not blank evidence).
+func TestHeartbeatAgentLogPersistedAndServed(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	hb := heartbeat("enc-01", 1, 0)
+	hb.AgentLog = "{\"level\":\"INFO\",\"msg\":\"heartbeat ok\"}\n{\"level\":\"WARN\",\"msg\":\"swap failed\"}"
+	resp, body := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, hb)
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat with log: %d %s", resp.StatusCode, body)
+	}
+
+	var nodes []model.Node
+	resp2, body2 := doJSON(t, "GET", ts.URL+"/api/nodes", adminTok, nil)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("list nodes: %d %s", resp2.StatusCode, body2)
+	}
+	if err := json.Unmarshal(body2, &nodes); err != nil {
+		t.Fatalf("decode nodes: %v (%s)", err, body2)
+	}
+	found := false
+	for _, n := range nodes {
+		if n.ID == e.node.ID {
+			found = true
+			if !strings.Contains(n.AgentLog, "swap failed") {
+				t.Fatalf("agent_log not served: %q", n.AgentLog)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("node missing from list")
+	}
+
+	// Empty-tail heartbeat must NOT blank the stored log.
+	resp3, body3 := doJSON(t, "POST", ts.URL+"/api/agent/heartbeat", e.token, heartbeat("enc-01", 2, 0))
+	if resp3.StatusCode != 200 {
+		t.Fatalf("heartbeat without log: %d %s", resp3.StatusCode, body3)
+	}
+	n, err := e.server.Store.GetNode(ctxBg(), e.node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if !strings.Contains(n.AgentLog, "swap failed") {
+		t.Fatalf("empty tail blanked stored log: %q", n.AgentLog)
 	}
 }

@@ -45,3 +45,29 @@ export function timeAgo(iso?: string | null) {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
 }
+
+// formatAgentLog pretty-prints JSON slog lines into "LEVEL time msg k=v…"
+// form so the agent-log dialog is readable without a log viewer. Lines that
+// are not JSON pass through untouched (PowerShell output, panics). An empty
+// log renders an explanatory placeholder, never a blank pane.
+export function formatAgentLog(raw: string): string {
+  if (!raw) return '(no agent log reported — the node may run an older agent)';
+  return raw
+    .split('\n')
+    .map((line) => {
+      try {
+        const o = JSON.parse(line) as Record<string, unknown>;
+        const lvl = String(o.level ?? 'INFO');
+        const time = o.time ? String(o.time).replace('T', ' ').slice(0, 19) : '';
+        const msg = String(o.msg ?? '');
+        const rest = Object.entries(o)
+          .filter(([k]) => !['level', 'time', 'msg'].includes(k))
+          .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+          .join(' ');
+        return [`${lvl.padEnd(5)}`, time, msg, rest].filter(Boolean).join(' ');
+      } catch {
+        return line;
+      }
+    })
+    .join('\n');
+}

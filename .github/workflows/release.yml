@@ -93,8 +93,22 @@ jobs:
       # --- complete deploy bundle -------------------------------------------
       - name: Assemble bundle
         run: |
-          mkdir -p dist/provision
+          mkdir -p dist/provision dist/provision/roles dist/systemd
           cp infra/ansible/provision.yml dist/provision/
+          # Linux provisioning tree: the engine (executeLinux) reads
+          # PlaybookDir/linux-node.yml and copies PlaybookDir/roles/linux-node/
+          # into the run dir for ansible role resolution. mkdir roles/ first:
+          # `cp -r linux-node dest/` flattens into dest/ when dest/ is absent.
+          cp infra/ansible/linux-node.yml dist/provision/
+          cp -r infra/ansible/roles/linux-node dist/provision/roles/
+          # systemd unit: stageSystemdUnit's FIRST resolution path is
+          # PlaybookDir/../systemd/encode-agent.service. With PlaybookDir
+          # = /app/provision (Dockerfile.runtime + Dockerfile) that resolves
+          # to /app/systemd/encode-agent.service, so the unit ships as a
+          # SIBLING of provision/ in the bundle (dist/systemd/). install.sh
+          # copies it next to provision/ in HOME_DIR, and Dockerfile.runtime
+          # COPYs it to /app/systemd.
+          cp infra/systemd/encode-agent.service dist/systemd/
           cp docker/Dockerfile.runtime dist/
           cp docker/docker-compose.runtime.yml dist/
           cp docker/.env.example dist/
@@ -108,7 +122,7 @@ jobs:
       - name: Pack bundle tarball
         run: |
           tar -czf "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz" -C dist \
-            controller encode-agent.exe encode-agent-linux-amd64 ui provision \
+            controller encode-agent.exe encode-agent-linux-amd64 ui provision systemd \
             Dockerfile.runtime docker-compose.runtime.yml .env.example \
             install.sh install-agent.ps1 install-agent.sh EncodeLib.ps1 SHA256SUMS
 

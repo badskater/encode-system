@@ -24,6 +24,16 @@ WORKDIR /app
 COPY --from=backend /out/controller /app/controller
 COPY --from=frontend /src/dist /app/ui
 COPY powershell/EncodeLib.ps1 /app/seed/EncodeLib.ps1
+# Provision tree (PlaybookDir=/app/provision, set below):
+#   provision.yml (Windows executeWindows reads PlaybookDir/provision.yml)
+#   linux-node.yml + roles/linux-node/ (executeLinux reads PlaybookDir/
+#   linux-node.yml and copies PlaybookDir/roles/linux-node/ into the run dir)
+COPY infra/ansible/provision.yml /app/provision/provision.yml
+COPY infra/ansible/linux-node.yml /app/provision/linux-node.yml
+COPY infra/ansible/roles/linux-node /app/provision/roles/linux-node
+# systemd unit: stageSystemdUnit resolves PlaybookDir/../systemd/encode-agent.service
+# FIRST — /app/provision/../systemd → /app/systemd. Ships as sibling of provision/.
+COPY infra/systemd/encode-agent.service /app/systemd/encode-agent.service
 
 # Data dir: SQLite db + update payloads (persistent). The SPA is baked into
 # /app/ui and served via ENCODE_UI_DIR, so it stays out of the data volume.
@@ -32,6 +42,7 @@ COPY powershell/EncodeLib.ps1 /app/seed/EncodeLib.ps1
 # open fail with a misleading "out of memory (14)".
 ENV ENCODE_DATA=/data
 ENV ENCODE_UI_DIR=/app/ui
+ENV ENCODE_PROVISION_DIR=/app/provision
 VOLUME /data
 EXPOSE 8080
 USER encode

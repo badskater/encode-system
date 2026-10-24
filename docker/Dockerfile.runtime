@@ -19,7 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY controller /app/controller
 COPY ui /app/ui
+# Provision tree: provision.yml (Windows) + linux-node.yml + roles/linux-node/
+# (Linux). ENCODE_PROVISION_DIR=/app/provision so PlaybookDir=/app/provision.
 COPY provision /app/provision
+# systemd unit: stageSystemdUnit resolves PlaybookDir/../systemd/encode-agent.service
+# FIRST — /app/provision/../systemd → /app/systemd. Ships as sibling of provision/.
+COPY systemd /app/systemd
 # Non-root runtime (security audit 2026-10): a controller compromise must
 # not start as root with the /data volume (DB, node tokens, share-cred key).
 # Mirrors the build-time Dockerfile; chown /data BEFORE the volume is

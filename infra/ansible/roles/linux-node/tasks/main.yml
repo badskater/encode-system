@@ -125,10 +125,34 @@
     mode: "0644"
   register: systemd_unit
 
+# The agent refuses self-update downloads over plain HTTP unless
+# ENCODE_AGENT_ALLOW_HTTP_UPDATES=1 (agent.go getAuth guard). Controllers on
+# http:// (this farm's default) need the opt-in or published agent updates
+# silently stop reaching the node. A drop-in composes with the canonical unit
+# from any source; HTTPS controllers get the drop-in removed instead.
+- name: Allow HTTP agent updates when controller URL is plain HTTP
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encode-agent.service.d/http-updates.conf
+    content: |
+      [Service]
+      Environment=ENCODE_AGENT_ALLOW_HTTP_UPDATES=1
+    owner: root
+    group: root
+    mode: "0644"
+  when: encode_controller_url is match('^http://')
+  register: http_updates_dropin
+
+- name: Remove HTTP-updates drop-in for HTTPS controllers
+  ansible.builtin.file:
+    path: /etc/systemd/system/encode-agent.service.d/http-updates.conf
+    state: absent
+  when: encode_controller_url is not match('^http://')
+  register: http_updates_dropin_removed
+
 - name: Reload systemd daemon
   ansible.builtin.systemd:
     daemon_reload: true
-  when: systemd_unit is changed
+  when: systemd_unit is changed or http_updates_dropin is changed or http_updates_dropin_removed is changed
 
 - name: Enable encode-agent service
   ansible.builtin.systemd:
@@ -139,7 +163,10 @@
   ansible.builtin.systemd:
     name: encode-agent
     state: restarted
-  when: (agent_binary is changed or agent_config_file is changed) and not (systemd_unit is changed)
+  when: >-
+    (agent_binary is changed or agent_config_file is changed
+     or http_updates_dropin is changed or http_updates_dropin_removed is changed)
+    and not (systemd_unit is changed)
 
 - name: Start encode-agent service
   ansible.builtin.systemd:

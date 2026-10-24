@@ -401,10 +401,29 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job, platform string)
 	if sr, err := s.Store.SeriesByName(ctx, job.Series); err == nil && sr.Tag != "" {
 		tag = sr.Tag
 	}
+	// Per-platform node paths: a Linux node uses the linux_* settings when
+	// the operator set them (POSIX paths), falling back to the Windows
+	// values when a linux_* field is empty (back-compat — nothing changes
+	// until an operator sets them). Windows and empty/legacy platforms keep
+	// the Windows values verbatim. S3 staging (below) still takes
+	// precedence over both: it rewrites ScriptsDir/ReleaseDir to the
+	// {{JOBDIR}} placeholder regardless of platform.
+	binDir, scriptsDir, releaseDir := st.NodeBinDir, st.NodeScriptsDir, st.NodeReleaseDir
+	if platform == model.PlatformLinux {
+		if st.LinuxBinDir != "" {
+			binDir = st.LinuxBinDir
+		}
+		if st.LinuxScriptsDir != "" {
+			scriptsDir = st.LinuxScriptsDir
+		}
+		if st.LinuxReleaseDir != "" {
+			releaseDir = st.LinuxReleaseDir
+		}
+	}
 	vars := flow.Vars{
-		BinDir:         st.NodeBinDir,
-		ScriptsDir:     st.NodeScriptsDir,
-		ReleaseDir:     st.NodeReleaseDir,
+		BinDir:         binDir,
+		ScriptsDir:     scriptsDir,
+		ReleaseDir:     releaseDir,
 		Group:          st.Group,
 		Tag:            tag,
 		DiscordWebhook: s.discordWebhook(ctx),

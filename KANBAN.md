@@ -124,6 +124,14 @@ Mirror of the session task list. Move cards through columns as work lands.
   dialect methods reproduce the pre-refactor renderer's exact lines
   (source-commented byte-identical). Exec-tested rendered bash flows
   cover all 14 ported templates.
+- Per-platform node paths: three optional Settings overrides
+  (`linux_bin_dir`, `linux_scripts_dir`, `linux_release_dir`) that
+  `renderJob` applies when the target node's platform is `linux`. A
+  non-empty override replaces the Windows value in the rendered Vars;
+  empty = fall back to the Windows value (back-compat). S3 staging
+  precedence preserved: the `{{JOBDIR}}` placeholder wins regardless of
+  platform. Fix for the live-farm bug where Linux renders carried
+  Windows paths (`ScriptsDir='C:\encode-system\scripts'`).
 
 ## Done (web UI redesign + dependency security, 2026-10-23)
 

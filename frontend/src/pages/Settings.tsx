@@ -278,6 +278,19 @@ export default function SettingsPage() {
       </div>
 
       <div className="card">
+        <h3 style={{ marginTop: 0 }}>Linux node paths (optional overrides)</h3>
+        <p className="muted">
+          POSIX paths used when a job renders for a Linux node. Empty = use the
+          Windows path above (back-compat). S3-staged jobs ignore these (the
+          per-job staging dir wins). Set these when Linux nodes mount shares
+          or tools at different locations than the Windows nodes.
+        </p>
+        {field('Linux bin dir', 'Tools folder on Linux nodes, e.g. /opt/encode-bin. Empty = use the Windows path.', 'linux_bin_dir', '/opt/encode-bin')}
+        {field('Linux scripts dir', 'Scripts mount on Linux nodes, e.g. /mnt/encode/scripts. Empty = use the Windows path.', 'linux_scripts_dir', '/mnt/encode/scripts')}
+        {field('Linux release dir', 'Release mount on Linux nodes, e.g. /mnt/encode/release. Empty = use the Windows path.', 'linux_release_dir', '/mnt/encode/release')}
+      </div>
+
+      <div className="card">
         <h3 style={{ marginTop: 0 }}>Behavior & naming</h3>
         <div className="toolbar">
           <label style={{ flex: 1 }}>

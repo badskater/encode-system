@@ -17,6 +17,9 @@ function baseSettings(overrides: Partial<Settings> = {}): Settings {
     node_bin_dir: 'C:\\bin',
     node_scripts_dir: 'C:\\Encodes\\scripts',
     node_release_dir: 'C:\\Encodes\\ReleaseFolders',
+    linux_bin_dir: '',
+    linux_scripts_dir: '',
+    linux_release_dir: '',
     scan_interval_seconds: 30,
     tasks_before_reboot: 10,
     group: 'OldFartsSubs',
@@ -218,5 +221,48 @@ describe('Settings disk alert threshold', () => {
     await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
     const sent = saveSpy.mock.calls[0][0] as Settings;
     expect(sent.disk_alert_gb).toBe(100000);
+  });
+});
+
+describe('Settings linux node path overrides', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the three linux path fields empty by default and sends edited values on save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const binField = (await screen.findByLabelText(/linux bin dir/i)) as HTMLInputElement;
+    const scriptsField = (await screen.findByLabelText(/linux scripts dir/i)) as HTMLInputElement;
+    const releaseField = (await screen.findByLabelText(/linux release dir/i)) as HTMLInputElement;
+    expect(binField.value).toBe('');
+    expect(scriptsField.value).toBe('');
+    expect(releaseField.value).toBe('');
+
+    fireEvent.change(binField, { target: { value: '/opt/encode-bin' } });
+    fireEvent.change(scriptsField, { target: { value: '/mnt/encode/scripts' } });
+    fireEvent.change(releaseField, { target: { value: '/mnt/encode/release' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.linux_bin_dir).toBe('/opt/encode-bin');
+    expect(sent.linux_scripts_dir).toBe('/mnt/encode/scripts');
+    expect(sent.linux_release_dir).toBe('/mnt/encode/release');
+  });
+
+  it('reflects persisted linux path values on load', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(
+      baseSettings({
+        linux_bin_dir: '/opt/encode-bin',
+        linux_scripts_dir: '/mnt/encode/scripts',
+        linux_release_dir: '/mnt/encode/release',
+      }),
+    );
+    render(<SettingsPage />);
+    const binField = (await screen.findByLabelText(/linux bin dir/i)) as HTMLInputElement;
+    expect(binField.value).toBe('/opt/encode-bin');
   });
 });

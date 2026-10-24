@@ -167,10 +167,21 @@ type Settings struct {
 	ScriptsRoot string `json:"scripts_root"`
 	ReleaseRoot string `json:"release_root"`
 	// Remote path mapping: node-side locations used when rendering job
-	// scripts ($Job.BinDir / ScriptsDir / ReleaseDir).
+	// scripts ($Job.BinDir / ScriptsDir / ReleaseDir). These are the
+	// WINDOWS node paths — the historical fleet default.
 	NodeBinDir     string `json:"node_bin_dir"`
 	NodeScriptsDir string `json:"node_scripts_dir"`
 	NodeReleaseDir string `json:"node_release_dir"`
+	// Linux node path overrides: when a job renders for a node whose
+	// platform is "linux", a non-empty linux_* value replaces the
+	// corresponding windows value in the rendered Vars. Empty/absent =
+	// fall back to the windows value above (back-compat: nothing changes
+	// until an operator sets them). S3-staging still takes precedence
+	// over both (the staging {{JOBDIR}} placeholder wins regardless of
+	// platform — see renderJob).
+	LinuxBinDir     string `json:"linux_bin_dir"`
+	LinuxScriptsDir string `json:"linux_scripts_dir"`
+	LinuxReleaseDir string `json:"linux_release_dir"`
 	// Behavior.
 	ScanIntervalSeconds int    `json:"scan_interval_seconds"`
 	TasksBeforeReboot   int    `json:"tasks_before_reboot"`

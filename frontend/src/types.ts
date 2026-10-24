@@ -95,6 +95,13 @@ export interface Settings {
   node_bin_dir: string;
   node_scripts_dir: string;
   node_release_dir: string;
+  // Per-platform node path overrides for Linux nodes. When non-empty and the
+  // target node's platform is "linux", the rendered job script uses these
+  // POSIX paths instead of the Windows values above. Empty = fall back to the
+  // Windows value (back-compat). S3 staging still wins over both.
+  linux_bin_dir?: string;
+  linux_scripts_dir?: string;
+  linux_release_dir?: string;
   scan_interval_seconds: number;
   tasks_before_reboot: number;
   group: string;

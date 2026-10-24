@@ -198,6 +198,20 @@ Unit name is `encode-agent.service` in both. The agent's `swap-update.sh`
 self-update works in both channels (`os.Executable()` resolves the
 running binary).
 
+### Per-platform node paths (mixed Windows/Linux farms)
+
+The Settings page exposes three optional overrides — `linux_bin_dir`,
+`linux_scripts_dir`, `linux_release_dir` — used only when a job renders
+for a node whose `platform` is `linux`. When a field is non-empty, the
+rendered bash script carries the POSIX path instead of the Windows value
+(`node_bin_dir`/`node_scripts_dir`/`node_release_dir`). When empty, the
+Windows value is used unchanged (back-compat: nothing changes until an
+operator sets them). S3-staged jobs ignore these overrides: the scripts
+and release roles point at the per-job `{{JOBDIR}}` staging placeholder
+regardless of platform. Set these when Linux nodes mount shares or tools
+at different locations than the Windows nodes (e.g. `/mnt/encode/scripts`
+on Linux vs `C:\Encodes\scripts` on Windows).
+
 ### WinRM over HTTPS (recommended)
 
 Plain WinRM (`http`/5985) transmits the WinRM password unencrypted on the

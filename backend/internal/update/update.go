@@ -1,6 +1,14 @@
 // Package update manages the agent auto-update manifest: which agent binary
 // and EncodeLib.ps1 version the controller wants deployed, plus serving the
 // payloads to agents.
+//
+// The store is per-platform for agent binaries: a Windows payload
+// (encode-agent.exe) and a Linux payload (encode-agent-linux-amd64) are kept
+// in independent slots with their own version/sha/prev. Publishing to one
+// platform never disturbs the other's manifest fields. The model carries
+// both sets of fields; the controller scopes the manifest to the requesting
+// node's platform so the agent-side comparison logic is unchanged across
+// platforms.
 package update
 
 import (
@@ -11,9 +19,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+)
+
+// Platform keys identifying which agent slot a publish/rollback/payload
+// operation targets. The empty string and any unknown value are treated as
+// Windows (the historical fleet default) so a legacy caller that omits the
+// platform behaves exactly as before.
+const (
+	PlatformWindows = "windows"
+	PlatformLinux   = "linux"
 )
 
 // Store tracks the current manifest and stores payloads on disk.
@@ -37,14 +55,39 @@ func NewStore(dir string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) agentPath() string { return filepath.Join(s.dir, "encode-agent.exe") }
+// NormalizePlatform coerces a platform key to one of the known slots. The
+// empty string (legacy callers, old manifest rows, form field absent) maps
+// to Windows — the historical fleet default — so a publish without a
+// platform field behaves exactly as the single-slot code did.
+func NormalizePlatform(platform string) string {
+	switch strings.ToLower(platform) {
+	case PlatformLinux:
+		return PlatformLinux
+	default:
+		return PlatformWindows
+	}
+}
+
+// agentPath returns the on-disk path for the CURRENT payload of the given
+// platform. Windows keeps the historical encode-agent.exe name (existing
+// Windows agents and the provisioner's win_copy staging depend on it); Linux
+// uses encode-agent-linux-amd64 so the two platforms never collide.
+func (s *Store) agentPath(platform string) string {
+	switch NormalizePlatform(platform) {
+	case PlatformLinux:
+		return filepath.Join(s.dir, "encode-agent-linux-amd64")
+	default:
+		return filepath.Join(s.dir, "encode-agent.exe")
+	}
+}
 
 // prevAgentPath is the rollback slot: the payload that was current before
 // the most recent publish. Rotated on every PublishAgent; promoted back by
 // RollbackAgent (which demotes the rolled-back release into this slot, so
-// a rollback is itself reversible).
-func (s *Store) prevAgentPath() string {
-	return filepath.Join(s.dir, "encode-agent.exe.prev")
+// a rollback is itself reversible). Per-platform so each slot has its own
+// one-release history.
+func (s *Store) prevAgentPath(platform string) string {
+	return s.agentPath(platform) + ".prev"
 }
 
 // Dir returns the payload directory (used by the provisioner to stage
@@ -58,10 +101,16 @@ func (s *Store) versionPath() string {
 
 // loadFromDisk rebuilds the manifest from previously stored payloads. Each
 // payload type is restored INDEPENDENTLY: a fleet may publish only some of
-// them (e.g. agent + bin but never EncodeLib), and a missing payload must
-// only invalidate ITS OWN entry — not the whole manifest. Discarding
-// everything because one payload was never published is what orphans the
-// others on every restart.
+// them (e.g. agent + bin but never EncodeLib, or windows agent but never
+// linux), and a missing payload must only invalidate ITS OWN entry — not the
+// whole manifest. Discarding everything because one payload was never
+// published is what orphans the others on every restart.
+//
+// Back-compat: a manifest.json written by the OLD single-slot code carries
+// only the windows agent fields (no linux_* keys). Those unmarshal to zero
+// values (empty linux version/sha), which is correct — a fleet that never
+// published a linux payload has an empty linux slot. The recovery below then
+// recomputes each platform's sha from its on-disk payload independently.
 func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	b, err := os.ReadFile(s.versionPath())
 	if err != nil {
@@ -71,26 +120,47 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return model.UpdateManifest{}, false
 	}
-	// Agent payload: recompute the hash from what is actually on disk; a
-	// vanished payload clears its entry.
-	if _, err := os.Stat(s.agentPath()); err == nil {
-		if h, err := fileSHA256(s.agentPath()); err == nil {
+	// Windows agent payload: recompute the hash from what is actually on
+	// disk; a vanished payload clears its entry.
+	if _, err := os.Stat(s.agentPath(PlatformWindows)); err == nil {
+		if h, err := fileSHA256(s.agentPath(PlatformWindows)); err == nil {
 			m.AgentSHA256 = h
 		}
 	} else {
 		m.AgentVersion = ""
 		m.AgentSHA256 = ""
 	}
-	// Rollback slot: recover prev identity the same way — a vanished prev
-	// payload clears the entry so RollbackAgent errors cleanly instead of
-	// promoting a missing file.
-	if _, err := os.Stat(s.prevAgentPath()); err == nil {
-		if h, err := fileSHA256(s.prevAgentPath()); err == nil {
+	// Windows rollback slot: recover prev identity the same way — a vanished
+	// prev payload clears the entry so RollbackAgent errors cleanly instead
+	// of promoting a missing file.
+	if _, err := os.Stat(s.prevAgentPath(PlatformWindows)); err == nil {
+		if h, err := fileSHA256(s.prevAgentPath(PlatformWindows)); err == nil {
 			m.PrevAgentSHA256 = h
 		}
 	} else {
 		m.PrevAgentVersion = ""
 		m.PrevAgentSHA256 = ""
+	}
+	// Linux agent payload: recover independently. A missing linux payload
+	// (Windows-only fleet, or a legacy manifest with no linux_* fields)
+	// just leaves the linux fields empty — it must NOT invalidate the
+	// windows entry above.
+	if _, err := os.Stat(s.agentPath(PlatformLinux)); err == nil {
+		if h, err := fileSHA256(s.agentPath(PlatformLinux)); err == nil {
+			m.LinuxAgentSHA256 = h
+		}
+	} else {
+		m.LinuxAgentVersion = ""
+		m.LinuxAgentSHA256 = ""
+	}
+	// Linux rollback slot.
+	if _, err := os.Stat(s.prevAgentPath(PlatformLinux)); err == nil {
+		if h, err := fileSHA256(s.prevAgentPath(PlatformLinux)); err == nil {
+			m.PrevLinuxAgentSHA256 = h
+		}
+	} else {
+		m.PrevLinuxAgentVersion = ""
+		m.PrevLinuxAgentSHA256 = ""
 	}
 	// EncodeLib payload (often never published — that is fine).
 	if _, err := os.Stat(s.libPath()); err == nil {
@@ -114,55 +184,59 @@ func (s *Store) loadFromDisk() (model.UpdateManifest, bool) {
 	return m, true
 }
 
-// Manifest returns the current desired versions.
+// Manifest returns the current desired versions (both platforms' fields).
 func (s *Store) Manifest() model.UpdateManifest {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.manifest
 }
 
-// PublishAgent stores a new agent binary and bumps the manifest version.
-// The whole write-hash-rename-persist sequence runs under the lock so two
-// concurrent publishes cannot interleave on the same temp path.
+// PublishAgent stores a new agent binary for the given platform and bumps
+// that platform's manifest version. The whole write-hash-rename-persist
+// sequence runs under the lock so two concurrent publishes cannot interleave
+// on the same temp path.
 //
 // Before installing the new payload, the CURRENT one is rotated into the
-// rollback slot (encode-agent.exe.prev) and its identity recorded in the
-// manifest — one release of history, enough to undo a bad publish without
-// re-uploading. The rotation is best-effort: a failure to copy the old
-// payload aside (e.g. first publish, or a vanished file) must not block the
-// new release.
-func (s *Store) PublishAgent(version string, r io.Reader) error {
+// rollback slot (encode-agent.exe.prev / encode-agent-linux-amd64.prev) and
+// its identity recorded in the manifest — one release of history, enough to
+// undo a bad publish without re-uploading. The rotation is best-effort: a
+// failure to copy the old payload aside (e.g. first publish, or a vanished
+// file) must not block the new release.
+//
+// Publishing to one platform never touches the other platform's fields:
+// a Windows publish leaves LinuxVersion/SHA/Prev unchanged and vice-versa.
+func (s *Store) PublishAgent(platform, version string, r io.Reader) error {
+	platform = NormalizePlatform(platform)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if version == s.manifest.AgentVersion {
+	curVersion := s.currentAgentVersion(platform)
+	if version == curVersion {
 		return fmt.Errorf("agent version %s is already published", version)
 	}
 	// Rotate the outgoing release into the rollback slot BEFORE overwriting
 	// it. Only when the current payload actually exists on disk (first
 	// publish has nothing to keep) and a version is recorded.
 	prevVersion, prevSHA := "", ""
-	if s.manifest.AgentVersion != "" {
-		if cur, err := os.Open(s.agentPath()); err == nil {
-			if err := writeFileHashing(s.prevAgentPath(), cur); err == nil {
-				if h, err := fileSHA256(s.prevAgentPath()); err == nil {
-					prevVersion, prevSHA = s.manifest.AgentVersion, h
+	if curVersion != "" {
+		if cur, err := os.Open(s.agentPath(platform)); err == nil {
+			if err := writeFileHashing(s.prevAgentPath(platform), cur); err == nil {
+				if h, err := fileSHA256(s.prevAgentPath(platform)); err == nil {
+					prevVersion, prevSHA = curVersion, h
 				}
 			}
 			cur.Close()
 		}
 	}
-	hash, err := installPayload(s.agentPath(), r)
+	hash, err := installPayload(s.agentPath(platform), r)
 	if err != nil {
 		return fmt.Errorf("publish agent: %w", err)
 	}
-	s.manifest.AgentVersion = version
-	s.manifest.AgentSHA256 = hash
+	s.setAgentVersion(platform, version, hash)
 	// Always overwrite the prev entry (even with empties) so the manifest
 	// never advertises a rollback slot that this publish didn't produce.
-	s.manifest.PrevAgentVersion = prevVersion
-	s.manifest.PrevAgentSHA256 = prevSHA
+	s.setPrevAgent(platform, prevVersion, prevSHA)
 	if prevVersion == "" {
-		os.Remove(s.prevAgentPath()) // stale slot from an older release
+		os.Remove(s.prevAgentPath(platform)) // stale slot from an older release
 	}
 	return s.persistLocked()
 }
@@ -171,46 +245,107 @@ func (s *Store) PublishAgent(version string, r io.Reader) error {
 // available (single publish so far, or the prev payload vanished).
 var ErrNoRollback = fmt.Errorf("no previous agent release to roll back to")
 
-// RollbackAgent promotes the rollback slot to current and demotes the
-// just-rolled-back release into the slot, so the operation is symmetric:
-// rolling back twice returns to the original state. Nodes pick the change
-// up through the normal sync — syncAgent triggers on ANY version
+// RollbackAgent promotes the rollback slot to current for the given platform
+// and demotes the just-rolled-back release into the slot, so the operation is
+// symmetric: rolling back twice returns to the original state. Nodes pick
+// the change up through the normal sync — syncAgent triggers on ANY version
 // difference, so a downgrade propagates exactly like an upgrade (staged
 // as <binary>.new + swap on restart — on Windows that is encode-agent.exe.new,
 // on Linux encode-agent.new). Returns the updated manifest.
-func (s *Store) RollbackAgent() (model.UpdateManifest, error) {
+func (s *Store) RollbackAgent(platform string) (model.UpdateManifest, error) {
+	platform = NormalizePlatform(platform)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.manifest.PrevAgentVersion == "" {
+	prevVer := s.prevAgentVersion(platform)
+	if prevVer == "" {
 		return s.manifest, ErrNoRollback
 	}
-	if _, err := os.Stat(s.prevAgentPath()); err != nil {
+	if _, err := os.Stat(s.prevAgentPath(platform)); err != nil {
 		return s.manifest, ErrNoRollback
 	}
 	// Swap payloads: current -> prev slot, prev slot -> current. Use a
 	// temp name because os.Rename onto an existing file is fine on Unix
 	// but the two-step swap keeps both files intact if either rename
 	// fails halfway (the manifest only flips after both succeed).
-	swap := s.prevAgentPath() + ".swap"
-	if err := os.Rename(s.agentPath(), swap); err != nil {
+	swap := s.prevAgentPath(platform) + ".swap"
+	if err := os.Rename(s.agentPath(platform), swap); err != nil {
 		return s.manifest, fmt.Errorf("rollback agent: %w", err)
 	}
-	if err := os.Rename(s.prevAgentPath(), s.agentPath()); err != nil {
-		os.Rename(swap, s.agentPath()) // restore on failure
+	if err := os.Rename(s.prevAgentPath(platform), s.agentPath(platform)); err != nil {
+		os.Rename(swap, s.agentPath(platform)) // restore on failure
 		return s.manifest, fmt.Errorf("rollback agent: %w", err)
 	}
-	if err := os.Rename(swap, s.prevAgentPath()); err != nil {
+	if err := os.Rename(swap, s.prevAgentPath(platform)); err != nil {
 		return s.manifest, fmt.Errorf("rollback agent: %w", err)
 	}
 	// Flip the manifest identities to match the swapped payloads.
-	s.manifest.AgentVersion, s.manifest.PrevAgentVersion =
-		s.manifest.PrevAgentVersion, s.manifest.AgentVersion
-	s.manifest.AgentSHA256, s.manifest.PrevAgentSHA256 =
-		s.manifest.PrevAgentSHA256, s.manifest.AgentSHA256
+	curVer, prevVer2 := s.currentAgentVersion(platform), s.prevAgentVersion(platform)
+	s.setAgentVersion(platform, prevVer2, s.prevAgentSHA(platform))
+	s.setPrevAgent(platform, curVer, s.currentAgentSHA(platform))
 	if err := s.persistLocked(); err != nil {
 		return s.manifest, err
 	}
 	return s.manifest, nil
+}
+
+// currentAgentVersion returns the manifest's current agent version for the
+// platform. Caller holds s.mu.
+func (s *Store) currentAgentVersion(platform string) string {
+	if NormalizePlatform(platform) == PlatformLinux {
+		return s.manifest.LinuxAgentVersion
+	}
+	return s.manifest.AgentVersion
+}
+
+// currentAgentSHA returns the manifest's current agent sha for the platform.
+// Caller holds s.mu.
+func (s *Store) currentAgentSHA(platform string) string {
+	if NormalizePlatform(platform) == PlatformLinux {
+		return s.manifest.LinuxAgentSHA256
+	}
+	return s.manifest.AgentSHA256
+}
+
+// prevAgentVersion returns the manifest's prev agent version for the
+// platform. Caller holds s.mu.
+func (s *Store) prevAgentVersion(platform string) string {
+	if NormalizePlatform(platform) == PlatformLinux {
+		return s.manifest.PrevLinuxAgentVersion
+	}
+	return s.manifest.PrevAgentVersion
+}
+
+// prevAgentSHA returns the manifest's prev agent sha for the platform.
+// Caller holds s.mu.
+func (s *Store) prevAgentSHA(platform string) string {
+	if NormalizePlatform(platform) == PlatformLinux {
+		return s.manifest.PrevLinuxAgentSHA256
+	}
+	return s.manifest.PrevAgentSHA256
+}
+
+// setAgentVersion stamps the current version+sha for the platform. Caller
+// holds s.mu.
+func (s *Store) setAgentVersion(platform, version, sha string) {
+	if NormalizePlatform(platform) == PlatformLinux {
+		s.manifest.LinuxAgentVersion = version
+		s.manifest.LinuxAgentSHA256 = sha
+		return
+	}
+	s.manifest.AgentVersion = version
+	s.manifest.AgentSHA256 = sha
+}
+
+// setPrevAgent stamps the prev version+sha for the platform. Caller holds
+// s.mu.
+func (s *Store) setPrevAgent(platform, version, sha string) {
+	if NormalizePlatform(platform) == PlatformLinux {
+		s.manifest.PrevLinuxAgentVersion = version
+		s.manifest.PrevLinuxAgentSHA256 = sha
+		return
+	}
+	s.manifest.PrevAgentVersion = version
+	s.manifest.PrevAgentSHA256 = sha
 }
 
 // PublishLib stores a new EncodeLib.ps1 and bumps its version counter.
@@ -277,8 +412,14 @@ func (s *Store) PublishBin(version int64, r io.Reader) error {
 	return s.persistLocked()
 }
 
-// AgentPayload opens the stored agent binary for serving.
-func (s *Store) AgentPayload() (*os.File, error) { return os.Open(s.agentPath()) }
+// AgentPayload opens the stored agent binary for the given platform for
+// serving. Returns an error wrapping the open failure when no payload for
+// that platform has been published — the caller (handleDownloadAgent)
+// surfaces a clean 404 so a Linux node on a Windows-only controller gets a
+// "no linux agent payload published" 404 instead of a Windows PE binary.
+func (s *Store) AgentPayload(platform string) (*os.File, error) {
+	return os.Open(s.agentPath(platform))
+}
 
 // LibPayload opens the stored EncodeLib.ps1 for serving.
 func (s *Store) LibPayload() (*os.File, error) { return os.Open(s.libPath()) }

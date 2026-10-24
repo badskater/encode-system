@@ -14,6 +14,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/s3"
 	"github.com/badskater/encode-system/backend/internal/store"
+	"github.com/badskater/encode-system/backend/internal/update"
 )
 
 // ctxBg returns a background context for startup seeding operations.
@@ -692,23 +693,61 @@ func (s *Server) discordWebhook(ctx context.Context) string {
 	return s.currentSettings(ctx).DiscordWebhook
 }
 
-// handleManifest returns the desired versions (agents compare and act).
-func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request, _ *model.Node) {
-	writeJSON(w, http.StatusOK, s.Update.Manifest())
+// handleManifest returns the desired versions scoped to the caller's
+// platform. The manifest carries both Windows and Linux agent slots; an
+// agent's compare-and-sync logic reads agent_version/agent_sha256 unchanged,
+// so for a Linux node we serve a manifest whose agent_version/agent_sha256
+// are populated from the LINUX fields (and Lib*/Bin* zeroed — Linux nodes
+// must not sync the Windows-only EncodeLib.ps1 or the C:\bin zip). For a
+// Windows (or legacy empty-platform) node we return the manifest as-is
+// (Windows fields + real lib/bin). This keeps the agent-side comparison
+// logic identical across platforms — only the server scopes the view.
+func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request, node *model.Node) {
+	m := s.Update.Manifest()
+	if node.Platform == model.PlatformLinux {
+		// Scope to the Linux slot: project the linux_* fields into the
+		// agent_version/agent_sha256 the agent reads, and zero the
+		// Windows-only lib/bin fields so the Linux agent skips them.
+		m.AgentVersion = m.LinuxAgentVersion
+		m.AgentSHA256 = m.LinuxAgentSHA256
+		m.PrevAgentVersion = m.PrevLinuxAgentVersion
+		m.PrevAgentSHA256 = m.PrevLinuxAgentSHA256
+		m.LinuxAgentVersion = ""
+		m.LinuxAgentSHA256 = ""
+		m.PrevLinuxAgentVersion = ""
+		m.PrevLinuxAgentSHA256 = ""
+		m.LibVersion = 0
+		m.LibSHA256 = ""
+		m.BinVersion = 0
+		m.BinSHA256 = ""
+		m.BinSize = 0
+	}
+	writeJSON(w, http.StatusOK, m)
 }
 
-// handleDownloadAgent streams the stored agent binary.
-func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request, _ *model.Node) {
-	f, err := s.Update.AgentPayload()
+// handleDownloadAgent streams the stored agent binary for the caller's
+// platform: the Linux ELF (encode-agent-linux-amd64) for a Linux node, the
+// Windows PE (encode-agent.exe) for a Windows/legacy node. A clean 404 is
+// returned when no payload has been published for that platform — so a
+// Linux node on a controller with only a Windows publish gets a 404, NOT a
+// Windows PE binary it would swap over its own ELF.
+func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request, node *model.Node) {
+	platform := update.PlatformWindows
+	filename := "encode-agent.exe"
+	if node.Platform == model.PlatformLinux {
+		platform = update.PlatformLinux
+		filename = "encode-agent-linux-amd64"
+	}
+	f, err := s.Update.AgentPayload(platform)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "no agent payload published")
+		writeErr(w, http.StatusNotFound, "no "+platform+" agent payload published")
 		return
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// Passing the request enables Range/If-Range so interrupted downloads
 	// can resume instead of restarting from byte zero.
-	http.ServeContent(w, r, "encode-agent.exe", time.Time{}, f)
+	http.ServeContent(w, r, filename, time.Time{}, f)
 }
 
 // handleDownloadLib streams the stored EncodeLib.ps1.

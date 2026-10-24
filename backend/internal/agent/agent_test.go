@@ -291,7 +291,11 @@ func TestUpdateRefusesChecksumMismatch(t *testing.T) {
 	os.WriteFile(cfg.LibPath, []byte("# original"), 0o644)
 	a, _ := New(cfg, "v", testLog())
 
-	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: strings.Repeat("0", 64)})
+	// Call syncLib directly: handleUpdate now gates lib/bin sync on
+	// shouldSyncLibBin(runtime.GOOS), so on a Linux test host the lib step
+	// is skipped. The checksum/download/install logic this test exercises
+	// lives in syncLib itself; the platform gate is covered separately.
+	a.syncLib(context.Background(), model.UpdateManifest{LibVersion: 2, LibSHA256: strings.Repeat("0", 64)})
 
 	// The original lib must be untouched and the version not advanced.
 	if b, _ := os.ReadFile(cfg.LibPath); string(b) != "# original" {
@@ -325,7 +329,9 @@ func TestUpdateAcceptsMatchingChecksum(t *testing.T) {
 	os.WriteFile(cfg.LibPath, []byte("# original"), 0o644)
 	a, _ := New(cfg, "v", testLog())
 
-	a.handleUpdate(model.UpdateManifest{LibVersion: 3, LibSHA256: wantHash})
+	// Call syncLib directly (see TestUpdateRefusesChecksumMismatch for why:
+	// handleUpdate now skips lib sync on non-Windows hosts).
+	a.syncLib(context.Background(), model.UpdateManifest{LibVersion: 3, LibSHA256: wantHash})
 
 	if b, _ := os.ReadFile(cfg.LibPath); string(b) != payload {
 		t.Fatalf("lib not installed with valid checksum: %s", b)
@@ -504,14 +510,14 @@ func TestUpdateRefusesPlainHTTPByDefault(t *testing.T) {
 	a, _ := New(cfg, "v", testLog())
 
 	// Default (no opt-in env): download refused, lib untouched.
-	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
+	a.syncLib(context.Background(), model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
 	if b, _ := os.ReadFile(cfg.LibPath); string(b) != "# original" {
 		t.Fatalf("lib installed over plain HTTP without opt-in: %s", b)
 	}
 
 	// With the explicit opt-in: the same update installs.
 	t.Setenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES", "1")
-	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
+	a.syncLib(context.Background(), model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
 	if b, _ := os.ReadFile(cfg.LibPath); string(b) != payload {
 		t.Fatalf("lib not installed with opt-in env: %s", b)
 	}

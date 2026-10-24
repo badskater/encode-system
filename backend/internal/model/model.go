@@ -213,6 +213,14 @@ type Session struct {
 	CreatedAt *time.Time `json:"created_at,omitempty"`
 }
 
+// Platform constants for node platform values. Empty means a legacy row or
+// an old agent that has not reported its OS yet — callers MUST treat "" as
+// Windows (the historical fleet default).
+const (
+	PlatformWindows = "windows"
+	PlatformLinux   = "linux"
+)
+
 // Node is one Windows encode machine.
 type Node struct {
 	ID        int64      `json:"id"`
@@ -571,6 +579,14 @@ type AuditEvent struct {
 // UpdateManifest describes the agent/lib/bin versions the controller wants
 // deployed. Agents compare each field against what they run and sync what
 // differs (lib first, then the bin folder, then the agent binary itself).
+//
+// The manifest carries TWO agent platform slots: the WINDOWS agent fields
+// (AgentVersion/AgentSHA256 + Prev*) and the LINUX agent fields below. This
+// keeps existing Windows agents 100% wire-compatible — they read the same
+// agent_version/agent_sha256 fields they always have. Linux agents are served
+// a platform-scoped manifest by the controller (handleManifest maps the
+// linux_* fields into agent_version/agent_sha256 for the requesting node), so
+// the agent-side comparison logic is identical across platforms.
 type UpdateManifest struct {
 	AgentVersion string `json:"agent_version"`
 	AgentSHA256  string `json:"agent_sha256"`
@@ -581,8 +597,17 @@ type UpdateManifest struct {
 	// self-downgrade because AgentVersion then differs from what they run.
 	PrevAgentVersion string `json:"prev_agent_version,omitempty"`
 	PrevAgentSHA256  string `json:"prev_agent_sha256,omitempty"`
-	LibVersion       int64  `json:"lib_version"`
-	LibSHA256        string `json:"lib_sha256"`
+	// Linux agent slot: independent version/sha/prev for the Linux binary.
+	// Empty when no Linux payload has been published (a Windows-only fleet).
+	// The controller's handleManifest maps these into agent_version/
+	// agent_sha256 for a Linux node so the agent's compare logic is
+	// platform-agnostic; handleDownloadAgent serves the linux payload.
+	LinuxAgentVersion     string `json:"linux_agent_version,omitempty"`
+	LinuxAgentSHA256      string `json:"linux_agent_sha256,omitempty"`
+	PrevLinuxAgentVersion string `json:"prev_linux_agent_version,omitempty"`
+	PrevLinuxAgentSHA256  string `json:"prev_linux_agent_sha256,omitempty"`
+	LibVersion            int64  `json:"lib_version"`
+	LibSHA256             string `json:"lib_sha256"`
 	// Bin folder package: a zip of the node tools dir (C:\bin). Version is a
 	// publish counter; agents extract it over their bin dir when it differs.
 	BinVersion int64  `json:"bin_version"`

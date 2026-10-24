@@ -13,7 +13,7 @@ func TestPublishAndManifestRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.PublishAgent("0.2.0", strings.NewReader("MZ-binary-bytes")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "0.2.0", strings.NewReader("MZ-binary-bytes")); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PublishLib(3, strings.NewReader("Write-Output hi")); err != nil {
@@ -29,7 +29,7 @@ func TestPublishAndManifestRoundTrip(t *testing.T) {
 	}
 
 	// Payloads must be servable.
-	f, err := s.AgentPayload()
+	f, err := s.AgentPayload(PlatformWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestPublishAndManifestRoundTrip(t *testing.T) {
 func TestManifestRecoversAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	s1, _ := NewStore(dir)
-	s1.PublishAgent("0.5.0", strings.NewReader("bytes"))
+	s1.PublishAgent(PlatformWindows, "0.5.0", strings.NewReader("bytes"))
 	s1.PublishLib(7, strings.NewReader("lib"))
 
 	// Simulate controller restart: new store over the same dir.
@@ -73,7 +73,7 @@ func TestEmptyManifestWhenNoPayloads(t *testing.T) {
 func TestManifestSurvivesRestartWithPartialPayloads(t *testing.T) {
 	dir := t.TempDir()
 	s1, _ := NewStore(dir)
-	s1.PublishAgent("0.8.1", strings.NewReader("agent-bytes"))
+	s1.PublishAgent(PlatformWindows, "0.8.1", strings.NewReader("agent-bytes"))
 	s1.PublishBin(1, strings.NewReader("zip-bytes"))
 	// Deliberately NO PublishLib.
 
@@ -97,7 +97,7 @@ func TestManifestSurvivesRestartWithPartialPayloads(t *testing.T) {
 func TestManifestClearsOnlyVanishedPayload(t *testing.T) {
 	dir := t.TempDir()
 	s1, _ := NewStore(dir)
-	s1.PublishAgent("0.8.1", strings.NewReader("agent-bytes"))
+	s1.PublishAgent(PlatformWindows, "0.8.1", strings.NewReader("agent-bytes"))
 	s1.PublishBin(1, strings.NewReader("zip-bytes"))
 
 	if err := os.Remove(dir + "/bin-package.zip"); err != nil {

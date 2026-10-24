@@ -16,7 +16,7 @@ func TestPublishAgentKeepsPrevious(t *testing.T) {
 		t.Fatal(err)
 	}
 	// First publish: nothing previous yet.
-	if err := s.PublishAgent("1.0.0", strings.NewReader("binary-v1")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.0.0", strings.NewReader("binary-v1")); err != nil {
 		t.Fatal(err)
 	}
 	m := s.Manifest()
@@ -25,7 +25,7 @@ func TestPublishAgentKeepsPrevious(t *testing.T) {
 	}
 
 	// Second publish: v1 becomes the rollback target.
-	if err := s.PublishAgent("1.1.0", strings.NewReader("binary-v2")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.1.0", strings.NewReader("binary-v2")); err != nil {
 		t.Fatal(err)
 	}
 	m = s.Manifest()
@@ -47,7 +47,7 @@ func TestPublishAgentKeepsPrevious(t *testing.T) {
 	}
 
 	// Third publish rotates: prev is now v2, and the v1 payload is gone.
-	if err := s.PublishAgent("1.2.0", strings.NewReader("binary-v3")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.2.0", strings.NewReader("binary-v3")); err != nil {
 		t.Fatal(err)
 	}
 	m = s.Manifest()
@@ -69,14 +69,14 @@ func TestRollbackAgentSwapsCurrentAndPrev(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishAgent("1.0.0", strings.NewReader("binary-v1")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.0.0", strings.NewReader("binary-v1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishAgent("1.1.0", strings.NewReader("binary-v2")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.1.0", strings.NewReader("binary-v2")); err != nil {
 		t.Fatal(err)
 	}
 
-	m, err := s.RollbackAgent()
+	m, err := s.RollbackAgent(PlatformWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestRollbackAgentSwapsCurrentAndPrev(t *testing.T) {
 	}
 
 	// Rollback of the rollback returns to 1.1.0.
-	m2, err := s.RollbackAgent()
+	m2, err := s.RollbackAgent(PlatformWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,10 +120,10 @@ func TestRollbackAgentWithoutPrev(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishAgent("1.0.0", strings.NewReader("binary-v1")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.0.0", strings.NewReader("binary-v1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RollbackAgent(); err == nil {
+	if _, err := s.RollbackAgent(PlatformWindows); err == nil {
 		t.Fatal("rollback with no prev succeeded, want error")
 	}
 	// Manifest untouched.
@@ -141,10 +141,10 @@ func TestRollbackSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishAgent("1.0.0", strings.NewReader("binary-v1")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.0.0", strings.NewReader("binary-v1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishAgent("1.1.0", strings.NewReader("binary-v2")); err != nil {
+	if err := s.PublishAgent(PlatformWindows, "1.1.0", strings.NewReader("binary-v2")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,7 +157,7 @@ func TestRollbackSurvivesRestart(t *testing.T) {
 		t.Fatalf("recovered manifest: agent=%q prev=%q", m.AgentVersion, m.PrevAgentVersion)
 	}
 	// Rollback works on the reopened store.
-	m2, err := s2.RollbackAgent()
+	m2, err := s2.RollbackAgent(PlatformWindows)
 	if err != nil {
 		t.Fatal(err)
 	}

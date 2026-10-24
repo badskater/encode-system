@@ -36,8 +36,9 @@ const (
 )
 
 // handlePublishAgent uploads a new agent binary from the UI. Form fields:
-// version (string, required) + file (binary). Nodes adopt it on their next
-// idle heartbeat.
+// version (string, required) + file (binary) + optional platform ("windows"
+// default when absent/empty, or "linux"). Nodes adopt it on their next idle
+// heartbeat. Publishing to one platform never disturbs the other's slot.
 func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 	// Hard request-body cap: aborts the transfer mid-stream when exceeded,
 	// so an oversize upload never occupies controller disk or memory.
@@ -51,6 +52,14 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "version field is required")
 		return
 	}
+	rawPlatform := strings.TrimSpace(strings.ToLower(r.FormValue("platform")))
+	if rawPlatform == "" {
+		rawPlatform = update.PlatformWindows
+	}
+	if rawPlatform != update.PlatformWindows && rawPlatform != update.PlatformLinux {
+		writeErr(w, http.StatusBadRequest, "platform must be windows or linux")
+		return
+	}
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "file field is required")
@@ -61,7 +70,8 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "agent payload too large")
 		return
 	}
-	if err := s.Update.PublishAgent(version, f); err != nil {
+	platform := rawPlatform
+	if err := s.Update.PublishAgent(platform, version, f); err != nil {
 		// The store enforces the version rule under its lock; a collision is
 		// a client error, not a server fault.
 		if strings.Contains(err.Error(), "already published") {
@@ -71,8 +81,8 @@ func (s *Server) handlePublishAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "publish agent")
 		return
 	}
-	s.Log.Info("agent binary published from UI", "version", version, "bytes", hdr.Size)
-	s.audit(r, "update.publish_agent", "agent:"+version, map[string]any{"bytes": hdr.Size})
+	s.Log.Info("agent binary published from UI", "platform", platform, "version", version, "bytes", hdr.Size)
+	s.audit(r, "update.publish_agent", "agent:"+version, map[string]any{"bytes": hdr.Size, "platform": platform})
 	writeJSON(w, http.StatusOK, s.Update.Manifest())
 }
 
@@ -388,7 +398,16 @@ func (s *Server) handleManifestAdmin(w http.ResponseWriter, _ *http.Request) {
 // store faults. The response is the post-rollback manifest so the UI can
 // refresh its version display in one round-trip.
 func (s *Server) handleRollbackAgent(w http.ResponseWriter, r *http.Request) {
-	m, err := s.Update.RollbackAgent()
+	rawPlatform := strings.TrimSpace(strings.ToLower(r.FormValue("platform")))
+	if rawPlatform == "" {
+		rawPlatform = update.PlatformWindows
+	}
+	if rawPlatform != update.PlatformWindows && rawPlatform != update.PlatformLinux {
+		writeErr(w, http.StatusBadRequest, "platform must be windows or linux")
+		return
+	}
+	platform := rawPlatform
+	m, err := s.Update.RollbackAgent(platform)
 	if err != nil {
 		if errors.Is(err, update.ErrNoRollback) {
 			writeErr(w, http.StatusConflict, err.Error())
@@ -397,7 +416,13 @@ func (s *Server) handleRollbackAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "rollback agent")
 		return
 	}
-	s.Log.Warn("agent release rolled back", "now_current", m.AgentVersion, "now_prev", m.PrevAgentVersion)
-	s.audit(r, "update.rollback_agent", "agent:"+m.AgentVersion, map[string]any{"prev": m.PrevAgentVersion})
+	curVer := m.AgentVersion
+	prevVer := m.PrevAgentVersion
+	if platform == update.PlatformLinux {
+		curVer = m.LinuxAgentVersion
+		prevVer = m.PrevLinuxAgentVersion
+	}
+	s.Log.Warn("agent release rolled back", "platform", platform, "now_current", curVer, "now_prev", prevVer)
+	s.audit(r, "update.rollback_agent", "agent:"+curVer, map[string]any{"prev": prevVer, "platform": platform})
 	writeJSON(w, http.StatusOK, m)
 }

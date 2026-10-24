@@ -804,6 +804,14 @@ func (lb *limitedBuffer) Bytes() []byte { return lb.buf.Bytes() }
 //
 // Extraction happens with a.syncing set, which the controller sees on the
 // next heartbeat as busy — no job lands mid-swap.
+//
+// lib/bin sync is Windows-only: EncodeLib.ps1 and the C:\bin tools folder
+// are Windows-specific artifacts that do not exist on Linux nodes (the lib
+// is PowerShell, the bin holds Windows .exe tooling). On Linux the two
+// sync steps are skipped entirely — only the agent-binary sync runs, which
+// the server serves platform-scoped (a Linux node gets a Linux ELF, never a
+// Windows PE). The skip decision is factored into shouldSyncLibBin so it is
+// unit-testable without a runtime.GOOS build constraint.
 func (a *Agent) handleUpdate(m model.UpdateManifest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -817,10 +825,24 @@ func (a *Agent) handleUpdate(m model.UpdateManifest) {
 		a.mu.Unlock()
 	}()
 
-	a.syncLib(ctx, m)
-	a.syncBin(ctx, m)
+	if shouldSyncLibBin(runtime.GOOS) {
+		a.syncLib(ctx, m)
+		a.syncBin(ctx, m)
+	} else {
+		// Linux: lib/bin are Windows-only artifacts. Log once so a mixed
+		// farm's Linux nodes leave a breadcrumb that the skip is by design,
+		// not a dropped step.
+		a.Log.Debug("lib/bin sync skipped: windows-only on this platform", "goos", runtime.GOOS)
+	}
 	a.syncAgent(ctx, m)
 }
+
+// shouldSyncLibBin reports whether the EncodeLib.ps1 + bin-folder sync steps
+// apply to the given OS. They are Windows-only: the lib is PowerShell and
+// the bin package holds Windows tooling (.exe) extracted to C:\bin. On any
+// other platform (linux, darwin) the steps are skipped — the agent-binary
+// sync still runs (the server serves a platform-scoped payload).
+func shouldSyncLibBin(goos string) bool { return goos == "windows" }
 
 // registry returns the job registry, lazily initializing it so struct-literal
 // Agents built in tests (bypassing New) work without a nil panic.

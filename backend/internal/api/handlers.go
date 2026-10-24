@@ -90,7 +90,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	// blanking it — the same rolling-upgrade invariant as agent_log. The
 	// column write rides the existing UpdateNode below.
 	if hb.Platform != "" {
-		node.Platform = hb.Platform
+		node.Platform = strings.ToLower(hb.Platform)
 	}
 
 	// Persist the agent's latest resource sample into the node_metrics ring

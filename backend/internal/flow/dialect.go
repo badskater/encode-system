@@ -121,7 +121,7 @@ func safeIdentAlpha(s string) string {
 // fleet default. The controller calls this at dispatch time so a mixed
 // Windows/Linux farm renders the correct script per node.
 func DialectForPlatform(platform string) Dialect {
-	if platform == "linux" {
+	if platform == model.PlatformLinux {
 		return BashDialect{}
 	}
 	return PowerShellDialect{}

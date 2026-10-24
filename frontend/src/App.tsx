@@ -15,17 +15,35 @@ import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './a
 
 type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'stats' | 'audit' | 'settings' | 'provision';
 
-const PAGES: { id: Page; label: string }[] = [
-  { id: 'dashboard', label: 'Dashboard' },
-  { id: 'jobs', label: 'Jobs' },
-  { id: 'nodes', label: 'Nodes' },
-  { id: 'series', label: 'Series' },
-  { id: 'flows', label: 'Flows' },
-  { id: 'steps', label: 'Steps' },
-  { id: 'stats', label: 'Stats' },
-  { id: 'audit', label: 'Audit' },
-  { id: 'provision', label: 'Provision' },
-  { id: 'settings', label: 'Settings' },
+// Nav is grouped by operational concern: live monitoring first, pipeline
+// configuration second, and fleet-wide/system pages last. Group labels are
+// rendered as .nav-label separators in the sidebar.
+const NAV_GROUPS: { label: string; items: { id: Page; label: string }[] }[] = [
+  {
+    label: 'Monitor',
+    items: [
+      { id: 'dashboard', label: 'Dashboard' },
+      { id: 'jobs', label: 'Jobs' },
+      { id: 'nodes', label: 'Nodes' },
+      { id: 'stats', label: 'Stats' },
+    ],
+  },
+  {
+    label: 'Pipeline',
+    items: [
+      { id: 'series', label: 'Series' },
+      { id: 'flows', label: 'Flows' },
+      { id: 'steps', label: 'Steps' },
+      { id: 'provision', label: 'Provision' },
+    ],
+  },
+  {
+    label: 'System',
+    items: [
+      { id: 'audit', label: 'Audit' },
+      { id: 'settings', label: 'Settings' },
+    ],
+  },
 ];
 
 export default function App() {
@@ -85,21 +103,36 @@ export default function App() {
   return (
     <div className="app">
       <aside className="sidebar">
-        <h1>encode-system</h1>
-        {PAGES.map((p) => (
-          <button
-            key={p.id}
-            className={page === p.id ? 'active' : ''}
-            onClick={() => setPage(p.id)}
-          >
-            {p.label}
-          </button>
+        <div className="sidebar-brand">
+          <span className="mark" aria-hidden="true">E</span>
+          <span className="name">
+            encode-system
+            <small>farm control</small>
+          </span>
+        </div>
+        {NAV_GROUPS.map((g) => (
+          <div className="nav-group" key={g.label}>
+            <div className="nav-label">{g.label}</div>
+            {g.items.map((p) => (
+              <button
+                key={p.id}
+                className={page === p.id ? 'active' : ''}
+                onClick={() => setPage(p.id)}
+                aria-current={page === p.id ? 'page' : undefined}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
         ))}
-        <div style={{ marginTop: 'auto', paddingTop: 16 }}>
-          {who && <div className="muted" style={{ marginBottom: 6 }}>{who}</div>}
-          <button onClick={() => setShowChangePassword(true)} style={{ marginBottom: 6 }}>
-            Change password
-          </button>
+        <div className="sidebar-foot">
+          {who && (
+            <div className="who">
+              <span className="avatar" aria-hidden="true">{who.slice(0, 1)}</span>
+              {who}
+            </div>
+          )}
+          <button onClick={() => setShowChangePassword(true)}>Change password</button>
           <button onClick={logout}>Log out</button>
         </div>
       </aside>

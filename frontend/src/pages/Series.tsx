@@ -186,23 +186,23 @@ export default function SeriesPage() {
               <td>
                 <button
                   className="btn"
-                  style={{ padding: '2px 6px', fontSize: 14 }}
+                  style={{ padding: '2px 10px', fontSize: 12 }}
                   title={sr.paused ? 'Resume scanning and dispatch' : 'Pause scanning and hold queued jobs'}
                   aria-label={sr.paused ? 'Resume' : 'Pause'}
                   onClick={() => togglePause(sr)}
                 >
-                  {sr.paused ? '▶️' : '⏸️'}
+                  {sr.paused ? 'Resume' : 'Pause'}
                 </button>
               </td>
               <td>
                 <button
                   className="btn"
-                  style={{ padding: '2px 6px', fontSize: 14 }}
+                  style={{ padding: '2px 10px', fontSize: 12 }}
                   title={sr.notify === false ? 'Unmute Discord alerts' : 'Mute Discord alerts'}
                   aria-label={sr.notify === false ? 'Unmute' : 'Mute'}
                   onClick={() => toggleNotify(sr)}
                 >
-                  {sr.notify === false ? '🔕' : '🔔'}
+                  {sr.notify === false ? 'Muted' : 'Alerts'}
                 </button>
               </td>
               <td>

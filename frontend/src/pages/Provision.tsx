@@ -185,7 +185,7 @@ export default function ProvisionPage() {
           </label>
         </div>
         {httpWarning && (
-          <div style={{ fontSize: 12, color: '#d29922', marginBottom: 8 }}>⚠ {httpWarning}</div>
+          <div style={{ fontSize: 12, color: 'var(--yellow)', marginBottom: 8 }}>! {httpWarning}</div>
         )}
         <div className="toolbar">
           <label style={{ flex: 1 }}>

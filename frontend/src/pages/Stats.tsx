@@ -63,12 +63,12 @@ export default function StatsPage() {
 
       {!busy && !error && stats && (
         <>
-          {/* Summary cards: terminal counts + avg duration. Match the
-              Dashboard Stat card styling (badge tones) so the fleet
-              at-a-glance reads consistently across pages. */}
-          <div className="card" style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* Summary cards: terminal counts + avg duration. Same .stat-strip
+              grid as the Dashboard fleet strip so the at-a-glance numbers
+              read consistently across pages. */}
+          <div className="stat-strip">
             <Stat label="Done" value={stats.totals.done} tone="green" />
-            <Stat label="Failed" value={stats.totals.failed} tone="blue" />
+            <Stat label="Failed" value={stats.totals.failed} tone="red" />
             <Stat label="Cancelled" value={stats.totals.cancelled} />
             <Stat
               label="Avg duration"
@@ -233,9 +233,9 @@ export default function StatsPage() {
   );
 }
 
-// Stat is a single label/value card. Mirrors the Dashboard Stat component's
-// styling (badge tones) so the summary strip reads consistently. Kept local
-// rather than shared because Dashboard's is local too — YAGNI to extract.
+// Stat is one cell in the .stat-strip summary grid. Mirrors the Dashboard
+// Stat component; kept local rather than shared because Dashboard's is
+// local too — YAGNI to extract.
 function Stat({
   label,
   value,
@@ -244,18 +244,14 @@ function Stat({
 }: {
   label: string;
   value: string | number;
-  tone?: 'blue' | 'green' | 'gray';
+  tone?: 'blue' | 'green' | 'accent' | 'red';
   title?: string;
 }) {
-  const toneCls = tone ?? 'gray';
+  const toneCls = tone ? ` ${tone}` : '';
   return (
-    <div title={title} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <span className="muted" style={{ fontSize: 11, textTransform: 'uppercase' }}>
-        {label}
-      </span>
-      <span className={`badge ${toneCls}`} style={{ fontSize: 16, alignSelf: 'flex-start' }}>
-        {value}
-      </span>
+    <div className="stat" title={title}>
+      <span className="stat-label">{label}</span>
+      <span className={`stat-value${toneCls}`}>{value}</span>
     </div>
   );
 }

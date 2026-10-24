@@ -147,6 +147,24 @@ trusting any self-signed cert. The controller-driven Provision page exposes
 the same choice: **Enable WinRM HTTPS listener** (bootstrap) and **Accept
 self-signed listener certificate** (opt-in `ignore`; off = `validate`).
 
+### WinRM password rotation
+
+`group_vars/all/secrets.yml` holds the account password in plaintext
+(local-only, gitignored, mode 600). Rotate it fleet-wide with:
+
+```bash
+cd infra/ansible
+ansible-playbook -i inventory.yml rotate-winrm-password.yml
+# interactive prompt for the new password (avoid -e on the CLI: shell history)
+```
+
+The playbook sets the new password on every node, **verifies it actually
+authenticates over WinRM**, and only then rewrites `ansible_password` in
+`secrets.yml` (keeping mode 600 and all other keys). If any node rejects
+the new password the run aborts *before* touching the secrets file, so
+local management can never be locked out by a failed rotation — re-run is
+idempotent.
+
 ### Security hardening knobs (2026-10 audit)
 
 | Setting | Where | Default | Effect |

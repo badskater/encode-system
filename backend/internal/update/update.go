@@ -176,7 +176,8 @@ var ErrNoRollback = fmt.Errorf("no previous agent release to roll back to")
 // rolling back twice returns to the original state. Nodes pick the change
 // up through the normal sync — syncAgent triggers on ANY version
 // difference, so a downgrade propagates exactly like an upgrade (staged
-// .exe.new + swap on restart). Returns the updated manifest.
+// as <binary>.new + swap on restart — on Windows that is encode-agent.exe.new,
+// on Linux encode-agent.new). Returns the updated manifest.
 func (s *Store) RollbackAgent() (model.UpdateManifest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

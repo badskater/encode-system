@@ -30,7 +30,7 @@ FROM alpine:3.20
 RUN addgroup -S encode && adduser -S encode -G encode \
     && apk add --no-cache ca-certificates nfs-utils wget \
         python3 py3-pip \
-    && pip3 install --no-cache-dir \
+    && pip3 install --break-system-packages --no-cache-dir \
         'ansible-core==2.21.3' 'pywinrm==0.5.0' \
     && ansible-galaxy collection install ansible.windows:3.7.0 ansible.posix:2.2.2 \
     && rm -rf /root/.cache /tmp/* \

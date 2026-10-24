@@ -250,6 +250,12 @@ type Node struct {
 	// Store.LatestNodeMetric on the ListNodes path (see last_metrics there).
 	// nil for old agents that do not report metrics yet.
 	Metrics *NodeMetrics `json:"metrics,omitempty"`
+	// Platform is the agent's OS, reported via heartbeat ("windows" or
+	// "linux"). Empty means a legacy row or an old agent that has not
+	// reported it yet — callers must treat "" as "windows" (the historical
+	// fleet default). Persisted on the nodes row; the controller selects
+	// the script dialect per node from it.
+	Platform string `json:"platform,omitempty"`
 	// AgentLog is the tail of the agent's own slog output as reported in
 	// its latest heartbeat (bounded ≤8 KiB, newest last). Persisted on the
 	// nodes row so it survives a controller restart and is served by
@@ -453,6 +459,11 @@ type Heartbeat struct {
 	// Metrics is the agent's latest resource sample. nil for old agents
 	// that do not report metrics — callers must nil-check before use.
 	Metrics *NodeMetrics `json:"metrics,omitempty"`
+	// Platform is the agent's OS ("windows" or "linux"), normalized from
+	// runtime.GOOS by the agent. An empty/absent field means an old agent
+	// that has not been upgraded to report it — the controller MUST keep
+	// the prior stored value rather than blanking it (rolling upgrade).
+	Platform string `json:"platform,omitempty"`
 	// AgentLog carries the tail of the agent's OWN slog output (bounded
 	// ring, ≤8 KiB) so the controller can surface node-side diagnostics
 	// without a WinRM session. Empty for old agents and before the first

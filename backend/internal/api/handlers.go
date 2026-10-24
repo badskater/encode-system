@@ -83,6 +83,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		node.AgentLog = hb.AgentLog
 	}
 
+	// Platform shipping: persist the agent's OS so later tasks can select
+	// the script dialect per node. An empty field (old agent that has not
+	// been upgraded to report it) keeps the prior stored value rather than
+	// blanking it — the same rolling-upgrade invariant as agent_log. The
+	// column write rides the existing UpdateNode below.
+	if hb.Platform != "" {
+		node.Platform = hb.Platform
+	}
+
 	// Persist the agent's latest resource sample into the node_metrics ring
 	// table (24h retention, ≤500-point downsample on read). Old agents send
 	// nil Metrics — skip entirely so the ring stays empty for them. A write

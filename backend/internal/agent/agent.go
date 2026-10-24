@@ -288,6 +288,10 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		BinVersion:     binVer,
 		Syncing:        syncing, // update in flight -> controller holds jobs back
 		TasksSinceBoot: a.TasksSinceBoot(),
+		// Platform is the agent's OS, reported so the controller can pick
+		// the script dialect per node. Normalized from runtime.GOOS so a
+		// new value (e.g. "darwin") passes through verbatim for visibility.
+		Platform: runtime.GOOS,
 		// Metrics is collected best-effort on every heartbeat. Old
 		// controllers ignore the unknown key, so this is wire-safe.
 		// The pointer is always non-nil: zero values are meaningful

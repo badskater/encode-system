@@ -220,6 +220,15 @@ func (s *Store) migrateV2() error {
 			return fmt.Errorf("migrate series.webhook_url: %w", err)
 		}
 	}
+	// nodes.platform: the agent's OS ("windows" | "linux"), reported via
+	// heartbeat so later tasks can select the script dialect per node.
+	// Default 'windows' so legacy rows and old agents (which never report
+	// the field) resolve to the historical Windows-only fleet behavior.
+	if _, err := s.db.Exec(`ALTER TABLE nodes ADD COLUMN platform TEXT NOT NULL DEFAULT 'windows'`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate v2 nodes.platform: %w", err)
+		}
+	}
 	// node_metrics: rolling resource samples (one row per heartbeat) for
 	// the observability dashboard. Index on (node_id, ts) supports the
 	// "latest N samples for node" query shape.
@@ -363,14 +372,14 @@ func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
-  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, created_at FROM nodes WHERE id = ?`, id)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
-  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, created_at FROM nodes WHERE name = ?`, name)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
 
@@ -380,7 +389,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 	var lastSeen, issuedAt sql.NullString
 	var createdAt string
 	err := row.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.MaxConcurrentJobs, &n.AgentVersion,
-		&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &n.AgentLog, &createdAt)
+		&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &n.AgentLog, &n.Platform, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +408,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
-  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, created_at FROM nodes ORDER BY name`)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +420,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 		var lastSeen, issuedAt sql.NullString
 		var createdAt string
 		if err := rows.Scan(&n.ID, &n.Name, &n.TokenHash, &enabled, &n.Status, &n.Group, &n.MaxConcurrentJobs, &n.AgentVersion,
-			&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &n.AgentLog, &createdAt); err != nil {
+			&n.LibVersion, &n.BinVersion, &n.TasksSinceBoot, &reboot, &n.RebootIssuedAtTasks, &issuedAt, &lastSeen, &n.LastError, &n.AgentLog, &n.Platform, &createdAt); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled == 1
@@ -457,9 +466,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 // UpdateNode persists mutable node fields after a heartbeat or UI action.
 func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
-  lib_version=?, bin_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, reboot_issued_at=?, last_seen=?, last_error=?, agent_log=? WHERE id=?`,
+  lib_version=?, bin_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, reboot_issued_at=?, last_seen=?, last_error=?, agent_log=?, platform=? WHERE id=?`,
 		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.BinVersion, n.TasksSinceBoot,
-		boolToInt(n.RebootPending), n.RebootIssuedAtTasks, fmtPtrTime(n.RebootIssuedAt), fmtPtrTime(n.LastSeen), n.LastError, n.AgentLog, n.ID)
+		boolToInt(n.RebootPending), n.RebootIssuedAtTasks, fmtPtrTime(n.RebootIssuedAt), fmtPtrTime(n.LastSeen), n.LastError, n.AgentLog, n.Platform, n.ID)
 	return err
 }
 
@@ -479,7 +488,7 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
-  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, created_at FROM nodes WHERE token_hash = ?`, hash)
+  lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=encode-system agent
+# Encode farm worker: heartbeats to the controller and runs encode jobs.
+After=network-online.target mnt-encodes-scripts.automount mnt-encodes-release.automount
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=encode
+Group=encode
+ExecStart=/opt/encode-agent/encode-agent -config /etc/encode-agent/agent.json -foreground
+Restart=always
+RestartSec=5
+# The agent writes its node.token + state under its data dir.
+ReadWritePaths=/opt/encode-agent /var/lib/encode-agent
+# Hardening: no new privileges, private /tmp.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

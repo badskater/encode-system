@@ -13,6 +13,7 @@ package provision
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -39,6 +40,17 @@ type Request struct {
 	WinRMUser      string
 	WinRMPassword  string
 	NodeName       string
+	// Platform selects the provisioning path: "windows" (or "" for back
+	// compat with callers that never set it) drives the WinRM/ansible
+	// Windows playbook unchanged; "linux" drives the SSH/ansible
+	// linux-node playbook. Any other value is rejected.
+	Platform string
+	// SSH connection details for Linux nodes. SSHUser is required; the
+	// auth method is EITHER SSHPassword OR SSHKeyFile (one must be
+	// non-empty). SSHPort defaults to 22. These are ignored on Windows.
+	SSHUser     string
+	SSHPassword string
+	SSHKeyFile  string
 	// Options.
 	InstallToolchain bool // MediaInfo, AviSynth+, Python, VapourSynth
 	MountNFS         bool // legacy: NFS client + mounts from Settings (kept for API compat)
@@ -50,6 +62,9 @@ type Request struct {
 	WinRMHTTPS          bool
 	WinRMCertThumbprint string
 }
+
+// isLinux reports whether this request drives the SSH/Linux path.
+func (r Request) isLinux() bool { return r.Platform == "linux" }
 
 // Store is the persistence surface the engine needs (narrow for tests).
 type Store interface {
@@ -147,9 +162,30 @@ var nodeNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // Validate checks the request shape before any resources are allocated.
 func (r *Request) Validate() error {
+	r.Platform = strings.ToLower(r.Platform)
+	if r.Platform == "" {
+		r.Platform = "windows"
+	}
+	if r.Platform != "windows" && r.Platform != "linux" {
+		return fmt.Errorf("platform must be 'windows' or 'linux'")
+	}
 	if !hostRe.MatchString(r.Host) {
 		return fmt.Errorf("invalid host %q", r.Host)
 	}
+	if r.NodeName == "" {
+		return fmt.Errorf("node_name is required")
+	}
+	if !nodeNameRe.MatchString(r.NodeName) {
+		return fmt.Errorf("node_name %q contains invalid characters", r.NodeName)
+	}
+	if r.isLinux() {
+		return r.validateLinux()
+	}
+	return r.validateWindows()
+}
+
+// validateWindows checks the historical WinRM shape — unchanged behavior.
+func (r *Request) validateWindows() error {
 	if r.Port == 0 {
 		r.Port = 5985
 	}
@@ -183,11 +219,24 @@ func (r *Request) Validate() error {
 	if r.WinRMPassword == "" {
 		return fmt.Errorf("winrm_password is required")
 	}
-	if r.NodeName == "" {
-		return fmt.Errorf("node_name is required")
+	return nil
+}
+
+// validateLinux checks the SSH shape: a user and exactly one auth method
+// (password or key file). Port defaults to 22. No WinRM fields are
+// consulted.
+func (r *Request) validateLinux() error {
+	if r.Port == 0 {
+		r.Port = 22
 	}
-	if !nodeNameRe.MatchString(r.NodeName) {
-		return fmt.Errorf("node_name %q contains invalid characters", r.NodeName)
+	if r.Port < 1 || r.Port > 65535 {
+		return fmt.Errorf("invalid port %d", r.Port)
+	}
+	if r.SSHUser == "" {
+		return fmt.Errorf("ssh_user is required for linux nodes")
+	}
+	if r.SSHPassword == "" && strings.TrimSpace(r.SSHKeyFile) == "" {
+		return fmt.Errorf("linux nodes require ssh_password or ssh_key_file")
 	}
 	return nil
 }
@@ -244,27 +293,72 @@ func (e *Engine) run(id int64, req Request) {
 	_ = e.Store.SetProvisionRunStatus(bg, id, "success", "", true)
 }
 
-// execute performs staging, runs ansible-playbook, and streams the output.
+// execute dispatches to the platform-specific provisioning path.
 func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
+	if req.isLinux() {
+		return e.executeLinux(ctx, bg, id, req)
+	}
+	return e.executeWindows(ctx, bg, id, req)
+}
+
+// loadProvisionCtx resolves settings + per-role shares and checks the
+// controller URL. Shared by both platforms before staging.
+func (e *Engine) loadProvisionCtx(ctx context.Context) (*model.Settings, *model.Share, *model.Share, error) {
 	settings, err := e.Store.GetSettings(ctx)
 	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
+		return nil, nil, nil, fmt.Errorf("load settings: %w", err)
 	}
 	if settings == nil {
-		return fmt.Errorf("no settings configured — open the Settings page first")
+		return nil, nil, nil, fmt.Errorf("no settings configured (open the Settings page first)")
 	}
 	if strings.TrimSpace(settings.ControllerURL) == "" {
-		return fmt.Errorf("settings.controller_url is empty — set it on the Settings page (nodes must be able to reach this URL)")
+		return nil, nil, nil, fmt.Errorf("settings.controller_url is empty (set it on the Settings page; nodes must be able to reach this URL)")
 	}
-	// Resolve the enabled share per role (nil = fall back to legacy NFS
-	// Settings for that role). ShareForRole prefers smb over nfs over s3.
 	scriptsShare, err := e.Store.ShareForRole(ctx, model.ShareRoleScripts)
 	if err != nil {
-		return fmt.Errorf("resolve scripts share: %w", err)
+		return nil, nil, nil, fmt.Errorf("resolve scripts share: %w", err)
 	}
 	releaseShare, err := e.Store.ShareForRole(ctx, model.ShareRoleRelease)
 	if err != nil {
-		return fmt.Errorf("resolve release share: %w", err)
+		return nil, nil, nil, fmt.Errorf("resolve release share: %w", err)
+	}
+	return settings, scriptsShare, releaseShare, nil
+}
+
+// stagePayloads copies the agent binary, lib, and optional bin zip from
+// the update store into the run dir's files/ tree. agentName is the
+// platform-specific binary filename (encode-agent.exe on Windows,
+// encode-agent on Linux). Returns (libOK, binOK).
+func (e *Engine) stagePayloads(dir, agentName string, req Request) (libOK, binOK bool, err error) {
+	agentOK, err := e.Payloads.StageAgentBinary(filepath.Join(dir, "files", "agent", agentName))
+	if err != nil {
+		return false, false, fmt.Errorf("stage agent binary: %w", err)
+	}
+	if !agentOK {
+		return false, false, fmt.Errorf("no agent binary published (publish one on Settings > Push to nodes first)")
+	}
+	libOK, err = e.Payloads.StageLib(filepath.Join(dir, "files", "agent", "EncodeLib.ps1"))
+	if err != nil {
+		return false, false, fmt.Errorf("stage EncodeLib: %w", err)
+	}
+	if req.PushBin {
+		binOK, err = e.Payloads.StageBinZip(filepath.Join(dir, "files", "bin-package.zip"))
+		if err != nil {
+			return false, false, fmt.Errorf("stage bin package: %w", err)
+		}
+		if !binOK {
+			return false, false, fmt.Errorf("push_bin requested but no bin package is published")
+		}
+	}
+	return libOK, binOK, nil
+}
+
+// executeWindows performs staging, runs the WinRM ansible playbook, and
+// streams the output. Unchanged from the original Windows path.
+func (e *Engine) executeWindows(ctx, bg context.Context, id int64, req Request) error {
+	settings, scriptsShare, releaseShare, err := e.loadProvisionCtx(ctx)
+	if err != nil {
+		return err
 	}
 
 	dir, err := os.MkdirTemp("", "provision-*")
@@ -274,29 +368,12 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	defer os.RemoveAll(dir)
 
 	// 1. Stage payloads from the update store.
-	agentOK, err := e.Payloads.StageAgentBinary(filepath.Join(dir, "files", "agent", "encode-agent.exe"))
+	libOK, binOK, err := e.stagePayloads(dir, "encode-agent.exe", req)
 	if err != nil {
-		return fmt.Errorf("stage agent binary: %w", err)
-	}
-	if !agentOK {
-		return fmt.Errorf("no agent binary published — publish one on Settings → Push to nodes first")
-	}
-	libOK, err := e.Payloads.StageLib(filepath.Join(dir, "files", "agent", "EncodeLib.ps1"))
-	if err != nil {
-		return fmt.Errorf("stage EncodeLib: %w", err)
-	}
-	binOK := false
-	if req.PushBin {
-		binOK, err = e.Payloads.StageBinZip(filepath.Join(dir, "files", "bin-package.zip"))
-		if err != nil {
-			return fmt.Errorf("stage bin package: %w", err)
-		}
-		if !binOK {
-			return fmt.Errorf("push_bin requested but no bin package is published")
-		}
+		return err
 	}
 
-	// 2. Pairing code — single-use bootstrap, plaintext only in vars.yml.
+	// 2. Pairing code (single-use bootstrap, plaintext only in vars.yml).
 	code, err := e.IssuePairing(req.NodeName)
 	if err != nil {
 		return fmt.Errorf("issue pairing code: %w", err)
@@ -347,6 +424,159 @@ func (e *Engine) execute(ctx, bg context.Context, id int64, req Request) error {
 	// reflect secrets into the output; scrub them before they reach the DB.
 	redact := []string{req.WinRMPassword, code}
 	return streamCommand(ctx, bg, e.Store, id, cmd, e.logCap(), redact)
+}
+
+// executeLinux provisions a Linux node over SSH using the linux-node
+// playbook. The SSH password and any CIFS share credentials flow ONLY
+// through a 0600 JSON vars file passed as `-e @vars.json` (never on a
+// command line: a `$` in a password breaks shell/env passing, and command
+// lines are visible in /proc). The vars file is shredded by the run-dir
+// cleanup (defer os.RemoveAll).
+func (e *Engine) executeLinux(ctx, bg context.Context, id int64, req Request) error {
+	settings, scriptsShare, releaseShare, err := e.loadProvisionCtx(ctx)
+	if err != nil {
+		return err
+	}
+
+	dir, err := os.MkdirTemp("", "provision-*")
+	if err != nil {
+		return fmt.Errorf("create work dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// 1. Stage payloads (agent binary has no .exe on Linux).
+	libOK, binOK, err := e.stagePayloads(dir, "encode-agent", req)
+	if err != nil {
+		return err
+	}
+
+	// 2. Pairing code (single-use bootstrap, plaintext only in vars.json).
+	code, err := e.IssuePairing(req.NodeName)
+	if err != nil {
+		return fmt.Errorf("issue pairing code: %w", err)
+	}
+
+	// 3. Inventory: SSH connection, one host. ansible_become is in vars.
+	inv := fmt.Sprintf("[encode_nodes]\n%s ansible_host=%s ansible_port=%d\n",
+		req.NodeName, req.Host, req.Port)
+	if err := os.WriteFile(filepath.Join(dir, "inventory.yml"), []byte(inv), 0o600); err != nil {
+		return err
+	}
+
+	// 4. Vars as a 0600 JSON file (not env/YAML on a command line): a `$`
+	//    in an SMB password breaks env-file passing; JSON is robust. The
+	//    file is the ONLY channel for the SSH + CIFS passwords.
+	varsJSON := buildVars(settings, req, code, libOK, binOK, scriptsShare, releaseShare)
+	varsPath := filepath.Join(dir, "vars.json")
+	if err := os.WriteFile(varsPath, []byte(varsJSON), 0o600); err != nil {
+		return err
+	}
+
+	// 5. Copy the linux-node playbook + role INTO the run dir so the
+	//    playbook resolves staged payloads via {{ playbook_dir }}/files/
+	//    and its roles/ import.
+	srcPlaybook := filepath.Join(e.PlaybookDir, "linux-node.yml")
+	playbook := filepath.Join(dir, "linux-node.yml")
+	if b, err := os.ReadFile(srcPlaybook); err != nil {
+		return fmt.Errorf("linux-node playbook missing: %w", err)
+	} else if err := os.WriteFile(playbook, b, 0o600); err != nil {
+		return err
+	}
+	rolesSrc := filepath.Join(e.PlaybookDir, "roles", "linux-node")
+	rolesDest := filepath.Join(dir, "roles", "linux-node")
+	if err := copyDir(rolesSrc, rolesDest); err != nil {
+		return fmt.Errorf("copy linux-node role: %w", err)
+	}
+
+	ansibleBin := e.AnsibleBin
+	if ansibleBin == "" {
+		ansibleBin = "ansible-playbook"
+	}
+	_ = e.Store.AppendProvisionRunLog(bg, id,
+		"[controller] launching ansible-playbook for linux node ("+ansibleBin+")\n", e.logCap())
+	cmd := exec.CommandContext(ctx, ansibleBin,
+		"-i", filepath.Join(dir, "inventory.yml"),
+		"-e", "@"+varsPath,
+		playbook)
+	cmd.Env = append(os.Environ(),
+		"ANSIBLE_HOST_KEY_CHECKING=False",
+		"ANSIBLE_PYTHON_INTERPRETER=auto_silent",
+		"ANSIBLE_TIMEOUT=120",
+	)
+	// Redact every secret that could reach the log: the SSH password, the
+	// pairing code, and each CIFS share password (the playbook prints mount
+	// commands whose creds file path is fine, but a stray `mount` could
+	// echo a password; scrub all of them).
+	redact := []string{req.SSHPassword, code}
+	redact = append(redact, linuxCIFSPasswords(req, scriptsShare, releaseShare)...)
+	return streamCommand(ctx, bg, e.Store, id, cmd, e.logCap(), redact)
+}
+
+// linuxCIFSPasswords collects every CIFS (SMB) password that could appear
+// in ansible output for a Linux run, so the redact list covers them all.
+func linuxCIFSPasswords(req Request, scriptsShare, releaseShare *model.Share) []string {
+	var out []string
+	if !req.MountShares {
+		return out
+	}
+	if sh := scriptsShare; sh != nil && sh.Kind == model.ShareSMB && sh.Password != "" {
+		out = append(out, sh.Password)
+	}
+	if sh := releaseShare; sh != nil && sh.Kind == model.ShareSMB && sh.Password != "" {
+		out = append(out, sh.Password)
+	}
+	return out
+}
+
+// copyDir recursively copies src to dst, preserving file permissions. Used
+// to stage the linux-node ansible role next to the playbook copy in the
+// run dir (ansible resolves roles/ relative to playbook_dir).
+func copyDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("copyDir: %s is not a directory", src)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, en := range entries {
+		s := filepath.Join(src, en.Name())
+		d := filepath.Join(dst, en.Name())
+		if en.IsDir() {
+			if err := copyDir(s, d); err != nil {
+				return err
+			}
+		} else {
+			fi, err := en.Info()
+			if err != nil {
+				return err
+			}
+			in, err := os.Open(s)
+			if err != nil {
+				return err
+			}
+			out, err := os.OpenFile(d, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
+			if err != nil {
+				in.Close()
+				return err
+			}
+			if _, err := io.Copy(out, in); err != nil {
+				in.Close()
+				out.Close()
+				return err
+			}
+			in.Close()
+			out.Close()
+		}
+	}
+	return nil
 }
 
 func (e *Engine) logCap() int {
@@ -490,17 +720,25 @@ func streamCommand(ctx, bg context.Context, st Store, id int64, cmd *exec.Cmd, c
 
 // buildVars renders the ansible extra-vars file from live settings + the
 // request + the resolved per-role shares (nil = fall back to the legacy NFS
-// Settings fields for that role). The WinRM password, pairing code and any
-// share credentials are the only secrets; the file is written 0600 and
-// deleted after the run.
+// Settings fields for that role). It dispatches on Platform: Windows
+// requests produce YAML (the historical contract, unchanged), Linux
+// requests produce JSON (robust against `$` in SMB passwords — a JSON
+// string value carries any character, unlike env/YAML command-line args).
+// The file is written 0600 and deleted after the run either way.
 func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK bool,
 	scriptsShare, releaseShare *model.Share) string {
-	// Mounting is requested by either flag: MountShares (shares table) or
-	// the legacy MountNFS (Settings NFS). A share owning a role SUPPRESSES
-	// the legacy NFS export for that role — one transport per role.
-	mount := req.MountShares || req.MountNFS
-	nfsScripts := ""
-	nfsRelease := ""
+	if req.isLinux() {
+		return buildVarsLinux(s, req, pairingCode, libOK, binOK, scriptsShare, releaseShare)
+	}
+	return buildVarsWindows(s, req, pairingCode, libOK, binOK, scriptsShare, releaseShare)
+}
+
+// resolveMountAndNFS computes the shared mount flag and legacy NFS export
+// strings used by both Windows and Linux var renderers. A share owning a
+// role SUPPRESSES the legacy NFS export for that role (one transport per
+// role).
+func resolveMountAndNFS(s *model.Settings, req Request, scriptsShare, releaseShare *model.Share) (mount bool, nfsScripts, nfsRelease string) {
+	mount = req.MountShares || req.MountNFS
 	server := strings.TrimSpace(s.NFSServer)
 	if mount && server != "" {
 		if sp := strings.TrimSpace(s.ScriptsShare); sp != "" && !shareOwnsRole(scriptsShare) {
@@ -510,6 +748,14 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 			nfsRelease = server + ":" + rp
 		}
 	}
+	return mount, nfsScripts, nfsRelease
+}
+
+// buildVarsWindows renders the historical YAML vars file for WinRM targets.
+// Unchanged behavior: existing tests assert its exact output.
+func buildVarsWindows(s *model.Settings, req Request, pairingCode string, libOK, binOK bool,
+	scriptsShare, releaseShare *model.Share) string {
+	mount, nfsScripts, nfsRelease := resolveMountAndNFS(s, req, scriptsShare, releaseShare)
 	// SMB vars: only a smb-kind share renders them (s3 shares have no
 	// mount — the agent transfers per job).
 	smbScriptsUNC, smbScriptsUser, smbScriptsPass := "", "", ""
@@ -571,6 +817,98 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "ansible_winrm_read_timeout_sec: 150\n")
 	fmt.Fprintf(&b, "ansible_winrm_operation_timeout_sec: 120\n")
 	return b.String()
+}
+
+// buildVarsLinux renders a JSON extra-vars file for SSH/Linux targets. JSON
+// (not YAML/env) is chosen deliberately: an SMB password containing `$`
+// breaks env-file and shell passing, and YAML single-quote scalars mangle
+// values with control characters — a JSON string escapes all of them
+// faithfully. The file is passed as `-e @vars.json` (0600) and shredded
+// after the run; no secret ever appears on a command line.
+//
+// CIFS vars mirror the Windows encode_smb_* naming as encode_cifs_*: the
+// Linux role mounts each enabled SMB share with a per-share credentials
+// file (never on a command line), so the password travels only inside this
+// JSON file -> the ansible vars -> a 0600 creds file on the node.
+func buildVarsLinux(s *model.Settings, req Request, pairingCode string, libOK, binOK bool,
+	scriptsShare, releaseShare *model.Share) string {
+	mount, nfsScripts, nfsRelease := resolveMountAndNFS(s, req, scriptsShare, releaseShare)
+
+	// CIFS vars: only smb-kind shares render them (s3 shares have no mount;
+	// nfs shares have no credentials).
+	type cifsShare struct {
+		Server, Share, User, Pass, MountPath string
+	}
+	var cifsScripts, cifsRelease cifsShare
+	mountCIFS := false
+	if mount {
+		if sh := scriptsShare; sh != nil && sh.Kind == model.ShareSMB {
+			cifsScripts = cifsShare{sh.Server, cifsShareName(sh.Path), sh.Username, sh.Password, sh.MountPath}
+			mountCIFS = true
+		}
+		if sh := releaseShare; sh != nil && sh.Kind == model.ShareSMB {
+			cifsRelease = cifsShare{sh.Server, cifsShareName(sh.Path), sh.Username, sh.Password, sh.MountPath}
+			mountCIFS = true
+		}
+	}
+
+	v := map[string]any{
+		"encode_controller_url":      s.ControllerURL,
+		"encode_node_name":           req.NodeName,
+		"encode_bin_dir":             firstNonEmpty(s.NodeBinDir, "/opt/encode/bin"),
+		"encode_scripts_mount":       firstNonEmpty(s.NodeScriptsDir, "/mnt/encodes/scripts"),
+		"encode_release_mount":       firstNonEmpty(s.NodeReleaseDir, "/mnt/encodes/release"),
+		"encode_agent_dir":           "/opt/encode-agent",
+		"encode_agent_user":          "encode",
+		"encode_heartbeat_seconds":   15,
+		"encode_nfs_scripts_export":  nfsScripts,
+		"encode_nfs_release_export":  nfsRelease,
+		"encode_mount_nfs":           mount && (nfsScripts != "" || nfsRelease != ""),
+		"encode_cifs_vers":           "3.0",
+		"encode_cifs_scripts_server": cifsScripts.Server,
+		"encode_cifs_scripts_share":  cifsScripts.Share,
+		"encode_cifs_scripts_user":   cifsScripts.User,
+		"encode_cifs_scripts_pass":   cifsScripts.Pass,
+		"encode_cifs_scripts_mount":  cifsScripts.MountPath,
+		"encode_cifs_release_server": cifsRelease.Server,
+		"encode_cifs_release_share":  cifsRelease.Share,
+		"encode_cifs_release_user":   cifsRelease.User,
+		// The release pass is intentionally omitted from redaction concerns:
+		// it travels inside the JSON file, not on a command line.
+		"encode_cifs_release_pass":  cifsRelease.Pass,
+		"encode_cifs_release_mount": cifsRelease.MountPath,
+		"encode_mount_cifs":         mountCIFS,
+		"encode_install_toolchain":  req.InstallToolchain,
+		"encode_push_bin":           binOK,
+		"encode_has_lib":            libOK,
+		"encode_pairing_code":       pairingCode,
+		// SSH connection — ansible ssh plugin reads these. ansible_become
+		// runs the agent install/mount tasks as root via sudo.
+		"ansible_host":   req.Host,
+		"ansible_user":   req.SSHUser,
+		"ansible_port":   req.Port,
+		"ansible_become": true,
+	}
+	if req.SSHPassword != "" {
+		v["ansible_password"] = req.SSHPassword
+	}
+	if kf := strings.TrimSpace(req.SSHKeyFile); kf != "" {
+		v["ansible_ssh_private_key_file"] = kf
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Should never happen: all values are strings/bools/ints. Fall back
+		// to a minimal safe payload rather than crashing a provision run.
+		return `{"encode_node_name":"` + req.NodeName + `"}`
+	}
+	return string(b)
+}
+
+// cifsShareName extracts the SMB share name from a share row's Path. The
+// Path field holds the share name (e.g. "scripts") for smb-kind shares;
+// leading/trailing slashes are trimmed.
+func cifsShareName(p string) string {
+	return strings.Trim(p, "/\\")
 }
 
 // shareOwnsRole reports whether a resolved share (any kind) owns a role —

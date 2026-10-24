@@ -1,0 +1,33 @@
+# linux-node.yml — controller-driven single-node provisioning for Linux.
+#
+# NOT run from a workstation: the controller's provision engine invokes
+# this playbook with a generated inventory + vars.json (SSH credentials,
+# CIFS share passwords, and a one-shot pairing code, all in a 0600 temp
+# JSON file, deleted after the run).
+#
+# Variable contract (all provided by the engine via -e @vars.json):
+#   encode_controller_url, encode_node_name, encode_bin_dir,
+#   encode_scripts_mount, encode_release_mount, encode_agent_dir,
+#   encode_agent_user, encode_heartbeat_seconds,
+#   encode_nfs_scripts_export, encode_nfs_release_export, encode_mount_nfs,
+#   encode_cifs_vers, encode_cifs_scripts_server/share/user/pass/mount,
+#   encode_cifs_release_server/share/user/pass/mount, encode_mount_cifs,
+#   encode_install_toolchain, encode_push_bin, encode_has_lib,
+#   encode_pairing_code,
+#   ansible_host, ansible_user, ansible_port, ansible_become,
+#   ansible_password OR ansible_ssh_private_key_file
+#
+# Connection: ansible ssh (become=true). SSH + CIFS passwords flow ONLY
+# through the JSON vars file — never on a command line (a `$` in a CIFS
+# password breaks shell/env passing). The role writes per-share CIFS
+# credentials files (0600) via ansible copy content, never inline on mount.
+#
+# Everything is idempotent: re-running only fixes what is missing.
+---
+- name: Provision encode-system Linux node
+  hosts: encode_nodes
+  gather_facts: true
+  become: "{{ ansible_become | default(true) }}"
+
+  roles:
+    - role: linux-node

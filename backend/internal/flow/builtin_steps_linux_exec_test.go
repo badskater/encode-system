@@ -355,15 +355,11 @@ func TestBuiltinBashExecAllPortedTemplates(t *testing.T) {
 		t.Run(key, func(t *testing.T) {
 			v, root := execTestEnv(t, binDir)
 			script := renderExecScript(t, key, v)
-
-			// Inject the shared find_source_file helper (defined as the
-			// findSourceFileBash const) before the step definitions. This
-			// helper is called by many templates but is a pre-existing
-			// rendering gap (not linked into the output) that is OUTSIDE
-			// this test's scope — the P0 fix this test guards is the
-			// STEP-FUNCTION call→define linkage, not the shared helper.
-			// Injecting it here isolates the P0 assertion from that gap.
-			script = findSourceFileBash + "\n" + script
+			// The shared find_source_file helper is now emitted naturally by
+			// BashDialect.Preamble (mirroring the PS `. $LibPath` dot-source
+			// of EncodeLib.ps1). No manual injection here — the rendered
+			// output must contain it on its own. This was previously masked
+			// by a manual prepend; the Preamble emission fixed the real gap.
 
 			scriptPath := filepath.Join(root, key+".sh")
 			if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {

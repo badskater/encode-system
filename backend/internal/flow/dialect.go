@@ -115,6 +115,18 @@ func safeIdentAlpha(s string) string {
 	return b.String()
 }
 
+// DialectForPlatform selects the script dialect for a node's reported platform.
+// "linux" → BashDialect; anything else (including "" for legacy rows and old
+// agents that never reported a platform) → PowerShellDialect, the historical
+// fleet default. The controller calls this at dispatch time so a mixed
+// Windows/Linux farm renders the correct script per node.
+func DialectForPlatform(platform string) Dialect {
+	if platform == "linux" {
+		return BashDialect{}
+	}
+	return PowerShellDialect{}
+}
+
 // --- PowerShellDialect (byte-identical to the pre-refactor renderer) ---
 
 // PowerShellDialect emits the same PowerShell the renderer always did.

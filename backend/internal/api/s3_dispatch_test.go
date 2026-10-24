@@ -46,7 +46,7 @@ func TestRenderJobS3Staging(t *testing.T) {
 	}
 
 	job := &model.Job{Series: "4k-test", EpisodeDir: "4k-test/Ep 02", FlowID: fl.ID}
-	payload, err := e.server.renderJob(ctx, job)
+	payload, err := e.server.renderJob(ctx, job, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestRenderJobMountSharesUnchanged(t *testing.T) {
 	}
 
 	job := &model.Job{Series: "s", EpisodeDir: "s/Ep 01", FlowID: fl.ID}
-	payload, err := e.server.renderJob(ctx, job)
+	payload, err := e.server.renderJob(ctx, job, "")
 	if err != nil {
 		t.Fatal(err)
 	}

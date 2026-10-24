@@ -443,11 +443,18 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
-	scriptPath := filepath.Join(jobDir, "job.ps1")
-	// Windows PowerShell 5.1 reads .ps1 files WITHOUT a BOM as ANSI and
-	// mangles any non-ASCII content — with anime series names that is a
-	// data-corruption bug, not a cosmetic one. Always write UTF-8 with BOM;
-	// pwsh (7+) and PS 5.1 both honor it identically.
+	// Platform selects the interpreter and script file extension. The
+	// controller already rendered the script in the matching dialect
+	// (PowerShell for Windows/legacy, bash for Linux); the agent branches
+	// on its own OS so a Linux agent runs the .sh via bash and a Windows
+	// agent runs the .ps1 via PowerShell. The ENCODE_STEP markers are
+	// identical text in both dialects, so the observer/parser is shared.
+	linux := runtime.GOOS == "linux"
+	scriptName := "job.ps1"
+	if linux {
+		scriptName = "job.sh"
+	}
+	scriptPath := filepath.Join(jobDir, scriptName)
 	// Expand the controller's {{JOBDIR}} placeholder (s3-staged jobs point
 	// $ScriptsDir/$ReleaseDir into the per-job dir; the controller never
 	// knows node-local paths).
@@ -455,17 +462,40 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	if job.S3 != nil {
 		expandS3Paths(job.S3, jobDir)
 	}
-	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
+	// Windows PowerShell 5.1 reads .ps1 files WITHOUT a BOM as ANSI and
+	// mangles any non-ASCII content — with anime series names that is a
+	// data-corruption bug, not a cosmetic one. Always write UTF-8 with
+	// BOM for PS; pwsh (7+) and PS 5.1 both honor it identically. Bash
+	// scripts must NOT carry a BOM: some shells reject it and the
+	// shebang line would not be at byte 0.
+	var scriptBytes []byte
+	if linux {
+		scriptBytes = []byte(expanded)
+	} else {
+		scriptBytes = append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
+	}
 	// 0600: the rendered script embeds the Discord webhook (a bearer
 	// credential) and job paths — other local users must not read it
-	// (security audit 2026-10). Same for run.log below.
-	if err := os.WriteFile(scriptPath, scriptBytes, 0o600); err != nil {
+	// (security audit 2026-10). Same for run.log below. Linux uses 0700
+	// on the script so it is owner-executable if run directly (the bash
+	// dialect preamble's shebang is a fallback to the explicit `bash`
+	// invocation below).
+	var scriptPerm os.FileMode = 0o600
+	if linux {
+		scriptPerm = 0o700
+	}
+	if err := os.WriteFile(scriptPath, scriptBytes, scriptPerm); err != nil {
 		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
-	if _, err := os.Stat(a.Cfg.LibPath); err != nil {
-		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
-		return
+	// EncodeLib.ps1 is only needed by Windows PS scripts (dot-sourced in
+	// the preamble). Bash scripts are self-contained — the lib does not
+	// exist on Linux nodes and must not be required.
+	if !linux {
+		if _, err := os.Stat(a.Cfg.LibPath); err != nil {
+			a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
+			return
+		}
 	}
 
 	// S3-backed shares: pull the job's source objects into the local
@@ -485,13 +515,21 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		}
 	}
 
-	ps := a.findPowerShell()
 	runLog := filepath.Join(jobDir, "run.log")
 	// Expose this job's run.log to the heartbeat goroutine (FPS parsing
 	// picks the newest active job's log). Per-job slot in the registry;
 	// cleared with the job on completion.
 	r.setRunLog(job.ID, runLog)
-	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
+	var exitCode int
+	var tail string
+	var stepErr string
+	var timings *stepTimingTracker
+	if linux {
+		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics)
+	} else {
+		ps := a.findPowerShell()
+		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
+	}
 
 	status := "done"
 	errMsg := ""
@@ -570,8 +608,8 @@ func (a *Agent) findPowerShell() string {
 	return "powershell"
 }
 
-// runPowerShell executes the job script, teeing output to run.log, and
-// returns the exit code plus the last output lines and the step timing
+// runPowerShell executes the Windows job script, teeing output to run.log,
+// and returns the exit code plus the last output lines and the step timing
 // tracker. Progress lines (ENCODE_STEP) are forwarded into the agent log for
 // heartbeat context AND feed the tracker's first-seen timestamps — the scan
 // is LIVE: a lineObserver processes each complete line as it arrives (at
@@ -581,11 +619,38 @@ func (a *Agent) findPowerShell() string {
 func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings)
+}
 
+// runBash executes the Linux job script via bash, teeing output to run.log.
+// The observer/parser is identical to the PowerShell path: the ENCODE_STEP /
+// ENCODE_STEP_FAILED markers are the same text in both dialects, so no
+// per-dialect parser logic is needed. bash's `set -euo pipefail` (emitted by
+// the bash dialect preamble) makes a nonzero step exit propagate to a nonzero
+// script exit, which the exit-code path below reports as failed.
+func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+	timings = newStepTracker()
+	// /usr/bin/env bash resolves the interpreter via PATH; falls back to
+	// a direct bash lookup. The script carries its own shebang too, so
+	// `bash <script>` is belt-and-suspenders on hosts where /usr/bin/env
+	// is missing.
+	cmd := exec.Command("bash", scriptPath)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings)
+}
+
+// runJobCommand is the shared execution core for both PowerShell and bash
+// job scripts. It wires the lineObserver (live ENCODE_STEP scan + progress
+// feed), the run.log tee (owner-only, 0600 — the log can echo the Discord
+// webhook), accumulates the full output for tail extraction and the
+// ENCODE_STEP_FAILED scan, and returns the exit code / tail / step error /
+// timings. The interpreter label is used only in the cmd.Start error message
+// so a failure to launch names the right tool. This is dialect-agnostic: the
+// marker text is identical across dialects, so the parser never branches.
+func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
 	if prog == nil {
-		// Defensive: direct runPowerShell callers without a tracker get a
-		// throwaway one so the observer feed never nil-panics.
+		// Defensive: direct callers without a tracker get a throwaway
+		// one so the observer feed never nil-panics.
 		prog = newProgressTracker(progressRingLines)
 	}
 	observer.prog = prog // per-job live heartbeat step/pct/tail feed
@@ -609,7 +674,7 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 	cmd.Stderr = mw
 
 	if err := cmd.Start(); err != nil {
-		return -1, "", "start powershell: " + err.Error(), timings
+		return -1, "", "start " + interpreter + ": " + err.Error(), timings
 	}
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

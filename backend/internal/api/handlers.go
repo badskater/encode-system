@@ -339,7 +339,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		if job == nil {
 			break // queue drained
 		}
-		payload, err := s.renderJob(ctx, job)
+		payload, err := s.renderJob(ctx, job, node.Platform)
 		if err != nil {
 			s.Log.Error("render job failed", "job", job.ID, "err", err)
 			s.Store.FinishJob(ctx, job.ID, model.JobFailed, -1, "render failed: "+err.Error(), nil, "")
@@ -370,8 +370,12 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	writeJSON(w, http.StatusOK, reply)
 }
 
-// renderJob builds the PowerShell payload for a job from its flow.
-func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPayload, error) {
+// renderJob builds the job payload for a job from its flow, rendered in the
+// dialect matching the target node's platform. An empty platform (legacy row
+// or old agent) defaults to PowerShell — the historical fleet default — so a
+// mixed Windows/Linux farm dispatches the correct script per node: a Windows
+// node gets a .ps1, a Linux node gets a .sh with the same ENCODE_STEP markers.
+func (s *Server) renderJob(ctx context.Context, job *model.Job, platform string) (*model.JobPayload, error) {
 	fl, err := s.Store.GetFlow(ctx, job.FlowID)
 	if err != nil {
 		return nil, err
@@ -424,7 +428,11 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job) (*model.JobPaylo
 			LocalDir: "{{JOBDIR}}/release",
 		})
 	}
-	script, err := flow.Render(fl, job, vars, s.storeResolver())
+	// Render in the dialect matching the node that will RUN this job.
+	// Rendering happens at dispatch time (here), where the node is known,
+	// so a mixed farm sends bash to Linux nodes and PowerShell to Windows.
+	// Empty platform = legacy/Windows default (PowerShellDialect).
+	script, err := flow.RenderDialect(fl, job, vars, s.storeResolver(), flow.DialectForPlatform(platform))
 	if err != nil {
 		return nil, err
 	}

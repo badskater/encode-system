@@ -1029,8 +1029,9 @@ func (a *Agent) launchPosixSwap(staged, self string) {
 		a.Log.Error("write swap script", "err", err)
 		return
 	}
-	// Spawn detached: setsid + nohup detach the script from the agent's
-	// process group so it keeps running after this process exits.
+	// Spawn detached: setsid moves the script into a new session so it
+	// keeps running after this process exits (the plain-bash fallback
+	// below lacks this immunity but only fires when setsid is absent).
 	cmd := exec.Command("setsid", "bash", scriptPath)
 	cmd.Stdout = nil
 	cmd.Stderr = nil

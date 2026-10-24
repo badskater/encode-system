@@ -28,6 +28,9 @@
 #   INSTALL_DIR      binary install dir (default: /opt/encode-system)
 #   CONFIG_DIR       agent.json dir (default: /etc/encode-agent)
 #   GITHUB_TOKEN     PAT with repo read access for private repos
+#   ENCODE_AGENT_ALLOW_HTTP_UPDATES  set to 1 to allow agent self-updates over
+#                    plain HTTP (auto-enabled when CONTROLLER_URL is http://; the
+#                    agent refuses these downloads otherwise — see agent.go getAuth)
 set -euo pipefail
 
 REPO="${REPO:-${ENCODE_REPO:-badskater/encode-system}}"
@@ -182,16 +185,33 @@ mv -f "$CFG.tmp" "$CFG"
 log "wrote $CFG (controller=$CONTROLLER_URL node=$NODE_NAME)"
 
 # --- systemd unit ------------------------------------------------------------
-# Task 1.5 owns infra/systemd/encode-agent.service; prefer it from the bundle if
-# present (the deploy tarball ships it alongside the installer), else write an
-# inline unit. The agent on Linux runs a foreground loop under systemd
-# (service_other.go) — no -foreground flag — so ExecStart points the binary at
-# the config file directly.
+# There are two install channels for the Linux agent, each with a different
+# on-disk layout:
+#
+#   standalone (this script): binary at /opt/encode-system (INSTALL_DIR),
+#     runs as root, inline unit written below (no -foreground flag: the agent
+#     runs a foreground loop under systemd per service_other.go).
+#   provisioned (ansible roles/linux-node): binary at /opt/encode-agent
+#     (encode_agent_dir), runs as User=encode, uses the canonical repo unit
+#     infra/systemd/encode-agent.service (with -foreground flag + hardening).
+#
+# This script prefers a bundled unit if one ships with the release tarball;
+# otherwise it writes an inline unit. The canonical repo unit lives at
+# infra/systemd/encode-agent.service — do NOT change it from here.
+#
+# Bundled-unit lookup: the release tarball (install.sh) ships the unit at
+# systemd/encode-agent.service as a SIBLING of provision/ — matching the
+# engine's stageSystemdUnit resolution (PlaybookDir/../systemd/...). So the
+# primary lookup is $INSTALL_DIR/systemd/encode-agent.service. The older
+# infra/systemd/ path and a bare-neighbor check cover prior bundle layouts and
+# a git-checkout run where the script sits next to infra/.
 UNIT_FILE="/etc/systemd/system/encode-agent.service"
 BUNDLED_UNIT=""
 for candidate in \
+    "$INSTALL_DIR/systemd/encode-agent.service" \
     "$INSTALL_DIR/infra/systemd/encode-agent.service" \
     "$INSTALL_DIR/encode-agent.service" \
+    "./systemd/encode-agent.service" \
     "./infra/systemd/encode-agent.service"; do
     if [ -f "$candidate" ]; then BUNDLED_UNIT="$candidate"; break; fi
 done
@@ -226,6 +246,28 @@ ReadWritePaths=$INSTALL_DIR
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
+
+# --- HTTP-update opt-in (I2) -------------------------------------------------
+# The agent refuses self-update downloads (lib/bin/agent binaries) over plain
+# HTTP unless ENCODE_AGENT_ALLOW_HTTP_UPDATES=1 — a MITM on plaintext HTTP can
+# swap payload and checksum together (getAuth, agent.go:403-408). This farm's
+# controller is commonly http:// on a trusted LAN. When that is the case, emit
+# a systemd drop-in so the env reaches the agent regardless of whether the unit
+# was bundled or inline. Drop-ins compose with any unit source and are cleaner
+# than editing the shipped file.
+HTTP_DROPIN_DIR="/etc/systemd/system/encode-agent.service.d"
+if [ "${CONTROLLER_URL#http://}" != "$CONTROLLER_URL" ]; then
+    log "controller URL is http:// — enabling ENCODE_AGENT_ALLOW_HTTP_UPDATES (agent updates over plain HTTP); prefer HTTPS in production"
+    mkdir -p "$HTTP_DROPIN_DIR"
+    cat > "$HTTP_DROPIN_DIR/http-updates.conf" <<'DROPIN'
+[Service]
+Environment=ENCODE_AGENT_ALLOW_HTTP_UPDATES=1
+DROPIN
+else
+    # An HTTPS controller does not need the opt-in; remove a stale drop-in from
+    # a prior install that pointed at HTTP so it does not linger.
+    rm -f "$HTTP_DROPIN_DIR/http-updates.conf"
 fi
 
 # --- enable + start ----------------------------------------------------------

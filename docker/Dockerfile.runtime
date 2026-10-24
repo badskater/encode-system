@@ -9,12 +9,15 @@
 FROM debian:trixie-slim
 # Versions pinned to the combination validated end-to-end on the live fleet
 # (ansible.windows 3.x removed win_unzip; an unpinned rebuild could pull a
-# breaking release and silently break provisioning). Bump deliberately.
+# breaking release and silently break provisioning). ansible.posix is required
+# by roles/linux-node/tasks/main.yml (ansible.posix.mount, 4 instances). Both
+# collections are tested against ansible-core 2.21 (the version installed
+# below). Bump deliberately.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates tzdata wget python3 python3-pip && \
     pip3 install --break-system-packages --no-cache-dir \
         'ansible-core==2.21.3' 'pywinrm==0.5.0' && \
-    ansible-galaxy collection install ansible.windows:3.7.0 && \
+    ansible-galaxy collection install ansible.windows:3.7.0 ansible.posix:2.2.2 && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY controller /app/controller

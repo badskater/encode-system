@@ -17,8 +17,23 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM alpine:3.20
+# Provisioning capability: the GHCR image is the production controller for
+# installs that can reach ghcr.io (install.sh pulls it first, falling back to
+# building Dockerfile.runtime). The provision engine runs ansible-playbook
+# INSIDE this container (engine.go executeWindows/executeLinux), so the image
+# must carry ansible-core + both collections: ansible.windows for WinRM
+# provisioning (provision.yml) and ansible.posix for roles/linux-node's
+# ansible.posix.mount tasks. Alpine's apk ansible package is unmaintained and
+# far behind ansible-core 2.21, so install via pip (same proven pattern as
+# Dockerfile.runtime). Versions are pinned for the same fleet-stability reason
+# documented there — an unpinned rebuild could pull a breaking release.
 RUN addgroup -S encode && adduser -S encode -G encode \
     && apk add --no-cache ca-certificates nfs-utils wget \
+        python3 py3-pip \
+    && pip3 install --no-cache-dir \
+        'ansible-core==2.21.3' 'pywinrm==0.5.0' \
+    && ansible-galaxy collection install ansible.windows:3.7.0 ansible.posix:2.2.2 \
+    && rm -rf /root/.cache /tmp/* \
     && mkdir -p /data && chown encode:encode /data
 WORKDIR /app
 COPY --from=backend /out/controller /app/controller

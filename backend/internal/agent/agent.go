@@ -389,8 +389,19 @@ func (a *Agent) postJSON(ctx context.Context, path string, body, out any) error 
 }
 
 // getAuth performs a GET with the node token, streaming the body to w.
+//
+// Security (audit 2026-10): update payloads (lib/bin/agent binaries) flow
+// through here, and their manifest checksums arrive over the SAME channel —
+// a MITM on plaintext HTTP can swap binary and checksum together. Plain-HTTP
+// downloads are therefore refused unless the operator explicitly opts in
+// with ENCODE_AGENT_ALLOW_HTTP_UPDATES=1 (trusted-LAN fleets that accept
+// the risk; the startup warning already flags the HTTP controller URL).
 func (a *Agent) getAuth(ctx context.Context, path string, w io.Writer) error {
 	url := strings.TrimRight(a.Cfg.ControllerURL, "/") + path
+	if strings.HasPrefix(a.Cfg.ControllerURL, "http://") &&
+		os.Getenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES") != "1" {
+		return fmt.Errorf("refusing download %s over plain HTTP (MITM can swap payload+checksum); use an HTTPS controller URL or set ENCODE_AGENT_ALLOW_HTTP_UPDATES=1", path)
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
@@ -441,7 +452,10 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		expandS3Paths(job.S3, jobDir)
 	}
 	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
-	if err := os.WriteFile(scriptPath, scriptBytes, 0o644); err != nil {
+	// 0600: the rendered script embeds the Discord webhook (a bearer
+	// credential) and job paths — other local users must not read it
+	// (security audit 2026-10). Same for run.log below.
+	if err := os.WriteFile(scriptPath, scriptBytes, 0o600); err != nil {
 		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
@@ -577,7 +591,9 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 	}
 	observer.metrics = metrics // ENCODE_METRIC accumulator (vmaf, sizes…)
 	metrics.reset()
-	f, err := os.Create(runLog)
+	// 0600: run.log can echo the discord_notify webhook line — keep it
+	// owner-only like the job script (security audit 2026-10).
+	f, err := os.OpenFile(runLog, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err == nil {
 		defer f.Close()
 	}

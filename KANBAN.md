@@ -13,6 +13,118 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Linux node support, 2026-10-24)
+
+- Node platform field (`nodes.platform`, `"windows"|"linux"`, empty =
+  legacy/old-agent → treated as windows): reported by the agent via
+  heartbeat (`Platform: runtime.GOOS`, `internal/agent/agent.go`) and
+  persisted on the node row by the heartbeat handler
+  (`internal/api/handlers.go`). An empty field keeps the prior stored
+  value (rolling-upgrade invariant, same as `agent_log`).
+- Flow renderer Dialect abstraction (`internal/flow/dialect.go`):
+  `Dialect` interface (Quote/SafeIdent/Comment/Preamble/JobContext/
+  StepCall/FuncName/StepBody/ParamsLiteral/JobDone). `RenderDialect`
+  selects the dialect; `Render` delegates to it with
+  `PowerShellDialect` so PS output is byte-identical to the
+  pre-refactor renderer (dialect methods reproduce the exact lines;
+  source-commented byte-identical). `DialectForPlatform(node.Platform)`
+  maps `"linux"` → `BashDialect`, else → `PowerShellDialect`.
+- `BashDialect` (`internal/flow/dialect_bash.go`): shebang +
+  `set -euo pipefail`, POSIX single-quote escaping (the injection
+  guard, parity with PS `psQuote`), newline-flattened comments, same
+  `ENCODE_STEP`/`ENCODE_STEP_FAILED`/`ENCODE_JOB_DONE` marker text so
+  the agent's stdout parser is dialect-agnostic. Emits the shared
+  `find_source_file` helper into every bash render (mirrors PS
+  dot-sourcing `EncodeLib.ps1`). Refuses PS-only user templates
+  (cmdlet/hashtable/pscustomobject detection) with a clear render
+  error.
+- Claim-time dialect dispatch: `renderJob` (`handlers.go`) renders the
+  job script in the dialect matching the claiming node's platform, so a
+  mixed Windows/Linux farm sends `.ps1` to Windows nodes and `.sh` to
+  Linux nodes.
+- Linux tool mappings (`internal/flow/builtin_steps_linux.go`): 14 of
+  16 built-in templates ported to bash-native sources
+  (`builtinBashSources`): `source_rename`, `media_probe`,
+  `hdr_probe`, `audio`, `audio_branch`, `audio_lang`, `flac_audio`,
+  `encode`, `encode_4k`, `mux`, `verify_output`, `crc32_rename`,
+  `release_copy`, `discord_notify`. 2 refused
+  (`builtinBashRefused`): `dgindex` (DGIndexNV is Windows/Nvidia-GPU
+  only; Linux uses VapourSynth source filters, no `.dgi` index) and
+  `keyframes` (no faithful SCXvid Linux equivalent yet — the previous
+  bash body was a fake every-240th-frame stub; shipping a fake is worse
+  than refusing). Tool mappings: `vspipe | x265` (y4m pipe, args
+  mirrored verbatim from the PS template — ffmpeg never video-encodes),
+  `ffmpeg` decode-only → `opusenc`/`flac` for audio, `mkvmerge`/`mediainfo`/`jq`
+  verify (bc required — `verify_output` fail-fasts if `bc` is absent),
+  `cksum` CRC32, `sha256sum` hashing, `curl` notify.
+- Bash execution on Linux (`internal/agent/agent.go`): writes
+  `job.sh` (mode 0700, no BOM) and runs it via `bash`; the shared
+  `runJobCommand` core tees output to `run.log` and parses the same
+  `ENCODE_STEP` markers — no per-dialect parser. `EncodeLib.ps1` is
+  not required on Linux (bash scripts are self-contained). Bare
+  foreground loop for dev (`cmd/agent/service_other.go`).
+- Linux self-update via `swap-update.sh` sidecar
+  (`internal/agent/agent.go` `launchPosixSwap`/`linuxSwapScript`):
+  setsid-detached bash process that retries the `mv` (15 attempts),
+  logs failures to `swap-update.log` in the data dir, then either lets
+  systemd's `Restart=always` bring the new binary back (detected via
+  the `INVOCATION_ID` env var systemd sets + `systemctl is-active
+  encode-agent` belt-and-suspenders check) or relaunches the new
+  binary directly via `setsid` for bare foreground deployments.
+  `os.Executable()`-based and channel-agnostic; new binary staged as
+  `<self>.new`.
+- SSH/ansible Linux provisioning (`infra/ansible/linux-node.yml` +
+  `roles/linux-node`): controller invokes the playbook over SSH with a
+  generated inventory + 0600 JSON vars file (SSH creds, CIFS share
+  passwords, one-shot pairing code — never on a command line; all tasks
+  `no_log: true`). Installs the agent, writes `agent.json` to
+  `/etc/encode-agent/` (0640), deploys the systemd unit from
+  `infra/systemd/encode-agent.service` (single source of truth,
+  `After=` automount units + `ReadWritePaths=`/`NoNewPrivileges=`/
+  `PrivateTmp=` hardening), and mounts CIFS shares (`mount -t cifs`
+  with per-share 0600 credential files `/etc/encode-agent/cifs-*.cred`
+  + `x-systemd.automount` fstab opts) and NFS shares. Packages:
+  `cifs-utils` + `nfs-common` (Debian) / `nfs-utils` (RHEL).
+- Release artifacts (`release.yml`): `encode-agent-linux-amd64`
+  (`GOOS=linux GOARCH=amd64`, `-trimpath`, version ldflags) in
+  `SHA256SUMS` + the deploy tarball + provenance. The bundle ships
+  `provision/` (provision.yml + linux-node.yml + roles/linux-node) and
+  `systemd/` (encode-agent.service) trees; both `Dockerfile` and
+  `Dockerfile.runtime` COPY them into the GHCR image (context = repo
+  root). `ENCODE_PROVISION_DIR` (controller, default `/app/provision`)
+  sets the engine's `PlaybookDir`.
+- `docker/install-agent.sh` standalone Linux installer: downloads
+  `encode-agent-linux-amd64` from a GitHub release, verifies SHA-256
+  against `SHA256SUMS`, installs to `/opt/encode-system`, writes
+  `/etc/encode-agent/agent.json` (0600, pairing code or token), and
+  registers `encode-agent.service` (prefers the bundled unit from
+  `infra/systemd/` else writes an inline unit). Env overrides:
+  `CONTROLLER_URL`/`PAIRING_CODE`/`TOKEN`/`NODE_NAME`/`VERSION`/`REPO`/
+  `INSTALL_DIR`/`CONFIG_DIR`/`GITHUB_TOKEN`.
+- Two install channels (documented divergence): standalone
+  `install-agent.sh` → `/opt/encode-system`, runs as root; controller-
+  provisioned (ansible) → `/opt/encode-agent`, `User=encode` hardened
+  unit. Unit name `encode-agent.service` in both. `swap-update.sh`
+  works in both (`os.Executable()` resolves the running binary).
+- Integration fixes: both controller Dockerfiles pin
+  `ansible.posix:2.2.2` + `ansible.windows:3.7.0` (required by
+  `roles/linux-node`'s `ansible.posix.mount` tasks and Windows
+  `provision.yml` respectively). `ENCODE_AGENT_ALLOW_HTTP_UPDATES=1`
+  agent env opt-in for self-updates over `http://` controllers (agent
+  refuses plain-HTTP update downloads by default; MITM can swap
+  payload+checksum together).
+- Verification: full `go test ./...` green (incl. bash-rendered-script
+  exec tests under `/bin/bash` with stubbed tools;
+  `ENCODE_STEP` marker parity tests across dialects;
+  `DialectForPlatform` dispatch tests). Frontend vitest suite green.
+  CI cross-builds: controller (linux/amd64) + `encode-agent.exe`
+  (windows/amd64); release workflow builds all three (adds
+  `encode-agent-linux-amd64`). PS byte-identity proven structurally:
+  `Render` delegates to `RenderDialect(..., PowerShellDialect{})`;
+  dialect methods reproduce the pre-refactor renderer's exact lines
+  (source-commented byte-identical). Exec-tested rendered bash flows
+  cover all 14 ported templates.
+
 ## Done (web UI redesign + dependency security, 2026-10-23)
 
 - Full visual redesign of the management SPA (PR #6): dark ops-console design

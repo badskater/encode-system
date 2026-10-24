@@ -286,7 +286,17 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 	//    needed), then the bin folder, then the agent binary (restart via the
 	//    swap-bat trick). Re-issued every idle heartbeat until the node
 	//    reports matching versions.
-	m := s.Update.Manifest()
+	//
+	// The manifest is platform-scoped BEFORE the comparison: a Linux node
+	// compares against its LINUX agent version (projected into
+	// AgentVersion/AgentSHA256) and has Lib*/Bin* zeroed (those are
+	// Windows-only artifacts). Without this, a Linux node would compare
+	// against the Windows agent version — missing a real Linux update or
+	// falsely triggering one when only the Windows version differs — and,
+	// when triggered, would receive the Windows sha, checksumming its Linux
+	// ELF against it and refusing the update forever. Windows (or legacy
+	// empty-platform) nodes are a no-op pass-through.
+	m := scopeManifestForNode(s.Update.Manifest(), node)
 	needsAgent := m.AgentVersion != "" && m.AgentVersion != node.AgentVersion
 	needsLib := m.LibVersion > 0 && m.LibVersion != node.LibVersion
 	needsBin := m.BinVersion > 0 && m.BinVersion != node.BinVersion
@@ -703,26 +713,43 @@ func (s *Server) discordWebhook(ctx context.Context) string {
 // (Windows fields + real lib/bin). This keeps the agent-side comparison
 // logic identical across platforms — only the server scopes the view.
 func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request, node *model.Node) {
-	m := s.Update.Manifest()
-	if node.Platform == model.PlatformLinux {
-		// Scope to the Linux slot: project the linux_* fields into the
-		// agent_version/agent_sha256 the agent reads, and zero the
-		// Windows-only lib/bin fields so the Linux agent skips them.
-		m.AgentVersion = m.LinuxAgentVersion
-		m.AgentSHA256 = m.LinuxAgentSHA256
-		m.PrevAgentVersion = m.PrevLinuxAgentVersion
-		m.PrevAgentSHA256 = m.PrevLinuxAgentSHA256
-		m.LinuxAgentVersion = ""
-		m.LinuxAgentSHA256 = ""
-		m.PrevLinuxAgentVersion = ""
-		m.PrevLinuxAgentSHA256 = ""
-		m.LibVersion = 0
-		m.LibSHA256 = ""
-		m.BinVersion = 0
-		m.BinSHA256 = ""
-		m.BinSize = 0
+	writeJSON(w, http.StatusOK, scopeManifestForNode(s.Update.Manifest(), node))
+}
+
+// scopeManifestForNode projects the per-platform manifest into the single
+// agent_version/agent_sha256 slot the agent reads, keyed off the node's
+// platform. For a Linux node: the linux_* fields are moved into
+// AgentVersion/AgentSHA256 (+ the Prev* pair), the linux_* fields are then
+// zeroed so the scoped manifest looks single-platform to the agent, and the
+// Windows-only lib/bin fields are zeroed so a Linux node never tries to sync
+// EncodeLib.ps1 or the C:\bin zip. For a Windows or legacy empty-platform
+// node the manifest is returned unchanged — the historical wire format. The
+// shared helper is used by both handleManifest (the GET endpoint) and the
+// heartbeat update-trigger path so the two cannot diverge in what they serve
+// to the same Linux node. Manifest() returns a value copy of a pure-value
+// struct, so mutating the local copy here is race-free.
+func scopeManifestForNode(m model.UpdateManifest, node *model.Node) model.UpdateManifest {
+	if node.Platform != model.PlatformLinux {
+		return m // Windows / legacy: pass-through, byte-identical.
 	}
-	writeJSON(w, http.StatusOK, m)
+	m.AgentVersion = m.LinuxAgentVersion
+	m.AgentSHA256 = m.LinuxAgentSHA256
+	m.PrevAgentVersion = m.PrevLinuxAgentVersion
+	m.PrevAgentSHA256 = m.PrevLinuxAgentSHA256
+	// zero linux_* so the scoped manifest looks single-platform to the
+	// agent (it reads agent_version/agent_sha256 only — leaving linux_*
+	// populated would leak the linux slot in the JSON the agent does not
+	// read, but zeroing keeps the wire shape clean and unambiguous).
+	m.LinuxAgentVersion = ""
+	m.LinuxAgentSHA256 = ""
+	m.PrevLinuxAgentVersion = ""
+	m.PrevLinuxAgentSHA256 = ""
+	m.LibVersion = 0
+	m.LibSHA256 = ""
+	m.BinVersion = 0
+	m.BinSHA256 = ""
+	m.BinSize = 0
+	return m
 }
 
 // handleDownloadAgent streams the stored agent binary for the caller's

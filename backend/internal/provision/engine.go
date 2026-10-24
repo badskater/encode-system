@@ -28,17 +28,17 @@ import (
 
 // Request is one provisioning attempt (validated before execution).
 type Request struct {
-	Host          string
-	Port          int
-	Scheme        string // http | https
+	Host   string
+	Port   int
+	Scheme string // http | https
 	// CertValidation: "validate" | "ignore" for https WinRM server certs.
 	// Default https → "ignore" would silently trust MITM'd listeners, so the
 	// engine defaults https to "validate"; operators with self-signed node
 	// certs opt into "ignore" explicitly (UI checkbox / API field).
-	CertValidation  string
-	WinRMUser       string
-	WinRMPassword   string
-	NodeName        string
+	CertValidation string
+	WinRMUser      string
+	WinRMPassword  string
+	NodeName       string
 	// Options.
 	InstallToolchain bool // MediaInfo, AviSynth+, Python, VapourSynth
 	MountNFS         bool // legacy: NFS client + mounts from Settings (kept for API compat)

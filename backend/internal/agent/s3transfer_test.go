@@ -162,9 +162,9 @@ func TestS3DownloadRejectsTraversalKeys(t *testing.T) {
 	// Prefix handling: keys are listed with the bucket-relative prefix; the
 	// fake lists by prefix match, so seed under the real prefix shape.
 	f.objects = map[string][]byte{
-		"scripts/Ep 02/../../evil.dll":   []byte("mz"),
-		"scripts/Ep 02/ok.mkv":           []byte("video"),
-		"scripts/Ep 02/..\\..\\win.dll":  []byte("mz"),
+		"scripts/Ep 02/../../evil.dll":  []byte("mz"),
+		"scripts/Ep 02/ok.mkv":          []byte("video"),
+		"scripts/Ep 02/..\\..\\win.dll": []byte("mz"),
 	}
 
 	err := runS3Downloads(context.Background(), f, tr)

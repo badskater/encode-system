@@ -13,9 +13,9 @@ import (
 // provisionRequest is the UI form payload. The WinRM password is used for
 // this single run and never persisted.
 type provisionRequest struct {
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	Scheme           string `json:"scheme"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+	Scheme string `json:"scheme"`
 	// CertValidation controls pywinrm's server-cert check for https WinRM:
 	// "validate" (default for https) or "ignore" (self-signed homelab certs —
 	// the operator's explicit opt-in, surfaced as a UI checkbox). Ignored
@@ -30,7 +30,7 @@ type provisionRequest struct {
 	PushBin          bool   `json:"push_bin"`
 	// WinRMHTTPS bootstraps an HTTPS listener (5986) on the node during
 	// this run so future management can drop plaintext WinRM.
-	WinRMHTTPS       bool   `json:"winrm_https"`
+	WinRMHTTPS          bool   `json:"winrm_https"`
 	WinRMCertThumbprint string `json:"winrm_cert_thumbprint"` // optional CA cert reuse
 }
 
@@ -48,7 +48,7 @@ func (s *Server) handleStartProvision(w http.ResponseWriter, r *http.Request) {
 	run, err := s.Provision.Start(r.Context(), provision.Request{
 		Host: req.Host, Port: req.Port, Scheme: req.Scheme,
 		CertValidation: req.CertValidation,
-		WinRMUser: req.WinRMUser, WinRMPassword: req.WinRMPassword,
+		WinRMUser:      req.WinRMUser, WinRMPassword: req.WinRMPassword,
 		NodeName: req.NodeName, InstallToolchain: req.InstallToolchain,
 		MountNFS: req.MountNFS, MountShares: req.MountShares, PushBin: req.PushBin,
 		WinRMHTTPS: req.WinRMHTTPS, WinRMCertThumbprint: req.WinRMCertThumbprint,

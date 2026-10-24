@@ -155,15 +155,15 @@ func TestPublishBinFromURLSSRFBlockedByDefault(t *testing.T) {
 // opt-in, and what passes.
 func TestCheckBinFetchIPClassification(t *testing.T) {
 	cases := []struct {
-		ip       string
-		allow    bool // permitted with ENCODE_BIN_FETCH_PRIVATE=1
+		ip        string
+		allow     bool // permitted with ENCODE_BIN_FETCH_PRIVATE=1
 		defaultOK bool // permitted with no env
 	}{
-		{"127.0.0.1", true, false},   // loopback: opt-in only
-		{"::1", true, false},         // IPv6 loopback: opt-in only
-		{"10.0.0.5", true, false},    // RFC1918: opt-in only
-		{"192.168.1.1", true, false}, // RFC1918: opt-in only
-		{"172.16.0.1", true, false},  // RFC1918: opt-in only
+		{"127.0.0.1", true, false},        // loopback: opt-in only
+		{"::1", true, false},              // IPv6 loopback: opt-in only
+		{"10.0.0.5", true, false},         // RFC1918: opt-in only
+		{"192.168.1.1", true, false},      // RFC1918: opt-in only
+		{"172.16.0.1", true, false},       // RFC1918: opt-in only
 		{"169.254.169.254", false, false}, // cloud metadata: ALWAYS refused
 		{"169.254.1.1", false, false},     // link-local: ALWAYS refused
 		{"224.0.0.1", false, false},       // multicast: ALWAYS refused

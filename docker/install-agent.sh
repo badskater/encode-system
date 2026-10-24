@@ -39,18 +39,34 @@ NODE_NAME="${NODE_NAME:-$(hostname 2>/dev/null || echo linux-node)}"
 log() { printf '[install] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
+# I1: escape backslash and double-quote for safe interpolation into a JSON
+# string value. Operator-supplied values (pairing code, token, node name,
+# controller URL) could contain these characters; without escaping a single
+# `"` or `\` would break the generated agent.json and the agent would fail to
+# start. Backslash+quote escaping is sufficient for the JSON string grammar;
+# control characters are not expected in these fields.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
 # --- parse args (flags mirror install-agent.ps1 short names) -----------------
 CONTROLLER_URL="${CONTROLLER_URL:-}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 TOKEN="${TOKEN:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        -c|--controller-url) CONTROLLER_URL="${2:-}"; shift 2 ;;
-        -p|--pairing-code)   PAIRING_CODE="${2:-}"; shift 2 ;;
-        -t|--token)          TOKEN="${2:-}"; shift 2 ;;
-        -n|--node-name)     NODE_NAME="${2:-}"; shift 2 ;;
-        -V|--version)       VERSION="${2:-}"; shift 2 ;;
-        -r|--repo)          REPO="${2:-}"; shift 2 ;;
+        # I2: every value-taking flag checks a value follows before consuming,
+        # so e.g. `install-agent.sh -c` (no URL) fails loudly instead of
+        # silently proceeding with an empty string.
+        -c|--controller-url) [ $# -ge 2 ] || die "-c requires a value"; CONTROLLER_URL="$2"; shift 2 ;;
+        -p|--pairing-code)   [ $# -ge 2 ] || die "-p requires a value"; PAIRING_CODE="$2"; shift 2 ;;
+        -t|--token)          [ $# -ge 2 ] || die "-t requires a value"; TOKEN="$2"; shift 2 ;;
+        -n|--node-name)      [ $# -ge 2 ] || die "-n requires a value"; NODE_NAME="$2"; shift 2 ;;
+        -V|--version)        [ $# -ge 2 ] || die "-V requires a value"; VERSION="$2"; shift 2 ;;
+        -r|--repo)           [ $# -ge 2 ] || die "-r requires a value"; REPO="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,30p' "$0" 2>/dev/null || true
             exit 0 ;;
@@ -77,7 +93,7 @@ CONTROLLER_URL="${CONTROLLER_URL%/}"
 gh_curl() {
     local url="$1" out="${2:-}"
     local args=(-fsSL)
-    [ -n "${GITHUB_TOKEN:-}" ] && args+=(-H "Authorization: Bearer ***")
+    [ -n "${GITHUB_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
     if [ -n "$out" ]; then curl "${args[@]}" -o "$out" "$url"
     else curl "${args[@]}" "$url"; fi
 }
@@ -129,7 +145,11 @@ if systemctl is-active --quiet encode-agent 2>/dev/null; then
 fi
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
-install -m 0755 "$TMP/agent.new" "$INSTALL_DIR/encode-agent"
+# I4: install to a temp path then mv -f into place (atomic rename), so a crash
+# mid-install never leaves a truncated binary on disk. Matches the agent.json
+# temp+mv pattern below. The service is already stopped above (verified order).
+install -m 0755 "$TMP/agent.new" "$INSTALL_DIR/encode-agent.new"
+mv -f "$INSTALL_DIR/encode-agent.new" "$INSTALL_DIR/encode-agent"
 log "agent binary installed: $INSTALL_DIR/encode-agent"
 
 # --- agent.json --------------------------------------------------------------
@@ -142,18 +162,18 @@ log "agent binary installed: $INSTALL_DIR/encode-agent"
 CFG="$CONFIG_DIR/agent.json"
 CRED_LINE=""
 if [ -n "$PAIRING_CODE" ]; then
-    CRED_LINE="\"pairing_code\": \"$PAIRING_CODE\","
+    CRED_LINE="\"pairing_code\": \"$(json_escape "$PAIRING_CODE")\","
 elif [ -n "$TOKEN" ]; then
-    CRED_LINE="\"token\": \"$TOKEN\","
+    CRED_LINE="\"token\": \"$(json_escape "$TOKEN")\","
 fi
 # Build the JSON with the credential line inline. printf to the temp file so
 # the secret never crosses argv or an external interpreter's stdin.
 {
     printf '{\n'
-    printf '  "controller_url": "%s",\n' "$CONTROLLER_URL"
-    printf '  "node_name": "%s",\n' "$NODE_NAME"
+    printf '  "controller_url": "%s",\n' "$(json_escape "$CONTROLLER_URL")"
+    printf '  "node_name": "%s",\n' "$(json_escape "$NODE_NAME")"
     [ -n "$CRED_LINE" ] && printf '  %s\n' "$CRED_LINE"
-    printf '  "data_dir": "%s",\n' "$INSTALL_DIR"
+    printf '  "data_dir": "%s",\n' "$(json_escape "$INSTALL_DIR")"
     printf '  "heartbeat_seconds": 5\n'
     printf '}\n'
 } > "$CFG.tmp"
@@ -181,7 +201,10 @@ if [ -n "$BUNDLED_UNIT" ]; then
     install -m 0644 "$BUNDLED_UNIT" "$UNIT_FILE"
 else
     log "no bundled unit found — writing inline systemd unit"
-    cat > "$UNIT_FILE" <<'UNIT'
+    # I3: unquoted heredoc delimiter so $INSTALL_DIR/$CONFIG_DIR expand into
+    # the unit. The unit has no shell expansions of its own (verified: no $ in
+    # the body below), so this is safe.
+    cat > "$UNIT_FILE" <<UNIT
 [Unit]
 Description=encode-system agent
 After=network-online.target
@@ -189,7 +212,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/encode-system/encode-agent -config /etc/encode-agent/agent.json
+ExecStart=$INSTALL_DIR/encode-agent -config $CONFIG_DIR/agent.json
 Restart=always
 RestartSec=5
 # Hardening: the agent needs network + its data dir, little else.
@@ -197,8 +220,8 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-WorkingDirectory=/opt/encode-system
-ReadWritePaths=/opt/encode-system
+WorkingDirectory=$INSTALL_DIR
+ReadWritePaths=$INSTALL_DIR
 
 [Install]
 WantedBy=multi-user.target

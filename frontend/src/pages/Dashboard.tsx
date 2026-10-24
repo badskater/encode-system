@@ -40,7 +40,7 @@ export default function Dashboard() {
       <div className="stat-strip">
         <Stat label="Busy" value={busy.length} tone="blue" />
         <Stat label="Idle" value={idle.length} tone="green" />
-        <Stat label="Online" value={`${online.length}/${nodes?.length ?? 0}`} tone="amber" />
+        <Stat label="Online" value={`${online.length}/${nodes?.length ?? 0}`} tone="accent" />
         <Stat
           label="Avg encode fps"
           value={avgFps !== null ? avgFps.toFixed(1) : '—'}
@@ -145,7 +145,7 @@ export default function Dashboard() {
 }
 
 // Stat is one cell in the fleet summary strip (.stat-strip grid). `tone`
-// colors the value (blue=busy, green=idle, amber=online) so the strip
+// colors the value (blue=busy, green=idle, accent=online) so the strip
 // reads at a glance; default tone is neutral text.
 function Stat({
   label,
@@ -155,7 +155,7 @@ function Stat({
 }: {
   label: string;
   value: string | number;
-  tone?: 'blue' | 'green' | 'amber';
+  tone?: 'blue' | 'green' | 'accent';
   title?: string;
 }) {
   const toneCls = tone ? ` ${tone}` : '';

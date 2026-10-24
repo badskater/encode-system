@@ -5,7 +5,7 @@
 
    Palette: near-black canvas with luminance-step surfaces
    (canvas → panel → elevated), whisper-thin translucent white
-   borders, single amber accent (forge/GPU theme), semantic
+   borders, single violet accent, semantic
    status colors. Type: Inter (UI) + JetBrains Mono (all
    numerics — metrics, timestamps, ids, versions).
    ============================================================ */
@@ -30,11 +30,11 @@
   --muted: #8a8f98;
   --dim: #62666d;
 
-  /* Accent — amber, used only for interactive/active state */
-  --accent: #f0a92e;
-  --accent-hi: #ffbf4d;
-  --accent-ink: #171102; /* text on amber fills */
-  --accent-soft: rgba(240, 169, 46, 0.12);
+  /* Accent — violet, used only for interactive/active state */
+  --accent: #9d6bff;
+  --accent-hi: #b98dff;
+  --accent-ink: #120a24; /* text on accent fills */
+  --accent-soft: rgba(157, 107, 255, 0.13);
 
   /* Status */
   --green: #3dd68c;
@@ -65,7 +65,7 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-::selection { background: rgba(240, 169, 46, 0.3); }
+::selection { background: rgba(157, 107, 255, 0.35); }
 
 /* Scrollbars — thin, dark, unobtrusive */
 * { scrollbar-width: thin; scrollbar-color: #2c2d30 transparent; }
@@ -95,7 +95,7 @@ body {
   height: 100vh;
 }
 
-/* Brand: amber logomark + tight-tracked wordmark */
+/* Brand: violet logomark + tight-tracked wordmark */
 .sidebar-brand { display: flex; align-items: center; gap: 9px; padding: 0 10px 16px; }
 
 /* Nav groups: each group is a vertical flex column so buttons stack
@@ -105,14 +105,14 @@ body {
   width: 22px;
   height: 22px;
   border-radius: 6px;
-  background: linear-gradient(160deg, var(--accent-hi), #c77f14);
+  background: linear-gradient(160deg, var(--accent-hi), #6d3fd4);
   display: grid;
   place-items: center;
   color: var(--accent-ink);
   font-weight: 700;
   font-size: 12px;
   letter-spacing: -0.5px;
-  box-shadow: 0 0 12px rgba(240, 169, 46, 0.25);
+  box-shadow: 0 0 12px rgba(157, 107, 255, 0.3);
 }
 .sidebar-brand .name {
   font-size: 13.5px;
@@ -337,7 +337,7 @@ td { color: var(--text-2); }
 }
 .stat .stat-value.blue { color: var(--blue); }
 .stat .stat-value.green { color: var(--green); }
-.stat .stat-value.amber { color: var(--accent); }
+.stat .stat-value.accent { color: var(--accent); }
 .stat .stat-value.red { color: var(--red); }
 
 /* ---------- Buttons ---------- */
@@ -367,7 +367,7 @@ td { color: var(--text-2); }
   border-color: var(--accent);
   color: var(--accent-ink);
   font-weight: 600;
-  box-shadow: 0 0 14px rgba(240, 169, 46, 0.18);
+  box-shadow: 0 0 14px rgba(157, 107, 255, 0.22);
 }
 .btn.primary:hover {
   background: var(--accent-hi);
@@ -403,7 +403,7 @@ input:hover, select:hover, textarea:hover { border-color: rgba(255, 255, 255, 0.
 input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(240, 169, 46, 0.15);
+  box-shadow: 0 0 0 3px rgba(157, 107, 255, 0.18);
 }
 select option { background: var(--elevated); color: var(--text); }
 label { color: var(--text-2); font-size: 12.5px; font-weight: 500; }
@@ -418,7 +418,7 @@ label { color: var(--text-2); font-size: 12.5px; font-weight: 500; }
   overflow: hidden;
 }
 .progress-fill {
-  background: linear-gradient(90deg, #d18d1c, var(--accent-hi));
+  background: linear-gradient(90deg, #7c4fe0, var(--accent-hi));
   height: 100%;
   border-radius: 999px;
   transition: width 0.4s ease;
@@ -472,7 +472,7 @@ pre {
   overflow: hidden;
 }
 .step-bar-fill {
-  background: linear-gradient(90deg, #d18d1c, var(--accent-hi));
+  background: linear-gradient(90deg, #7c4fe0, var(--accent-hi));
   height: 100%;
   border-radius: 999px;
 }
@@ -588,7 +588,7 @@ pre {
 }
 .palette-step:hover {
   border-color: var(--accent);
-  background: rgba(240, 169, 46, 0.04);
+  background: rgba(157, 107, 255, 0.05);
 }
 .palette-step .desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
 
@@ -661,13 +661,13 @@ pre {
   width: 34px;
   height: 34px;
   border-radius: 9px;
-  background: linear-gradient(160deg, var(--accent-hi), #c77f14);
+  background: linear-gradient(160deg, var(--accent-hi), #6d3fd4);
   display: grid;
   place-items: center;
   color: var(--accent-ink);
   font-weight: 700;
   font-size: 16px;
-  box-shadow: 0 0 20px rgba(240, 169, 46, 0.3);
+  box-shadow: 0 0 20px rgba(157, 107, 255, 0.35);
 }
 .login-card .brand h1 {
   margin: 0;

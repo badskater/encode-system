@@ -244,7 +244,7 @@ function Stat({
 }: {
   label: string;
   value: string | number;
-  tone?: 'blue' | 'green' | 'amber' | 'red';
+  tone?: 'blue' | 'green' | 'accent' | 'red';
   title?: string;
 }) {
   const toneCls = tone ? ` ${tone}` : '';

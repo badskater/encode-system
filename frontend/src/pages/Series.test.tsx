@@ -152,7 +152,7 @@ describe('Series page notify mute toggle', () => {
     vi.restoreAllMocks();
   });
 
-  it('renders a muted 🔕 button for a series with notify=false', async () => {
+  it('renders a Muted button for a series with notify=false', async () => {
     vi.spyOn(api, 'series').mockResolvedValue([
       seriesFixture({ notify: false }),
     ]);
@@ -164,10 +164,10 @@ describe('Series page notify mute toggle', () => {
     // Muted series shows the muted icon button.
     const muteBtn = screen.getByRole('button', { name: /unmute/i });
     expect(muteBtn).toBeInTheDocument();
-    expect(muteBtn.textContent).toContain('🔕');
+    expect(muteBtn.textContent).toContain('Muted');
   });
 
-  it('renders an active 🔔 button for a series with notify=true (or absent)', async () => {
+  it('renders an active Alerts button for a series with notify=true (or absent)', async () => {
     vi.spyOn(api, 'series').mockResolvedValue([
       seriesFixture({ notify: true }),
     ]);
@@ -178,7 +178,7 @@ describe('Series page notify mute toggle', () => {
 
     const muteBtn = screen.getByRole('button', { name: /mute/i });
     expect(muteBtn).toBeInTheDocument();
-    expect(muteBtn.textContent).toContain('🔔');
+    expect(muteBtn.textContent).toContain('Alerts');
   });
 
   it('PATCHes notify:false when muting an unmuted series', async () => {
@@ -239,7 +239,7 @@ describe('Series page pause toggle', () => {
     vi.restoreAllMocks();
   });
 
-  it('renders a ▶️ resume button for a paused series', async () => {
+  it('renders a Resume button for a paused series', async () => {
     vi.spyOn(api, 'series').mockResolvedValue([
       seriesFixture({ paused: true }),
     ]);
@@ -250,10 +250,10 @@ describe('Series page pause toggle', () => {
 
     const pauseBtn = screen.getByRole('button', { name: /resume/i });
     expect(pauseBtn).toBeInTheDocument();
-    expect(pauseBtn.textContent).toContain('▶️');
+    expect(pauseBtn.textContent).toContain('Resume');
   });
 
-  it('renders a ⏸️ pause button for an unpaused series', async () => {
+  it('renders a Pause button for an unpaused series', async () => {
     vi.spyOn(api, 'series').mockResolvedValue([
       seriesFixture({ paused: false }),
     ]);
@@ -264,7 +264,7 @@ describe('Series page pause toggle', () => {
 
     const pauseBtn = screen.getByRole('button', { name: /^pause/i });
     expect(pauseBtn).toBeInTheDocument();
-    expect(pauseBtn.textContent).toContain('⏸️');
+    expect(pauseBtn.textContent).toContain('Pause');
   });
 
   it('PATCHes paused:true when pausing', async () => {

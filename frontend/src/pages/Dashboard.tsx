@@ -37,10 +37,10 @@ export default function Dashboard() {
       {/* Fleet summary strip: busy/idle/online counts + fleet avg encode
           fps and avg GPU util (computed only from nodes reporting
           last_metrics; GPU util further excludes no-GPU hosts). */}
-      <div className="card" style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+      <div className="stat-strip">
         <Stat label="Busy" value={busy.length} tone="blue" />
         <Stat label="Idle" value={idle.length} tone="green" />
-        <Stat label="Online" value={`${online.length}/${nodes?.length ?? 0}`} />
+        <Stat label="Online" value={`${online.length}/${nodes?.length ?? 0}`} tone="amber" />
         <Stat
           label="Avg encode fps"
           value={avgFps !== null ? avgFps.toFixed(1) : '—'}
@@ -51,10 +51,12 @@ export default function Dashboard() {
           value={avgGpu !== null ? `${Math.round(avgGpu)}%` : '—'}
           title="Average GPU utilization across GPU-equipped nodes reporting metrics"
         />
-        {withMetrics.length === 0 && (
-          <span className="muted" style={{ fontSize: 12 }}>no metrics yet</span>
-        )}
       </div>
+      {withMetrics.length === 0 && (
+        <span className="muted" style={{ fontSize: 12, display: 'block', marginTop: -8, marginBottom: 12 }}>
+          no metrics yet
+        </span>
+      )}
 
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Farm</h3>
@@ -85,7 +87,7 @@ export default function Dashboard() {
                 <td>{nodeBadge(n.status, !!n.online)}</td>
                 <td>
                   {n.tasks_since_boot}
-                  {settings && n.tasks_since_boot >= settings.tasks_before_reboot ? ' ⚠ reboot' : ''}
+                  {settings && n.tasks_since_boot >= settings.tasks_before_reboot ? ' · reboot' : ''}
                 </td>
                 <td className="muted">{n.agent_version || '—'}</td>
                 <td className="muted">{timeAgo(n.last_seen)}</td>
@@ -142,9 +144,9 @@ export default function Dashboard() {
   );
 }
 
-// Stat is a single label/value card in the fleet summary strip. `tone`
-// optional color mirrors the badge palette (blue=busy, green=idle) so the
-// strip reads at a glance without a new stylesheet.
+// Stat is one cell in the fleet summary strip (.stat-strip grid). `tone`
+// colors the value (blue=busy, green=idle, amber=online) so the strip
+// reads at a glance; default tone is neutral text.
 function Stat({
   label,
   value,
@@ -153,16 +155,14 @@ function Stat({
 }: {
   label: string;
   value: string | number;
-  tone?: 'blue' | 'green' | 'gray';
+  tone?: 'blue' | 'green' | 'amber';
   title?: string;
 }) {
-  const toneCls = tone ?? 'gray';
+  const toneCls = tone ? ` ${tone}` : '';
   return (
-    <div title={title} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <span className="muted" style={{ fontSize: 11, textTransform: 'uppercase' }}>{label}</span>
-      <span className={`badge ${toneCls}`} style={{ fontSize: 16, alignSelf: 'flex-start' }}>
-        {value}
-      </span>
+    <div className="stat" title={title}>
+      <span className="stat-label">{label}</span>
+      <span className={`stat-value${toneCls}`}>{value}</span>
     </div>
   );
 }

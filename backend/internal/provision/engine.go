@@ -450,6 +450,17 @@ func (e *Engine) executeLinux(ctx, bg context.Context, id int64, req Request) er
 		return err
 	}
 
+	// 1b. Stage the canonical systemd unit from the repo so the role deploys
+	// the SAME file infra/systemd/encode-agent.service defines (single source
+	// of truth: no inline unit in the role that can drift). The unit carries
+	// After= ordering on automount units (mnt-*.automount); systemd ignores
+	// After= on units that don't exist, so the static file is safe on
+	// shareless nodes too. The role copies it from
+	// {{ playbook_dir }}/files/encode-agent.service.
+	if err := e.stageSystemdUnit(dir); err != nil {
+		return err
+	}
+
 	// 2. Pairing code (single-use bootstrap, plaintext only in vars.json).
 	code, err := e.IssuePairing(req.NodeName)
 	if err != nil {
@@ -506,10 +517,25 @@ func (e *Engine) executeLinux(ctx, bg context.Context, id int64, req Request) er
 	// Redact every secret that could reach the log: the SSH password, the
 	// pairing code, and each CIFS share password (the playbook prints mount
 	// commands whose creds file path is fine, but a stray `mount` could
-	// echo a password; scrub all of them).
-	redact := []string{req.SSHPassword, code}
+	// echo a password; scrub all of them). Empty strings are filtered: a
+	// blank entry would match-and-replace nothing but clutters the list, and
+	// strings.ReplaceAll("", ...) is a no-op that still iterates.
+	redact := filterNonEmpty(req.SSHPassword, code)
 	redact = append(redact, linuxCIFSPasswords(req, scriptsShare, releaseShare)...)
 	return streamCommand(ctx, bg, e.Store, id, cmd, e.logCap(), redact)
+}
+
+// filterNonEmpty returns the non-empty values among ss. Used to keep the
+// redact list free of no-op blank entries (the SSH password may be empty
+// when key-file auth is used, and pairing codes are never empty).
+func filterNonEmpty(ss ...string) []string {
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // linuxCIFSPasswords collects every CIFS (SMB) password that could appear
@@ -526,6 +552,35 @@ func linuxCIFSPasswords(req Request, scriptsShare, releaseShare *model.Share) []
 		out = append(out, sh.Password)
 	}
 	return out
+}
+
+// stageSystemdUnit copies the canonical systemd unit file from the repo
+// into the run dir's files/ tree so the linux-node role can deploy it via
+// ansible.builtin.copy (single source of truth — the role never inlines a
+// divergent unit). The unit is looked up next to PlaybookDir first
+// (infra/ansible/../systemd/encode-agent.service in dev, or wherever the
+// provision bundle ships it) and falls back to a repo-root relative path.
+// Missing unit is a hard error: provisioning without it would silently
+// deploy a stale inline unit.
+func (e *Engine) stageSystemdUnit(runDir string) error {
+	const unitName = "encode-agent.service"
+	destDir := filepath.Join(runDir, "files")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create files dir: %w", err)
+	}
+	dest := filepath.Join(destDir, unitName)
+	for _, src := range []string{
+		filepath.Join(e.PlaybookDir, "..", "systemd", unitName),
+		filepath.Join(e.PlaybookDir, "systemd", unitName),
+		filepath.Join(e.PlaybookDir, "..", "..", "infra", "systemd", unitName),
+	} {
+		b, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		return os.WriteFile(dest, b, 0o644)
+	}
+	return fmt.Errorf("systemd unit not found near PlaybookDir %q (expected infra/systemd/%s alongside it)", e.PlaybookDir, unitName)
 }
 
 // copyDir recursively copies src to dst, preserving file permissions. Used
@@ -873,15 +928,13 @@ func buildVarsLinux(s *model.Settings, req Request, pairingCode string, libOK, b
 		"encode_cifs_release_server": cifsRelease.Server,
 		"encode_cifs_release_share":  cifsRelease.Share,
 		"encode_cifs_release_user":   cifsRelease.User,
-		// The release pass is intentionally omitted from redaction concerns:
-		// it travels inside the JSON file, not on a command line.
-		"encode_cifs_release_pass":  cifsRelease.Pass,
-		"encode_cifs_release_mount": cifsRelease.MountPath,
-		"encode_mount_cifs":         mountCIFS,
-		"encode_install_toolchain":  req.InstallToolchain,
-		"encode_push_bin":           binOK,
-		"encode_has_lib":            libOK,
-		"encode_pairing_code":       pairingCode,
+		"encode_cifs_release_pass":   cifsRelease.Pass,
+		"encode_cifs_release_mount":  cifsRelease.MountPath,
+		"encode_mount_cifs":          mountCIFS,
+		"encode_install_toolchain":   req.InstallToolchain,
+		"encode_push_bin":            binOK,
+		"encode_has_lib":             libOK,
+		"encode_pairing_code":        pairingCode,
 		// SSH connection — ansible ssh plugin reads these. ansible_become
 		// runs the agent install/mount tasks as root via sudo.
 		"ansible_host":   req.Host,

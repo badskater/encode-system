@@ -2,7 +2,9 @@ package provision
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -242,7 +244,71 @@ func TestBuildVarsLinuxS3NoMount(t *testing.T) {
 	}
 }
 
-// --- Redaction: cifs credentials must be scrubbed from the run log ---
+// --- stageSystemdUnit: the repo unit is staged into the run dir files/ tree ---
+
+// stageSystemdUnit copies infra/systemd/encode-agent.service into the run
+// dir's files/ tree so the linux-node role deploys the canonical unit
+// (single source of truth — no inline unit that can drift). The engine
+// resolves the unit next to PlaybookDir (infra/ansible/../systemd/...).
+func TestStageSystemdUnitStagesRepoUnit(t *testing.T) {
+	// Build a temp "repo" layout mirroring infra/ansible + infra/systemd.
+	repoRoot := t.TempDir()
+	playbookDir := filepath.Join(repoRoot, "ansible")
+	systemdDir := filepath.Join(repoRoot, "systemd")
+	if err := os.MkdirAll(playbookDir, 0o755); err != nil {
+		t.Fatalf("mkdir ansible: %v", err)
+	}
+	if err := os.MkdirAll(systemdDir, 0o755); err != nil {
+		t.Fatalf("mkdir systemd: %v", err)
+	}
+	const wantUnit = "[Unit]\nDescription=encode-system agent\nAfter=network-online.target mnt-encodes-scripts.automount\n"
+	unitSrc := filepath.Join(systemdDir, "encode-agent.service")
+	if err := os.WriteFile(unitSrc, []byte(wantUnit), 0o644); err != nil {
+		t.Fatalf("write unit: %v", err)
+	}
+
+	runDir := t.TempDir()
+	e := &Engine{PlaybookDir: playbookDir}
+	if err := e.stageSystemdUnit(runDir); err != nil {
+		t.Fatalf("stageSystemdUnit: %v", err)
+	}
+	staged := filepath.Join(runDir, "files", "encode-agent.service")
+	got, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatalf("staged unit missing at %s: %v", staged, err)
+	}
+	if string(got) != wantUnit {
+		t.Errorf("staged unit content mismatch:\ngot:\n%s\nwant:\n%s", got, wantUnit)
+	}
+}
+
+// stageSystemdUnit must fail loudly when the repo unit is absent —
+// provisioning must never silently fall back to a stale inline unit.
+func TestStageSystemdUnitErrorsWhenUnitMissing(t *testing.T) {
+	e := &Engine{PlaybookDir: t.TempDir()} // no systemd/ alongside
+	runDir := t.TempDir()
+	err := e.stageSystemdUnit(runDir)
+	if err == nil {
+		t.Fatal("expected error when systemd unit is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "systemd unit not found") {
+		t.Errorf("error should mention missing unit, got: %v", err)
+	}
+}
+
+// filterNonEmpty drops blank entries so the redact list has no no-op members
+// (the SSH password is empty under key-file auth).
+func TestFilterNonEmpty(t *testing.T) {
+	got := filterNonEmpty("", "abc", "", "d")
+	if len(got) != 2 || got[0] != "abc" || got[1] != "d" {
+		t.Errorf("filterNonEmpty = %v, want [abc d]", got)
+	}
+	// All-empty input yields an empty (non-nil) slice, not nil.
+	got = filterNonEmpty("", "")
+	if len(got) != 0 {
+		t.Errorf("all-empty filter = %v, want []", got)
+	}
+}
 
 func TestStreamCommandRedactsCIFSCredentials(t *testing.T) {
 	st := &fakeProvStore{}

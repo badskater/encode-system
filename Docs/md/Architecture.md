@@ -39,6 +39,24 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
 - **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel, prune, SSE log stream), flows, step templates, series, shares, scanner config, settings, stats, metrics, audit log, API tokens, DB backups, updates (agent/lib/bin + rollback). Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session. A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA).
 
+### Web UI (`frontend/` — React + TypeScript SPA)
+
+- Single design system in `src/styles.css` (2026-10 redesign): dark ops-console
+  tokens — near-black luminance-step surfaces (`#08090a → #0f1011 → #191a1b`),
+  translucent hairline borders, one violet accent (`--accent: #9d6bff`),
+  semantic status colors (blue=busy/running, green=idle/done, red=failed,
+  yellow=warning). Inter for UI text, JetBrains Mono for all numerics; both
+  self-hosted under `public/fonts/` (no external CDN — the console renders
+  identically on an offline farm LAN).
+- App shell (`App.tsx`): fixed sidebar with grouped nav (Monitor: Dashboard /
+  Jobs / Nodes / Stats · Pipeline: Series / Flows / Steps / Provision ·
+  System: Audit / Settings) and a user footer; login is a dedicated centered
+  brand card (`TokenGate`). Pages switch client-side (no router); deep links
+  like `/jobs?job=<id>` open the job-log dialog on load.
+- Dashboard and Stats share a `.stat-strip` KPI grid (tabular mono values);
+  tables are dense `nowrap` grids with dotted status pills (live pulse on
+  running jobs); log viewers are recessed mono panes.
+
 ### Agent (`backend/cmd/agent` → `encode-agent.exe`)
 
 - Runs as a Windows scheduled task (`EncodeAgentDist`, restart-safe) or service/foreground for debugging. Config file + flags: controller URL, node token, data dir.

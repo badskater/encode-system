@@ -18,7 +18,7 @@ Distributed encode farm: a Linux control plane queues and monitors encoding jobs
 | Path | What |
 | --- | --- |
 | `backend/` | Go: controller service, queue, scanner, flow renderer, REST API (also builds the Windows agent) |
-| `frontend/` | React + TypeScript SPA: dashboard, jobs, nodes, flow builder |
+| `frontend/` | React + TypeScript SPA: dashboard, jobs, nodes, flow builder — dark ops-console design system (violet accent, self-hosted Inter/JetBrains Mono, no CDN deps) |
 | `powershell/` | `EncodeLib.ps1` — the encode step implementations run on Windows nodes |
 | `infra/ansible/` | Playbooks: NFS/SMB client setup, folder patterns, `C:\bin`, agent deployment |
 | `docker/` | Controller images, compose files, `install.sh` / `install-agent.ps1` one-command installers |

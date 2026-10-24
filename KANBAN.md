@@ -13,6 +13,25 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (web UI redesign + dependency security, 2026-10-23)
+
+- Full visual redesign of the management SPA (PR #6): dark ops-console design
+  system in `src/styles.css` — near-black luminance-step surfaces, translucent
+  hairline borders, violet accent (`--accent` token), Inter UI + JetBrains Mono
+  numerics, self-hosted font subsets under `public/fonts/` (renders offline),
+  grouped sidebar nav (Monitor/Pipeline/System), branded login card, KPI
+  `.stat-strip` grids on Dashboard+Stats, dotted status pills with live pulse,
+  dense nowrap tables. Emoji glyphs replaced with text labels (tofu on minimal
+  container font stacks). Verified against a mock controller API; 11 pages
+  screenshotted and visually reviewed; 168/168 tests, tsc/eslint/build clean.
+- Frontend dependency security (PRs #3, #5): source-map-js 1.2.2
+  (CVE-2026-93749 DoS), vite 8.3.5 (launch-editor CVE-2026-112942/-112943/
+  -112944 + 3 more), vitest/@vitest/mocker 5.0.5 (GHSA-qxg6-89mg-rqv8,
+  GHSA-xp26-3454-mjgp). Dependabot alerts: 0 open; `npm audit`: clean.
+- Node2Shell (CVE-2026-111497, Brotli decoder RCE) exposure check: no Node in
+  production (Go binaries + static SPA), CI pins node 22 → 22.23.4 (patched),
+  dev host upgraded to 22.23.4.
+
 ## Done (observability + production on the release pipeline, 2026-09-30)
 
 - Encode speedup ratio in `GET /api/stats`: `avg_speedup` on totals +

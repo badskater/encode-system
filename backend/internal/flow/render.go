@@ -208,8 +208,14 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 	}
 
 	// Resolve all templates up front so a missing custom template fails the
-	// whole render instead of dying mid-job on the node.
+	// whole render instead of dying mid-job on the node. Compute each
+	// template's dialect-specific body ONCE here (review follow-up #3:
+	// render.go previously called d.StepBody(t) twice per template — once
+	// in this resolve loop and once at emission, where the second call
+	// discarded its error with `body, _ :=`). The validated body is cached
+	// in the bodies slice and reused at emission below.
 	templates := make([]*model.StepTemplate, len(f.Steps))
+	bodies := make([]string, len(f.Steps))
 	for i, st := range f.Steps {
 		t, err := resolve(st.TemplateKey())
 		if err != nil {
@@ -219,11 +225,13 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 			return "", fmt.Errorf("flow %q step %d (%s): template defines no function", f.Name, i, t.Key)
 		}
 		// Ask the dialect to validate/transform the body. Bash refuses
-		// PowerShell-only cmdlets here (Task 1.3 will map them).
-		if _, err := d.StepBody(t); err != nil {
+		// PowerShell-only cmdlets here (Task 1.3 maps built-ins to Linux tools).
+		body, err := d.StepBody(t)
+		if err != nil {
 			return "", fmt.Errorf("flow %q step %d (%s): %w", f.Name, i, t.Key, err)
 		}
 		templates[i] = t
+		bodies[i] = body
 	}
 
 	episode := j.Episode
@@ -241,6 +249,8 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 
 	// Link each step's body into the final script (dedupe by key: a
 	// flow may reference the same template twice with different params).
+	// The body was computed once in the resolve loop above and is reused
+	// here (review follow-up #3: no second StepBody call).
 	emitted := map[string]bool{}
 	b.WriteString("# --- Step implementations (linked from step templates) ---\n")
 	for i, t := range templates {
@@ -248,9 +258,8 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 			continue
 		}
 		emitted[t.Key] = true
-		body, _ := d.StepBody(t)
+		body := bodies[i]
 		fmt.Fprintf(&b, "\n# Step template: %s (%s)\n%s\n", d.Comment(t.Key), d.Comment(t.Label), body)
-		_ = i
 	}
 	b.WriteString("\n# --- Pipeline execution ---\n")
 

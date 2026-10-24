@@ -145,22 +145,50 @@ func (BashDialect) JobDone() string {
 // --- per-dialect template body validation ----------------------------
 
 // bashFuncName matches a bash function declaration: `name () {` or
-// `function name {`. Bash step templates (once Task 1.3 adds them) will
-// declare functions this way; for now we also accept the PS `function`
-// keyword so a template's PS function-name regex still locates the
-// declared name — the body validation below then refuses PS cmdlets.
+// `function name {`. Task 1.3 built-in bash templates declare their
+// functions with the POSIX `name () {` form, so this regex locates the
+// function name directly for both the definition (StepBody returns the
+// source verbatim) and the call site (FuncName).
+//
+// REVIEW FOLLOW-UP #1 (func-name divergence, now resolved):
+// Before Task 1.3, built-in templates stored PowerShell source and the
+// bash dialect derived the function name two ways: FuncName used
+// bashFuncName (or fell back to the PS `function <Name>` regex), while
+// bashWrapFunction used bashFuncNameFromPS — two separate code paths
+// that could diverge on a PS declaration shaped `function Foo () {`
+// (with parens). Task 1.3 eliminates the divergence for built-ins: their
+// bash sources declare functions with `name () {`, so bashFuncName is
+// the ONE path that derives the name for both call and definition. The
+// PS→bash translation path (bashWrapFunction + bashFuncNameFromPS) now
+// serves ONLY user/custom templates; it still converts the PS name
+// (lowercase, hyphens→underscores) consistently because
+// bashFuncNameFromPS and FuncName's PS fallback both apply the same
+// transform — but built-ins no longer touch that path at all.
 var bashFuncName = regexp.MustCompile(`(?m)^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{`)
 
 // psCmdletRe matches PowerShell Verb-Noun cmdlet calls (e.g.
 // Get-FileHash, Resolve-Tool). Write-Output is the one cmdlet the bash
 // dialect intentionally translates (to `echo`), so StepBody excludes
 // it from the matches rather than refusing the whole body.
+//
+// TEMPORARY (review follow-up #2): this refuse-list and psCmdletRe
+// exist ONLY to validate USER/CUSTOM templates (whose source is still
+// PowerShell). Task 1.3 built-in templates BYPASS this list entirely —
+// BashDialect.StepBody resolves built-ins to their Linux variant
+// (builtinBashSources) before any PS inspection, so a built-in body
+// containing cmdlets is never examined here. Once all user templates
+// also carry per-dialect sources (or the UI stops accepting PS for
+// custom steps), this list and the translate-or-refuse path can be
+// removed.
 var psCmdletRe = regexp.MustCompile(`\b[A-Z][a-z]+-[A-Z][a-zA-Z]+\b`)
 
 // psCmdletRefuseRe catches PowerShell-only constructs that have no
 // direct bash equivalent and are NOT translated by bashWrapFunction. If
-// any appear, StepBody returns a render error — Task 1.3 will translate
-// these into Linux tool invocations.
+// any appear, StepBody returns a render error.
+//
+// TEMPORARY: applies ONLY to user/custom templates (see psCmdletRe
+// comment). Built-in templates resolve to their Linux variant before
+// this list is consulted.
 var psCmdletRefuseRe = []*regexp.Regexp{
 	// PS variable sigils interpolated into commands ($($x…)).
 	regexp.MustCompile(`\$\([A-Za-z]`),
@@ -199,23 +227,43 @@ func (BashDialect) FuncName(src string) string {
 	return ""
 }
 
-// StepBody validates that the template's body is renderable as bash.
-// For Task 1.2: a body containing PowerShell-only cmdlets/constructs is
-// refused with a clear error (Task 1.3 will translate them). A body
-// that is plain external commands (echo, plain argv) is wrapped into a
-// bash function and returned.
+// StepBody resolves a template's executable body for the bash dialect.
 //
-// The accepted minimal subset for 1.2: the function body may contain
-// `Write-Output "…"` lines (for ENCODE_STEP markers and progress) and
-// nothing that trips the PS-cmdlet detectors. This is enough to render
-// simple flows and to prove the dialect seam end-to-end; real encode
-// steps arrive in 1.3.
+// Task 1.3 seam (built-in templates):
+//   - If the template Key is in builtinBashSources, return that bash
+//     source verbatim. This BYPASSES the PS cmdlet refuse-list entirely
+//     (review follow-up #2): a built-in body containing cmdlets is never
+//     inspected — the Linux variant is the source of truth.
+//   - If the template Key is in builtinBashRefused, return a clear error
+//     naming the template and the platform reason (e.g. dgindex → no
+//     Linux equivalent).
 //
-// Detection runs on the BODY lines only (between the `function … {`
-// declaration and the closing `}`), never on the declaration itself —
-// the PS function name (e.g. Invoke-Noop) is the wrapper we strip, not
-// a cmdlet call.
+// For USER/CUSTOM templates (anything not in either map), fall through
+// to the Task 1.2 translate-or-refuse path: a body of pure external
+// commands (echo + plain argv) renders into a bash function; a body
+// using PowerShell-only cmdlets returns a clear render error. This path
+// is the ONLY consumer of psCmdletRe/psCmdletRefuseRe (see the
+// TEMPORARY comment there).
+//
+// The bash sources in builtinBashSources declare functions with the
+// POSIX `name () {` form, so bashFuncName (the ONE name-derivation path
+// for built-ins — review follow-up #1) locates the function name for
+// both the definition and the call site.
 func (BashDialect) StepBody(t *model.StepTemplate) (string, error) {
+	// Built-in Linux mappings: resolve to the bash variant verbatim,
+	// bypassing all PS inspection (the refuse-list is for user templates).
+	if src, ok := builtinBashSources[t.Key]; ok {
+		return src, nil
+	}
+	// Built-in templates with no Linux equivalent: refuse with a clear
+	// platform reason so an operator reading the job log understands why.
+	if reason, ok := builtinBashRefused[t.Key]; ok {
+		return "", fmt.Errorf(
+			"bash dialect cannot render built-in template %q on Linux: %s",
+			t.Key, reason)
+	}
+	// User/custom templates: validate the PS body and translate the
+	// wrapper. This is the ONLY path that uses psCmdletRe/psCmdletRefuseRe.
 	bodyLines := psFunctionBodyLines(t.PowerShell)
 	for _, line := range bodyLines {
 		// Refuse PS-only constructs bashWrapFunction does not translate.
@@ -223,7 +271,7 @@ func (BashDialect) StepBody(t *model.StepTemplate) (string, error) {
 			if re.MatchString(line) {
 				return "", fmt.Errorf(
 					"bash dialect cannot render PowerShell-only template %q: "+
-						"contains %q (Task 1.3 will add Linux tool mappings)",
+						"contains %q (provide a bash-native step template for Linux nodes)",
 					t.Key, re.FindString(line))
 			}
 		}
@@ -235,7 +283,7 @@ func (BashDialect) StepBody(t *model.StepTemplate) (string, error) {
 			}
 			return "", fmt.Errorf(
 				"bash dialect cannot render PowerShell-only template %q: "+
-					"contains cmdlet %q (Task 1.3 will add Linux tool mappings)",
+					"contains cmdlet %q (provide a bash-native step template for Linux nodes)",
 				t.Key, m)
 		}
 	}

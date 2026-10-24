@@ -23,6 +23,13 @@ export default function ProvisionPage() {
   const httpWarning = scheme === 'http'
     ? 'WinRM over plain http sends the WinRM password unencrypted on the LAN. Use https/5986 if the node has a listener configured for it.'
     : null;
+  // https only: pywinrm validates the listener cert by default. Homelab nodes
+  // usually carry a self-signed cert, so expose an explicit opt-in to skip
+  // validation (sent as cert_validation:'ignore'). Off by default → validate.
+  const [allowSelfSigned, setAllowSelfSigned] = useState(false);
+  // Bootstrap an HTTPS listener on the node during this run so future
+  // management can use scheme: https (plaintext WinRM can then be disabled).
+  const [winrmHttps, setWinrmHttps] = useState(false);
   const [winrmUser, setWinrmUser] = useState('Administrator');
   const [password, setPassword] = useState('');
   const [nodeName, setNodeName] = useState('');
@@ -115,12 +122,14 @@ export default function ProvisionPage() {
         host: host.trim(),
         port: Number(port) || 5985,
         scheme,
+        cert_validation: scheme === 'https' ? (allowSelfSigned ? 'ignore' : 'validate') : 'ignore',
         winrm_user: winrmUser.trim() || 'Administrator',
         winrm_password: password,
         node_name: nodeName.trim(),
         install_toolchain: installToolchain,
         mount_nfs: mountNFS,
         push_bin: pushBin,
+        winrm_https: winrmHttps,
       });
       setNotice(`Provisioning run #${run.id} started for ${run.host} — watch the log below.`);
       setPassword(''); // never hold the password in state after submit
@@ -187,6 +196,19 @@ export default function ProvisionPage() {
         {httpWarning && (
           <div style={{ fontSize: 12, color: 'var(--yellow)', marginBottom: 8 }}>! {httpWarning}</div>
         )}
+        {scheme === 'https' && (
+          <label className="check" style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 8 }}>
+            <input
+              type="checkbox"
+              checked={allowSelfSigned}
+              onChange={(e) => setAllowSelfSigned(e.target.checked)}
+            />
+            <span>
+              Accept self-signed listener certificate
+              <span className="muted"> — skip WinRM cert validation (self-signed homelab nodes)</span>
+            </span>
+          </label>
+        )}
         <div className="toolbar">
           <label style={{ flex: 1 }}>
             <span style={{ display: 'block', marginBottom: 2 }}>WinRM user</span>
@@ -205,6 +227,7 @@ export default function ProvisionPage() {
           <label><input type="checkbox" checked={installToolchain} onChange={(e) => setInstallToolchain(e.target.checked)} /> Install toolchain (MediaInfo, AviSynth+, Python 64-bit, VapourSynth)</label>
           <label><input type="checkbox" checked={mountNFS} onChange={(e) => setMountNFS(e.target.checked)} /> Mount NFS shares</label>
           <label><input type="checkbox" checked={pushBin} onChange={(e) => setPushBin(e.target.checked)} /> Push tools folder (bin package)</label>
+          <label><input type="checkbox" checked={winrmHttps} onChange={(e) => setWinrmHttps(e.target.checked)} /> Enable WinRM HTTPS listener (self-signed)</label>
         </div>
         <button className="btn primary" disabled={starting} onClick={start}>
           {starting ? 'Starting…' : 'Provision node'}

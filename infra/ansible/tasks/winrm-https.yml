@@ -1,0 +1,39 @@
+# winrm-https.yml — enable an HTTPS WinRM listener on the node.
+#
+# Runs over the existing (bootstrap) connection — typically http/5985 — and
+# adds a self-signed HTTPS listener on 5986 so SUBSEQUENT Ansible runs and
+# agent reinstalls can use scheme: https instead of plaintext WinRM.
+#
+# Self-signed is the homelab default (cert_validation: ignore pairs with
+# this). To use CA-issued certs instead, deploy them out-of-band and pass
+# encode_winrm_cert_thumbprint; this task will reuse that cert rather than
+# minting a new one.
+#
+# Idempotent: exits unchanged if an HTTPS listener already exists.
+---
+- name: Enable HTTPS WinRM listener (5986)
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $haveHttps = Get-ChildItem WSMan:\localhost\Listener |
+      Where-Object { $_.Keys -match 'Transport = HTTPS' }
+    if ($haveHttps) {
+      Write-Output 'HTTPS listener already present'
+      exit 100   # sentinel: nothing changed
+    }
+    $thumbprint = '{{ encode_winrm_cert_thumbprint | default("") }}'
+    if (-not $thumbprint) {
+      $cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME `
+        -CertStoreLocation Cert:\LocalMachine\My
+      $thumbprint = $cert.Thumbprint
+      Write-Output "created self-signed cert $thumbprint"
+    }
+    winrm create winrm/config/Listener?Address=*+Transport=HTTPS `
+      "@{Hostname=`"$env:COMPUTERNAME`";CertificateThumbprint=`"$thumbprint`"}" | Out-Null
+    if (-not (Get-NetFirewallRule -Name 'WinRM-HTTPS' -ErrorAction SilentlyContinue)) {
+      New-NetFirewallRule -Name 'WinRM-HTTPS' -DisplayName 'WinRM over HTTPS' `
+        -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any | Out-Null
+    }
+    Write-Output 'HTTPS listener created'
+  register: winrm_https
+  changed_when: winrm_https.rc == 0
+  failed_when: winrm_https.rc not in [0, 100]

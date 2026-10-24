@@ -3,6 +3,14 @@
 # Controller the agents talk to.
 encode_controller_url: "https://controller.homelab.example:8080"
 
+# --- WinRM HTTPS bootstrap (security audit 2026-10) --------------------------
+# Set true (or run `ansible-playbook -i inventory.yml site.yml --tags
+# winrm-https`) once, over the current connection, to add an HTTPS listener on
+# 5986 to each node; then switch inventory.yml to scheme https / port 5986.
+# Self-signed by default; set a thumbprint to reuse a CA-issued node cert.
+encode_winrm_https: false
+# encode_winrm_cert_thumbprint: "0123456789ABCDEF..."   # optional CA cert
+
 # Windows-side paths (per project decision: tools in C:\bin, shares mounted
 # under C:\Encodes).
 encode_bin_dir: 'C:\bin'

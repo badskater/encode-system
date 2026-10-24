@@ -21,6 +21,14 @@
   gather_facts: false
 
   tasks:
+    # --------------------------------------------- WinRM HTTPS listener
+    # Opt-in: adds a (self-signed by default) HTTPS listener on 5986 over
+    # the bootstrap connection so future management runs can drop
+    # plaintext WinRM. See tasks/winrm-https.yml.
+    - name: Enable WinRM HTTPS listener
+      when: encode_winrm_https | bool
+      ansible.builtin.include_tasks: tasks/winrm-https.yml
+
     # --------------------------------------------------------------- NFS
     - name: NFS client + share mounts
       when: encode_mount_nfs | bool

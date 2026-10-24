@@ -193,12 +193,14 @@ export const api = {
     host: string;
     port?: number;
     scheme?: string;
+    cert_validation?: string; // https: 'validate' (default) | 'ignore' (self-signed opt-in)
     winrm_user?: string;
     winrm_password: string;
     node_name: string;
     install_toolchain: boolean;
     mount_nfs: boolean;
     push_bin: boolean;
+    winrm_https?: boolean; // bootstrap HTTPS listener (5986) on the node
   }) => request<ProvisionRun>('POST', '/api/provision', req),
   provisionRuns: () => request<ProvisionRun[]>('GET', '/api/provision/runs'),
   provisionRun: (id: number) => request<ProvisionRun>('GET', `/api/provision/runs/${id}`),

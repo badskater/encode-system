@@ -189,3 +189,76 @@ func TestHostReAllowsRealisticTargets(t *testing.T) {
 		}
 	}
 }
+
+// Security audit 2026-10: https defaults to cert VALIDATION (explicit opt-in
+// for self-signed "ignore"), http stays "ignore" (no cert exists), and an
+// illegal value is rejected rather than passed to pywinrm.
+func TestRequestValidateCertDefaults(t *testing.T) {
+	base := Request{Host: "10.0.0.5", NodeName: "n1", WinRMPassword: "pw"}
+
+	httpsReq := base
+	httpsReq.Scheme = "https"
+	if err := httpsReq.Validate(); err != nil {
+		t.Fatalf("https validate: %v", err)
+	}
+	if httpsReq.CertValidation != "validate" {
+		t.Errorf("https default cert_validation = %q, want validate", httpsReq.CertValidation)
+	}
+
+	httpsIgnore := base
+	httpsIgnore.Scheme = "https"
+	httpsIgnore.CertValidation = "IGNORE" // case-insensitive opt-in
+	if err := httpsIgnore.Validate(); err != nil {
+		t.Fatalf("https ignore validate: %v", err)
+	}
+	if httpsIgnore.CertValidation != "ignore" {
+		t.Errorf("opt-in ignored: got %q", httpsIgnore.CertValidation)
+	}
+
+	httpReq := base
+	httpReq.Scheme = "http"
+	if err := httpReq.Validate(); err != nil {
+		t.Fatalf("http validate: %v", err)
+	}
+	if httpReq.CertValidation != "ignore" {
+		t.Errorf("http default cert_validation = %q, want ignore", httpReq.CertValidation)
+	}
+
+	bad := base
+	bad.Scheme = "https"
+	bad.CertValidation = "trust-me"
+	if err := bad.Validate(); err == nil {
+		t.Error("invalid cert_validation accepted")
+	}
+}
+
+// The rendered Ansible vars must carry the cert-validation choice and the
+// winrm-https bootstrap flag so tasks/winrm-https.yml can gate on it.
+func TestBuildVarsCertAndHTTPSBootstrap(t *testing.T) {
+	settings := &model.Settings{ControllerURL: "http://controller:8080", NodeBinDir: `C:\bin`,
+		NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`}
+	req := Request{Host: "10.0.0.5", Port: 5986, Scheme: "https", CertValidation: "validate",
+		WinRMUser: "Administrator", WinRMPassword: "pw", NodeName: "enc-09",
+		WinRMHTTPS: true, WinRMCertThumbprint: "AB12CD34"}
+	vars := buildVars(settings, req, "paircode", true, true, nil, nil)
+	for _, want := range []string{
+		"ansible_winrm_server_cert_validation: validate",
+		"encode_winrm_https: true",
+		"encode_winrm_cert_thumbprint: 'AB12CD34'",
+	} {
+		if !strings.Contains(vars, want) {
+			t.Errorf("vars missing %q\ngot:\n%s", want, vars)
+		}
+	}
+
+	// Default (http, no bootstrap): listener task stays off.
+	req2 := Request{Host: "10.0.0.5", Port: 5985, Scheme: "http", CertValidation: "ignore",
+		WinRMUser: "Administrator", WinRMPassword: "pw", NodeName: "enc-10"}
+	vars2 := buildVars(settings, req2, "paircode", true, true, nil, nil)
+	if !strings.Contains(vars2, "encode_winrm_https: false") {
+		t.Errorf("winrm-https should default false\ngot:\n%s", vars2)
+	}
+	if strings.Contains(vars2, "cert_validation: validate") {
+		t.Errorf("http run must not validate certs")
+	}
+}

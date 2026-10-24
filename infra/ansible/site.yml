@@ -13,6 +13,25 @@
   gather_facts: true
 
   tasks:
+    # --- optional WinRM HTTPS bootstrap (security audit 2026-10) -------------
+    # Run over the CURRENT connection (e.g. http/5985) to add a self-signed
+    # HTTPS listener on 5986. Afterwards switch inventory.yml to
+    # ansible_winrm_scheme: https / ansible_port: 5986 and re-run. Off unless
+    # you pass --tags winrm-https (or set encode_winrm_https=true).
+    #   ansible-playbook -i inventory.yml site.yml --tags winrm-https
+    # Set encode_winrm_cert_thumbprint in group_vars to reuse a CA-issued
+    # cert instead of minting a self-signed one.
+    - name: Enable WinRM HTTPS listener
+      when: encode_winrm_https | default(false) | bool
+      ansible.builtin.include_tasks:
+        file: tasks/winrm-https.yml
+        # `apply` propagates the tag to the dynamically-included tasks;
+        # without it `--tags winrm-https` includes the file but filters out
+        # its contents (dynamic includes don't inherit include-level tags).
+        apply:
+          tags: [winrm-https]
+      tags: [winrm-https]
+
     - name: Include NFS client play
       ansible.builtin.import_tasks: tasks/nfs-client.yml
       tags: [nfs-client]

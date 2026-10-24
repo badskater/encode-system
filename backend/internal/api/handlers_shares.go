@@ -57,7 +57,9 @@ func (s *Server) handleListShares(w http.ResponseWriter, r *http.Request) {
 // with a plaintext password; stored encrypted.
 func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	var req shareReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// decodeJSON (not a raw json.Decoder): applies the 1 MiB body cap so an
+	// oversized payload cannot exhaust controller memory (security audit).
+	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
@@ -101,7 +103,9 @@ func (s *Server) handleUpdateShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req shareReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// decodeJSON (not a raw json.Decoder): applies the 1 MiB body cap so an
+	// oversized payload cannot exhaust controller memory (security audit).
+	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}

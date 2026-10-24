@@ -136,6 +136,14 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 fi
 compose -f docker-compose.runtime.yml pull controller 2>/dev/null \
     || { log "image pull unavailable — building from bundle"; compose -f docker-compose.runtime.yml build controller; }
+# One-time data migration: the runtime image now runs as the unprivileged
+# 'encode' user (security fix). Volumes created by older root-running images
+# are root-owned — chown them via a throwaway root container so SQLite can
+# still write after the upgrade. Idempotent: already-owned dirs are no-ops.
+log "ensuring /data volume ownership (non-root runtime)"
+compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chown \
+    controller -R encode:encode /data >/dev/null 2>&1 \
+    || log "chown step failed — if the controller cannot write /data, run: docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chown controller -R encode:encode /data"
 compose -f docker-compose.runtime.yml up -d
 
 # --- health check -----------------------------------------------------------

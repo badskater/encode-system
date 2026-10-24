@@ -123,6 +123,67 @@ Node credentials — two options:
   instead of a token (Ansible template supports both). The agent registers
   itself on first start and stores its own credential.
 
+### WinRM over HTTPS (recommended)
+
+Plain WinRM (`http`/5985) transmits the WinRM password unencrypted on the
+LAN. Migrate each node to `https`/5986 once:
+
+```bash
+cd infra/ansible
+# 1. bootstrap an HTTPS listener (self-signed by default) over the current connection
+ansible-playbook -i inventory.yml site.yml --tags winrm-https
+# 2. switch inventory.yml group vars:
+#      ansible_winrm_scheme: https
+#      ansible_port: 5986
+#      ansible_winrm_server_cert_validation: ignore   # self-signed (homelab)
+#                                                       # or 'validate' with a CA cert
+# 3. re-run to confirm management works over 5986
+ansible-playbook -i inventory.yml site.yml
+```
+
+CA-issued certs: set `encode_winrm_cert_thumbprint` in `group_vars/all.yml`
+(and `cert_validation: validate` in inventory) to pin identity instead of
+trusting any self-signed cert. The controller-driven Provision page exposes
+the same choice: **Enable WinRM HTTPS listener** (bootstrap) and **Accept
+self-signed listener certificate** (opt-in `ignore`; off = `validate`).
+
+### WinRM password rotation
+
+`group_vars/all/secrets.yml` holds the account password in plaintext
+(local-only, gitignored, mode 600). Rotate it fleet-wide with:
+
+```bash
+cd infra/ansible
+ansible-playbook -i inventory.yml rotate-winrm-password.yml
+# interactive prompt for the new password (avoid -e on the CLI: shell history)
+```
+
+The playbook sets the new password on every node, **verifies it actually
+authenticates over WinRM**, and only then rewrites `ansible_password` in
+`secrets.yml` (keeping mode 600 and all other keys). If any node rejects
+the new password the run aborts *before* touching the secrets file, so
+local management can never be locked out by a failed rotation — re-run is
+idempotent.
+
+### Security hardening knobs (2026-10 audit)
+
+| Setting | Where | Default | Effect |
+| --- | --- | --- | --- |
+| `ENCODE_BIND_ADDR` | controller `.env` | `0.0.0.0` | bind API to one interface; set `127.0.0.1` behind a reverse proxy |
+| `ENCODE_AGENT_ALLOW_HTTP_UPDATES` | agent node env | unset (refuse) | allow lib/bin/agent downloads over plain HTTP (trusted LAN only) |
+| `ENCODE_BIN_FETCH_PRIVATE` | controller env | unset (refuse) | allow `publishBinFromURL` to fetch from LAN/localhost hosts (SSRF guard opt-in) |
+| `-ServiceUser` / `-ServicePassword` | `install-agent.ps1` | LocalSystem | run the agent service as a least-privilege account |
+
+**Runtime image upgrade note:** `docker/Dockerfile.runtime` now runs as the
+unprivileged `encode` user. `install.sh` performs a one-time `chown` of the
+existing `/data` volume via a throwaway root container; for manual compose
+deploys run once after upgrading:
+
+```bash
+docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chown \
+    controller -R encode:encode /data
+```
+
 ## Post-deploy validation
 
 See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:

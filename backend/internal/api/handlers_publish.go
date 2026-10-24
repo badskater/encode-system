@@ -3,11 +3,13 @@ package api
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -165,7 +167,65 @@ func (s *Server) handlePublishBin(w http.ResponseWriter, r *http.Request) {
 
 // binFetchClient downloads bin packages from URLs. Generous timeout: a 144
 // MiB package over a modest uplink can legitimately take minutes.
-var binFetchClient = &http.Client{Timeout: 10 * time.Minute}
+//
+// SSRF guard (security audit 2026-10): the dialer validates every resolved
+// IP before connecting, so redirects and DNS rebinding cannot smuggle the
+// fetch to loopback/link-local/metadata endpoints. Private RFC1918 ranges
+// stay blocked unless the operator opts in with
+// ENCODE_BIN_FETCH_PRIVATE=1 (homelab package servers live on the LAN).
+// Checking at dial time (not URL-parse time) is what makes it rebinding-
+// and redirect-safe.
+var binFetchClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("no addresses for %s", host)
+			}
+			for _, ip := range ips {
+				if err := checkBinFetchIP(ip.IP); err != nil {
+					return nil, err
+				}
+			}
+			// Dial the first acceptable address explicitly.
+			d := &net.Dialer{Timeout: 30 * time.Second}
+			return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	},
+}
+
+// binFetchAllowPrivate reads the opt-in env each call so tests can toggle it
+// with t.Setenv.
+func binFetchAllowPrivate() bool {
+	v := strings.ToLower(os.Getenv("ENCODE_BIN_FETCH_PRIVATE"))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// checkBinFetchIP refuses addresses that would turn an admin-supplied URL
+// into internal reconnaissance. Link-local (incl. the cloud metadata IP
+// 169.254.169.254), multicast, and unspecified are ALWAYS refused.
+// Loopback and RFC1918/ULA private space require the opt-in flag — homelab
+// package servers (and the test suite's httptest hosts) live there, but a
+// production controller reachable from the internet must not default to
+// allowing it.
+func checkBinFetchIP(ip net.IP) error {
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("refusing to fetch from non-routable/local address %s", ip)
+	}
+	if !binFetchAllowPrivate() && (ip.IsLoopback() || ip.IsPrivate()) {
+		return fmt.Errorf("refusing to fetch from private address %s (set ENCODE_BIN_FETCH_PRIVATE=1 to allow LAN/localhost package hosts)", ip)
+	}
+	return nil
+}
 
 // handlePublishBinFromURL fetches a bin package from a URL (e.g. a GitHub
 // release asset on badskater/encode-bin), validates it exactly like a
@@ -213,7 +273,11 @@ func (s *Server) handlePublishBinFromURL(w http.ResponseWriter, r *http.Request)
 
 	fresp, err := binFetchClient.Get(req.URL)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "fetch failed: "+err.Error())
+		// Log the detail server-side; the client gets a generic message —
+		// raw dial errors leak internal-network reconnaissance data
+		// (connection-refused vs timeout vs blocked-IP).
+		s.Log.Warn("bin url fetch failed", "url", req.URL, "error", err.Error())
+		writeErr(w, http.StatusBadGateway, "fetch failed — see controller log")
 		return
 	}
 	defer fresp.Body.Close()
@@ -224,7 +288,8 @@ func (s *Server) handlePublishBinFromURL(w http.ResponseWriter, r *http.Request)
 	limited := io.LimitReader(fresp.Body, maxBinPublishBytes+1)
 	n, err := io.Copy(tmp, limited)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "download failed: "+err.Error())
+		s.Log.Warn("bin url download failed", "url", req.URL, "error", err.Error())
+		writeErr(w, http.StatusBadGateway, "download failed — see controller log")
 		return
 	}
 	if n > maxBinPublishBytes {

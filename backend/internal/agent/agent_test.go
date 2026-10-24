@@ -259,6 +259,9 @@ func TestFailedRebootKeepsCounter(t *testing.T) {
 
 // Regression: update payloads with a checksum mismatch must be refused.
 func TestUpdateRefusesChecksumMismatch(t *testing.T) {
+	// httptest serves plain HTTP; updates over HTTP need the explicit
+	// trusted-LAN opt-in (getAuth refuses otherwise).
+	t.Setenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES", "1")
 	dir := t.TempDir()
 	// Serve a lib payload whose hash does NOT match the manifest.
 	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,6 +292,7 @@ func TestUpdateRefusesChecksumMismatch(t *testing.T) {
 
 // Regression: matching checksum installs the payload.
 func TestUpdateAcceptsMatchingChecksum(t *testing.T) {
+	t.Setenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES", "1") // httptest is plain HTTP
 	dir := t.TempDir()
 	payload := "new lib content"
 	sum := sha256.Sum256([]byte(payload))
@@ -460,5 +464,43 @@ func TestHeartbeatShipsAgentLog(t *testing.T) {
 	body2, _ := got.Load().(string)
 	if strings.Contains(body2, "agent_log") {
 		t.Fatalf("ring-less agent must omit agent_log: %s", body2)
+	}
+}
+
+// Regression (security audit 2026-10): update downloads over plain HTTP are
+// refused by default — the manifest checksum travels the same channel, so a
+// LAN MITM could swap payload and checksum together. The trusted-LAN opt-in
+// (ENCODE_AGENT_ALLOW_HTTP_UPDATES=1) restores the old behavior.
+func TestUpdateRefusesPlainHTTPByDefault(t *testing.T) {
+	dir := t.TempDir()
+	payload := "new lib content"
+	sum := sha256.Sum256([]byte(payload))
+
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lib") {
+			w.Write([]byte(payload))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer controller.Close() // plain HTTP, like a non-TLS LAN controller
+
+	cfg := Config{ControllerURL: controller.URL, NodeName: "n", DataDir: dir,
+		LibPath: filepath.Join(dir, "EncodeLib.ps1")}
+	cfg.Token = nodeTok()
+	os.WriteFile(cfg.LibPath, []byte("# original"), 0o644)
+	a, _ := New(cfg, "v", testLog())
+
+	// Default (no opt-in env): download refused, lib untouched.
+	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
+	if b, _ := os.ReadFile(cfg.LibPath); string(b) != "# original" {
+		t.Fatalf("lib installed over plain HTTP without opt-in: %s", b)
+	}
+
+	// With the explicit opt-in: the same update installs.
+	t.Setenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES", "1")
+	a.handleUpdate(model.UpdateManifest{LibVersion: 2, LibSHA256: hex.EncodeToString(sum[:])})
+	if b, _ := os.ReadFile(cfg.LibPath); string(b) != payload {
+		t.Fatalf("lib not installed with opt-in env: %s", b)
 	}
 }

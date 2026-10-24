@@ -28,17 +28,27 @@ import (
 
 // Request is one provisioning attempt (validated before execution).
 type Request struct {
-	Host          string
-	Port          int
-	Scheme        string // http | https
-	WinRMUser     string
-	WinRMPassword string
-	NodeName      string
+	Host   string
+	Port   int
+	Scheme string // http | https
+	// CertValidation: "validate" | "ignore" for https WinRM server certs.
+	// Default https → "ignore" would silently trust MITM'd listeners, so the
+	// engine defaults https to "validate"; operators with self-signed node
+	// certs opt into "ignore" explicitly (UI checkbox / API field).
+	CertValidation string
+	WinRMUser      string
+	WinRMPassword  string
+	NodeName       string
 	// Options.
 	InstallToolchain bool // MediaInfo, AviSynth+, Python, VapourSynth
 	MountNFS         bool // legacy: NFS client + mounts from Settings (kept for API compat)
 	MountShares      bool // mount the enabled shares (smb/nfs rows in the shares table)
 	PushBin          bool // extract the published bin package into the bin dir
+	// WinRMHTTPS adds an HTTPS listener (5986) to the node during this run
+	// so future management can drop plaintext WinRM. Self-signed by default;
+	// set WinRMCertThumbprint to reuse a CA-issued cert already on the node.
+	WinRMHTTPS          bool
+	WinRMCertThumbprint string
 }
 
 // Store is the persistence surface the engine needs (narrow for tests).
@@ -152,6 +162,20 @@ func (r *Request) Validate() error {
 	}
 	if r.Scheme != "http" && r.Scheme != "https" {
 		return fmt.Errorf("scheme must be http or https")
+	}
+	// Cert validation defaults: https → validate (explicit opt-in for
+	// self-signed "ignore"); http → ignore is irrelevant (no cert) but
+	// pywinrm still wants a legal value.
+	r.CertValidation = strings.ToLower(r.CertValidation)
+	if r.CertValidation == "" {
+		if r.Scheme == "https" {
+			r.CertValidation = "validate"
+		} else {
+			r.CertValidation = "ignore"
+		}
+	}
+	if r.CertValidation != "validate" && r.CertValidation != "ignore" {
+		return fmt.Errorf("cert_validation must be 'validate' or 'ignore'")
 	}
 	if r.WinRMUser == "" {
 		r.WinRMUser = "Administrator"
@@ -523,6 +547,10 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "encode_smb_release_pass: %s\n", yamlQuote(smbReleasePass))
 	fmt.Fprintf(&b, "encode_mount_smb: %v\n", mountSMB)
 	fmt.Fprintf(&b, "encode_install_toolchain: %v\n", req.InstallToolchain)
+	// WinRM HTTPS listener bootstrap (opt-in; self-signed unless a thumbprint
+	// is supplied). See infra/ansible/tasks/winrm-https.yml.
+	fmt.Fprintf(&b, "encode_winrm_https: %v\n", req.WinRMHTTPS)
+	fmt.Fprintf(&b, "encode_winrm_cert_thumbprint: %s\n", yamlQuote(req.WinRMCertThumbprint))
 	fmt.Fprintf(&b, "encode_push_bin: %v\n", binOK)
 	fmt.Fprintf(&b, "encode_has_lib: %v\n", libOK)
 	fmt.Fprintf(&b, "encode_pairing_code: %s\n", yamlQuote(pairingCode))
@@ -530,7 +558,14 @@ func buildVars(s *model.Settings, req Request, pairingCode string, libOK, binOK 
 	fmt.Fprintf(&b, "ansible_password: %s\n", yamlQuote(req.WinRMPassword))
 	fmt.Fprintf(&b, "ansible_connection: winrm\n")
 	fmt.Fprintf(&b, "ansible_winrm_transport: ntlm\n")
-	fmt.Fprintf(&b, "ansible_winrm_server_cert_validation: ignore\n")
+	// Cert validation: "validate" for https with proper certs; "ignore"
+	// only when the operator opted in (self-signed homelab listeners).
+	// Validate() defaults https→validate, http→ignore.
+	certVal := req.CertValidation
+	if certVal == "" {
+		certVal = "ignore"
+	}
+	fmt.Fprintf(&b, "ansible_winrm_server_cert_validation: %s\n", certVal)
 	// pywinrm requirement: read_timeout MUST exceed operation_timeout (the
 	// read window wraps the operation with slack), both non-zero.
 	fmt.Fprintf(&b, "ansible_winrm_read_timeout_sec: 150\n")

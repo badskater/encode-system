@@ -20,9 +20,15 @@ WORKDIR /app
 COPY controller /app/controller
 COPY ui /app/ui
 COPY provision /app/provision
-RUN chmod +x /app/controller && mkdir -p /data
+# Non-root runtime (security audit 2026-10): a controller compromise must
+# not start as root with the /data volume (DB, node tokens, share-cred key).
+# Mirrors the build-time Dockerfile; chown /data BEFORE the volume is
+# mounted over it (compose) so SQLite can create its files.
+RUN addgroup --system encode && adduser --system --ingroup encode encode \
+    && chmod +x /app/controller && mkdir -p /data && chown encode:encode /data
 ENV ENCODE_DATA=/data \
     ENCODE_UI_DIR=/app/ui \
     ENCODE_PROVISION_DIR=/app/provision
 EXPOSE 8080
+USER encode
 ENTRYPOINT ["/app/controller"]

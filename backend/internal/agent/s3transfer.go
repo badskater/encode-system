@@ -20,6 +20,34 @@ type ObjectStore = s3.ObjectStore
 // newObjectStore builds the production store from a transfer spec.
 func newObjectStore(t *model.S3Transfer) (ObjectStore, error) { return s3.New(t) }
 
+// safeS3Rel validates a bucket-key-derived relative path before it is
+// joined onto a local directory. It reuses SafeRelPath (absolute paths,
+// drive letters, UNC roots, "/"-separated "..") and additionally rejects
+// backslash-separated traversal segments: S3 keys are arbitrary strings
+// and the agent runs on Windows, where filepath.Join also resolves "..\".
+func safeS3Rel(rel string) error {
+	if err := SafeRelPath(rel); err != nil {
+		return err
+	}
+	for _, seg := range strings.Split(rel, `\`) {
+		if seg == ".." {
+			return fmt.Errorf("parent-traversal segment")
+		}
+	}
+	return nil
+}
+
+// isWithinDir reports whether resolved stays inside dir (both cleaned).
+// Final guard after filepath.Join so no normalization quirk can escape.
+func isWithinDir(dir, resolved string) bool {
+	cleanDir := filepath.Clean(dir)
+	cleanResolved := filepath.Clean(resolved)
+	if cleanResolved == cleanDir {
+		return true
+	}
+	return strings.HasPrefix(cleanResolved, cleanDir+string(filepath.Separator))
+}
+
 // expandS3Paths replaces the {{JOBDIR}} placeholder in every LocalDir of
 // the transfer spec with the agent's real per-job directory. The
 // controller renders placeholders because it never knows node-local paths.
@@ -55,7 +83,19 @@ func runS3Downloads(ctx context.Context, store ObjectStore, t *model.S3Transfer)
 			if rel == "" {
 				continue
 			}
+			// Security: a bucket key is attacker-influenceable (anyone with
+			// write access to the bucket, or a MITM on a non-TLS endpoint).
+			// Reject traversal BEFORE filepath.Join — Join resolves ".." and
+			// would silently place the object body outside LocalDir
+			// (arbitrary file write on the node).
+			if err := safeS3Rel(rel); err != nil {
+				return fmt.Errorf("s3://%s/%s: %w", d.Bucket, o.Key, err)
+			}
 			dest := filepath.Join(d.LocalDir, filepath.FromSlash(rel))
+			// Defense in depth: the resolved path must stay inside LocalDir.
+			if !isWithinDir(d.LocalDir, dest) {
+				return fmt.Errorf("s3://%s/%s: key escapes local dir", d.Bucket, o.Key)
+			}
 			if err := store.Get(ctx, d.Bucket, o.Key, dest); err != nil {
 				return fmt.Errorf("get s3://%s/%s: %w", d.Bucket, o.Key, err)
 			}

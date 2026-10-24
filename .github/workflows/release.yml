@@ -26,6 +26,11 @@ on:
 permissions:
   contents: write
   packages: write
+  # Build provenance attestations (security audit 2026-10): signed,
+  # tamper-evident proof of which workflow run produced each binary/image.
+  # Verify with: gh attestation verify dist/encode-agent.exe -R <owner/repo>
+  id-token: write
+  attestations: write
 
 env:
   REGISTRY: ghcr.io
@@ -109,6 +114,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        id: build-image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -121,6 +127,16 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+
+      # Signed build provenance for the container image (same root of trust
+      # as the binaries — GitHub Actions OIDC identity).
+      - name: Attest build provenance (image)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-image.outputs.digest }}
+          push-to-registry: true
 
       # --- publish -------------------------------------------------------------
       - name: Create GitHub release
@@ -149,6 +165,18 @@ jobs:
             dist/install.sh \
             dist/install-agent.ps1 \
             dist/SHA256SUMS
+
+      # Signed build provenance for the release binaries. SHA256SUMS ships
+      # inside the same release it verifies (tamper-consistent), so the
+      # attestation chain — signed by GitHub Actions via OIDC — is the real
+      # root of trust for what a tag produced.
+      - name: Attest build provenance (binaries)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/controller
+            dist/encode-agent.exe
+            dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz
 
       - name: Upload UI bundle artifact
         uses: actions/upload-artifact@v4

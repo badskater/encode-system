@@ -143,3 +143,43 @@ func TestS3UploadFailurePropagates(t *testing.T) {
 		t.Fatal("want error when Put fails")
 	}
 }
+
+// Regression (security audit 2026-10): a malicious bucket key containing
+// ".." segments must NOT escape the download LocalDir. filepath.Join
+// resolves "..", so without a guard the object body lands anywhere on the
+// node's filesystem (arbitrary file write → code execution on reboot).
+func TestS3DownloadRejectsTraversalKeys(t *testing.T) {
+	dir := t.TempDir()
+	f := newFakeObjectStore()
+	f.objects["scripts/Ep 02/../../evil.dll"] = []byte("mz")
+	f.objects["scripts/Ep 02/ok.mkv"] = []byte("video")
+	// Absolute-style and backslash variants must be refused too.
+	f.objects["scripts/Ep 02/..\\..\\win.dll"] = []byte("mz")
+
+	tr := &model.S3Transfer{Downloads: []model.S3Download{
+		{Bucket: "scripts", Prefix: "Ep 02", LocalDir: dir},
+	}}
+	// Prefix handling: keys are listed with the bucket-relative prefix; the
+	// fake lists by prefix match, so seed under the real prefix shape.
+	f.objects = map[string][]byte{
+		"scripts/Ep 02/../../evil.dll":  []byte("mz"),
+		"scripts/Ep 02/ok.mkv":          []byte("video"),
+		"scripts/Ep 02/..\\..\\win.dll": []byte("mz"),
+	}
+
+	err := runS3Downloads(context.Background(), f, tr)
+	if err == nil {
+		t.Fatal("expected traversal key to be rejected, got nil error")
+	}
+	// The good file may or may not have been written before the bad key was
+	// hit (map order) — the security property is that nothing lands OUTSIDE
+	// dir. Check the escape targets do not exist.
+	for _, escaped := range []string{
+		filepath.Join(filepath.Dir(dir), "evil.dll"),
+		filepath.Join(filepath.Dir(dir), "win.dll"),
+	} {
+		if _, statErr := os.Stat(escaped); statErr == nil {
+			t.Fatalf("traversal escaped LocalDir: %s exists", escaped)
+		}
+	}
+}

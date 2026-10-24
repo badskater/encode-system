@@ -91,7 +91,11 @@ if docker volume inspect encode-system_encode-state >/dev/null 2>&1 \
 fi
 
 # Copy bundle files, never clobbering an existing .env.
-for f in controller encode-agent.exe ui provision EncodeLib.ps1 \
+# provision/ holds provision.yml (Windows) + linux-node.yml + roles/linux-node/
+# (Linux). systemd/ holds encode-agent.service — a SIBLING of provision/ so
+# the engine's stageSystemdUnit resolves PlaybookDir/../systemd/... (e.g.
+# $HOME_DIR/provision/../systemd → $HOME_DIR/systemd) on bundle-based builds.
+for f in controller encode-agent.exe ui provision systemd EncodeLib.ps1 \
          Dockerfile.runtime docker-compose.runtime.yml .env.example \
          install-agent.ps1 SHA256SUMS; do
     [ -e "$BUNDLE/$f" ] && cp -r "$BUNDLE/$f" "$HOME_DIR/"

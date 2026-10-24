@@ -116,7 +116,7 @@ func TestDiscordWebhookReachesRenderedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	rendered := func() string {
-		payload, err := e.server.renderJob(ctx, job)
+		payload, err := e.server.renderJob(ctx, job, "")
 		if err != nil {
 			t.Fatalf("render: %v", err)
 		}

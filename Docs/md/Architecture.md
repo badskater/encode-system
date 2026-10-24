@@ -4,7 +4,7 @@
 
 - Queue-driven encode farm: detect new episode material on storage shares, run jobs on a fleet of nodes, monitor everything from one web UI.
 - Storage is pluggable: **NFS**, **SMB**, or **S3-compatible object storage** (MinIO, Ceph RGW, AWS). S3 needs no mounts anywhere — the controller lists the bucket and agents stage episodes per job.
-- Windows Server 2025 nodes with Nvidia GPUs; encode tooling unchanged (DGIndexNV, x265 fork, mkvmerge), audio migrated from FLAC/eac3to-only to Opus (eac3to → WAV → opusenc).
+- Windows Server 2025 nodes with Nvidia GPUs; encode tooling unchanged (DGIndexNV, x265 fork, mkvmerge), audio migrated from FLAC/eac3to-only to Opus (eac3to → WAV → opusenc). Linux nodes (CPU, no GPU) run a VapourSynth-first path: `.vpy` source filter piped through `vspipe -c y4m` into the same x265 fork, audio decoded with ffmpeg (decode-only) → `opusenc`/`flac`. `dgindex` and `keyframes` are refused on Linux (DGIndexNV is Windows/Nvidia-only; no faithful SCXvid Linux port yet).
 - NFRs: single source of truth (controller DB), bounded concurrency per node, node reboot after 10 tasks, agent auto-update without touching each box, structured logs with job IDs, audit trail for admin mutations.
 
 ## System overview
@@ -23,8 +23,24 @@
                           | Win node A  |   ...         | Win node N  |
                           | encode-agent|               | encode-agent|
                           | + PS encod  |               | + PS encod  |
+                          | platform=   |               | platform=   |
+                          |   windows   |               |   windows   |
                           +-------------+               +-------------+
+                          +------+------+
+                          | Linux node  |
+                          | encode-agent|
+                          | + bash encod|
+                          | platform=   |
+                          |   linux     |
+                          +-------------+
 ```
+
+The controller renders each job's script in the dialect matching the
+claiming node's reported platform (`DialectForPlatform`): Windows nodes
+get a `.ps1` (PowerShell, dot-sources `EncodeLib.ps1`); Linux nodes get a
+`.sh` (bash, `set -euo pipefail`, self-contained). Both dialects emit the
+same `ENCODE_STEP`/`ENCODE_STEP_FAILED`/`ENCODE_JOB_DONE` marker text, so
+the agent's stdout parser is dialect-agnostic.
 
 Storage transport per role is chosen from the **shares table** (`nfs|smb|s3`);
 the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
@@ -35,7 +51,7 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 
 - **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
 - **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
-- **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained PowerShell script. The generated script calls functions from `EncodeLib.ps1`. For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
+- **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained script — PowerShell (`.ps1`) for Windows nodes or bash (`.sh`) for Linux nodes, selected at dispatch time via `DialectForPlatform(node.Platform)`. PowerShell scripts call functions from `EncodeLib.ps1` (dot-sourced by the preamble); bash scripts are self-contained (the shared `find_source_file` helper is emitted into every render). For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
 - **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel, prune, SSE log stream), flows, step templates, series, shares, scanner config, settings, stats, metrics, audit log, API tokens, DB backups, updates (agent/lib/bin + rollback). Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session. A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA).
 
@@ -57,14 +73,14 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
   tables are dense `nowrap` grids with dotted status pills (live pulse on
   running jobs); log viewers are recessed mono panes.
 
-### Agent (`backend/cmd/agent` → `encode-agent.exe`)
+### Agent (`backend/cmd/agent` → `encode-agent.exe` on Windows, `encode-agent` on Linux)
 
-- Runs as a Windows scheduled task (`EncodeAgentDist`, restart-safe) or service/foreground for debugging. Config file + flags: controller URL, node token, data dir.
-- Loop: heartbeat (status JSON: current job(s), step, tasks_since_boot, agent version, metrics) → controller response carries instructions: `job` (rendered script + vars), `reboot`, `update`.
-- Executes jobs by writing the generated `.ps1`, invoking `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`, streaming stdout/stderr to the controller, tracking exit code. Reports per-step timings and `ENCODE_METRIC key=value` quality/output stats (vmaf, bitrate, durations, sizes) in the completion payload.
+- Runs as a Windows scheduled task (`EncodeAgentDist`, restart-safe) or service/foreground for debugging; on Linux as a systemd service (`encode-agent.service`, `Restart=always`) or bare foreground loop (`cmd/agent/service_other.go`). Config file + flags: controller URL, node token, data dir. The agent reports its platform (`runtime.GOOS`: `"windows"` or `"linux"`) in every heartbeat so the controller selects the correct script dialect at dispatch time.
+- Loop: heartbeat (status JSON: current job(s), step, tasks_since_boot, agent version, platform, metrics) → controller response carries instructions: `job` (rendered script + vars), `reboot`, `update`.
+- Executes jobs by writing the generated `.ps1` (Windows) or `job.sh` (Linux, mode 0700, no BOM), invoking `powershell.exe -NoProfile -ExecutionPolicy Bypass -File` (Windows) or `bash <script>` (Linux), streaming stdout/stderr to the controller, tracking exit code. The shared `runJobCommand` core parses the same `ENCODE_STEP` markers in both dialects — no per-dialect parser. `EncodeLib.ps1` is only required on Windows (bash scripts are self-contained). Reports per-step timings and `ENCODE_METRIC key=value` quality/output stats (vmaf, bitrate, durations, sizes) in the completion payload.
 - S3-backed jobs: downloads `scripts/<episode_dir>` into the job staging dir before the run (mirroring the subdir layout the rendered script joins) and uploads outputs after success only.
-- Reboot: on `reboot` instruction with no running job, schedules `shutdown /r /t 30` and reports; counter resets naturally on next boot.
-- Auto-update: on `update` instruction, downloads new `encode-agent.exe` + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary via the swap sidecar (task relaunch). The controller keeps one `.prev` agent slot; `POST /api/updates/agent/rollback` re-promotes it and nodes self-downgrade through the same version-diff sync.
+- Reboot: on `reboot` instruction with no running job, schedules `shutdown /r /t 30` (Windows) and reports; counter resets naturally on next boot.
+- Auto-update: on `update` instruction, downloads new agent binary + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary via a swap sidecar. Windows uses `swap-update.bat` (task relaunch via the swap sidecar); Linux uses `swap-update.sh` (setsid-detached, retries the `mv`, then either exits to let systemd's `Restart=always` relaunch — detected via `INVOCATION_ID` + `systemctl is-active encode-agent` — or relaunches the new binary directly via `setsid` for bare deployments). The controller keeps one `.prev` agent slot; `POST /api/updates/agent/rollback` re-promotes it and nodes self-downgrade through the same version-diff sync.
 
 ### Step templates — every flow section owns its PowerShell
 
@@ -74,6 +90,39 @@ time the controller **links** every referenced function into the final job
 script and calls it with a shared `$Job` context object plus the step's
 `$Params` — so a saved flow is always self-contained and custom steps need no
 node-side install.
+
+**Dialect abstraction** (`internal/flow/dialect.go`): the renderer emits
+either PowerShell (`.ps1`) or bash (`.sh`) through the `Dialect` interface
+(`Quote`, `SafeIdent`, `Comment`, `Preamble`, `JobContext`, `StepCall`,
+`FuncName`, `StepBody`, `ParamsLiteral`, `JobDone`). `Render` delegates to
+`RenderDialect(..., PowerShellDialect{})`, so PS output is byte-identical
+to the pre-refactor renderer (the dialect methods reproduce the exact lines).
+`DialectForPlatform(node.Platform)` selects the dialect at dispatch time:
+`"linux"` → `BashDialect`, anything else (including `""` for legacy rows)
+→ `PowerShellDialect`.
+
+- `BashDialect` (`internal/flow/dialect_bash.go`): shebang +
+  `set -euo pipefail`, POSIX single-quote escaping (the injection guard,
+  parity with PS `psQuote`), newline-flattened comments, and the same
+  `ENCODE_STEP`/`ENCODE_STEP_FAILED`/`ENCODE_JOB_DONE` marker text so the
+  agent's stdout parser is dialect-agnostic. The shared `find_source_file`
+  helper is emitted into every bash render (mirroring PS dot-sourcing
+  `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
+  (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
+  render error; `Write-Output` is the one translated cmdlet (→ `echo`).
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 14
+  of 16 built-in templates carry bash-native sources
+  (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
+  `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
+  `encode_4k`, `mux`, `verify_output`, `crc32_rename`, `release_copy`,
+  `discord_notify`. Tool mappings: `vspipe -c y4m | x265` (video, args
+  mirrored verbatim from the PS template — ffmpeg never video-encodes),
+  `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac` (audio),
+  `mkvmerge`/`mediainfo`/`jq` verify (`bc` required — `verify_output`
+  fail-fasts if absent), `cksum` CRC32, `sha256sum` hashing, `curl` notify.
+  2 templates are refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
+  Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
+  index needed) and `keyframes` (no faithful SCXvid Linux equivalent yet).
 
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
@@ -197,9 +246,14 @@ shares card).
   Secrets are AES-GCM encrypted with a key file beside the DB, so backup
   downloads never carry them. Mutations audit as `share.create/update/delete`.
 - **Provisioning** resolves one enabled share per role (preference
-  smb > nfs > s3). SMB mounts on nodes go through Ansible `encode_smb_*`
+  smb > nfs > s3). SMB mounts on Windows nodes go through Ansible `encode_smb_*`
   vars (`New-SmbMapping` + a startup remount task), gated by the
-  `mount_shares` provision option.
+  `mount_shares` provision option. On Linux nodes, CIFS shares mount via
+  `mount -t cifs` with per-share 0600 credential files
+  (`/etc/encode-agent/cifs-*.cred`, written via Ansible `copy content` —
+  never on a command line) and `x-systemd.automount` fstab opts (so a dead
+  NAS never holds the boot path); NFS mounts use `ansible.posix.mount`.
+  S3 roles need no mount on either platform.
 - **S3** works against any plain-S3 endpoint (MinIO, Ceph RGW, AWS) via
   minio-go; the shared client lives in `internal/s3`. S3-backed roles never
   mount: the controller lists the bucket for the scanner, and the agent

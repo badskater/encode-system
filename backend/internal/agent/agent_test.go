@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -102,6 +103,12 @@ func TestExecuteJobEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	ps := a.findPowerShell()
+	if runtime.GOOS != "windows" {
+		// On Linux the agent executes job.sh via bash (Task 1.4); this
+		// PowerShell-scripted e2e is Windows-path only. The bash path is
+		// covered by agent_linux_test.go.
+		t.Skip("PowerShell execution path is Windows-only")
+	}
 	if ps == "powershell" {
 		if _, err := os.Stat("powershell"); err != nil {
 			t.Skip("no PowerShell available on this host")
@@ -162,6 +169,11 @@ func TestExecuteJobFailureReportsFailed(t *testing.T) {
 	defer controller.Close()
 
 	a, _ := New(Config{ControllerURL: controller.URL, NodeName: "n", Token: nodeTok(), DataDir: dir, LibPath: libPath}, "v", testLog())
+	if runtime.GOOS != "windows" {
+		// PowerShell-scripted failure path is Windows-only; the bash
+		// failure path is covered by agent_linux_test.go.
+		t.Skip("PowerShell execution path is Windows-only")
+	}
 	if a.findPowerShell() == "powershell" {
 		if _, err := os.Stat("powershell"); err != nil {
 			t.Skip("no PowerShell available on this host")

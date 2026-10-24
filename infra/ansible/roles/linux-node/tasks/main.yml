@@ -1,0 +1,295 @@
+# roles/linux-node/tasks/main.yml — Linux node provisioning.
+#
+# Installs the encode-agent as a systemd service + mounts share exports.
+# Idempotent: safe to re-run.
+#
+# Credential model: CIFS passwords arrive ONLY in the JSON vars file
+# (encode_cifs_scripts_pass, encode_cifs_release_pass). They are written
+# to per-share 0600 credentials files via ansible copy content (never on
+# a command line — a `$` in a password breaks shell passing and command
+# lines are visible in /proc). The credentials files back the
+# `credentials=` mount option. NFS mounts need no credentials.
+---
+# ----------------------------------------------------- package prerequisites
+# cifs-utils for SMB/CIFS mounts; nfs-common for NFS. apt default; the
+# task auto-detects the package manager (apt/dnf) so it works on Debian
+# and RHEL-family without hardcoding.
+- name: Install CIFS and NFS client packages (apt)
+  ansible.builtin.apt:
+    name:
+      - cifs-utils
+      - nfs-common
+    state: present
+    update_cache: true
+  when: ansible_os_family | default("Debian") == "Debian"
+
+- name: Install CIFS and NFS client packages (dnf)
+  ansible.builtin.dnf:
+    name:
+      - cifs-utils
+      - nfs-utils
+    state: present
+  when: ansible_os_family | default("Debian") == "RedHat"
+
+# --------------------------------------------------- agent user + directories
+- name: Create agent service user
+  ansible.builtin.user:
+    name: "{{ encode_agent_user }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Ensure agent directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ encode_agent_user }}"
+    group: "{{ encode_agent_user }}"
+    mode: "0755"
+  loop:
+    - "{{ encode_agent_dir }}"
+    - "{{ encode_bin_dir }}"
+    - "{{ encode_scripts_mount }}"
+    - "{{ encode_release_mount }}"
+
+# Config dir is root-owned (agent.json may carry a pairing code briefly).
+- name: Ensure config directory exists
+  ansible.builtin.file:
+    path: "/etc/encode-agent"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# --------------------------------------------------------- agent binary
+- name: Copy agent binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/files/agent/encode-agent"
+    dest: "{{ encode_agent_dir }}/encode-agent"
+    owner: root
+    group: root
+    mode: "0755"
+  register: agent_binary
+
+# ----------------------------------------------------------- agent.json
+# Mirrors the Windows provisioning's agent.json shape: controller_url,
+# node_name, pairing_code (one-shot bootstrap), data_dir, bin_dir,
+# heartbeat_seconds. Built as a dict and serialized with to_nice_json so
+# path backslashes/quotes are escaped correctly (inline templating would
+# produce invalid JSON).
+- name: Build agent.json content
+  ansible.builtin.set_fact:
+    agent_config: >-
+      {{ {
+        'controller_url': encode_controller_url,
+        'node_name': encode_node_name,
+        'pairing_code': encode_pairing_code,
+        'data_dir': encode_agent_dir,
+        'bin_dir': encode_bin_dir,
+        'heartbeat_seconds': encode_heartbeat_seconds | int,
+      } | combine({'lib_path': encode_agent_dir ~ '/EncodeLib.ps1'} if (encode_has_lib | bool) else {}) }}
+  no_log: true
+
+- name: Write agent.json (pairing bootstrap)
+  ansible.builtin.copy:
+    dest: "/etc/encode-agent/agent.json"
+    content: "{{ agent_config | to_nice_json }}"
+    owner: root
+    group: "{{ encode_agent_user }}"
+    mode: "0640"
+  no_log: true
+  register: agent_config_file
+
+# Clear a stale pairing token from a previous provision so the one-shot
+# code is always consumed by THIS run.
+- name: Clear stale pairing credential
+  ansible.builtin.file:
+    path: "{{ encode_agent_dir }}/node.token"
+    state: absent
+
+# ------------------------------------------------------- systemd unit
+# Deploy the canonical unit from the repo (infra/systemd/encode-agent.service),
+# staged into the run dir by the provision engine at
+# {{ playbook_dir }}/files/encode-agent.service. This is the SINGLE source of
+# truth: the role never inlines a unit that could drift from the repo copy.
+# The unit carries After= ordering on automount units (mnt-*.automount) and
+# ReadWritePaths= hardening that an inline unit would silently drop.
+# Note: After= on a unit that doesn't exist (shareless node, no automount) is
+# silently ignored by systemd, so the static repo file is safe everywhere.
+- name: Install encode-agent systemd unit
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/files/encode-agent.service"
+    dest: "/etc/systemd/system/encode-agent.service"
+    owner: root
+    group: root
+    mode: "0644"
+  register: systemd_unit
+
+# The agent refuses self-update downloads over plain HTTP unless
+# ENCODE_AGENT_ALLOW_HTTP_UPDATES=1 (agent.go getAuth guard). Controllers on
+# http:// (this farm's default) need the opt-in or published agent updates
+# silently stop reaching the node. A drop-in composes with the canonical unit
+# from any source; HTTPS controllers get the drop-in removed instead.
+- name: Allow HTTP agent updates when controller URL is plain HTTP
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encode-agent.service.d/http-updates.conf
+    content: |
+      [Service]
+      Environment=ENCODE_AGENT_ALLOW_HTTP_UPDATES=1
+    owner: root
+    group: root
+    mode: "0644"
+  when: encode_controller_url is match('^http://')
+  register: http_updates_dropin
+
+- name: Remove HTTP-updates drop-in for HTTPS controllers
+  ansible.builtin.file:
+    path: /etc/systemd/system/encode-agent.service.d/http-updates.conf
+    state: absent
+  when: encode_controller_url is not match('^http://')
+  register: http_updates_dropin_removed
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: systemd_unit is changed or http_updates_dropin is changed or http_updates_dropin_removed is changed
+
+- name: Enable encode-agent service
+  ansible.builtin.systemd:
+    name: encode-agent
+    enabled: true
+
+- name: Restart encode-agent when binary or config changed
+  ansible.builtin.systemd:
+    name: encode-agent
+    state: restarted
+  when: >-
+    (agent_binary is changed or agent_config_file is changed
+     or http_updates_dropin is changed or http_updates_dropin_removed is changed)
+    and not (systemd_unit is changed)
+
+- name: Start encode-agent service
+  ansible.builtin.systemd:
+    name: encode-agent
+    state: started
+
+# ----------------------------------------------------------- CIFS mounts
+# Each enabled SMB share is mounted via mount -t cifs with a per-share
+# credentials file (0600, written via copy content — never on a cmdline).
+# One ansible.posix.mount task per share with state: mounted writes the
+# fstab entry AND mounts now. The opts carry x-systemd.automount +
+# x-systemd.idle-timeout + noauto so systemd generates a .automount unit
+# from fstab: after reboot the share auto-mounts on first access without
+# holding the boot path on a dead NAS. state: mounted mounts immediately
+# (now); the x-systemd.* opts are systemd directives that mount(8) passes
+# through to fstab verbatim — the live mount succeeds regardless, and the
+# automount semantics apply on next boot. A SINGLE canonical opts string
+# per share (no separate fstab-present vs mount-now tasks with divergent
+# opts that could drift).
+- name: Configure CIFS scripts share
+  when: encode_mount_cifs | bool and encode_cifs_scripts_server | default('') | length > 0
+  block:
+    - name: Write CIFS scripts credentials file
+      ansible.builtin.copy:
+        dest: "/etc/encode-agent/cifs-scripts.cred"
+        content: |
+          username={{ encode_cifs_scripts_user }}
+          password={{ encode_cifs_scripts_pass }}
+        owner: root
+        group: "{{ encode_agent_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Mount CIFS scripts share (fstab + now, automount on boot)
+      ansible.posix.mount:
+        path: "{{ encode_cifs_scripts_mount }}"
+        src: "//{{ encode_cifs_scripts_server }}/{{ encode_cifs_scripts_share }}"
+        fstype: cifs
+        opts: "credentials=/etc/encode-agent/cifs-scripts.cred,uid={{ encode_agent_user }},file_mode=0644,dir_mode=0755,vers={{ encode_cifs_vers }},x-systemd.automount,x-systemd.idle-timeout=60,noauto"
+        state: mounted
+      no_log: true
+
+- name: Configure CIFS release share
+  when: encode_mount_cifs | bool and encode_cifs_release_server | default('') | length > 0
+  block:
+    - name: Write CIFS release credentials file
+      ansible.builtin.copy:
+        dest: "/etc/encode-agent/cifs-release.cred"
+        content: |
+          username={{ encode_cifs_release_user }}
+          password={{ encode_cifs_release_pass }}
+        owner: root
+        group: "{{ encode_agent_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Mount CIFS release share (fstab + now, automount on boot)
+      ansible.posix.mount:
+        path: "{{ encode_cifs_release_mount }}"
+        src: "//{{ encode_cifs_release_server }}/{{ encode_cifs_release_share }}"
+        fstype: cifs
+        opts: "credentials=/etc/encode-agent/cifs-release.cred,uid={{ encode_agent_user }},file_mode=0644,dir_mode=0755,vers={{ encode_cifs_vers }},x-systemd.automount,x-systemd.idle-timeout=60,noauto"
+        state: mounted
+      no_log: true
+
+# ------------------------------------------------------------ NFS mounts
+# NFS needs no credentials; mounts come from legacy Settings exports.
+- name: Mount NFS scripts share
+  when: encode_mount_nfs | bool and encode_nfs_scripts_export | default('') | length > 0
+  ansible.posix.mount:
+    path: "{{ encode_scripts_mount }}"
+    src: "{{ encode_nfs_scripts_export }}"
+    fstype: nfs
+    opts: "x-systemd.automount,x-systemd.idle-timeout=60,noauto"
+    state: mounted
+
+- name: Mount NFS release share
+  when: encode_mount_nfs | bool and encode_nfs_release_export | default('') | length > 0
+  ansible.posix.mount:
+    path: "{{ encode_release_mount }}"
+    src: "{{ encode_nfs_release_export }}"
+    fstype: nfs
+    opts: "x-systemd.automount,x-systemd.idle-timeout=60,noauto"
+    state: mounted
+
+# ----------------------------------------------------------- pairing wait
+# Definitive pairing proof: the agent persists its permanent credential to
+# <data_dir>/node.token once pairing succeeds. Poll until it appears.
+- name: Wait for the agent to pair
+  ansible.builtin.command:
+    test -f "{{ encode_agent_dir }}/node.token"
+  register: pair_check
+  retries: 12
+  delay: 10
+  until: pair_check.rc == 0
+  changed_when: false
+
+# Hygiene: the one-shot pairing code has served its purpose — strip it
+# from agent.json so credential material doesn't sit on disk.
+# Module-native + idempotent + atomic-ish: slurp the file, parse JSON, and
+# only when pairing_code is actually present write the stripped dict back
+# via ansible.builtin.copy (which writes atomically via tempfile+rename).
+# no_log because agent.json content (even stripped) is credential-adjacent.
+# changed only when the key was actually removed (idempotent on re-run).
+- name: Slurp agent.json
+  ansible.builtin.slurp:
+    src: "/etc/encode-agent/agent.json"
+  register: agent_json_raw
+  no_log: true
+
+- name: Check if pairing code is present in agent.json
+  ansible.builtin.set_fact:
+    agent_json_parsed: "{{ (agent_json_raw.content | b64decode | from_json) }}"
+    agent_json_has_pairing: >-
+      {{ (agent_json_raw.content | b64decode | from_json).pairing_code is defined }}
+  no_log: true
+
+- name: Remove pairing code from agent.json
+  ansible.builtin.copy:
+    dest: "/etc/encode-agent/agent.json"
+    content: "{{ agent_json_parsed | dict2items | rejectattr('key', 'equalto', 'pairing_code') | list | items2dict | to_nice_json }}\n"
+    owner: root
+    group: "{{ encode_agent_user }}"
+    mode: "0640"
+  when: agent_json_has_pairing | bool
+  no_log: true

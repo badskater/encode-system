@@ -288,6 +288,10 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		BinVersion:     binVer,
 		Syncing:        syncing, // update in flight -> controller holds jobs back
 		TasksSinceBoot: a.TasksSinceBoot(),
+		// Platform is the agent's OS, reported so the controller can pick
+		// the script dialect per node. Normalized from runtime.GOOS so a
+		// new value (e.g. "darwin") passes through verbatim for visibility.
+		Platform: runtime.GOOS,
 		// Metrics is collected best-effort on every heartbeat. Old
 		// controllers ignore the unknown key, so this is wire-safe.
 		// The pointer is always non-nil: zero values are meaningful
@@ -439,11 +443,18 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		a.completeJob(job.ID, "failed", -1, "create job dir: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
-	scriptPath := filepath.Join(jobDir, "job.ps1")
-	// Windows PowerShell 5.1 reads .ps1 files WITHOUT a BOM as ANSI and
-	// mangles any non-ASCII content — with anime series names that is a
-	// data-corruption bug, not a cosmetic one. Always write UTF-8 with BOM;
-	// pwsh (7+) and PS 5.1 both honor it identically.
+	// Platform selects the interpreter and script file extension. The
+	// controller already rendered the script in the matching dialect
+	// (PowerShell for Windows/legacy, bash for Linux); the agent branches
+	// on its own OS so a Linux agent runs the .sh via bash and a Windows
+	// agent runs the .ps1 via PowerShell. The ENCODE_STEP markers are
+	// identical text in both dialects, so the observer/parser is shared.
+	linux := runtime.GOOS == "linux"
+	scriptName := "job.ps1"
+	if linux {
+		scriptName = "job.sh"
+	}
+	scriptPath := filepath.Join(jobDir, scriptName)
 	// Expand the controller's {{JOBDIR}} placeholder (s3-staged jobs point
 	// $ScriptsDir/$ReleaseDir into the per-job dir; the controller never
 	// knows node-local paths).
@@ -451,17 +462,40 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	if job.S3 != nil {
 		expandS3Paths(job.S3, jobDir)
 	}
-	scriptBytes := append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
+	// Windows PowerShell 5.1 reads .ps1 files WITHOUT a BOM as ANSI and
+	// mangles any non-ASCII content — with anime series names that is a
+	// data-corruption bug, not a cosmetic one. Always write UTF-8 with
+	// BOM for PS; pwsh (7+) and PS 5.1 both honor it identically. Bash
+	// scripts must NOT carry a BOM: some shells reject it and the
+	// shebang line would not be at byte 0.
+	var scriptBytes []byte
+	if linux {
+		scriptBytes = []byte(expanded)
+	} else {
+		scriptBytes = append([]byte{0xEF, 0xBB, 0xBF}, []byte(expanded)...)
+	}
 	// 0600: the rendered script embeds the Discord webhook (a bearer
 	// credential) and job paths — other local users must not read it
-	// (security audit 2026-10). Same for run.log below.
-	if err := os.WriteFile(scriptPath, scriptBytes, 0o600); err != nil {
+	// (security audit 2026-10). Same for run.log below. Linux uses 0700
+	// on the script so it is owner-executable if run directly (the bash
+	// dialect preamble's shebang is a fallback to the explicit `bash`
+	// invocation below).
+	var scriptPerm os.FileMode = 0o600
+	if linux {
+		scriptPerm = 0o700
+	}
+	if err := os.WriteFile(scriptPath, scriptBytes, scriptPerm); err != nil {
 		a.completeJob(job.ID, "failed", -1, "write job script: "+err.Error(), nil, "", "", nil, nil)
 		return
 	}
-	if _, err := os.Stat(a.Cfg.LibPath); err != nil {
-		a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
-		return
+	// EncodeLib.ps1 is only needed by Windows PS scripts (dot-sourced in
+	// the preamble). Bash scripts are self-contained — the lib does not
+	// exist on Linux nodes and must not be required.
+	if !linux {
+		if _, err := os.Stat(a.Cfg.LibPath); err != nil {
+			a.completeJob(job.ID, "failed", -1, "EncodeLib.ps1 missing at "+a.Cfg.LibPath, nil, "", "", nil, nil)
+			return
+		}
 	}
 
 	// S3-backed shares: pull the job's source objects into the local
@@ -481,13 +515,21 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 		}
 	}
 
-	ps := a.findPowerShell()
 	runLog := filepath.Join(jobDir, "run.log")
 	// Expose this job's run.log to the heartbeat goroutine (FPS parsing
 	// picks the newest active job's log). Per-job slot in the registry;
 	// cleared with the job on completion.
 	r.setRunLog(job.ID, runLog)
-	exitCode, tail, stepErr, timings := a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
+	var exitCode int
+	var tail string
+	var stepErr string
+	var timings *stepTimingTracker
+	if linux {
+		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics)
+	} else {
+		ps := a.findPowerShell()
+		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
+	}
 
 	status := "done"
 	errMsg := ""
@@ -566,8 +608,8 @@ func (a *Agent) findPowerShell() string {
 	return "powershell"
 }
 
-// runPowerShell executes the job script, teeing output to run.log, and
-// returns the exit code plus the last output lines and the step timing
+// runPowerShell executes the Windows job script, teeing output to run.log,
+// and returns the exit code plus the last output lines and the step timing
 // tracker. Progress lines (ENCODE_STEP) are forwarded into the agent log for
 // heartbeat context AND feed the tracker's first-seen timestamps — the scan
 // is LIVE: a lineObserver processes each complete line as it arrives (at
@@ -577,11 +619,38 @@ func (a *Agent) findPowerShell() string {
 func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings)
+}
 
+// runBash executes the Linux job script via bash, teeing output to run.log.
+// The observer/parser is identical to the PowerShell path: the ENCODE_STEP /
+// ENCODE_STEP_FAILED markers are the same text in both dialects, so no
+// per-dialect parser logic is needed. bash's `set -euo pipefail` (emitted by
+// the bash dialect preamble) makes a nonzero step exit propagate to a nonzero
+// script exit, which the exit-code path below reports as failed.
+func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+	timings = newStepTracker()
+	// /usr/bin/env bash resolves the interpreter via PATH; falls back to
+	// a direct bash lookup. The script carries its own shebang too, so
+	// `bash <script>` is belt-and-suspenders on hosts where /usr/bin/env
+	// is missing.
+	cmd := exec.Command("bash", scriptPath)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings)
+}
+
+// runJobCommand is the shared execution core for both PowerShell and bash
+// job scripts. It wires the lineObserver (live ENCODE_STEP scan + progress
+// feed), the run.log tee (owner-only, 0600 — the log can echo the Discord
+// webhook), accumulates the full output for tail extraction and the
+// ENCODE_STEP_FAILED scan, and returns the exit code / tail / step error /
+// timings. The interpreter label is used only in the cmd.Start error message
+// so a failure to launch names the right tool. This is dialect-agnostic: the
+// marker text is identical across dialects, so the parser never branches.
+func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
 	if prog == nil {
-		// Defensive: direct runPowerShell callers without a tracker get a
-		// throwaway one so the observer feed never nil-panics.
+		// Defensive: direct callers without a tracker get a throwaway
+		// one so the observer feed never nil-panics.
 		prog = newProgressTracker(progressRingLines)
 	}
 	observer.prog = prog // per-job live heartbeat step/pct/tail feed
@@ -605,7 +674,7 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 	cmd.Stderr = mw
 
 	if err := cmd.Start(); err != nil {
-		return -1, "", "start powershell: " + err.Error(), timings
+		return -1, "", "start " + interpreter + ": " + err.Error(), timings
 	}
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -879,10 +948,13 @@ func (a *Agent) syncBin(ctx context.Context, m model.UpdateManifest) {
 }
 
 // syncAgent updates the agent binary when the controller's version differs.
-// Same mandatory-checksum rule. On Windows the running exe cannot overwrite
-// itself, so the binary is staged and a cmd sidecar performs the swap after
-// this process exits (then relaunches it); POSIX renames in place and exits
-// for its supervisor.
+// Same mandatory-checksum rule. The new binary is staged as <self>.new (on
+// Windows that is encode-agent.exe.new; on POSIX encode-agent.new). On
+// Windows the running exe cannot overwrite itself, so a cmd sidecar
+// (swap-update.bat) performs the swap after this process exits and relaunches
+// it. On POSIX a bash sidecar (swap-update.sh) does the same — a detached
+// setsid process that retries the mv and either relaunches the new binary
+// directly (bare deployments) or lets systemd's Restart=always bring it back.
 func (a *Agent) syncAgent(ctx context.Context, m model.UpdateManifest) {
 	if m.AgentVersion == "" || m.AgentVersion == a.Version {
 		return
@@ -913,15 +985,14 @@ func (a *Agent) syncAgent(ctx context.Context, m model.UpdateManifest) {
 	a.Log.Info("agent binary staged; will swap on restart", "staged", staged, "version", m.AgentVersion)
 	if runtime.GOOS == "windows" {
 		a.launchWindowsSwap(staged, self)
-	} else {
-		// POSIX: the process can rename over its own running binary.
-		if err := os.Rename(staged, self); err != nil {
-			a.Log.Error("swap binary", "err", err)
-			return
-		}
-		a.Log.Info("binary swapped; exiting — supervisor (systemd etc.) restarts the new version")
-		a.Stop()
+		return
 	}
+	// POSIX: spawn a detached swap-update.sh sidecar (mirrors swap-update.bat).
+	// The sidecar waits for this process to exit, retries the mv, then either
+	// lets systemd's Restart=always bring the new binary back (when the agent
+	// was launched by systemd — detected via INVOCATION_ID) or relaunches the
+	// new binary directly for bare foreground deployments.
+	a.launchPosixSwap(staged, self)
 }
 
 // launchWindowsSwap hands the swap to a cmd sidecar because a running Windows
@@ -943,6 +1014,99 @@ func (a *Agent) launchWindowsSwap(staged, self string) {
 	}
 	a.Log.Info("exiting for binary swap; service manager will restart")
 	a.Stop()
+}
+
+// launchPosixSwap hands the binary swap to a detached bash sidecar. Unlike
+// Windows, POSIX rename(2) CAN replace a running binary, but the swap is
+// still delegated to a sidecar so the retry loop, systemd-aware relaunch,
+// and failure log live in one place — mirroring swap-update.bat. The sidecar
+// is spawned via setsid so it survives this process's exit, then this
+// process stops so the file can be replaced.
+func (a *Agent) launchPosixSwap(staged, self string) {
+	script := linuxSwapScript(self, staged, a.Cfg.DataDir, relaunchCommand(self))
+	scriptPath := filepath.Join(a.Cfg.DataDir, "swap-update.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		a.Log.Error("write swap script", "err", err)
+		return
+	}
+	// Spawn detached: setsid moves the script into a new session so it
+	// keeps running after this process exits (the plain-bash fallback
+	// below lacks this immunity but only fires when setsid is absent).
+	cmd := exec.Command("setsid", "bash", scriptPath)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		// Fall back to plain bash if setsid is unavailable (rare).
+		a.Log.Warn("setsid spawn failed, retrying plain bash", "err", err)
+		fallback := exec.Command("bash", scriptPath)
+		fallback.Stdout = nil
+		fallback.Stderr = nil
+		fallback.Stdin = nil
+		if err := fallback.Start(); err != nil {
+			a.Log.Error("launch swap script", "err", err)
+			return
+		}
+		_ = fallback.Process.Release()
+	} else {
+		_ = cmd.Process.Release()
+	}
+	a.Log.Info("exiting for binary swap; sidecar will swap and relaunch", "script", scriptPath)
+	a.Stop()
+}
+
+// linuxSwapScript renders the bash sidecar that performs the binary swap on
+// POSIX nodes. Behavior contract (mirrors swap-update.bat): wait for the old
+// process to exit, retry the mv until it succeeds (15 attempts — on POSIX
+// rename almost never fails, but a network filesystem or a AV-grade scanner
+// can hold the file briefly), and then either let systemd's Restart=always
+// bring the new binary back (when the agent was started under systemd —
+// detected via the INVOCATION_ID env var that systemd sets for every
+// service invocation) or start the new binary directly with its original
+// arguments for bare foreground deployments so the node is never left
+// without an agent. Failed swaps are logged to swap-update.log.
+//
+// Why INVOCATION_ID: systemd unconditionally sets it (a per-invocation
+// UUID) in every service's environment; it's simpler and more reliable than
+// scraping /proc/1/comm or checking for a PPID of 1, and it works without
+// root or any DBus call. The active-unit check (systemctl is-active) is the
+// belt-and-suspenders confirmation before relying on Restart=always.
+func linuxSwapScript(self, staged, dataDir, relaunch string) string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
+# Generated by the encode-agent to swap a staged new binary over the running
+# one, then restart it (or let systemd do so). Do not edit by hand.
+set -u
+logf="%s/swap-update.log"
+# Wait briefly for the old agent process to exit so the file is not held.
+# On POSIX rename(2) can replace a running binary, but on network
+# filesystems the old inode may be briefly busy; a short wait avoids it.
+sleep 1
+tries=0
+while :; do
+  if mv -f "%s" "%s" 2>/dev/null; then
+    break
+  fi
+  tries=$((tries + 1))
+  if [ $tries -ge 15 ]; then
+    echo "swap failed after $tries retries: %s" >>"$logf"
+    exit 1
+  fi
+  sleep 2
+done
+# swapped
+chmod 0755 "%s"
+# systemd-aware relaunch: if the agent was started by systemd (INVOCATION_ID
+# is set for every service invocation) AND the encode-agent unit is active,
+# rely on Restart=always to bring the new binary back — do NOT relaunch
+# directly, or we'd race the service manager and spawn a duplicate.
+if [ -n "${INVOCATION_ID:-}" ] && systemctl --quiet is-active encode-agent 2>/dev/null; then
+  exit 0
+fi
+# Bare foreground deployments: relaunch the new binary detached so the node
+# is never left without an agent. setsid detaches it from this (exiting)
+# sidecar's session.
+setsid %s >/dev/null 2>&1 &
+`, dataDir, staged, self, staged, self, relaunch)
 }
 
 // windowsSwapScript renders the cmd sidecar that performs the binary swap.

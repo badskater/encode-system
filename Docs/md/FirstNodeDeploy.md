@@ -1,7 +1,8 @@
 # First Node Deployment — Step-by-Step
 
-One-time runbook to bring up the controller and the first Windows Server
-2025 encode node. All paths below are relative to the repo root unless noted.
+One-time runbook to bring up the controller and the first encode node
+(Windows Server 2025 or Linux). All paths below are relative to the repo
+root unless noted.
 
 ## 0. What you need
 
@@ -11,6 +12,7 @@ One-time runbook to bring up the controller and the first Windows Server
 | NFS exports | unRAID serving `scripts/` and `ReleaseFolders/` (NFSv3 default) |
 | Windows node | Server 2025, reachable from the Ansible control node via WinRM or SSH |
 | Encode tools | `DGIndexNV.exe`, `x265_x64.exe` (your fork), `mkvmerge.exe`, `ffmpeg.exe`, `eac3to.exe`, `opusenc.exe`, `SCXvid.exe` |
+| Linux node (optional) | A Linux host (Debian/RHEL-family), reachable from the controller via SSH, with the toolchain on `PATH` (`vspipe`, `x265`, `ffmpeg`, `opusenc`, `flac`, `mkvmerge`, `mediainfo`, `jq`, `bc`, `cksum`/`sha256sum`, `curl`) and systemd |
 
 ## 1. Controller (15 min)
 
@@ -246,6 +248,36 @@ command line. Re-provisioning a host whose node name already exists: delete
 the old registration first (Nodes → Delete). The manual Ansible flow in
 sections 2–6 remains available for air-gapped or workstation-driven deploys.
 
+## Linux node (one-command installer)
+
+For a Linux node, skip sections 2–5 (the Windows Ansible flow) and use
+the standalone installer:
+
+```bash
+# Issue a pairing code in the UI (Nodes → Issue pairing code), then on the node:
+curl -fsSL -o install-agent.sh \
+  https://github.com/badskater/encode-system/releases/latest/download/install-agent.sh
+chmod +x install-agent.sh
+sudo ./install-agent.sh -c http://<controller>:8080 -p <pairing-code>
+```
+
+The installer downloads `encode-agent-linux-amd64`, verifies its SHA-256
+against `SHA256SUMS`, installs `/opt/encode-system/encode-agent`, writes
+`/etc/encode-agent/agent.json` (mode 0600), and registers
+`encode-agent.service` (systemd, `Restart=always`). The node appears as
+`idle` within ~5 s. The toolchain (`vspipe`, `x265`, `ffmpeg`, `opusenc`,
+`flac`, `mkvmerge`, `mediainfo`, `jq`, `bc`, `cksum`/`sha256sum`,
+`curl`) must already be on `PATH` — install it via your distro's
+packages or provision it from the controller (UI → Provision → Linux
+node runs `infra/ansible/linux-node.yml` over SSH).
+
+Alternatively, provision the Linux node entirely from the browser: UI →
+Provision → enter the SSH host/user/password, node name, and tick the
+options (the controller runs `linux-node.yml` with a 0600 vars file
+carrying SSH creds + CIFS passwords + a one-shot pairing code). This
+installs to `/opt/encode-agent` as the `encode` service user with the
+hardened systemd unit.
+
 ## Rollback & recovery
 
 - **Controller:** `docker compose down` never touches the state volume; the
@@ -271,4 +303,5 @@ sections 2–6 remains available for air-gapped or workstation-driven deploys.
 | Job stuck `assigned` | Agent claimed but PowerShell failed — job's log tail in the UI shows the failing step and tool |
 | `required tool not found` | Tool missing from `C:\bin` on that node — re-run `site.yml` or push a bin package from Settings |
 | Scanner doesn't create jobs | Folder needs a source media file **and** a `.avs`/`.vpy`; series paused/disabled; drain mode on; check controller logs for skip reasons. S3: keys must be `<series>/<episode>/…` and ≥2 min old |
-| Agent warns "plain HTTP" | Expected on trusted LANs; put a reverse proxy with TLS in front for anything else |
+| Agent warns "plain HTTP" | Expected on trusted LANs; put a reverse proxy with TLS in front for anything else. For agent self-updates over HTTP, set `ENCODE_AGENT_ALLOW_HTTP_UPDATES=1` in the agent's environment (the agent refuses plain-HTTP update downloads by default — a MITM can swap payload+checksum together). |
+| Linux node never appears | `journalctl -u encode-agent` — pairing/401 means credential issue; connection refused means `controller_url` in `/etc/encode-agent/agent.json` is wrong. Check `systemctl status encode-agent` is active. |

@@ -8,6 +8,10 @@
   - NFS client feature enabled for NFS transports (Ansible: `Install-WindowsFeature NFS-Clnt`); SMB uses `New-SmbMapping`; S3 needs nothing installed.
   - `C:\bin` populated with encode tools (DGIndexNV, x265_x64, mkvmerge, ffmpeg, eac3to, opusenc, SCXvid) — Ansible copies from a staging dir, or publish a bin zip from the UI.
   - The shares mounted at `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` (nfs/smb only).
+- Linux nodes (CPU, no GPU required) with:
+  - Toolchain on `PATH`: `bash`, VapourSynth (`vspipe`), `x265`, `ffmpeg` (decode-only), `opusenc`, `flac`, `mkvmerge` (mkvtoolnix), `mediainfo`, `jq`, `bc`, coreutils (`cksum`/`sha256sum`), `curl`. `dgindex` and `keyframes` steps are refused on Linux (no GPU/DGIndexNV, no faithful SCXvid port) — use a flow that omits them (e.g. a VapourSynth-first `default-4k-cpu` flow).
+  - `cifs-utils` + `nfs-common` (Debian) or `nfs-utils` (RHEL) for share mounts; S3 needs nothing.
+  - systemd (recommended — the agent ships a `encode-agent.service` unit with `Restart=always`) or run the agent as a bare foreground loop.
 - Ansible control node with `pywinrm` (or SSH) reachability to the Windows hosts — or use the controller's built-in Web UI provisioning (no workstation needed).
 
 ## Controller
@@ -50,6 +54,25 @@ code from UI → Nodes:
 ```powershell
 .\install-agent.ps1 -ControllerUrl http://<controller>:8080 -PairingCode <CODE>
 ```
+
+Linux nodes install with one root command using a pairing code from
+UI → Nodes:
+
+```bash
+sudo ./install-agent.sh -c http://<controller>:8080 -p <pairing-code>
+# or: sudo ./install-agent.sh -c http://<controller>:8080 -t <permanent-token>
+# env overrides: CONTROLLER_URL, PAIRING_CODE, TOKEN, NODE_NAME, VERSION,
+#   REPO, INSTALL_DIR (default /opt/encode-system), CONFIG_DIR (default
+#   /etc/encode-agent), GITHUB_TOKEN (private repos)
+```
+
+`install-agent.sh` downloads `encode-agent-linux-amd64` from the GitHub
+release, verifies its SHA-256 against `SHA256SUMS`, installs the binary
+to `/opt/encode-system`, writes `/etc/encode-agent/agent.json` (mode 0600),
+and registers `encode-agent.service` (prefers the bundled
+`infra/systemd/encode-agent.service` unit if present, else writes an
+inline unit). The toolchain is expected on `PATH` — provision it
+separately (UI → Provision or `infra/ansible/linux-node.yml`).
 
 ### Manual compose (build from source)
 
@@ -123,6 +146,58 @@ Node credentials — two options:
   instead of a token (Ansible template supports both). The agent registers
   itself on first start and stores its own credential.
 
+## Linux nodes (Ansible)
+
+The controller's provision engine invokes `infra/ansible/linux-node.yml`
+over SSH with a generated inventory + a 0600 JSON vars file (SSH
+credentials, CIFS share passwords, and a one-shot pairing code — never
+on a command line; all tasks are `no_log: true`). From the Web UI
+Provision page this is automatic; from a workstation:
+
+```bash
+cd infra/ansible
+# The controller engine generates inventory + vars.json; a manual run needs:
+#   ansible-playbook -i inventory.yml linux-node.yml \
+#     -e @vars.json   # 0600, carries SSH creds + CIFS passwords + pairing code
+```
+
+The `roles/linux-node` role (`roles/linux-node/tasks/main.yml`):
+
+1. Installs packages: `cifs-utils` + `nfs-common` (Debian/apt) or
+   `cifs-utils` + `nfs-utils` (RHEL/dnf) — auto-detected by
+   `ansible_os_family`.
+2. Creates the `encode` service user (`system: true`, `nologin` shell)
+   and agent + bin + mount directories.
+3. Copies the agent binary to `/opt/encode-agent/encode-agent` (0755),
+   writes `/etc/encode-agent/agent.json` (0640, built as a dict and
+   serialized with `to_nice_json` so path backslashes are escaped
+   correctly; `no_log: true` because it briefly carries a pairing
+   code), and deploys the systemd unit from
+   `infra/systemd/encode-agent.service` (single source of truth — the
+   role never inlines a unit that could drift; `After=` automount units
+   + `ReadWritePaths=`/`NoNewPrivileges=`/`PrivateTmp=` hardening).
+4. Mounts CIFS shares (`ansible.posix.mount`, `state: mounted`) with
+   per-share 0600 credential files
+   (`/etc/encode-agent/cifs-scripts.cred`, `cifs-release.cred`, written
+   via `copy content`) and `x-systemd.automount` + `x-systemd.idle-timeout=60`
+   + `noauto` opts (so systemd generates a `.automount` unit from fstab
+   — a dead NAS never holds the boot path). NFS shares mount the same
+   way (no credentials needed).
+5. Enables + starts `encode-agent.service`, waits for the agent to pair
+   (polls for `<data_dir>/node.token`), then strips the one-shot pairing
+   code from `agent.json` (idempotent, atomic-ish copy).
+
+Two install channels diverge — both are documented:
+
+- **Standalone `install-agent.sh`** → `/opt/encode-system`, runs as
+  root, prefers the bundled systemd unit else writes an inline unit.
+- **Controller-provisioned (ansible)** → `/opt/encode-agent`, `User=`
+  encode hardened unit from `infra/systemd/encode-agent.service`.
+
+Unit name is `encode-agent.service` in both. The agent's `swap-update.sh`
+self-update works in both channels (`os.Executable()` resolves the
+running binary).
+
 ### WinRM over HTTPS (recommended)
 
 Plain WinRM (`http`/5985) transmits the WinRM password unencrypted on the
@@ -184,6 +259,17 @@ docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chow
     controller -R encode:encode /data
 ```
 
+**Controller image provisioning collections:** both `docker/Dockerfile` and
+`docker/Dockerfile.runtime` pin `ansible.windows:3.7.0` (Windows
+`provision.yml` over WinRM) and `ansible.posix:2.2.2` (Linux
+`roles/linux-node`'s `ansible.posix.mount` tasks for CIFS/NFS mounts). An
+unpinned rebuild could pull a breaking release and silently break
+provisioning; the pins are the guard. The release bundle ships the
+`provision/` and `systemd/` trees, and both Dockerfiles COPY them into
+the GHCR image at `/app/provision` and `/app/systemd`
+(`ENCODE_PROVISION_DIR=/app/provision` sets the engine's `PlaybookDir`,
+default in `backend/cmd/controller/main.go`).
+
 ## Post-deploy validation
 
 See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:
@@ -204,13 +290,15 @@ Two workflows in `.github/workflows/`:
   runner), and cross-builds `controller` (linux) + `encode-agent.exe`
   (windows). Frontend: `eslint`, `tsc --noEmit`, `vitest`, `vite build`.
 - **Release** (`release.yml`) — on a version tag (`git tag v1.4.0 && git push
-  origin v1.4.0`): builds controller + agent binaries with `-X main.Version`,
-  the built SPA, packs the complete offline bundle
-  `encode-system-<ver>-deploy.tar.gz` (binaries, ui/, provision/,
-  Dockerfile.runtime, compose, .env.example, installers, SHA256SUMS), pushes
-  `ghcr.io/badskater/encode-system:<ver>` + `:latest`, and attaches
-  everything plus loose `install.sh` / `install-agent.ps1` to the GitHub
-  release.
+  origin v1.4.0`): builds controller + `encode-agent.exe` (windows/amd64) +
+  `encode-agent-linux-amd64` (`GOOS=linux GOARCH=amd64`, `-trimpath`,
+  version ldflags), the built SPA, packs the complete offline bundle
+  `encode-system-<ver>-deploy.tar.gz` (binaries, ui/, `provision/`
+  (provision.yml + linux-node.yml + roles/linux-node), `systemd/`
+  (encode-agent.service), Dockerfile.runtime, compose, .env.example,
+  installers, SHA256SUMS), pushes `ghcr.io/badskater/encode-system:<ver>`
+  + `:latest`, and attaches everything plus loose `install.sh` /
+  `install-agent.ps1` / `install-agent.sh` to the GitHub release.
 
 Release-workflow operational notes:
 

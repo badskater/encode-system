@@ -8,14 +8,14 @@
 ## Logs
 
 - Controller: JSON logs to stdout (`slog`), fields `component`, `job_id`, `node`. Container log driver captures them.
-- Agent: `<data_dir>\agent.log` (rolling, 5×10MB) + per-job logs under `<data_dir>\jobs\<job_id>\run.log` — `C:\encode-agent` for service installs, `C:\encode-agent-dist` for the scheduled-task dist installs used on the current farm. The agent also uploads the log tail (and the last 1 MiB as `log_full`) on completion/failure.
+- Agent: `<data_dir>\agent.log` (rolling, 5×10MB) + per-job logs under `<data_dir>\jobs\<job_id>\run.log` — `C:\encode-agent` for service installs, `C:\encode-agent-dist` for the scheduled-task dist installs used on the current farm. On Linux the agent logs to stdout, so under systemd the agent log is the journal (`journalctl -u encode-agent`) and per-job logs live under `<data_dir>/jobs/<job_id>/run.log` — `<data_dir>` is the `data_dir` field from `agent.json` (`/opt/encode-agent` for controller-provisioned nodes, `/opt/encode-system` for standalone `install-agent.sh` installs). The agent also uploads the log tail (and the last 1 MiB as `log_full`) on completion/failure.
 - Job stdout/stderr from x265/mkvmerge/etc. is captured in full in the per-job log; progress lines follow `ENCODE_STEP <name> <pct>`; quality/output stats follow `ENCODE_METRIC <key>=<value>`.
 - Audit log: UI → Audit (or `GET /api/audit`) records every mutating admin action with actor, action, object, and a small detail snippet.
 
 ## Alerts and signals
 
 - Job `failed` with non-zero exit code — UI job detail shows the tail; investigate `run.log`.
-- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle).
+- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle). On Linux: `systemctl status encode-agent` (or `journalctl -u encode-agent -f` for the live log) — the unit has `Restart=always` so a crash loop is the usual failure mode.
 - Disk-space alert (Discord, per-node cooldown) — the node soft-drained: no new jobs until free space recovers above `settings.disk_alert_gb`. Free the node's work disk or raise the threshold.
 - Scanner backlog growing while nodes idle — usually all nodes disabled in the UI, token mismatch, every series paused, a node_group with no matching nodes, or drain mode left on.
 - Prometheus scrape endpoint: `GET /metrics` on the controller port (`encode_jobs_*`, `encode_node_*`).
@@ -50,7 +50,7 @@
 | Register a node without copy-pasting tokens | UI → Nodes → Issue pairing code → `pairing_code` in the node's `agent.json`. |
 | Get job alerts in Discord | Settings → Discord notifications → webhook URL → Save (env `ENCODE_DISCORD_WEBHOOK` seeds the default); done/failed alerts post automatically with series/episode/node/error. Blank = off. |
 | Send one series' alerts to its own channel | UI → Series → alert-channel cell (per-series webhook URL; empty = global webhook). Digest mode always posts to the global channel. |
-| Push agent update | Settings → Push to nodes: upload new `encode-agent.exe`/`EncodeLib.ps1`/bin zip (SHA-256 hashed, version-gated), or **Fetch from URL** for a `badskater/encode-bin` release asset. Idle nodes self-swap on the next heartbeat. |
+|| Push agent update | Settings → Push to nodes: upload new `encode-agent.exe`/`encode-agent`/`EncodeLib.ps1`/bin zip (SHA-256 hashed, version-gated), or **Fetch from URL** for a `badskater/encode-bin` release asset. Idle nodes self-swap on the next heartbeat — Windows via `swap-update.bat`, Linux via `swap-update.sh` (systemd-aware). |
 | Roll back a bad agent release | Settings → Push to nodes → **Rollback** (`POST /api/updates/agent/rollback`) — the previous published agent becomes current again; nodes self-downgrade through the same version-diff sync. One `.prev` slot only (409 when there is none). |
 | Inspect queue | UI → Jobs (filter by status), or `GET /api/jobs?status=pending`. |
 | Read a job's full log | UI → Jobs → **Log** on a finished job (monospace viewer + download); step timings render in the same dialog. Note `GET /api/jobs/{id}/log` returns raw text, not JSON. |
@@ -74,12 +74,12 @@
 
 ## Known failure modes
 
-- **Share mount dropped on a Windows node** (NFS/SMB): jobs fail at source read; remount via the Ansible play (`ansible-playbook site.yml --tags nfs-client`) or the provisioning "mount shares" option.
+- **Share mount dropped on a Windows node** (NFS/SMB): jobs fail at source read; remount via the Ansible play (`ansible-playbook site.yml --tags nfs-client`) or the provisioning "mount shares" option. On Linux: `mount -a` or `systemctl restart mnt-*.automount` (the CIFS/NFS mounts use `x-systemd.automount` so they auto-remount on first access; check the 0600 credential files at `/etc/encode-agent/cifs-*.cred` if a mount refuses).
 - **S3-backed job fails at download/upload**: controller logs `s3 scan failed …` (scanner side) or the job errors in staging; check the share's endpoint/credentials (`has_password` in the API), bucket reachability from BOTH the controller container and the node, and that keys mirror `scripts/<episode_dir>`.
 - **x265 fork crash on odd dimensions**: step fails with non-zero exit; inspect `run.log` for the x265 banner error; usually a filter-script issue (`.avs` crop values).
 - **opusenc missing**: audio step fails fast with "required tool not found" — Ansible `bin-tools` play or a bin-package push fixes.
 - **Reboot during a job**: controller defers reboot instructions until the node reports idle; a crash-reboot mid-job leaves the job orphaned — recovery fails it with a clear retry message (retry policy honored) instead of staying `running` forever.
 - **Node stuck in reboot_pending**: attempts expire after a 10-minute grace period and the node rejoins automatically; check the agent log (`<data_dir>\agent.log`) if the node never actually reboots (permissions, pending reboot).
-- **Node offline after an agent self-update**: the swap sidecar relaunches the task, but if it didn't fire, `Start-ScheduledTask -TaskName EncodeAgentDist` over WinRM; the agent stages the pending `.exe.new`, exits once more, and comes back on the new version (~1 min). Also check for a **stale pre-swap process**: two `encode-agent.exe` PIDs double-heartbeat — kill the one with the earlier StartTime.
+- **Node offline after an agent self-update**: the swap sidecar relaunches the task, but if it didn't fire, `Start-ScheduledTask -TaskName EncodeAgentDist` over WinRM; the agent stages the pending `.exe.new`, exits once more, and comes back on the new version (~1 min). Also check for a **stale pre-swap process**: two `encode-agent.exe` PIDs double-heartbeat — kill the one with the earlier StartTime. On Linux the `swap-update.sh` sidecar retries the `mv` (15 attempts, logged to `swap-update.log` in the data dir) then either exits to let systemd's `Restart=always` relaunch (detected via `INVOCATION_ID` + `systemctl is-active encode-agent`) or relaunches the new binary directly via `setsid`; check `swap-update.log` and `journalctl -u encode-agent` if the node never returns.
 - **Two jobs on one node beyond its slots**: impossible by store constraint (active jobs ≤ `max_concurrent_jobs`), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.
 - **SQLite "out of memory (14)" on a fresh volume**: the data dir is owned by the wrong user — `/data` must be chowned to the runtime user (fixed in the v1.17.4 image; reappears after base-image changes).

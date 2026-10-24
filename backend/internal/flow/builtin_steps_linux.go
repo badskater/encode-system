@@ -70,7 +70,6 @@ var builtinBashSources = map[string]string{
 	"verify_output":  bashSourceVerifyOutput,
 	"crc32_rename":   bashSourceCrc32Rename,
 	"release_copy":   bashSourceReleaseCopy,
-	"keyframes":      bashSourceKeyframes,
 	"discord_notify": bashSourceDiscordNotify,
 }
 
@@ -78,7 +77,8 @@ var builtinBashSources = map[string]string{
 // equivalent. Each value is the human-readable reason included in the render
 // error so an operator reading the job log understands the platform mismatch.
 var builtinBashRefused = map[string]string{
-	"dgindex": "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
+	"dgindex":   "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
+	"keyframes": "scene-change keyframe detection: the PS template uses SCXvid.exe (Windows .NET); a faithful Linux equivalent requires scxvid-standalone or a VapourSynth SCXvid plugin, neither of which is wired into this change. The previous bash body was a fake (every-240th-frame, NOT scene-change detection) — shipping a fake is worse than refusing. Add a real Linux SCXvid path before re-enabling.",
 }
 
 // findSourceFileBash mirrors the EncodeLib Find-SourceFile helper: locate the
@@ -803,6 +803,16 @@ const bashSourceMux = `mux () {
 // two-mode logic is preserved.
 const bashSourceVerifyOutput = `verify_output () {
     echo 'ENCODE_STEP verify_output 0'
+    # GAP 3 FIX: verify_output uses bc -l for duration unit normalization
+    # (ns to ms, s to ms, etc.). If bc is absent the "|| echo 0" fallbacks
+    # would silently yield duration 0, producing the misleading
+    # 'mkvmerge reported no duration' failure downstream. Fail fast with an
+    # actionable error instead — bc is a tiny standard package operators
+    # can install.
+    command -v bc >/dev/null 2>&1 || {
+        echo 'ENCODE_STEP_FAILED verify_output: bc not installed (required for duration math; install the bc package)'
+        exit 1
+    }
     local mkv="$EpisodeDir/$OutputName"
     if ! [[ -e "$mkv" ]]; then
         echo "verify_output: muxed MKV not found: $mkv (run AFTER the mux step)"
@@ -965,96 +975,12 @@ const bashSourceReleaseCopy = `release_copy () {
     echo 'ENCODE_STEP release_copy 100'
 }`
 
-// bashSourceKeyframes: PS uses ffmpeg → temp y4m → SCXvid (.NET process
-// piping). bash uses ffmpeg (decode to y4m — this is a DECODE/transcode to
-// y4m, NOT a video encode; the y4m is an intermediate for SCXvid, then
-// discarded) piped into a SCXvid-compatible tool. SCXvid.exe is Windows-only;
-// the Linux equivalent is the python `scxvid` module or the vapoursynth
-// `haf qwc` plugin. We use ffmpeg → python SCXvid (the cross-platform path).
-const bashSourceKeyframes = `keyframes () {
-    echo 'ENCODE_STEP keyframes 0'
-    local ffmpeg
-    ffmpeg=$(command -v ffmpeg 2>/dev/null || true)
-    [[ -z "$ffmpeg" ]] && ffmpeg="$BinDir/ffmpeg"
-    local dest_dir="$ReleaseDir/$ReleaseFolder"
-    local mkv="$dest_dir/$OutputName"
-    local kf="$dest_dir/$Series - $Episode Keyframes.txt"
-    if ! [[ -e "$mkv" ]]; then
-        echo "release MKV not found: $mkv"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
-    fi
-    if [[ -e "$kf" ]] && [[ "$kf" -nt "$mkv" ]]; then
-        echo 'keyframes file exists and is newer than the MKV, skipping'
-        echo 'ENCODE_STEP keyframes 100'
-        return 0
-    fi
-    if [[ -e "$kf" ]]; then
-        echo 'keyframes file is stale (older than MKV), regenerating'
-        rm -f -- "$kf"
-    fi
-    echo '[keyframes] ffmpeg -> y4m -> SCXvid'
-    local y4m
-    y4m=$(mktemp -t encode-kf-XXXXXX.y4m)
-    # ffmpeg decodes the MKV to a small y4m for SCXvid scene-change detection.
-    # This is NOT a video encode — the y4m is an intermediate, discarded after.
-    if ! "$ffmpeg" -nostdin -y -i "$mkv" -f yuv4mpegpipe -vf scale=640:360 \
-        -pix_fmt yuv420p -vsync drop -loglevel quiet "$y4m" 2>/dev/null; then
-        rm -f -- "$y4m"
-        echo 'ffmpeg y4m generation failed'; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
-    fi
-    # SCXvid's contract: output log file is the only arg, y4m arrives on stdin.
-    if python3 -c "
-import sys, struct
-# Streaming CRC32-table SCXvid scene-change keyframe extractor.
-# Reads y4m on stdin, writes keyframe indices to the output file.
-table = []
-for i in range(256):
-    c = i
-    for _ in range(8):
-        c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
-    table.append(c)
-def crc32(data):
-    crc = 0xFFFFFFFF
-    for b in data:
-        crc = table[(crc ^ b) & 0xFF] ^ (crc >> 8)
-    return crc ^ 0xFFFFFFFF
-out = sys.argv[1]
-frames = []
-with open(0, 'rb') as f:
-    header = b''
-    while b'\n' not in header:
-        chunk = f.read(1)
-        if not chunk: break
-        header += chunk
-    # Parse frame sizes from the y4m stream (simplified: read frame by frame).
-    # SCXvid divides into buckets and reports the first frame of each bucket.
-    bucket_size = 0
-    frame_idx = 0
-    while True:
-        line = b''
-        while True:
-            c = f.read(1)
-            if not c: break
-            if c == b'\n': break
-            line += c
-        if not line: break
-        if line.startswith(b'FRAME'):
-            frame_idx += 1
-            if frame_idx % 240 == 1:
-                frames.append(frame_idx)
-with open(out, 'w') as o:
-    o.write('\n'.join(str(fr) for fr in frames) + '\n')
-" "$kf" < "$y4m" 2>/dev/null; then
-        :
-    else
-        rm -f -- "$y4m"
-        echo 'SCXvid python failed'; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
-    fi
-    rm -f -- "$y4m"
-    if ! [[ -e "$kf" ]]; then
-        echo "SCXvid finished but $kf was not created"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
-    fi
-    echo 'ENCODE_STEP keyframes 100'
-}`
+// bashSourceKeyframes was REMOVED (GAP 2): the inline Python emitted every
+// 240th frame, NOT scene-change detection — a fake. The PS template uses
+// SCXvid.exe (Windows .NET) for real scene-change detection. Rather than
+// ship a fake, `keyframes` is now refused in builtinBashRefused with a clear
+// error. A faithful Linux SCXvid path (scxvid-standalone / VapourSynth
+// plugin) can re-enable it in a future change.
 
 // bashSourceDiscordNotify: PS uses System.Net.WebClient to POST JSON to a
 // Discord webhook. bash uses curl -fsS with the same JSON payload shape

@@ -221,14 +221,22 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 		if err != nil {
 			return "", fmt.Errorf("flow %q step %d: %w", f.Name, i, err)
 		}
-		if d.FuncName(t.PowerShell) == "" {
-			return "", fmt.Errorf("flow %q step %d (%s): template defines no function", f.Name, i, t.Key)
-		}
 		// Ask the dialect to validate/transform the body. Bash refuses
 		// PowerShell-only cmdlets here (Task 1.3 maps built-ins to Linux tools).
 		body, err := d.StepBody(t)
 		if err != nil {
 			return "", fmt.Errorf("flow %q step %d (%s): %w", f.Name, i, t.Key, err)
+		}
+		// P0 FIX (func-name divergence): derive the function name from the
+		// RESOLVED body, not from t.PowerShell. The PS source declares
+		// `function Invoke-AudioExtract {` (no parens), so BashDialect.FuncName
+		// falls back to the PS regex and yields `invoke_audioextract` — but
+		// the bash body defines `audio () {`. Deriving from the resolved body
+		// means both the definition and call site use the same name. For PS,
+		// PowerShellDialect.StepBody returns t.PowerShell verbatim, so
+		// FuncName(bodies[i]) == FuncName(t.PowerShell) — byte-identity preserved.
+		if d.FuncName(body) == "" {
+			return "", fmt.Errorf("flow %q step %d (%s): template defines no function", f.Name, i, t.Key)
 		}
 		templates[i] = t
 		bodies[i] = body
@@ -268,7 +276,11 @@ func RenderDialect(f *model.Flow, j *model.Job, v Vars, resolve TemplateResolver
 	invoked := map[string]string{}
 	for i, st := range f.Steps {
 		t := templates[i]
-		fn := d.FuncName(t.PowerShell)
+		// P0 FIX: derive the call-site function name from the RESOLVED body,
+		// not t.PowerShell — the body is the source of truth for the function
+		// name the dialect actually emits (bash built-ins declare `audio () {`,
+		// not the PS `function Invoke-AudioExtract {`).
+		fn := d.FuncName(bodies[i])
 		if owner, dup := invoked[fn]; dup && owner != t.Key {
 			return "", fmt.Errorf("flow %q: templates %q and %q both define %s", f.Name, owner, t.Key, fn)
 		}

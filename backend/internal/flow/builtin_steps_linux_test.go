@@ -137,15 +137,19 @@ func markersFromFunctionBody(script string) []string {
 }
 
 // refusedTemplates is the set of built-in templates that genuinely have no
-// Linux equivalent (Windows/Nvidia-only tools). They are refused by the bash
-// dialect with a clear error rather than ported incorrectly.
+// Linux equivalent (Windows/Nvidia-only tools, or tools not yet wired). They
+// are refused by the bash dialect with a clear error rather than ported
+// incorrectly.
 var refusedTemplates = map[string]string{
-	"dgindex": "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters instead (no dgi index needed)",
+	"dgindex":   "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters instead (no dgi index needed)",
+	"keyframes": "scene-change keyframe detection uses SCXvid.exe (Windows .NET); the bash body was a fake (every-240th-frame, not scene detection) — refused until a real Linux SCXvid path is wired",
 }
 
 // builtinLinuxToolMap records the Linux tool each ported template MUST
 // reference in its bash body. A template missing its expected tool indicates
 // a broken port (e.g. audio still calling eac3to). Verified per-template.
+// Refused templates (dgindex, keyframes) are excluded — they error before
+// producing a body.
 var builtinLinuxToolMap = map[string]string{
 	"source_rename":  "mv",        // bash mv replaces Rename-Item
 	"media_probe":    "mediainfo", // MediaInfo CLI (lowercase binary name on Linux)
@@ -160,7 +164,6 @@ var builtinLinuxToolMap = map[string]string{
 	"verify_output":  "mkvmerge",  // mkvmerge -J (same binary)
 	"crc32_rename":   "cksum",     // POSIX cksum (CRC32) or python fallback
 	"release_copy":   "cp",        // bash cp replaces Copy-Item
-	"keyframes":      "ffmpeg",    // ffmpeg decode -> SCXvid (python)
 	"discord_notify": "curl",      // curl replaces WebClient
 }
 

@@ -16,7 +16,10 @@ services:
     container_name: encode-controller
     restart: unless-stopped
     ports:
-      - "${ENCODE_PORT:-8080}:8080"
+      # Security (audit 2026-10): the API is reachable by anything that can
+      # route to this host. Default stays 0.0.0.0 (nodes on the LAN need it);
+      # behind a reverse proxy set ENCODE_BIND_ADDR=127.0.0.1 in .env.
+      - "${ENCODE_BIND_ADDR:-0.0.0.0}:${ENCODE_PORT:-8080}:8080"
     environment:
       ENCODE_ADMIN_USER: ${ENCODE_ADMIN_USER:-admin}
       # Initial admin password — used ONLY on the boot that creates the

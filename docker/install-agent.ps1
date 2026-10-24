@@ -45,7 +45,13 @@ param(
     [string]$NodeName = $env:COMPUTERNAME,
     [string]$Version = "latest",
     [string]$Repo = "badskater/encode-system",
-    [string]$InstallDir = "C:\encode-agent"
+    [string]$InstallDir = "C:\encode-agent",
+    # Optional least-privilege service account (user\name + password). When
+    # omitted the service runs as LocalSystem (required today for the agent's
+    # share-mount / service-control work); supplying an account with the
+    # needed NTFS grants shrinks the blast radius of an agent compromise.
+    [string]$ServiceUser = "",
+    [string]$ServicePassword = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,6 +89,8 @@ if ($svc) { Stop-Service encode-agent -Force; Start-Sleep 2 }
 
 try {
     Invoke-WebRequest -Headers $Headers -Uri $url -OutFile "$exe.new" -UseBasicParsing
+    $sumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS"
+    Invoke-WebRequest -Headers $Headers -Uri $sumsUrl -OutFile "$exe.sums" -UseBasicParsing
 } catch {
     # Private repo: resolve the asset ID and download through the API.
     $relInfo = Invoke-RestMethod -Headers $Headers "https://api.github.com/repos/$Repo/releases/tags/$Version"
@@ -90,7 +98,28 @@ try {
     if (-not $assetObj) { throw "asset $asset not found in release $Version" }
     Invoke-WebRequest -Headers ($Headers + @{Accept = "application/octet-stream"}) `
         -Uri $assetObj.url -OutFile "$exe.new" -UseBasicParsing
+    $sumsObj = $relInfo.assets | Where-Object { $_.name -eq "SHA256SUMS" }
+    if (-not $sumsObj) { throw "SHA256SUMS not found in release $Version" }
+    Invoke-WebRequest -Headers ($Headers + @{Accept = "application/octet-stream"}) `
+        -Uri $sumsObj.url -OutFile "$exe.sums" -UseBasicParsing
 }
+
+# --- verify checksum ------------------------------------------------------------
+# Security (audit 2026-10): refuse to install an unverified binary. The
+# SHA256SUMS asset is fetched from the same release tag; a mismatch means a
+# tampered release asset or a bad download — never install in that case.
+# (HTTPS + GitHub release integrity is the root of trust; this guards against
+# download corruption and asset substitution.)
+$got = (Get-FileHash -Algorithm SHA256 "$exe.new").Hash.ToLower()
+$sumLine = Select-String -Path "$exe.sums" -Pattern "\s$asset$" | Select-Object -First 1
+if (-not $sumLine) { throw "SHA256SUMS has no entry for $asset" }
+$want = ($sumLine.Line -split "\s+")[0].ToLower()
+if ($got -ne $want) {
+    Remove-Item -Force "$exe.new", "$exe.sums" -ErrorAction SilentlyContinue
+    throw "checksum mismatch for $asset : want $want got $got - refusing to install"
+}
+Write-Host "[install] checksum verified: $got"
+Remove-Item -Force "$exe.sums" -ErrorAction SilentlyContinue
 Move-Item -Force "$exe.new" $exe
 Write-Host "[install] agent binary installed: $exe"
 
@@ -115,9 +144,24 @@ if ($svc) {
     # Upgrade: repoint the service in case paths changed.
     & sc.exe config encode-agent binPath= $binPath start= auto | Out-Null
 } else {
-    New-Service -Name encode-agent -DisplayName "encode-system agent" `
-        -Description "Encode farm worker: heartbeats to the controller and runs encode jobs." `
-        -BinaryPathName $binPath -StartupType Automatic | Out-Null
+    # Security (audit 2026-10): default remains LocalSystem because the agent
+    # mounts shares and manages child encoders; pass -ServiceUser to run as a
+    # least-privilege account instead (grant it Modify on $InstallDir and the
+    # share/service permissions it actually needs).
+    $svcParams = @{
+        Name            = "encode-agent"
+        DisplayName     = "encode-system agent"
+        Description     = "Encode farm worker: heartbeats to the controller and runs encode jobs."
+        BinaryPathName  = $binPath
+        StartupType     = "Automatic"
+    }
+    if ($ServiceUser) {
+        $secPwd = ConvertTo-SecureString $ServicePassword -AsPlainText -Force
+        $cred = [System.Management.Automation.PSCredential]::new($ServiceUser, $secPwd)
+        $svcParams["Credential"] = $cred
+        Write-Host "[install] service will run as $ServiceUser"
+    }
+    New-Service @svcParams | Out-Null
 }
 Start-Service encode-agent
 Write-Host "[install] service encode-agent started"

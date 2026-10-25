@@ -17,12 +17,12 @@ Distributed encode farm: a Linux control plane queues and monitors encoding jobs
 
 | Path | What |
 | --- | --- |
-|| `backend/` | Go: controller service, queue, scanner, flow renderer (PowerShell + bash dialects), REST API; also builds the Windows agent (`encode-agent.exe`) and the Linux agent (`encode-agent-linux-amd64`) |
-|| `frontend/` | React + TypeScript SPA: dashboard, jobs, nodes, flow builder — dark ops-console design system (violet accent, self-hosted Inter/JetBrains Mono, no CDN deps) |
-|| `powershell/` | `EncodeLib.ps1` — the encode step implementations run on Windows nodes (dot-sourced by rendered `.ps1` scripts; not needed on Linux) |
-|| `infra/ansible/` | Playbooks: Windows nodes (`site.yml` + WinRM roles), Linux nodes (`linux-node.yml` + `roles/linux-node` over SSH with CIFS/NFS mounts) |
-|| `infra/systemd/` | `encode-agent.service` — the canonical systemd unit for Linux agents (single source of truth; the role and `install-agent.sh` both deploy it) |
-|| `docker/` | Controller images, compose files, `install.sh` / `install-agent.ps1` / `install-agent.sh` one-command installers |
+| `backend/` | Go: controller service, queue, scanner, flow renderer (PowerShell + bash dialects), REST API; also builds the Windows agent (`encode-agent.exe`) and the Linux agent (`encode-agent-linux-amd64`) |
+| `frontend/` | React + TypeScript SPA: dashboard, jobs, nodes, flow builder — dark ops-console design system (violet accent, self-hosted Inter/JetBrains Mono, no CDN deps) |
+| `powershell/` | `EncodeLib.ps1` — the encode step implementations run on Windows nodes (dot-sourced by rendered `.ps1` scripts; not needed on Linux) |
+| `infra/ansible/` | Playbooks: Windows nodes (`site.yml` + WinRM roles), Linux nodes (`linux-node.yml` + `roles/linux-node` over SSH with CIFS/NFS mounts) |
+| `infra/systemd/` | `encode-agent.service` — the canonical systemd unit for Linux agents (single source of truth; the role and `install-agent.sh` both deploy it) |
+| `docker/` | Controller images, compose files, `install.sh` / `install-agent.ps1` / `install-agent.sh` one-command installers |
 | `Docs/` | Architecture, Deployment, Operations |
 
 ## Quick start

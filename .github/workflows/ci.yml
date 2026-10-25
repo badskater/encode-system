@@ -50,7 +50,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      ENCODE_TEST_PG_DSN: postgres://encode:encode_ci_pw@127.0.0.1:5432/postgres?sslmode=disable
+      ENCODE_TEST_PG_DSN: postgres://encode:encode_ci_pw@127.0.0.1:5432/encode_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 

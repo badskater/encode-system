@@ -87,6 +87,58 @@ The backup endpoint (`/api/backup`) branches on the backend: SQLite uses
 JSON-lines dump (`.dump`). See `Docs/md/Operations.md` for backup behavior
 and `Docs/md/Deployment.md` for the PG deploy path.
 
+## Active/active (HA)
+
+When `ENCODE_DATABASE_URL` points at Postgres, the controller can run as
+**two replicas behind one Traefik v3 load-balanced service**
+(`docker/docker-compose.ha.yml`). SQLite is single-writer and cannot serve
+two replicas; HA is PG-only and opt-in (the single-instance SQLite deploy
+remains the default). The HA facts:
+
+- **Instance identity.** Each replica gets a distinct `ENCODE_INSTANCE_ID`
+  (hardcoded `controller-1` / `controller-2` in the HA compose) stamped into
+  the structured logs and the `/api/health` `instance` field, so lock
+  ownership and failover logs are unambiguous. `install.sh --ha` refuses to
+  run when `ENCODE_DATABASE_URL` is empty/SQLite.
+
+- **Advisory-lock singleton loops.** Background loops that must run exactly
+  once across the fleet (scanner, retention prune, orphan recovery, backup
+  scheduler) take a Postgres advisory lock (`pg_advisory_lock`) before each
+  iteration. On SQLite this is a no-op (always-locked) because there is only
+  ever one writer; on PG only the replica holding the lock runs the loop,
+  the other skips. A replica killed mid-loop releases its advisory lock on
+  connection close, and the other replica's loop acquires it on its next
+  retry (~30s). This makes the singleton behavior safe under failover: no
+  loop runs twice concurrently, and a dead replica's loop is re-homed
+  automatically.
+
+- **`FOR UPDATE` dispatch hardening.** Job dispatch (`AssignJob`) uses a
+  row lock so two replicas heartbeating the same node do not double-assign
+  the same job. The `rows-affected` guard means only the replica that
+  successfully flips the job to `assigned` dispatches it; the other sees
+  zero rows and replies `none`.
+
+- **SSE live log streaming is per-replica.** The log hub
+  (`internal/api/logstream.go`) is in-memory per-process —
+  `Server.logHub` is constructed once in `newServer()` and lives only in
+  that replica's address space. `publishProgress` is called from the
+  heartbeat handler after the DB update lands, so it fires **only on the
+  replica that received the heartbeat**. Consequence: an SSE client attached
+  to replica A sees live progress events for heartbeats that landed on A,
+  but a heartbeat that lands on replica B writes its progress to the shared
+  PG DB (`Store.UpdateJobProgress`) and publishes to B's in-memory hub — A's
+  hub never sees it. A's SSE stream re-syncs on its next **15s keepalive
+  DB re-check** (`handleJobLogStream`'s keepalive ticker calls
+  `Store.GetJob` and emits a `final` if the job is terminal; for a
+  still-running job the client sees a stale snapshot until the next
+  heartbeat lands on A or the client reconnects and re-snapshots). This is
+  a tail-only cosmetic limitation: the persisted job row remains the source
+  of truth, and the persisted log tail is never lost.
+
+- **Postgres is the remaining SPOF.** Patroni / PG-side HA is deferred by
+  user decision; production HA should point `ENCODE_DATABASE_URL` at a
+  managed/external PG.
+
 ### Web UI (`frontend/` — React + TypeScript SPA)
 
 - Single design system in `src/styles.css` (2026-10 redesign): dark ops-console

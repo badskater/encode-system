@@ -13,6 +13,74 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Active/active HA, 2026-10)
+
+- `docker/docker-compose.ha.yml`: two controller replicas
+  (`encode-controller-1` / `encode-controller-2`) of the same GHCR image,
+  both on the shared external Traefik network + an internal `encode-ha-net`,
+  both with **required** `ENCODE_DATABASE_URL` (no default — compose fails
+  fast if unset via `${ENCODE_DATABASE_URL:?…}`), `ENCODE_SHARES_KEY_FILE`,
+  and **distinct hardcoded `ENCODE_INSTANCE_ID`** constants
+  (`controller-1` / `controller-2`) so the advisory-lock singleton loops
+  and `/api/health` `instance` field distinguish them. Shared `encode-state`
+  / `encode-scripts` / `encode-release` volumes (same named volumes as
+  `docker-compose.runtime.yml` so publish/backup/shares-key behavior
+  matches). Bundled `postgres:16-alpine` (no profile gate — HA requires PG)
+  with `encode-pgdata`, documented as trials-only (production HA points
+  `ENCODE_DATABASE_URL` at a managed/external PG; the bundled one is the
+  remaining SPOF). Healthcheck on `/api/health`. Lean style: hardcoded
+  image/container names + restart policy + logging; app config only via
+  `.env` consumed with `env_file`; `${VARS}` only for genuinely per-deploy
+  values (domain, entrypoint, resolver, Traefik network name).
+- **Traefik v3 load-balancing approach:** both replicas use the IDENTICAL
+  Traefik router + service name (`encode-controller` / `encode-controller-svc`)
+  via Docker labels. Traefik v3 coalesces services with the same name across
+  providers into one load-balanced backend accumulating the server entries
+  from both containers — the idiomatic v3 multi-container LB pattern (a
+  single compose service's labels can only describe one Traefik service, so
+  shared-name coalescing is what spans the two replicas). Host rule +
+  entrypoint + certresolver from `.env` `${VARS}`; optional Authelia
+  forwardAuth middleware chained via `ENCODE_AUTH_MIDDLEWARE`. The
+  approach + rationale is documented in a comment block in the compose.
+- `docker/.env.example`: HA vars section documenting `ENCODE_DATABASE_URL`
+  (required for HA, empty = SQLite single-instance default),
+  `ENCODE_TRAEFIK_NETWORK` / `ENCODE_TRAEFIK_ENTRYPOINT` /
+  `ENCODE_TRAEFIK_RESOLVER` / `ENCODE_DOMAIN` (required for HA) /
+  `ENCODE_AUTH_MIDDLEWARE` (optional Authelia), following the existing
+  file's comment style. Notes that SQLite = no HA and that
+  `ENCODE_INSTANCE_ID` is hardcoded (do not override).
+- `docker/install.sh --ha`: new flag → requires `ENCODE_DATABASE_URL`
+  non-empty (dies with `HA requires Postgres: set ENCODE_DATABASE_URL
+  (see --postgres)` when empty; also rejects a non-`postgres://` value).
+  Brings up `docker-compose.ha.yml` (postgres first, waits healthy, then
+  both replicas), applies the same `COMPOSE_PROJECT_NAME` safety guard to
+  both replica container names, and health-checks BOTH replicas (polls each
+  container's `/api/health` via `docker exec` so the check works regardless
+  of Traefik routing state). Without `--ha`, byte-identical behavior.
+  `bash -n` clean; shellcheck -x clean (no new findings — only pre-existing
+  SC2015/SC2034 info/warnings).
+- Agent reconnect audit (`backend/internal/agent/agent.go`): the
+  heartbeat/claim loop's error handling is already **bounded** — a failed
+  `postJSON`/heartbeat logs a `Warn` and the loop waits for the next ticker
+  tick (`HeartbeatEvery`, default 15s) before retrying. No tight spin
+  (<1s) loop, no absent retry. **No code change** — the existing cadence
+  is sensible backoff. `gofmt -l internal/agent/` clean;
+  `go vet ./internal/agent/` clean; `go test ./internal/agent/ -count=1`
+  green (3.7s).
+- Docs: `Deployment.md` — HA section (compose.ha, `install.sh --ha`,
+  Traefik LB approach, PG required, SQLite single-instance default,
+  rolling upgrades, rollback from HA, HA limitations); `Architecture.md`
+  — active/active section (instance identity, advisory-lock singleton
+  loops, `FOR UPDATE` dispatch hardening, SSE logstream per-replica
+  limitation grounded in `internal/api/logstream.go`'s in-memory
+  `logHub` + 15s keepalive DB re-check, PG SPOF); `Operations.md` — HA
+  runbook (verify both replicas healthy + distinct instance ids,
+  `kill -9` failover expectations ~30s lock retry, rollback =
+  scale-to-1 / unset DSN, PG remaining SPOF). Diagrams README: no new
+  diagram added — the existing system-overview ASCII is the only diagram
+  tracked; an HA topology diagram would be a generated artifact (noted in
+  report rather than hand-drawn).
+
 ## Done (Postgres backend, 2026-10-25)
 
 - Controller backend selection via `ENCODE_DATABASE_URL`

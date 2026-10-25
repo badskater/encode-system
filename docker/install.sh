@@ -5,6 +5,7 @@
 #   ./install.sh                 # latest release (SQLite backend)
 #   ./install.sh v1.17.0         # specific version
 #   ./install.sh --postgres      # enable Postgres backend (see below)
+#   ./install.sh --ha            # high-availability two-replica deploy (PG required)
 #   curl -fsSL <raw-url>/install.sh | bash
 #
 # What it does:
@@ -25,6 +26,18 @@
 #     - Sets ENCODE_DATABASE_URL in .env (idempotent grep/sed).
 #   Without --postgres the behavior is byte-identical to today (SQLite).
 #
+# --ha mode (high-availability, active/active):
+#   Brings up docker-compose.ha.yml — two controller replicas
+#   (encode-controller-1/-2) behind one Traefik v3 load-balanced service,
+#   both sharing a single Postgres backend. SQLite is single-writer and
+#   CANNOT serve two replicas, so --ha REQUIRES ENCODE_DATABASE_URL to be a
+#   non-empty postgres:// DSN: it dies with "HA requires Postgres: set
+#   ENCODE_DATABASE_URL (see --postgres)" when empty. The bundled postgres
+#   service in docker-compose.ha.yml is for trials; production HA should
+#   point ENCODE_DATABASE_URL at a managed/external PG. Both replicas are
+#   health-checked. The single-instance SQLite deploy (no --ha) is the
+#   default and remains byte-identical.
+#
 # Env overrides: ENCODE_HOME (default /opt/encode-system), ENCODE_REPO
 # (default badskater/encode-system), GITHUB_TOKEN (for private repos:
 # a PAT with repo read access; also used for `docker login ghcr.io`).
@@ -34,11 +47,13 @@ REPO="${ENCODE_REPO:-badskater/encode-system}"
 HOME_DIR="${ENCODE_HOME:-/opt/encode-system}"
 VERSION="latest"
 USE_POSTGRES=0
+USE_HA=0
 
-# Parse args: a leading --postgres flag, and an optional version arg.
+# Parse args: leading flags (--postgres, --ha) and an optional version arg.
 while [ $# -gt 0 ]; do
     case "$1" in
         --postgres) USE_POSTGRES=1; shift ;;
+        --ha) USE_HA=1; shift ;;
         --help|-h)
             sed -n '2,30p' "$0"
             exit 0
@@ -276,6 +291,72 @@ if [ "$USE_POSTGRES" = "1" ]; then
             log "no existing SQLite DB in state volume — fresh PG install (controller migrates fresh on boot)"
         fi
     fi
+fi
+
+# --- High-availability deploy (--ha) ---------------------------------------
+# Two replicas behind Traefik v3, Postgres backend REQUIRED. SQLite is
+# single-writer and cannot serve two replicas, so refuse hard when the DSN
+# is empty. The runtime-compose path below is skipped entirely in HA mode.
+if [ "$USE_HA" = "1" ]; then
+    HA_DSN="$(grep -E '^ENCODE_DATABASE_URL=' .env 2>/dev/null | cut -d= -f2- || true)"
+    if [ -z "$HA_DSN" ]; then
+        die "HA requires Postgres: set ENCODE_DATABASE_URL (see --postgres)"
+    fi
+    case "$HA_DSN" in
+        postgres://*|postgresql://*) : ;;  # valid PG DSN
+        *) die "HA requires Postgres: ENCODE_DATABASE_URL is set but not a postgres:// DSN" ;;
+    esac
+    log "HA mode: two replicas behind Traefik v3 (Postgres backend)"
+    # Same project-name safety as the runtime deploy, scoped to the HA
+    # container names. Refuse to touch a replica owned by a different
+    # compose project (same guard pattern as the single-instance path).
+    for c in encode-controller-1 encode-controller-2; do
+        ex=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null || true)
+        if [ -n "$ex" ] && [ "$ex" != "$COMPOSE_PROJECT_NAME" ]; then
+            die "container '$c' exists but belongs to compose project '$ex' (not '$COMPOSE_PROJECT_NAME'). Refusing to touch it — set ENCODE_COMPOSE_PROJECT=$ex or remove the container first."
+        fi
+    done
+    # Bring up the HA stack: postgres first (wait healthy), then both
+    # replicas. docker-compose.ha.yml has no postgres profile gate (HA
+    # requires PG), so a plain `up -d` starts all three services.
+    compose -f docker-compose.ha.yml up -d postgres
+    pg_healthy=0
+    for _ in $(seq 1 30); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "${ENCODE_PG_CONTAINER_NAME:-encode-postgres}" 2>/dev/null || true)"
+        if [ "$status" = "healthy" ]; then pg_healthy=1; break; fi
+        sleep 2
+    done
+    [ "$pg_healthy" = "1" ] || die "Postgres did not become healthy — check: docker logs ${ENCODE_PG_CONTAINER_NAME:-encode-postgres}"
+    log "Postgres healthy"
+    compose -f docker-compose.ha.yml up -d
+    # Health-check BOTH replicas (distinct instance ids via ENCODE_INSTANCE_ID
+    # stamped into /api/health). Poll each container's health endpoint via
+    # its published port-less container IP — the HA stack publishes no host
+    # ports (Traefik routes to :8080 in-container). Use docker exec to hit
+    # localhost:8080 inside each replica so the check works regardless of
+    # the Traefik routing state.
+    healthy=0
+    for c in encode-controller-1 encode-controller-2; do
+        ok=0
+        for _ in $(seq 1 30); do
+            if docker exec "$c" wget -qO- http://localhost:8080/api/health >/dev/null 2>&1; then
+                ok=1; break
+            fi
+            sleep 2
+        done
+        if [ "$ok" = "1" ]; then
+            log "$c healthy"
+            healthy=$((healthy + 1))
+        else
+            log "ERROR: $c did not become healthy — check: docker logs $c"
+        fi
+    done
+    if [ "$healthy" -lt 2 ]; then
+        die "HA deploy: only $healthy/2 replicas healthy — see logs above"
+    fi
+    log "HA deploy complete: 2/2 replicas healthy behind Traefik v3"
+    log "UI: https://${ENCODE_DOMAIN:-<set ENCODE_DOMAIN in .env>}"
+    exit 0
 fi
 
 compose -f docker-compose.runtime.yml up -d

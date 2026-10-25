@@ -38,8 +38,16 @@ type Config struct {
 	ScanIntervalSeconds int           // scanner cadence (default 30)
 	RebootGracePeriod   time.Duration // reboot attempt expires after this (default 10m)
 	StaleAfter          time.Duration // node offline after no heartbeat this long
-	DefaultFlowName     string        // flow used for auto-created jobs
-	DiscordWebhook      string        // optional job-outcome alerts (empty = off)
+	DefaultFlowName     string
+	DiscordWebhook      string
+	// InstanceID identifies THIS controller replica for HA: it is stamped
+	// into the slog logger (default attrs) and exposed in /api/health as the
+	// "instance" field so an operator can tell two replicas apart. Resolved
+	// in main from ENCODE_INSTANCE_ID (defaulting to os.Hostname); empty
+	// means the default was not set (New fills it with "controller" so the
+	// field is never blank in logs/health). Purely additive — the existing
+	// {"status":"ok"} health field stays.
+	InstanceID string
 }
 
 // Server bundles dependencies for all handlers.
@@ -104,6 +112,13 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	if cfg.DefaultFlowName == "" {
 		cfg.DefaultFlowName = "default-1080"
+	}
+	// InstanceID: never blank in logs/health. main resolves it from
+	// ENCODE_INSTANCE_ID (default os.Hostname); if somehow empty here, fall
+	// back to "controller" so the field is always present and distinguishable
+	// from a real two-replica run where both would share the same blank.
+	if cfg.InstanceID == "" {
+		cfg.InstanceID = "controller"
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
@@ -173,11 +188,22 @@ const digestInterval = time.Hour
 // (acceptable — see DigestBuffer docs).
 //
 // Safe to call when s.digest is nil (a no-op guard lets tests skip the loop).
+//
+// HA: on Postgres the loop body runs under store.RunLoopSupervisor with
+// LockKeyDigest, so exactly one replica flushes the hourly digest (a second
+// replica's flush would double-post the same buffered events if the buffer
+// were shared — it isn't, each replica has its own in-memory digest buffer,
+// but the lock still prevents redundant flushes). On SQLite the supervisor
+// is a transparent always-locked wrapper and the loop runs unchanged. The
+// existing ctx-cancel/SIGTERM stop contract is preserved (the supervisor
+// cancels the body's sub-ctx on parent cancel).
 func (s *Server) StartDigestLoop(ctx context.Context) {
 	if s.digest == nil || s.digest.buf == nil {
 		return // no buffer initialized; nothing to flush (test/edge guard)
 	}
-	go s.runDigestLoop(ctx)
+	go store.RunLoopSupervisor(ctx, s.Store, s.Log, store.LockKeyDigest, "digest", func(ctx context.Context) {
+		s.runDigestLoop(ctx)
+	})
 }
 
 func (s *Server) runDigestLoop(ctx context.Context) {
@@ -571,7 +597,11 @@ func (s *Server) withNodeAuth(h func(http.ResponseWriter, *http.Request, *model.
 // ---------- Health ----------
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	// Additive: the existing {"status":"ok"} field stays so any test/client
+	// that checks for "ok" keeps passing. The "instance" field identifies
+	// this replica (Phase 3 HA) so an operator can tell two controllers apart
+	// behind a load balancer — both serve health, each reports its own id.
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "instance": s.Cfg.InstanceID})
 }
 
 // storeResolver resolves step templates from the store so rendered jobs link

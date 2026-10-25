@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/badskater/encode-system/backend/internal/store"
 )
 
 // retentionInterval is the retention loop's tick cadence. Hourly matches the
@@ -15,8 +17,17 @@ const retentionInterval = time.Hour
 // goroutine bound to ctx (lifecycle mirrors StartDigestLoop). Each tick
 // reads the LIVE settings so a Settings-page edit applies on the next tick
 // without a restart; JobRetentionDays=0 (default) makes the tick a no-op.
+//
+// HA: on Postgres the loop body runs under store.RunLoopSupervisor with
+// LockKeyRetention so exactly one replica prunes per tick (two replicas
+// pruning concurrently is harmless — PruneOldJobs is a DELETE with a WHERE
+// clause — but the lock avoids redundant work and log noise). On SQLite
+// the supervisor is a transparent always-locked wrapper and the loop runs
+// unchanged; ctx-cancel/SIGTERM stop is preserved.
 func (s *Server) StartRetentionLoop(ctx context.Context) {
-	go s.runRetentionLoop(ctx)
+	go store.RunLoopSupervisor(ctx, s.Store, s.Log, store.LockKeyRetention, "retention", func(ctx context.Context) {
+		s.runRetentionLoop(ctx)
+	})
 }
 
 func (s *Server) runRetentionLoop(ctx context.Context) {

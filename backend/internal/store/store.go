@@ -1,4 +1,5 @@
-// Package store persists controller state (nodes, jobs, flows) in SQLite.
+// Package store persists controller state (nodes, jobs, flows) in SQLite or
+// Postgres, selected by DSN.
 package store
 
 import (
@@ -12,33 +13,60 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql
+	_ "modernc.org/sqlite"             // registers the "sqlite" driver for database/sql
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
 
-// Store wraps the SQLite database with typed operations.
+// Store wraps the database with typed operations. The backend is SQLite or
+// Postgres, selected by the DSN passed to Open. Queries written with ?
+// placeholders are rebound to $N on Postgres by the q() helper; every query
+// in the package routes through q() so the dialect split lives in one place.
 type Store struct {
 	db *sql.DB
-	// dbPath is the database file location, kept for the share-credential
-	// key file (<dbPath>.shares-key) and BackupTo.
+	// dbPath is the SQLite database file location, kept for the
+	// share-credential key file (<dbPath>.shares-key) and BackupTo. On
+	// Postgres this is the raw DSN string (no key file / no VACUUM INTO).
 	dbPath string
+	// dialect selects the SQL backend so q() and friends branch correctly.
+	dialect dialect
 	// aead is the lazily-created cipher protecting share passwords (see
 	// store_share.go). Guarded by nothing: only touched from store methods
 	// which the sqlite pool serializes (MaxOpenConns=1).
 	aead cipher.AEAD
 }
 
-// Open opens (creating if needed) the SQLite database at path and applies
-// migrations. The pragmas keep SQLite safe for a single-writer controller.
+// Open opens (creating if needed) a SQLite database at the given file path or
+// a Postgres database at the given DSN, and applies migrations. A DSN
+// starting with "postgres://" or "postgresql://" selects Postgres via the
+// pgx stdlib driver (pool size 10); anything else is treated as a SQLite
+// file path and opened with modernc.org/sqlite exactly as before — SQLite
+// behavior is byte-for-byte unchanged (single-writer, DELETE journal,
+// pragmas applied per-connection).
 //
-// journal_mode is DELETE (rollback journal), NOT WAL: on the Docker host's
-// Ceph-backed volume the WAL/shm path corrupts its read view — sessions
-// written through the WAL become invisible to subsequent lookups
+// The SQLite journal_mode is DELETE (rollback journal), NOT WAL: on the
+// Docker host's Ceph-backed volume the WAL/shm path corrupts its read view —
+// sessions written through the WAL become invisible to subsequent lookups
 // (reproduced on a pristine DB with this exact binary; the incident of
 // 2026-08-28 turned every login into a 401). The rollback journal uses no
 // shm/mmap and is the safe choice for a single-writer, low-volume store.
 func Open(path string) (*Store, error) {
+	if isPostgresDSN(path) {
+		return openPostgres(path)
+	}
+	return openSQLite(path)
+}
+
+// isPostgresDSN reports whether the DSN string selects Postgres (vs a SQLite
+// file path). The pgx stdlib driver recognizes both the "postgres://" and
+// "postgresql://" URL schemes.
+func isPostgresDSN(dsn string) bool {
+	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
+}
+
+// openSQLite opens a SQLite database at path with the single-writer pragmas.
+func openSQLite(path string) (*Store, error) {
 	// The _pragma query params apply to EVERY connection the pool opens,
 	// unlike a one-shot Exec PRAGMA which a replacement connection would lose.
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(DELETE)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)", path)
@@ -47,8 +75,25 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // SQLite: single writer avoids lock contention
-	s := &Store{db: db, dbPath: path}
+	s := &Store{db: db, dbPath: path, dialect: dialectSQLite}
 	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// openPostgres opens a Postgres database at the given DSN via the pgx stdlib
+// driver, applies the fresh full-schema migration (migratePG), and returns a
+// Store configured for the Postgres dialect.
+func openPostgres(dsn string) (*Store, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	db.SetMaxOpenConns(10) // Postgres: connection pool for concurrent writers
+	s := &Store{db: db, dbPath: dsn, dialect: dialectPostgres}
+	if err := s.migratePG(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -357,28 +402,24 @@ func fmtPtrTime(t *time.Time) any {
 
 // CreateNode registers a node with a bcrypt hash of its token.
 func (s *Store) CreateNode(ctx context.Context, name, tokenHash string) (*model.Node, error) {
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		`INSERT INTO nodes (name, token_hash) VALUES (?, ?)`, name, tokenHash)
 	if err != nil {
 		return nil, fmt.Errorf("create node: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("CreateNode: last insert id: %w", err)
 	}
 	return s.GetNode(ctx, id)
 }
 
 // GetNode loads a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
+	row := s.qRow(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE id = ?`, id)
 	return scanNode(row)
 }
 
 // NodeByName loads a node by unique name.
 func (s *Store) NodeByName(ctx context.Context, name string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
+	row := s.qRow(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
@@ -407,7 +448,7 @@ func scanNode(row *sql.Row) (*model.Node, error) {
 
 // ListNodes returns all nodes ordered by name.
 func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
+	rows, err := s.qQuery(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -441,7 +482,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 	// One grouped query, not one per node — the fleet list must not do
 	// N+1 round trips on a 4s poll.
 	counts := map[int64]int{}
-	crows, err := s.db.QueryContext(ctx,
+	crows, err := s.qQuery(ctx,
 		`SELECT node_id, COUNT(*) FROM jobs WHERE status IN ('assigned','running') GROUP BY node_id`)
 	if err != nil {
 		return nil, err
@@ -465,7 +506,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]*model.Node, error) {
 
 // UpdateNode persists mutable node fields after a heartbeat or UI action.
 func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
+	_, err := s.qExec(ctx, `UPDATE nodes SET enabled=?, status=?, agent_version=?,
   lib_version=?, bin_version=?, tasks_since_boot=?, reboot_pending=?, reboot_issued_at_tasks=?, reboot_issued_at=?, last_seen=?, last_error=?, agent_log=?, platform=? WHERE id=?`,
 		boolToInt(n.Enabled), string(n.Status), n.AgentVersion, n.LibVersion, n.BinVersion, n.TasksSinceBoot,
 		boolToInt(n.RebootPending), n.RebootIssuedAtTasks, fmtPtrTime(n.RebootIssuedAt), fmtPtrTime(n.LastSeen), n.LastError, n.AgentLog, n.Platform, n.ID)
@@ -475,19 +516,19 @@ func (s *Store) UpdateNode(ctx context.Context, n *model.Node) error {
 // SetNodeGroup updates ONLY the routing label — field-scoped SQL so a
 // concurrent status/enabled change isn't clobbered. ” = wildcard node.
 func (s *Store) SetNodeGroup(ctx context.Context, id int64, group string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET "group"=? WHERE id=?`, group, id)
+	_, err := s.qExec(ctx, `UPDATE nodes SET "group"=? WHERE id=?`, group, id)
 	return err
 }
 
 // DeleteNode removes a node row (used to roll back failed pairing).
 func (s *Store) DeleteNode(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
+	_, err := s.qExec(ctx, `DELETE FROM nodes WHERE id = ?`, id)
 	return err
 }
 
 // NodeByTokenHash finds the node holding this token hash (auth lookup).
 func (s *Store) NodeByTokenHash(ctx context.Context, hash string) (*model.Node, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
+	row := s.qRow(ctx, `SELECT id, name, token_hash, enabled, status, "group", max_concurrent_jobs, agent_version,
   lib_version, bin_version, tasks_since_boot, reboot_pending, reboot_issued_at_tasks, reboot_issued_at, last_seen, last_error, agent_log, platform, created_at FROM nodes WHERE token_hash = ?`, hash)
 	return scanNode(row)
 }
@@ -507,27 +548,23 @@ func (s *Store) CreateFlow(ctx context.Context, f *model.Flow) (*model.Flow, err
 	if err != nil {
 		return nil, fmt.Errorf("marshal steps: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO flows (name, steps_json, options_json) VALUES (?, ?, ?)`,
+	id, err := s.insertID(ctx, `INSERT INTO flows (name, steps_json, options_json) VALUES (?, ?, ?)`,
 		f.Name, string(b), marshalFlowOptions(f))
 	if err != nil {
 		return nil, fmt.Errorf("create flow: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("CreateFlow: last insert id: %w", err)
 	}
 	return s.GetFlow(ctx, id)
 }
 
 // GetFlow loads a flow by ID.
 func (s *Store) GetFlow(ctx context.Context, id int64) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE id = ?`, id)
+	row := s.qRow(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE id = ?`, id)
 	return scanFlow(row)
 }
 
 // FlowByName loads a flow by unique name.
 func (s *Store) FlowByName(ctx context.Context, name string) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE name = ?`, name)
+	row := s.qRow(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE name = ?`, name)
 	return scanFlow(row)
 }
 
@@ -551,7 +588,7 @@ func scanFlow(row *sql.Row) (*model.Flow, error) {
 
 // ListFlows returns all flows ordered by name.
 func (s *Store) ListFlows(ctx context.Context) ([]*model.Flow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows ORDER BY name`)
+	rows, err := s.qQuery(ctx, `SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -583,7 +620,7 @@ func (s *Store) UpdateFlow(ctx context.Context, f *model.Flow) error {
 	if err != nil {
 		return fmt.Errorf("marshal steps: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE flows SET name=?, steps_json=?, options_json=?, updated_at=datetime('now') WHERE id=?`,
+	_, err = s.qExec(ctx, `UPDATE flows SET name=?, steps_json=?, options_json=?, updated_at=datetime('now') WHERE id=?`,
 		f.Name, string(b), marshalFlowOptions(f), f.ID)
 	return err
 }
@@ -593,13 +630,13 @@ func (s *Store) UpdateFlow(ctx context.Context, f *model.Flow) error {
 // an honest error instead of a constraint violation.
 func (s *Store) DeleteFlow(ctx context.Context, id int64) error {
 	var refs int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE flow_id = ?`, id).Scan(&refs); err != nil {
+	if err := s.qRow(ctx, `SELECT COUNT(*) FROM jobs WHERE flow_id = ?`, id).Scan(&refs); err != nil {
 		return err
 	}
 	if refs > 0 {
 		return fmt.Errorf("flow %d has %d job(s) referencing it", id, refs)
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM flows WHERE id = ?`, id)
+	_, err := s.qExec(ctx, `DELETE FROM flows WHERE id = ?`, id)
 	return err
 }
 
@@ -610,16 +647,12 @@ func (s *Store) DeleteFlow(ctx context.Context, id int64) error {
 // step_timings_json, retry_count, next_retry_at) default in the schema and
 // are populated later by the completion/report paths.
 func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error) {
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		`INSERT INTO jobs (series, episode, episode_dir, script_type, script_file, flow_id, status, priority)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		j.Series, j.Episode, j.EpisodeDir, j.ScriptType, j.ScriptFile, j.FlowID, string(model.JobPending), j.Priority)
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("CreateJob: last insert id: %w", err)
 	}
 	return s.GetJob(ctx, id)
 }
@@ -630,7 +663,7 @@ func (s *Store) CreateJob(ctx context.Context, j *model.Job) (*model.Job, error)
 // average low. (0, 0, nil) means no history yet; callers gate confidence
 // on the sample count.
 func (s *Store) AvgFlowDuration(ctx context.Context, flowID int64) (avgSec float64, samples int, err error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT AVG(strftime('%s', finished_at) - strftime('%s', started_at)), COUNT(*)
 		 FROM jobs WHERE flow_id=? AND status='done'
 		   AND started_at IS NOT NULL AND finished_at IS NOT NULL`, flowID)
@@ -647,7 +680,7 @@ func (s *Store) AvgFlowDuration(ctx context.Context, flowID int64) (avgSec float
 // CountJobsByStatus returns the job count per status in one grouped query
 // (Prometheus exposition + dashboards). Keys are the raw status strings.
 func (s *Store) CountJobsByStatus(ctx context.Context) (map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM jobs GROUP BY status`)
+	rows, err := s.qQuery(ctx, `SELECT status, COUNT(*) FROM jobs GROUP BY status`)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +699,7 @@ func (s *Store) CountJobsByStatus(ctx context.Context) (map[string]int, error) {
 
 // GetJob loads a job by ID.
 func (s *Store) GetJob(ctx context.Context, id int64) (*model.Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+	row := s.qRow(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE id = ?`, id)
@@ -726,7 +759,7 @@ func (s *Store) ListJobs(ctx context.Context, status model.JobStatus, limit int)
 		q += ` LIMIT ?`
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.qQuery(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -813,14 +846,14 @@ func (s *Store) PatchPendingJob(ctx context.Context, id int64, flowID *int64, pr
 		// "at least one field" guard, which already rejects this, but the
 		// method is safe to call directly from tests).
 		var status string
-		err := s.db.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id=?`, id).Scan(&status)
+		err := s.qRow(ctx, `SELECT status FROM jobs WHERE id=?`, id).Scan(&status)
 		if err != nil {
 			return false, err
 		}
 		return status == "pending", nil
 	}
 	args = append(args, id)
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`UPDATE jobs SET `+strings.Join(sets, ", ")+` WHERE id=? AND status='pending'`, args...)
 	if err != nil {
 		return false, err
@@ -835,7 +868,7 @@ func (s *Store) PatchPendingJob(ctx context.Context, id int64, flowID *int64, pr
 // JobExistsForEpisode reports whether any job (non-cancelled) already covers this episode dir.
 func (s *Store) JobExistsForEpisode(ctx context.Context, episodeDir string) (bool, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx,
+	err := s.qRow(ctx,
 		`SELECT COUNT(*) FROM jobs WHERE episode_dir = ? AND status != ?`, episodeDir, string(model.JobCancelled)).Scan(&n)
 	return n > 0, err
 }
@@ -853,8 +886,7 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	// must be atomic or two concurrent heartbeats could both pass the
 	// guard and overshoot max_concurrent_jobs.
 	var active, maxConc, enabled int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT enabled, max_concurrent_jobs FROM nodes WHERE id = ?`, nodeID).Scan(&enabled, &maxConc); err != nil {
+	if err := tx.QueryRowContext(ctx, s.q(`SELECT enabled, max_concurrent_jobs FROM nodes WHERE id = ?`), nodeID).Scan(&enabled, &maxConc); err != nil {
 		return fmt.Errorf("assign to unknown node %d: %w", nodeID, err)
 	}
 	// The node must exist and be enabled; otherwise the job would be handed
@@ -865,16 +897,14 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	if maxConc < 1 {
 		maxConc = 1 // legacy rows pre-migration; never allow 0 slots
 	}
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status IN ('assigned','running')`, nodeID).Scan(&active); err != nil {
+	if err := tx.QueryRowContext(ctx, s.q(`SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status IN ('assigned','running')`), nodeID).Scan(&active); err != nil {
 		return err
 	}
 	if active >= maxConc {
 		return fmt.Errorf("node %d already has %d active job(s) (max %d)", nodeID, active, maxConc)
 	}
 
-	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET status='assigned', node_id=?, started_at=datetime('now') WHERE id=? AND status='pending'`,
+	res, err := tx.ExecContext(ctx, s.q(`UPDATE jobs SET status='assigned', node_id=?, started_at=datetime('now') WHERE id=? AND status='pending'`),
 		nodeID, jobID)
 	if err != nil {
 		return err
@@ -890,7 +920,7 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	// with spare capacity stays 'idle' so the UI and stale-node heuristics
 	// keep treating it as available.
 	if active+1 >= maxConc {
-		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET status='busy' WHERE id=?`, nodeID); err != nil {
+		if _, err := tx.ExecContext(ctx, s.q(`UPDATE nodes SET status='busy' WHERE id=?`), nodeID); err != nil {
 			return err
 		}
 	}
@@ -901,7 +931,7 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 // Only live jobs (assigned/running) are updatable — a stale heartbeat must
 // not resurrect a terminal job back into the queue.
 func (s *Store) UpdateJobStatus(ctx context.Context, id int64, status model.JobStatus, step string, progress float64, logTail string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE jobs SET status=?, step=?, progress=?, log_tail=? WHERE id=? AND status IN ('assigned','running')`,
 		string(status), step, progress, logTail, id)
 	return err
@@ -930,7 +960,7 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status model.JobStatus,
 		args = append(args, id)
 	}
 	args = append(args, id)
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, finished_at=datetime('now')`+progress+steer+` WHERE id=?`,
 		args...)
 	return err
@@ -1061,7 +1091,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 		args = append(args, id)
 	}
 	args = append(args, id)
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`UPDATE jobs SET status=?, exit_code=?, error=?, outputs_json=?, log_tail=?, full_log=?, step_timings_json=?, metrics_json=?, finished_at=datetime('now')`+progress+steer+` WHERE id=? AND status IN ('assigned','running')`,
 		args...)
 	if err != nil {
@@ -1079,7 +1109,7 @@ func (s *Store) FinishJobWithReport(ctx context.Context, id int64, status model.
 
 // ActiveJobForNode returns the node's assigned/running job, if any.
 func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+	rows, err := s.qQuery(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id LIMIT 1`, nodeID)
@@ -1099,7 +1129,7 @@ func (s *Store) ActiveJobForNode(ctx context.Context, nodeID int64) (*model.Job,
 // still-full node idle, and freeing the last slot of a capped node must
 // make it available again.
 func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE nodes SET status='idle' WHERE id=? AND (
 			SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status IN ('assigned','running')
 		) < max_concurrent_jobs`,
@@ -1110,7 +1140,7 @@ func (s *Store) ReleaseNode(ctx context.Context, nodeID int64) error {
 // ActiveJobsForNode returns all assigned/running jobs for a node (the set
 // the controller needs for multi-job orphan recovery).
 func (s *Store) ActiveJobsForNode(ctx context.Context, nodeID int64) ([]*model.Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
+	rows, err := s.qQuery(ctx, `SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
   FROM jobs WHERE node_id = ? AND status IN ('assigned','running') ORDER BY id`, nodeID)
@@ -1139,14 +1169,14 @@ func (s *Store) SetNodeMaxConcurrent(ctx context.Context, id int64, maxJobs int)
 	if maxJobs > 8 {
 		maxJobs = 8
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET max_concurrent_jobs=? WHERE id=?`, maxJobs, id)
+	_, err := s.qExec(ctx, `UPDATE nodes SET max_concurrent_jobs=? WHERE id=?`, maxJobs, id)
 	return err
 }
 
 // CancelJob marks a pending/assigned job cancelled and returns rows affected.
 // Terminal and running jobs are refused so the lifecycle cannot regress.
 func (s *Store) CancelJob(ctx context.Context, id int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`UPDATE jobs SET status='cancelled', finished_at=datetime('now') WHERE id=? AND status IN ('pending','assigned')`,
 		id)
 	if err != nil {
@@ -1171,7 +1201,7 @@ func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	// auto-retried — the operator can short-circuit the backoff to retry now.
 	// A plain pending job with no gate matches neither clause (it is already
 	// queued) and is correctly a no-op, surfacing as a 409 in the handler.
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, exit_code=0, error='', log_tail='', outputs_json='[]', full_log='', step_timings_json='[]', started_at=NULL, finished_at=NULL, next_retry_at=NULL, retry_count=0 WHERE id=? AND (status IN ('failed','cancelled','done') OR (status='pending' AND next_retry_at IS NOT NULL))`,
 		id)
 	if err != nil {
@@ -1195,7 +1225,7 @@ func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 // a just-retried job sits 'pending' carrying the previous failure's error
 // message and log tail until it is re-assigned.
 func (s *Store) ScheduleJobRetry(ctx context.Context, jobID int64, retryCount int, nextRetryAt time.Time) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE jobs SET status='pending', node_id=0, step='', progress=0, retry_count=?, next_retry_at=?,
 		 started_at=NULL, finished_at=NULL, error='', exit_code=0, outputs_json='[]', log_tail='', full_log='', step_timings_json='[]'
 		 WHERE id=? AND status='failed'`,
@@ -1211,7 +1241,7 @@ func (s *Store) ScheduleJobRetry(ctx context.Context, jobID int64, retryCount in
 // job is assignable. ListJobs stays unchanged for the UI (retry-pending
 // jobs remain visible).
 func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
@@ -1240,7 +1270,7 @@ func (s *Store) NextAssignableJob(ctx context.Context) (*model.Job, error) {
 // steered-away job is the only candidate it is still returned — a
 // single-node farm must never starve.
 func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*model.Job, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, series, episode, episode_dir, script_type, script_file, flow_id, status,
   node_id, step, progress, exit_code, error, log_tail, outputs_json, created_at, started_at, finished_at,
   full_log, step_timings_json, metrics_json, priority, retry_count, next_retry_at, last_failed_node_id
@@ -1265,7 +1295,7 @@ func (s *Store) NextAssignableJobForNode(ctx context.Context, nodeID int64) (*mo
 // only for display; the reboot counter itself comes from the agent heartbeat.
 func (s *Store) CountFinishedTasksForNode(ctx context.Context, nodeID int64) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx,
+	err := s.qRow(ctx,
 		`SELECT COUNT(*) FROM jobs WHERE node_id = ? AND status = 'done'`, nodeID).Scan(&n)
 	return n, err
 }

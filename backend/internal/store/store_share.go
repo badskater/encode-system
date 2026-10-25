@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ import (
 // ensureSharesTable creates the shares table (idempotent; called from
 // migrateV2 so every Open gets it).
 func (s *Store) ensureSharesTable(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.qExec(ctx, `
 CREATE TABLE IF NOT EXISTS shares (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
@@ -48,7 +49,23 @@ CREATE TABLE IF NOT EXISTS shares (
 // BESIDE the DB (not inside it) on purpose: the backup-download endpoint
 // hands the DB file to admins, and that must not hand over share
 // credentials too.
-func (s *Store) shareKeyPath() string { return s.dbPath + ".shares-key" }
+//
+// On SQLite, dbPath is the database file path, so the key file sits beside
+// it. On Postgres, dbPath is a DSN (no meaningful file path), so the key
+// file is derived from the ENCODE_SHARES_KEY_FILE env var when set, or falls
+// back to a path under the OS temp dir keyed by the database name parsed
+// from the DSN — so multiple PG databases on the same host get distinct
+// key files. The key file is created on first use (see shareCipher).
+func (s *Store) shareKeyPath() string {
+	if s.dialect != dialectPostgres {
+		return s.dbPath + ".shares-key"
+	}
+	// PG: env var takes priority, else derive from the DB name.
+	if p := os.Getenv("ENCODE_SHARES_KEY_FILE"); p != "" {
+		return p
+	}
+	return sharesKeyPathForDSN(s.dbPath)
+}
 
 // shareCipher returns (creating on first use) the AES-GCM cipher protecting
 // share passwords. Key is 32 random bytes, stored 0600.
@@ -148,7 +165,7 @@ func (s *Store) CreateShare(ctx context.Context, sh *model.Share) (*model.Share,
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.db.ExecContext(ctx, `
+	id, err := s.insertID(ctx, `
 INSERT INTO shares (name, kind, role, server, path, port, username, password,
   region, use_tls, endpoint, enabled, mount_path)
 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -157,7 +174,6 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 	if err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
 	sh.ID = id
 	now := time.Now().UTC()
 	sh.CreatedAt, sh.UpdatedAt = now, now
@@ -166,7 +182,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 
 // GetShare loads one share with the password decrypted.
 func (s *Store) GetShare(ctx context.Context, id int64) (*model.Share, error) {
-	row := s.db.QueryRowContext(ctx, "SELECT "+shareCols+" FROM shares WHERE id=?", id)
+	row := s.qRow(ctx, "SELECT "+shareCols+" FROM shares WHERE id=?", id)
 	return s.scanShareRow(row)
 }
 
@@ -197,7 +213,7 @@ func (s *Store) scanShareRow(row *sql.Row) (*model.Share, error) {
 // ListShares returns all shares ordered by role,kind,name with passwords
 // decrypted (provisioning needs them; the API layer masks).
 func (s *Store) ListShares(ctx context.Context) ([]*model.Share, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+shareCols+" FROM shares ORDER BY role, kind, name")
+	rows, err := s.qQuery(ctx, "SELECT "+shareCols+" FROM shares ORDER BY role, kind, name")
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +248,7 @@ func (s *Store) ListShares(ctx context.Context) ([]*model.Share, error) {
 // over NFS over S3 for mount-based consumers (deterministic when several
 // exist). Nil,nil when none.
 func (s *Store) ShareForRole(ctx context.Context, role model.ShareRole) (*model.Share, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.qRow(ctx, `
 SELECT `+shareCols+` FROM shares WHERE role=? AND enabled=1
 ORDER BY CASE kind WHEN 'smb' THEN 0 WHEN 'nfs' THEN 1 ELSE 2 END, id
 LIMIT 1`, role)
@@ -266,7 +282,7 @@ func (s *Store) UpdateShare(ctx context.Context, sh *model.Share) error {
 		pwSQL + `, region=?, use_tls=?, endpoint=?, enabled=?, mount_path=?,
   updated_at=datetime('now') WHERE id=?`
 	args = append(args, sh.ID)
-	res, err := s.db.ExecContext(ctx, q, args...)
+	res, err := s.qExec(ctx, q, args...)
 	if err != nil {
 		return err
 	}
@@ -278,7 +294,7 @@ func (s *Store) UpdateShare(ctx context.Context, sh *model.Share) error {
 
 // DeleteShare removes a share row.
 func (s *Store) DeleteShare(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM shares WHERE id=?", id)
+	res, err := s.qExec(ctx, "DELETE FROM shares WHERE id=?", id)
 	if err != nil {
 		return err
 	}
@@ -315,7 +331,7 @@ func (s *Store) MigrateSettingsShares(ctx context.Context) int {
 			continue
 		}
 		var exists int
-		s.db.QueryRowContext(ctx,
+		s.qRow(ctx,
 			"SELECT COUNT(*) FROM shares WHERE server=? AND path=?", server, m.path).Scan(&exists)
 		if exists > 0 {
 			continue
@@ -330,10 +346,49 @@ func (s *Store) MigrateSettingsShares(ctx context.Context) int {
 	return created
 }
 
-// boolInt maps a bool to SQLite's 0/1.
+// boolInt maps a bool to 0/1 (SQLite has no BOOLEAN type; Postgres columns
+// mirror this so boolToInt/==1 scan code is identical on both backends).
 func boolInt(b bool) int {
 	if b {
 		return 1
 	}
 	return 0
+}
+
+// sharesKeyPathForDSN derives a key-file path from a Postgres DSN. The
+// database name is extracted from the DSN path (the segment after the last
+// /), sanitized to a filename-safe form, and placed under the OS temp dir
+// with a .shares-key suffix. Two DSNs pointing at different databases on
+// the same host produce distinct paths. When the DSN can't be parsed, a
+// generic fallback name is used.
+func sharesKeyPathForDSN(dsn string) string {
+	dbName := "encode"
+	// Extract the database name from the DSN path: postgres://user@host:port/dbname?...
+	// The path starts after the host; the dbname is the first path segment.
+	if u := strings.Index(dsn, "://"); u >= 0 {
+		rest := dsn[u+3:]
+		// Skip past host:port (everything up to the first /)
+		if slash := strings.Index(rest, "/"); slash >= 0 {
+			pathPart := rest[slash+1:]
+			// Strip query string
+			if q := strings.Index(pathPart, "?"); q >= 0 {
+				pathPart = pathPart[:q]
+			}
+			if pathPart != "" {
+				dbName = pathPart
+			}
+		}
+	}
+	// Sanitize: keep only alphanumerics and dash/underscore.
+	var sb strings.Builder
+	for _, r := range dbName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			sb.WriteRune(r)
+		}
+	}
+	safe := sb.String()
+	if safe == "" {
+		safe = "encode"
+	}
+	return filepath.Join(os.TempDir(), "encode-shares-"+safe+".key")
 }

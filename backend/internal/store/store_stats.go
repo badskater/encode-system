@@ -86,7 +86,7 @@ func (s *Store) statsTotals(ctx context.Context, out *model.Stats, cutoff string
   FROM jobs` +
 		whereFinishedAt("finished_at", cutoff)
 	var avg sql.NullFloat64
-	if err := s.db.QueryRowContext(ctx, q, rangeArgs(cutoff)...).Scan(
+	if err := s.qRow(ctx, q, rangeArgs(cutoff)...).Scan(
 		&out.Totals.Done, &out.Totals.Failed, &out.Totals.Cancelled, &avg, &out.Totals.AvgSpeedup); err != nil {
 		return fmt.Errorf("stats totals: %w", err)
 	}
@@ -110,7 +110,7 @@ func (s *Store) statsPerNode(ctx context.Context, out *model.Stats, cutoff strin
   FROM jobs j LEFT JOIN nodes n ON n.id = j.node_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.node_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
-	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats per node: %w", err)
 	}
@@ -138,7 +138,7 @@ func (s *Store) statsPerFlow(ctx context.Context, out *model.Stats, cutoff strin
   FROM jobs j LEFT JOIN flows f ON f.id = j.flow_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
 		` GROUP BY j.flow_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
-	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats per flow: %w", err)
 	}
@@ -164,7 +164,7 @@ func (s *Store) statsFailuresByStep(ctx context.Context, out *model.Stats, cutof
 	q := `SELECT step, COUNT(*) FROM jobs WHERE status='failed'` +
 		andFinishedAt(cutoff) +
 		` GROUP BY step ORDER BY COUNT(*) DESC LIMIT 10`
-	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats failures by step: %w", err)
 	}
@@ -187,7 +187,7 @@ func (s *Store) statsPerDay(ctx context.Context, out *model.Stats, cutoff string
 	q := `SELECT date(finished_at) d, COUNT(*) FROM jobs WHERE status='done'` +
 		andFinishedAt(cutoff) +
 		` GROUP BY d ORDER BY d`
-	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats per day: %w", err)
 	}
@@ -217,7 +217,7 @@ func (s *Store) statsRepeatFailures(ctx context.Context, out *model.Stats, cutof
   WHERE j.status='failed' AND j.retry_count >= 1` +
 		andFinishedAt(cutoff) +
 		` ORDER BY j.retry_count DESC, j.finished_at DESC LIMIT 25`
-	rows, err := s.db.QueryContext(ctx, q, rangeArgs(cutoff)...)
+	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats repeat failures: %w", err)
 	}
@@ -297,7 +297,7 @@ func rangeArgs(cutoff string) []any {
 // finished_at=datetime('now'), which is uncontrolled; this helper lets a test
 // backdate. It is exported so cross-package API tests can use it too.
 func (s *Store) SeedFinishedJob(ctx context.Context, flowID, nodeID int64, status, step, startedAt, finishedAt string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`INSERT INTO jobs (series, episode, episode_dir, script_type, flow_id, status, node_id, step, started_at, finished_at)
 		 VALUES (?, ?, ?, 'vpy', ?, ?, ?, ?, ?, ?)`,
 		"S", "01", "S/Ep 01", flowID, status, nodeID, step, startedAt, finishedAt)

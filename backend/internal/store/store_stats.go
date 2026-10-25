@@ -109,7 +109,7 @@ func (s *Store) statsPerNode(ctx context.Context, out *model.Stats, cutoff strin
     ` + speedupAgg("j.") + `
   FROM jobs j LEFT JOIN nodes n ON n.id = j.node_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
-		` GROUP BY j.node_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
+		` GROUP BY j.node_id, n.name ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
 	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats per node: %w", err)
@@ -137,7 +137,7 @@ func (s *Store) statsPerFlow(ctx context.Context, out *model.Stats, cutoff strin
     ` + speedupAgg("j.") + `
   FROM jobs j LEFT JOIN flows f ON f.id = j.flow_id` +
 		whereFinishedAt("j.finished_at", cutoff) +
-		` GROUP BY j.flow_id ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
+		` GROUP BY j.flow_id, f.name ORDER BY COUNT(CASE WHEN j.status='done' THEN 1 END) DESC`
 	rows, err := s.qQuery(ctx, q, rangeArgs(cutoff)...)
 	if err != nil {
 		return fmt.Errorf("stats per flow: %w", err)

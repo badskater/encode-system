@@ -187,6 +187,31 @@ func storeContract(t *testing.T, openFn func(t *testing.T) *Store) {
 		t.Fatalf("counts[done] = %d, want >= 1", counts["done"])
 	}
 
+	// --- Stats: JobStats aggregate (per-node/per-flow GROUP BY joins) ---
+	// Regression guard: Postgres rejects non-grouped selected columns
+	// (n.name/f.name must appear in GROUP BY) where SQLite tolerates them,
+	// so this exercises the aggregate joins on both backends.
+	stats7, err := s.JobStats(ctx, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("JobStats(7d): %v", err)
+	}
+	if stats7.Totals.Done < 1 {
+		t.Fatalf("JobStats(7d) totals.done = %d, want >= 1", stats7.Totals.Done)
+	}
+	if len(stats7.PerNode) < 1 || stats7.PerNode[0].Name != "contract-job-node" {
+		t.Fatalf("JobStats(7d) per-node mismatch: %+v", stats7.PerNode)
+	}
+	if len(stats7.PerFlow) < 1 || stats7.PerFlow[0].Name != flow.Name {
+		t.Fatalf("JobStats(7d) per-flow mismatch: %+v", stats7.PerFlow)
+	}
+	statsAll, err := s.JobStats(ctx, 0)
+	if err != nil {
+		t.Fatalf("JobStats(all): %v", err)
+	}
+	if statsAll.Totals.Done < 1 {
+		t.Fatalf("JobStats(all) totals.done = %d, want >= 1", statsAll.Totals.Done)
+	}
+
 	// --- Share CRUD with encrypted password ---
 	sh, err := s.CreateShare(ctx, &model.Share{
 		Name: "contract-share", Kind: model.ShareSMB, Role: model.ShareRoleScripts,

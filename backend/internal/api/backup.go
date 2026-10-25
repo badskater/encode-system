@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,9 +22,20 @@ import (
 const maxBackups = 24
 
 // BackupManager owns DB snapshot scheduling. Snapshots live in
-// <dataDir>/backups as encode-<UTC timestamp>.db (VACUUM INTO output).
+// <dataDir>/backups. On SQLite they are VACUUM INTO .db files; on Postgres
+// they are logical table-walk JSON-lines .dump files (see dumpPG).
 type BackupManager struct {
-	Store   *store.Store
+	Store *store.Store
+	// Postgres selects the snapshot strategy: true → logical JSON dump
+	// (dumpPG), false → VACUUM INTO (.db). Set by the controller from the
+	// ENCODE_DATABASE_URL env (a postgres:// DSN ⇒ true). The store package
+	// keeps its own isPostgres() private, so the controller — which already
+	// knows the backend it selected — passes the flag in here.
+	Postgres bool
+	// PGDump is the *sql.DB the PG dump path uses for catalog/SELECT queries.
+	// It must be the same pool the store uses (store.Open's pgx handle) so the
+	// dump reads a consistent snapshot of the live schema. nil on SQLite.
+	PGDump  *sql.DB
 	Dir     string // absolute path to the backups dir
 	Log     *slog.Logger
 	Enabled bool // scheduled snapshots on/off (manual trigger always works)
@@ -42,9 +54,22 @@ type BackupInfo struct {
 	Scheduled bool      `json:"scheduled"`
 }
 
-// TakeSnapshot writes a new VACUUM INTO snapshot with a timestamped name.
-// scheduled=true marks it for auto-pruning; manual snapshots are kept until
-// explicitly deleted. Returns the created file's info.
+// TakeSnapshot writes a new snapshot with a timestamped name. On SQLite it
+// uses VACUUM INTO (a standalone .db file). On Postgres it writes a logical
+// table-walk dump as newline-delimited JSON (one JSON object per row, grouped
+// by table, in FK order) — a .dump file the operator can re-import with
+// pgimport -force or restore via a COPY/INSERT path. scheduled=true marks it
+// for auto-pruning; manual snapshots are kept until explicitly deleted.
+// Returns the created file's info.
+//
+// No-secrets contract (verified to match the SQLite VACUUM INTO parity): the
+// dump includes the shares table's password column exactly as SQLite VACUUM
+// INTO would — i.e. the AES-GCM ciphertext ("v1:<hex>"), NEVER plaintext and
+// NEVER the key file. The share-credential encryption key lives BESIDE the DB
+// (<sqlite>.shares-key) and is not inside it; a SQLite VACUUM INTO backup
+// therefore already carries the ciphertext-but-not-the-key, and the PG dump
+// preserves that identical contract. The key file must be backed up
+// separately (out of band) for a restore to decrypt.
 func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*BackupInfo, error) {
 	if err := os.MkdirAll(b.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create backups dir: %w", err)
@@ -53,16 +78,27 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 	if scheduled {
 		kind = "sched"
 	}
-	name := fmt.Sprintf("encode-%s-%s.db", time.Now().UTC().Format("20060102-150405"), kind)
+	pg := b.Postgres
+	suffix := ".db"
+	if pg {
+		suffix = ".dump"
+	}
+	name := fmt.Sprintf("encode-%s-%s%s", time.Now().UTC().Format("20060102-150405"), kind, suffix)
 	dest := filepath.Join(b.Dir, name)
 	// A name collision means two snapshots in the same second — append a
 	// counter rather than failing the backup.
 	for i := 1; fileExists(dest); i++ {
-		dest = filepath.Join(b.Dir, fmt.Sprintf("encode-%s-%s-%d.db",
-			time.Now().UTC().Format("20060102-150405"), kind, i))
+		dest = filepath.Join(b.Dir, fmt.Sprintf("encode-%s-%s-%d%s",
+			time.Now().UTC().Format("20060102-150405"), kind, i, suffix))
 	}
-	if err := b.Store.BackupTo(ctx, dest); err != nil {
-		return nil, fmt.Errorf("vacuum into: %w", err)
+	if pg {
+		if err := b.dumpPG(ctx, dest); err != nil {
+			return nil, fmt.Errorf("pg dump: %w", err)
+		}
+	} else {
+		if err := b.Store.BackupTo(ctx, dest); err != nil {
+			return nil, fmt.Errorf("vacuum into: %w", err)
+		}
 	}
 	info, err := os.Stat(dest)
 	if err != nil {
@@ -71,7 +107,9 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 	if scheduled {
 		b.pruneScheduled(ctx)
 	}
-	return &BackupInfo{Name: name, SizeBytes: info.Size(), CreatedAt: info.ModTime().UTC(), Scheduled: scheduled}, nil
+	// Reflect the actual filename (counter suffix may have advanced it).
+	base := filepath.Base(dest)
+	return &BackupInfo{Name: base, SizeBytes: info.Size(), CreatedAt: info.ModTime().UTC(), Scheduled: scheduled}, nil
 }
 
 // List returns all snapshots newest-first.
@@ -85,7 +123,12 @@ func (b *BackupManager) List() ([]*BackupInfo, error) {
 	}
 	out := []*BackupInfo{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".db") {
+		if e.IsDir() {
+			continue
+		}
+		// SQLite snapshots are .db (VACUUM INTO); PG snapshots are .dump
+		// (logical JSON-lines dump). Both are valid download/delete targets.
+		if !strings.HasSuffix(e.Name(), ".db") && !strings.HasSuffix(e.Name(), ".dump") {
 			continue
 		}
 		info, err := e.Info()
@@ -103,10 +146,11 @@ func (b *BackupManager) List() ([]*BackupInfo, error) {
 	return out, nil
 }
 
-// Delete removes one snapshot by exact filename. Only plain .db names
+// Delete removes one snapshot by exact filename. Only plain .db/.dump names
 // without path separators are accepted (no traversal).
 func (b *BackupManager) Delete(name string) error {
-	if name == "" || strings.ContainsAny(name, `/\`) || !strings.HasSuffix(name, ".db") {
+	if name == "" || strings.ContainsAny(name, `/\\`) ||
+		(!strings.HasSuffix(name, ".db") && !strings.HasSuffix(name, ".dump")) {
 		return fmt.Errorf("invalid backup name")
 	}
 	path := filepath.Join(b.Dir, name)
@@ -246,7 +290,8 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	if name == "" || strings.ContainsAny(name, `/\`) || !strings.HasSuffix(name, ".db") {
+	if name == "" || strings.ContainsAny(name, `/\\`) ||
+		(!strings.HasSuffix(name, ".db") && !strings.HasSuffix(name, ".dump")) {
 		writeErr(w, http.StatusBadRequest, "invalid backup name")
 		return
 	}

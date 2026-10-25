@@ -121,6 +121,98 @@ override — required for isolated test deploys), `ENCODE_HOME` /
 `ENCODE_COMPOSE_PROJECT` / `ENCODE_REPO` (install.sh overrides),
 `NFS_SERVER` (legacy NFS compose only).
 
+## Postgres backend (optional)
+
+The default backend is SQLite (state lives in the `encode-state` volume at
+`/data/encode.db`). For deployments that want a managed/HA database or a
+shared backend across controller instances, the controller can run against
+Postgres instead — selected by a single env var, with no code change.
+
+### `ENCODE_DATABASE_URL`
+
+Empty (the default) keeps the SQLite behavior byte-for-byte. Set it to a
+`postgres://` DSN to switch the controller to the Postgres backend:
+
+```bash
+# .env
+ENCODE_DATABASE_URL=postgres://encode:secret@postgres:5432/encode?sslmode=disable
+```
+
+On boot the controller opens the PG backend (`store.Open` → `migratePG`),
+which creates the full schema fresh on a new database and is a no-op on an
+existing one — so the first boot of a fresh PG is a self-migrating install.
+The controller logs one line stating which backend is active, with the DSN
+**redacted** (only scheme+host+db; the password is never logged). If PG is
+unreachable the controller exits non-zero with the connection error (same
+fail-fast path as a corrupt SQLite file).
+
+### Compose profile
+
+The runtime compose ships an **optional** `postgres` service
+(`postgres:16-alpine`), profile-gated (`profiles: [postgres]`) so the default
+`docker compose up -d` is byte-identical to the SQLite-only deploy. To run
+the controller against the bundled Postgres:
+
+```bash
+# 1. Set the DSN + PG credentials in .env (see .env.example):
+#    ENCODE_DATABASE_URL, ENCODE_PG_USER/PASSWORD/DB
+# 2. Bring up the postgres profile + controller together:
+docker compose --profile postgres up -d
+```
+
+The controller does **not** hard-`depends_on` postgres: a non-profiled
+service may not `depends_on` a profiled one (compose errors in default
+mode), so the ordering is handled by bringing the profile up explicitly.
+The postgres healthcheck (`pg_isready`) makes it ready before the controller
+connects; the controller fail-fast-exits if PG is unreachable, so a
+misordered `up` self-corrects on the next restart.
+
+### `install.sh --postgres`
+
+`install.sh --postgres` automates the whole path: brings up the postgres
+profile, waits for it healthy, and:
+
+- If an existing SQLite DB is present in the state volume **and** the target
+  PG is empty, runs the bundled `pgimport` binary to migrate it (dry-run
+  validates counts first, then the real import).
+- If no SQLite DB exists (fresh install), just wires the DSN — the
+  controller runs `migratePG` fresh on boot.
+- Sets `ENCODE_DATABASE_URL` in `.env` idempotently (and
+  `ENCODE_SHARES_KEY_FILE` to a path on the state volume).
+
+Without `--postgres` the behavior is byte-identical to today (SQLite).
+
+### `pgimport` (standalone SQLite → Postgres migration)
+
+The release ships a `pgimport` binary (linux/amd64) for one-shot SQLite →
+Postgres migration outside `install.sh`:
+
+```bash
+# Migrate an existing SQLite DB into a fresh PG (refuses a non-empty target):
+./pgimport -sqlite /data/encode.db -pg 'postgres://encode@host:5432/encode?sslmode=disable'
+
+# Dry-run (validate counts, write nothing):
+./pgimport -sqlite /data/encode.db -pg '<dsn>' -dry-run
+
+# Re-import into a non-empty target (TRUNCATEs every table CASCADE first):
+./pgimport -sqlite /data/encode.db -pg '<dsn>' -force
+```
+
+It copies tables in FK order, preserves explicit ids, advances the PG
+sequences via `setval`, and verifies per-table counts + key aggregates via
+the store package afterwards. See `cmd/pgimport` for the full design notes.
+
+### Shares key file on Postgres
+
+Share credentials (SMB password, S3 secret key) are AES-GCM encrypted with a
+key file that lives **beside** the SQLite DB (`<dataDir>/encode.db.shares-key`),
+never inside it — so the DB backup never leaks the key. On Postgres the DB is
+remote, so the key file resolves to `ENCODE_SHARES_KEY_FILE` (or a temp-dir
+path derived from the DSN's db name as a fallback). **Set
+`ENCODE_SHARES_KEY_FILE` to a path on the `encode-state` volume** so the key
+survives container recreation, and back it up out of band — losing it means
+stored share passwords can't be decrypted.
+
 ## Windows nodes (Ansible)
 
 ```bash

@@ -5,13 +5,16 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"flag"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/scanner"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql (backup PG dump handle)
 )
 
 func env(key, def string) string {
@@ -53,12 +57,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.Open(filepath.Join(*dataDir, "encode.db"))
+	// databaseURL selects the store backend. Empty (the default) keeps the
+	// historical SQLite file at <dataDir>/encode.db byte-for-byte. A
+	// postgres:// DSN switches the controller to the Postgres backend
+	// (store.Open → openPostgres → migratePG creates the schema fresh on a
+	// new database, no-op on an existing one). store.Open already fails
+	// fast (and returns a clear error) when PG is unreachable; this block
+	// exits non-zero on that error, same as today's SQLite failure path.
+	databaseURL := os.Getenv("ENCODE_DATABASE_URL")
+	dbTarget := filepath.Join(*dataDir, "encode.db")
+	if databaseURL != "" {
+		dbTarget = databaseURL
+	}
+	st, err := store.Open(dbTarget)
 	if err != nil {
-		log.Error("open store", "err", err)
+		log.Error("open store", "backend", redactDSN(databaseURL), "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
+	log.Info("store backend", "backend", redactDSN(databaseURL))
 
 	up, err := update.NewStore(filepath.Join(*dataDir, "updates"))
 	if err != nil {
@@ -204,11 +221,26 @@ func main() {
 	// defaults. The loop polls every 30s so changes apply without a
 	// restart.
 	srv.Backup = &api.BackupManager{
-		Store:   st,
-		Dir:     filepath.Join(*dataDir, "backups"),
-		Log:     log,
-		Enabled: env("ENCODE_BACKUP_ENABLED", "false") == "true",
-		Every:   time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
+		Store:    st,
+		Postgres: databaseURL != "" && (strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://")),
+		Dir:      filepath.Join(*dataDir, "backups"),
+		Log:      log,
+		Enabled:  env("ENCODE_BACKUP_ENABLED", "false") == "true",
+		Every:    time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
+	}
+	// On Postgres, open a second *sql.DB over the same DSN for the backup
+	// dump path (catalog + SELECT * per table). The store keeps its own
+	// private *sql.DB (no exported accessor), so the backup opens its own
+	// pool on the same DSN — the same pattern cmd/pgimport uses. pgx stdlib
+	// pools connections; the backup dump is single-threaded and reads a
+	// consistent snapshot. nil on SQLite (dumpPG is never called there).
+	if srv.Backup.Postgres {
+		pgDump, err := sql.Open("pgx", databaseURL)
+		if err != nil {
+			log.Error("open pg dump handle", "err", err)
+			os.Exit(1)
+		}
+		srv.Backup.PGDump = pgDump
 	}
 	// One-time migration: legacy flat NFS Settings fields become share rows
 	// (idempotent; never touches existing shares).
@@ -249,6 +281,34 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("controller stopped")
+}
+
+// redactDSN turns a database target into a safe, secret-free label for logs.
+//
+// Empty (SQLite default) → "sqlite". A non-empty value that is not a
+// postgres:// URL → "sqlite:<basename>" (the file path, basename only — a
+// full path could leak a host directory layout). A postgres:// URL →
+// "postgres://<host>/<dbname>", with the userinfo (user:password) stripped:
+// only scheme + host + db name survive, never the password. A DSN that fails
+// to parse → "postgres:<redacted>" so the password is never logged even on a
+// malformed input. The same function is used on the success log line (one
+// line, which backend is active) and the failure line (which backend failed).
+func redactDSN(dbTarget string) string {
+	if dbTarget == "" {
+		return "sqlite"
+	}
+	if !strings.HasPrefix(dbTarget, "postgres://") && !strings.HasPrefix(dbTarget, "postgresql://") {
+		return "sqlite:" + filepath.Base(dbTarget)
+	}
+	u, err := url.Parse(dbTarget)
+	if err != nil || u.Host == "" {
+		return "postgres:<redacted>"
+	}
+	db := strings.TrimPrefix(u.Path, "/")
+	if db == "" {
+		db = "?"
+	}
+	return u.Scheme + "://" + u.Host + "/" + db
 }
 
 // clampInt bounds v to [lo, hi].

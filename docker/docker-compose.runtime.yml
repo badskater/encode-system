@@ -14,6 +14,22 @@
 # storage from the UI (Settings → Storage shares): NFS/SMB mounts via the
 # provisioning playbooks, or S3 (MinIO / Ceph RGW / AWS) which needs NO host
 # mounts at all — the scanner lists the bucket and agents stage per job.
+#
+# --- Postgres backend (optional) -------------------------------------------
+# The default backend is SQLite (state lives in the encode-state volume). To
+# run the controller against Postgres instead:
+#   1. Set ENCODE_DATABASE_URL in .env (see .env.example), e.g.
+#      ENCODE_DATABASE_URL=postgres://encode:secret@postgres:5432/encode?sslmode=disable
+#   2. Bring up the postgres profile + controller together:
+#      docker compose --profile postgres up -d
+# The postgres service is profile-gated (profiles: [postgres]) so the default
+# `docker compose up -d` is byte-identical to the SQLite-only deploy. The
+# controller does NOT hard-depend_on postgres: a non-profiled service may not
+# depend_on a profiled one (compose errors in default mode), so the ordering is
+# handled by bringing the profile up explicitly (postgres's healthcheck makes
+# it ready before the controller connects; the controller fail-fast-exits if
+# PG is unreachable, so a misordered `up` self-corrects on the retry).
+# install.sh --postgres automates all of this.
 services:
   controller:
     image: ghcr.io/badskater/encode-system:${ENCODE_VERSION:-latest}
@@ -46,8 +62,21 @@ services:
       ENCODE_TAG: ${ENCODE_TAG:-1080p}
       ENCODE_DEFAULT_FLOW: ${ENCODE_DEFAULT_FLOW:-default-1080}
       ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
+      # Postgres backend (optional): empty (the default) keeps the SQLite
+      # behavior byte-for-byte. A postgres:// DSN switches the controller to
+      # the Postgres store (store.Open → migratePG builds the schema fresh on
+      # a new DB, no-op on an existing one). The password in the DSN is
+      # stripped from logs (controller logs only scheme+host+db).
+      ENCODE_DATABASE_URL: ${ENCODE_DATABASE_URL:-}
+      # Shares key file location when on Postgres (SQLite keeps the key
+      # beside the DB automatically). Set to a path on a mounted volume so
+      # the key survives container recreation. See Docs/md/Deployment.md.
+      ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-}
     volumes:
-      # Controller state (SQLite DB + update payloads).
+      # Controller state (SQLite DB + update payloads + shares key file).
+      # On Postgres the DB lives in the postgres container's volume, but the
+      # shares key file (ENCODE_SHARES_KEY_FILE) and update payloads still
+      # live here — keep this volume in both modes.
       - encode-state:/data
       # Local scratch shares — replace with NFS/SMB volumes or switch the
       # scripts/release roles to S3 shares in the UI (no mounts needed).
@@ -59,7 +88,33 @@ services:
       timeout: 5s
       retries: 3
 
+  # Postgres backend (optional, profile-gated). NOT started by the default
+  # `docker compose up -d` — only with `--profile postgres`. The controller
+  # connects to it via ENCODE_DATABASE_URL (set in .env). Healthcheck makes
+  # `up --profile postgres` wait for PG readiness before the controller boots.
+  postgres:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    container_name: ${ENCODE_PG_CONTAINER_NAME:-encode-postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ENCODE_PG_USER:-encode}
+      POSTGRES_PASSWORD: ${ENCODE_PG_PASSWORD:-changeme-encode-pg}
+      POSTGRES_DB: ${ENCODE_PG_DB:-encode}
+    volumes:
+      - encode-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready exits 0 when PG accepts connections; matches the user/db
+      # the controller will use so a half-up PG that can't serve the db
+      # stays unhealthy.
+      test: ["CMD-SHELL", "pg_isready -U ${ENCODE_PG_USER:-encode} -d ${ENCODE_PG_DB:-encode}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   encode-state:
   encode-scripts:
   encode-release:
+  encode-pgdata:

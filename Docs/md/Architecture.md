@@ -55,6 +55,38 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
 - **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel, prune, SSE log stream), flows, step templates, series, shares, scanner config, settings, stats, metrics, audit log, API tokens, DB backups, updates (agent/lib/bin + rollback). Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session. A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA).
 
+### Store: dialect layer (SQLite default, Postgres optional)
+
+The controller persists all state (nodes, jobs, flows, series, shares,
+sessions, audit, settings, metrics, provision runs, step templates) through
+`internal/store`, a single package with a dialect split selected by the DSN
+passed to `store.Open`:
+
+- **SQLite** (default): a `postgres://`-free path opens a single-writer
+  SQLite file (modernc.org/sqlite, `journal_mode=DELETE`, `MaxOpenConns=1`).
+  This is the historical backend; behavior is byte-for-byte unchanged.
+- **Postgres**: a `postgres://` or `postgresql://` DSN opens the pgx stdlib
+  driver (`MaxOpenConns=10`), and `migratePG` creates the full end-state
+  schema in one shot (every table with its final columns — not an ALTER
+  chain). The PG schema mirrors the SQLite end-state after all migrations:
+  `BIGSERIAL` for `AUTOINCREMENT`, `TEXT` timestamps (not `timestamptz` —
+  by design, so `fmtTime`/`parseTime` and every scan path run unchanged),
+  `INTEGER` 0/1 for booleans, PL/pgSQL compat functions (`julianday`,
+  `strftime`, `date`, `SUBSTR`, `substr`, `json_extract`) so the identical
+  stats SQL text runs on both backends.
+
+Every query in the package routes through `q()`, which rebinds `?`
+placeholders to `$N` on Postgres (skipping single-quoted literals so data
+`?`s are never rebound) and translates `datetime('now')`. The backend is
+selected at boot by the controller reading `ENCODE_DATABASE_URL` (empty =
+SQLite file at `<dataDir>/encode.db`; a `postgres://` DSN = PG). The
+controller logs one redacted line stating which backend is active (scheme +
+host + db; never the password) and fail-fast-exits on a connection error.
+The backup endpoint (`/api/backup`) branches on the backend: SQLite uses
+`VACUUM INTO` (a standalone `.db`); Postgres uses a logical table-walk
+JSON-lines dump (`.dump`). See `Docs/md/Operations.md` for backup behavior
+and `Docs/md/Deployment.md` for the PG deploy path.
+
 ### Web UI (`frontend/` — React + TypeScript SPA)
 
 - Single design system in `src/styles.css` (2026-10 redesign): dark ops-console

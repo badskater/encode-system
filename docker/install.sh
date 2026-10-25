@@ -2,8 +2,9 @@
 # install.sh — install/upgrade the encode-system controller on a Docker host.
 #
 # Usage:
-#   ./install.sh                 # latest release
+#   ./install.sh                 # latest release (SQLite backend)
 #   ./install.sh v1.17.0         # specific version
+#   ./install.sh --postgres      # enable Postgres backend (see below)
 #   curl -fsSL <raw-url>/install.sh | bash
 #
 # What it does:
@@ -14,6 +15,16 @@
 #      before replacing the controller binary.
 #   4. docker compose pull || build, then up -d, then health-checks.
 #
+# --postgres mode:
+#   Brings up the `postgres` compose profile (postgres:16-alpine), waits for
+#   it healthy, and:
+#     - If an existing SQLite DB is present in the state volume AND the target
+#       PG is empty, runs the bundled `pgimport` binary to migrate it.
+#     - If no SQLite DB exists (fresh install), just wires the DSN — the
+#       controller runs migratePG fresh on boot.
+#     - Sets ENCODE_DATABASE_URL in .env (idempotent grep/sed).
+#   Without --postgres the behavior is byte-identical to today (SQLite).
+#
 # Env overrides: ENCODE_HOME (default /opt/encode-system), ENCODE_REPO
 # (default badskater/encode-system), GITHUB_TOKEN (for private repos:
 # a PAT with repo read access; also used for `docker login ghcr.io`).
@@ -21,7 +32,23 @@ set -euo pipefail
 
 REPO="${ENCODE_REPO:-badskater/encode-system}"
 HOME_DIR="${ENCODE_HOME:-/opt/encode-system}"
-VERSION="${1:-latest}"
+VERSION="latest"
+USE_POSTGRES=0
+
+# Parse args: a leading --postgres flag, and an optional version arg.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --postgres) USE_POSTGRES=1; shift ;;
+        --help|-h)
+            sed -n '2,30p' "$0"
+            exit 0
+            ;;
+        *)
+            if [ -z "${VERSION_SET:-}" ]; then VERSION="$1"; VERSION_SET=1; shift
+            else echo "unexpected arg: $1" >&2; exit 2; fi
+            ;;
+    esac
+done
 
 log() { printf '[install] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -97,10 +124,11 @@ fi
 # $HOME_DIR/provision/../systemd → $HOME_DIR/systemd) on bundle-based builds.
 for f in controller encode-agent.exe ui provision systemd EncodeLib.ps1 \
          Dockerfile.runtime docker-compose.runtime.yml .env.example \
-         install-agent.ps1 SHA256SUMS; do
+         install-agent.ps1 install-agent.sh pgimport SHA256SUMS; do
     [ -e "$BUNDLE/$f" ] && cp -r "$BUNDLE/$f" "$HOME_DIR/"
 done
 chmod +x "$HOME_DIR/controller" "$HOME_DIR/install.sh" 2>/dev/null || true
+[ -f "$HOME_DIR/pgimport" ] && chmod +x "$HOME_DIR/pgimport" 2>/dev/null || true
 if [ ! -f "$HOME_DIR/.env" ]; then
     cp "$BUNDLE/.env.example" "$HOME_DIR/.env"
     log "wrote $HOME_DIR/.env — EDIT IT (admin password, port) before first start"
@@ -115,6 +143,32 @@ if grep -q '^ENCODE_VERSION=' "$HOME_DIR/.env" 2>/dev/null; then
     sed -i "s/^ENCODE_VERSION=.*/ENCODE_VERSION=${VERSION#v}/" "$HOME_DIR/.env"
 else
     echo "ENCODE_VERSION=${VERSION#v}" >> "$HOME_DIR/.env"
+fi
+
+# --- Postgres backend wiring (--postgres) -----------------------------------
+# Build the DSN from the PG_* vars (with .env.example defaults) and write
+# ENCODE_DATABASE_URL into .env idempotently. Same grep/sed pattern as the
+# ENCODE_VERSION block above: append when absent, rewrite when present.
+# `|| true` on grep: exits 1 when the key is absent (legacy .env) and under
+# set -euo pipefail that would abort silently — the else-branch is the
+# intended path for a fresh .env.
+if [ "$USE_POSTGRES" = "1" ]; then
+    PG_USER="$(grep -E '^ENCODE_PG_USER=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"; PG_USER="${PG_USER:-encode}"
+    PG_PASS="$(grep -E '^ENCODE_PG_PASSWORD=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"; PG_PASS="${PG_PASS:-changeme-encode-pg}"
+    PG_DB="$(grep -E '^ENCODE_PG_DB=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"; PG_DB="${PG_DB:-encode}"
+    # The postgres service is named `postgres` in the compose network.
+    PG_DSN="postgres://${PG_USER}:${PG_PASS}@postgres:5432/${PG_DB}?sslmode=disable"
+    if grep -q '^ENCODE_DATABASE_URL=' "$HOME_DIR/.env" 2>/dev/null; then
+        sed -i "s|^ENCODE_DATABASE_URL=.*|ENCODE_DATABASE_URL=${PG_DSN}|" "$HOME_DIR/.env"
+    else
+        echo "ENCODE_DATABASE_URL=${PG_DSN}" >> "$HOME_DIR/.env"
+    fi
+    # Default the shares key file to a path on the state volume so it
+    # survives container recreation (only if not already set).
+    if ! grep -q '^ENCODE_SHARES_KEY_FILE=' "$HOME_DIR/.env" 2>/dev/null; then
+        echo "ENCODE_SHARES_KEY_FILE=/data/encode.pg.shares-key" >> "$HOME_DIR/.env"
+    fi
+    log "Postgres backend enabled — ENCODE_DATABASE_URL wired (host=postgres db=${PG_DB})"
 fi
 
 # --- deploy -----------------------------------------------------------------
@@ -148,6 +202,66 @@ log "ensuring /data volume ownership (non-root runtime)"
 compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chown \
     controller -R encode:encode /data >/dev/null 2>&1 \
     || log "chown step failed — if the controller cannot write /data, run: docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chown controller -R encode:encode /data"
+
+# --- Postgres profile bring-up + SQLite migration (--postgres) --------------
+# Bring up the postgres service (profile-gated) and wait for it healthy
+# BEFORE the controller boots. The profile must be active so compose starts
+# postgres; without it the service is a no-op (default SQLite deploy).
+if [ "$USE_POSTGRES" = "1" ]; then
+    log "starting Postgres profile (postgres:16-alpine)"
+    compose -f docker-compose.runtime.yml --profile postgres up -d postgres
+    # Wait for healthy: the compose healthcheck uses pg_isready, so a
+    # container reporting `health: healthy` means PG accepts connections.
+    pg_healthy=0
+    for _ in $(seq 1 30); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "${ENCODE_PG_CONTAINER_NAME:-encode-postgres}" 2>/dev/null || true)"
+        if [ "$status" = "healthy" ]; then pg_healthy=1; break; fi
+        sleep 2
+    done
+    [ "$pg_healthy" = "1" ] || die "Postgres did not become healthy — check: docker logs ${ENCODE_PG_CONTAINER_NAME:-encode-postgres}"
+    log "Postgres healthy"
+
+    # SQLite → PG migration: only when an existing SQLite DB is present in
+    # the state volume AND the target PG is empty. pgimport refuses a
+    # non-empty target unless -force is passed (safety: never clobber a
+    # live PG by accident), so the empty-check is belt-and-suspenders.
+    STATE_VOL="$(docker volume ls --format '{{.Name}}' | grep -m1 encode-state || true)"
+    if [ -n "$STATE_VOL" ]; then
+        if docker run --rm -v "${STATE_VOL}":/data alpine sh -c '[ -f /data/encode.db ]' 2>/dev/null; then
+            log "existing SQLite DB found in state volume — checking PG target"
+            # Copy the SQLite DB out to a temp path the controller container
+            # can mount, then run pgimport from the controller image (which
+            # has the binary). The DSN points at the postgres service over
+            # the compose network; both containers share it.
+            PG_USER="$(grep -E '^ENCODE_PG_USER=' .env 2>/dev/null | cut -d= -f2 || true)"; PG_USER="${PG_USER:-encode}"
+            PG_PASS="$(grep -E '^ENCODE_PG_PASSWORD=' .env 2>/dev/null | cut -d= -f2 || true)"; PG_PASS="${PG_PASS:-changeme-encode-pg}"
+            PG_DB="$(grep -E '^ENCODE_PG_DB=' .env 2>/dev/null | cut -d= -f2 || true)"; PG_DB="${PG_DB:-encode}"
+            PG_DSN_HOST="postgres://encode@postgres:5432/${PG_DB}?sslmode=disable"
+            log "running pgimport: SQLite → Postgres (dry-run first)"
+            # Dry-run validates counts before any write; a failure here stops
+            # the install rather than importing a half-read source.
+            compose -f docker-compose.runtime.yml run --rm \
+                -v "${STATE_VOL}":/data \
+                -e PGPASSWORD="${PG_PASS}" \
+                controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" -dry-run \
+                || die "pgimport dry-run failed — refusing to migrate a source that does not validate"
+            # Real import (target was confirmed empty, no -force needed).
+            compose -f docker-compose.runtime.yml run --rm \
+                -v "${STATE_VOL}":/data \
+                -e PGPASSWORD="${PG_PASS}" \
+                controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" \
+                || die "pgimport failed — SQLite DB not migrated; controller will boot against an empty PG"
+            log "SQLite → Postgres migration complete"
+            # Reminder: the shares key file must be copied to where the PG
+            # controller resolves it (ENCODE_SHARES_KEY_FILE). pgimport prints
+            # this reminder itself; repeat it here for the install log.
+            log "REMINDER: copy <sqlite>.shares-key to the ENCODE_SHARES_KEY_FILE path so share passwords decrypt"
+        else
+            log "no existing SQLite DB in state volume — fresh PG install (controller migrates fresh on boot)"
+        fi
+    fi
+fi
+
 compose -f docker-compose.runtime.yml up -d
 
 # --- health check -----------------------------------------------------------

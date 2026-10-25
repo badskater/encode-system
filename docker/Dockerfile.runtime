@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY controller /app/controller
+COPY pgimport /app/pgimport
 COPY ui /app/ui
 # Provision tree: provision.yml (Windows) + linux-node.yml + roles/linux-node/
 # (Linux). ENCODE_PROVISION_DIR=/app/provision so PlaybookDir=/app/provision.
@@ -33,7 +34,7 @@ COPY systemd /app/systemd
 # Mirrors the build-time Dockerfile; chown /data BEFORE the volume is
 # mounted over it (compose) so SQLite can create its files.
 RUN addgroup --system encode && adduser --system --ingroup encode encode \
-    && chmod +x /app/controller && mkdir -p /data && chown encode:encode /data
+    && chmod +x /app/controller /app/pgimport && mkdir -p /data && chown encode:encode /data
 ENV ENCODE_DATA=/data \
     ENCODE_UI_DIR=/app/ui \
     ENCODE_PROVISION_DIR=/app/provision

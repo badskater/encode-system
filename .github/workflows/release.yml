@@ -82,6 +82,12 @@ jobs:
           -ldflags "-X main.Version=${{ steps.ver.outputs.version }}"
           -o ../dist/encode-agent-linux-amd64 ./cmd/agent
 
+      - name: Build pgimport (linux/amd64)
+        working-directory: backend
+        run: >
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false
+          -o ../dist/pgimport ./cmd/pgimport
+
       # Frontend SPA.
       - name: Build UI
         working-directory: frontend
@@ -117,12 +123,12 @@ jobs:
           cp docker/install-agent.sh dist/
           cp powershell/EncodeLib.ps1 dist/
           # Checksums cover the binaries (install.sh verifies these).
-          (cd dist && sha256sum controller encode-agent.exe encode-agent-linux-amd64 > SHA256SUMS)
+          (cd dist && sha256sum controller encode-agent.exe encode-agent-linux-amd64 pgimport > SHA256SUMS)
 
       - name: Pack bundle tarball
         run: |
           tar -czf "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz" -C dist \
-            controller encode-agent.exe encode-agent-linux-amd64 ui provision systemd \
+            controller encode-agent.exe encode-agent-linux-amd64 pgimport ui provision systemd \
             Dockerfile.runtime docker-compose.runtime.yml .env.example \
             install.sh install-agent.ps1 install-agent.sh EncodeLib.ps1 SHA256SUMS
 
@@ -188,6 +194,7 @@ jobs:
             dist/controller \
             dist/encode-agent.exe \
             dist/encode-agent-linux-amd64 \
+            dist/pgimport \
             dist/install.sh \
             dist/install-agent.ps1 \
             dist/install-agent.sh \
@@ -204,6 +211,7 @@ jobs:
             dist/controller
             dist/encode-agent.exe
             dist/encode-agent-linux-amd64
+            dist/pgimport
             dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz
 
       - name: Upload UI bundle artifact

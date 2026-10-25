@@ -37,7 +37,7 @@ func (s *Store) InsertNodeMetric(ctx context.Context, nodeID int64, m *model.Nod
 	if m == nil {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.qExec(ctx,
 		`INSERT INTO node_metrics (node_id, ts, cpu_pct, mem_used_mb, mem_total_mb, disk_free_gb, gpu_util, gpu_temp, gpu_mem_used_mb, encode_fps)
 		 VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nodeID, m.CPUPct, m.MemUsedMB, m.MemTotalMB, m.DiskFreeGB,
@@ -65,7 +65,7 @@ func (s *Store) InsertNodeMetric(ctx context.Context, nodeID int64, m *model.Nod
 func (s *Store) LatestNodeMetric(ctx context.Context, nodeID int64) (*model.NodeMetrics, error) {
 	var m model.NodeMetrics
 	var ts string
-	err := s.db.QueryRowContext(ctx,
+	err := s.qRow(ctx,
 		`SELECT ts, cpu_pct, mem_used_mb, mem_total_mb, disk_free_gb, gpu_util, gpu_temp, gpu_mem_used_mb, encode_fps
 		 FROM node_metrics WHERE node_id = ? ORDER BY ts DESC LIMIT 1`, nodeID).
 		Scan(&ts, &m.CPUPct, &m.MemUsedMB, &m.MemTotalMB, &m.DiskFreeGB,
@@ -99,7 +99,17 @@ func (s *Store) PruneNodeMetrics(ctx context.Context, nodeID int64, maxAge time.
 		return nil // nothing to prune (or caller passed a non-positive window)
 	}
 	mod := fmt.Sprintf("-%d hours", hours)
-	_, err := s.db.ExecContext(ctx,
+	// The cutoff expression is dialect-specific: SQLite uses datetime('now', ?)
+	// with a text modifier ('-24 hours'); PG adds the same modifier as an
+	// interval (the modifier is already negative, so + yields a past time).
+	// SQLite's datetime('now', '-24 hours') subtracts 24 hours; PG's
+	// now() + '-24 hours'::interval also subtracts 24 hours.
+	if s.dialect == dialectPostgres {
+		_, err := s.qExec(ctx,
+			`DELETE FROM node_metrics WHERE node_id = ? AND ts < to_char(now() AT TIME ZONE 'utc' + ?::interval, 'YYYY-MM-DD HH24:MI:SS')`, nodeID, mod)
+		return err
+	}
+	_, err := s.qExec(ctx,
 		`DELETE FROM node_metrics WHERE node_id = ? AND ts < datetime('now', ?)`, nodeID, mod)
 	return err
 }
@@ -114,7 +124,7 @@ func (s *Store) ListNodeMetrics(ctx context.Context, nodeID int64, since time.Ti
 	// 30s heartbeat cadence, which is trivially small to hold in memory for
 	// the sampling pass. Going through Go avoids a complex SQL window
 	// function that SQLite's older parser shapes handle inconsistently.
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT ts, cpu_pct, mem_used_mb, mem_total_mb, disk_free_gb, gpu_util, gpu_temp, gpu_mem_used_mb, encode_fps
 		 FROM node_metrics
 		 WHERE node_id = ? AND ts >= ?

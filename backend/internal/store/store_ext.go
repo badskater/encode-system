@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS provision_runs (
 // GetSettings loads the persisted settings row. Returns nil (not an error)
 // when no row exists yet — callers merge environment defaults in that case.
 func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT json, updated_at FROM settings WHERE id = 1`)
+	row := s.qRow(ctx, `SELECT json, updated_at FROM settings WHERE id = 1`)
 	var js, updatedAt string
 	if err := row.Scan(&js, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -144,23 +144,19 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 
 // CreateProvisionRun inserts a new run row and returns it with its ID.
 func (s *Store) CreateProvisionRun(ctx context.Context, pr *model.ProvisionRun) (*model.ProvisionRun, error) {
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		`INSERT INTO provision_runs (host, port, scheme, winrm_user, node_name, status, options_json)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		pr.Host, pr.Port, pr.Scheme, pr.WinRMUser, pr.NodeName, pr.Status, pr.OptionsJSON)
 	if err != nil {
 		return nil, fmt.Errorf("create provision run: %w", err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
 	return s.GetProvisionRun(ctx, id)
 }
 
 // GetProvisionRun loads one run (log included — callers tail it).
 func (s *Store) GetProvisionRun(ctx context.Context, id int64) (*model.ProvisionRun, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, host, port, scheme, winrm_user, node_name, status, options_json, log, error, created_at, finished_at
 		 FROM provision_runs WHERE id = ?`, id)
 	var pr model.ProvisionRun
@@ -180,7 +176,7 @@ func (s *Store) GetProvisionRun(ctx context.Context, id int64) (*model.Provision
 
 // ListProvisionRuns returns runs newest-first (the UI shows the recent ones).
 func (s *Store) ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, host, port, scheme, winrm_user, node_name, status, error, created_at, finished_at
 		 FROM provision_runs ORDER BY id DESC LIMIT 25`)
 	if err != nil {
@@ -208,12 +204,12 @@ func (s *Store) ListProvisionRuns(ctx context.Context) ([]*model.ProvisionRun, e
 // SetProvisionRunStatus updates status + optional error/finished markers.
 func (s *Store) SetProvisionRunStatus(ctx context.Context, id int64, status, errMsg string, finished bool) error {
 	if finished {
-		_, err := s.db.ExecContext(ctx,
+		_, err := s.qExec(ctx,
 			`UPDATE provision_runs SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?`,
 			status, errMsg, id)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE provision_runs SET status = ? WHERE id = ?`, status, id)
+	_, err := s.qExec(ctx, `UPDATE provision_runs SET status = ? WHERE id = ?`, status, id)
 	return err
 }
 
@@ -230,7 +226,7 @@ func (s *Store) UpgradeStepTemplateIfFactory(ctx context.Context, key, oldPowerS
 	if err != nil {
 		return false, fmt.Errorf("marshal params: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`UPDATE step_templates
 		 SET label = ?, description = ?, params_json = ?, powershell = ?, updated_at = datetime('now')
 		 WHERE key = ? AND builtin = 1 AND powershell = ?`,
@@ -249,7 +245,7 @@ func (s *Store) UpgradeStepTemplateIfFactory(ctx context.Context, key, oldPowerS
 // a full run log, so the table must not grow without bound across the
 // controller's lifetime. Finished runs are pruned first (never a live one).
 func (s *Store) PruneProvisionRuns(ctx context.Context, keep int) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.qExec(ctx, `
 		DELETE FROM provision_runs
 		WHERE id NOT IN (SELECT id FROM provision_runs ORDER BY id DESC LIMIT ?)
 		  AND status IN ('success', 'failed')`, keep)
@@ -261,7 +257,7 @@ func (s *Store) PruneProvisionRuns(ctx context.Context, keep int) error {
 // must not proceed, otherwise a job dispatched between check and delete
 // would be orphaned mid-encode (the TOCTOU the old check-then-act had).
 func (s *Store) DeleteNodeIfNotBusy(ctx context.Context, id int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND status != 'busy'`, id)
+	res, err := s.qExec(ctx, `DELETE FROM nodes WHERE id = ? AND status != 'busy'`, id)
 	if err != nil {
 		return 0, err
 	}
@@ -275,11 +271,11 @@ func (s *Store) DeleteNodeIfNotBusy(ctx context.Context, id int64) (int64, error
 // long run cannot grow the row without limit.
 func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk string, capBytes int) error {
 	if capBytes > 0 {
-		_, err := s.db.ExecContext(ctx,
+		_, err := s.qExec(ctx,
 			`UPDATE provision_runs SET log = substr(log || ?, -?) WHERE id = ?`, chunk, capBytes, id)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE provision_runs SET log = log || ? WHERE id = ?`, chunk, id)
 	return err
 }
@@ -290,7 +286,7 @@ func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.qExec(ctx,
 		`INSERT INTO settings (id, json, updated_at) VALUES (1, ?, datetime('now'))
 	 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
 		string(b))
@@ -303,7 +299,7 @@ func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 // row's updated_at is preserved so the patch does not masquerade as a manual
 // edit. Returns whether the row was changed.
 func (s *Store) MigrateSettingsKey(ctx context.Context, key string, value string) (bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT json FROM settings WHERE id = 1`)
+	row := s.qRow(ctx, `SELECT json FROM settings WHERE id = 1`)
 	var js string
 	if err := row.Scan(&js); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -327,7 +323,7 @@ func (s *Store) MigrateSettingsKey(ctx context.Context, key string, value string
 	if err != nil {
 		return false, err
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.qExec(ctx,
 		`UPDATE settings SET json = ? WHERE id = 1`, string(patched)); err != nil {
 		return false, err
 	}
@@ -339,7 +335,7 @@ func (s *Store) MigrateSettingsKey(ctx context.Context, key string, value string
 // UpsertSeriesByName returns the series row for name, creating it enabled
 // with no flow override when first seen. Existing rows are returned as-is.
 func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Series, error) {
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.qExec(ctx,
 		`INSERT OR IGNORE INTO series (name) VALUES (?)`, name); err != nil {
 		return nil, fmt.Errorf("upsert series: %w", err)
 	}
@@ -348,14 +344,14 @@ func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Ser
 
 // SeriesByName loads a series by exact folder name.
 func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE name = ?`, name)
 	return scanSeries(row)
 }
 
 // GetSeries loads a series by ID.
 func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE id = ?`, id)
 	return scanSeries(row)
 }
@@ -377,7 +373,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 
 // ListSeries returns all series ordered by name.
 func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -403,7 +399,7 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 
 // UpdateSeries persists flow selection, enabled state, and notify flag.
 func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET flow_id=?, tag=?, enabled=?, notify=?, updated_at=datetime('now') WHERE id=?`,
 		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), boolToInt(sr.Notify), sr.ID)
 	return err
@@ -413,21 +409,21 @@ func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 // concurrent enable/disable patch cannot be clobbered by a stale full-row
 // read-modify-write.
 func (s *Store) SetSeriesFlow(ctx context.Context, id, flowID int64) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET flow_id=?, updated_at=datetime('now') WHERE id=?`, flowID, id)
 	return err
 }
 
 // SetSeriesTag updates ONLY the quality tag override (same rationale).
 func (s *Store) SetSeriesTag(ctx context.Context, id int64, tag string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET tag=?, updated_at=datetime('now') WHERE id=?`, tag, id)
 	return err
 }
 
 // SetSeriesEnabled updates ONLY the enabled flag (same rationale).
 func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET enabled=?, updated_at=datetime('now') WHERE id=?`, boolToInt(enabled), id)
 	return err
 }
@@ -437,7 +433,7 @@ func (s *Store) SetSeriesEnabled(ctx context.Context, id int64, enabled bool) er
 // read-modify-write. A muted series (notify=false) suppresses both the direct
 // alert and the digest buffering for its jobs.
 func (s *Store) SetSeriesNotify(ctx context.Context, id int64, notify bool) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET notify=?, updated_at=datetime('now') WHERE id=?`, boolToInt(notify), id)
 	return err
 }
@@ -446,7 +442,7 @@ func (s *Store) SetSeriesNotify(ctx context.Context, id int64, notify bool) erro
 // other setters. A paused series holds at BOTH gates: the scanner skips it
 // (no new jobs) and dispatch refuses its queued pending jobs until lifted.
 func (s *Store) SetSeriesPaused(ctx context.Context, id int64, paused bool) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET paused=?, updated_at=datetime('now') WHERE id=?`, boolToInt(paused), id)
 	return err
 }
@@ -455,7 +451,7 @@ func (s *Store) SetSeriesPaused(ctx context.Context, id int64, paused bool) erro
 // the global webhook). Field-scoped like SetSeriesNotify so a concurrent
 // scanner upsert can't clobber it.
 func (s *Store) SetSeriesWebhook(ctx context.Context, id int64, webhookURL string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET webhook_url=?, updated_at=datetime('now') WHERE id=?`, webhookURL, id)
 	return err
 }
@@ -463,7 +459,7 @@ func (s *Store) SetSeriesWebhook(ctx context.Context, id int64, webhookURL strin
 // SetSeriesNodeGroup updates ONLY the routing label — field-scoped SQL.
 // ” means the series' jobs accept any node.
 func (s *Store) SetSeriesNodeGroup(ctx context.Context, id int64, group string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`UPDATE series SET node_group=?, updated_at=datetime('now') WHERE id=?`, group, id)
 	return err
 }
@@ -497,7 +493,7 @@ type SeriesProgress struct {
 // in the result map (callers treat absence as all-zero). The query is
 // covered by idx_jobs_episode_dir + idx_jobs_status so the cost is bounded.
 func (s *Store) SeriesProgressCounts(ctx context.Context) (map[string]SeriesProgress, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.qQuery(ctx, `
 SELECT DISTINCT series, episode_dir, status FROM jobs`)
 	if err != nil {
 		return nil, err
@@ -565,7 +561,7 @@ SELECT DISTINCT series, episode_dir, status FROM jobs`)
 
 // DefaultFlow returns the flow marked default, or an error when none exists.
 func (s *Store) DefaultFlow(ctx context.Context) (*model.Flow, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, name, steps_json, is_default, options_json, created_at, updated_at FROM flows WHERE is_default = 1 LIMIT 1`)
 	return scanFlowV2(row)
 }
@@ -578,16 +574,16 @@ func (s *Store) SetDefaultFlow(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback()
 	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM flows WHERE id = ?`, id).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, s.q(`SELECT COUNT(*) FROM flows WHERE id = ?`), id).Scan(&exists); err != nil {
 		return err
 	}
 	if exists == 0 {
 		return fmt.Errorf("flow %d not found", id)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE flows SET is_default = 0`); err != nil {
+	if _, err := tx.ExecContext(ctx, s.q(`UPDATE flows SET is_default = 0`)); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE flows SET is_default = 1 WHERE id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, s.q(`UPDATE flows SET is_default = 1 WHERE id = ?`), id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -625,7 +621,7 @@ func (s *Store) InsertStepTemplateIfAbsent(ctx context.Context, t *model.StepTem
 	if err != nil {
 		return nil, fmt.Errorf("marshal params: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.qExec(ctx,
 		`INSERT INTO step_templates (key, label, description, params_json, powershell, builtin)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(key) DO NOTHING`,
@@ -647,7 +643,7 @@ func (s *Store) UpsertStepTemplate(ctx context.Context, t *model.StepTemplate) (
 	if err != nil {
 		return nil, fmt.Errorf("marshal params: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.qExec(ctx,
 		`INSERT INTO step_templates (key, label, description, params_json, powershell, builtin)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET label=excluded.label, description=excluded.description,
@@ -660,7 +656,7 @@ func (s *Store) UpsertStepTemplate(ctx context.Context, t *model.StepTemplate) (
 
 // StepTemplateByKey loads a template by unique key.
 func (s *Store) StepTemplateByKey(ctx context.Context, key string) (*model.StepTemplate, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
      FROM step_templates WHERE key = ?`, key)
 	return scanTemplate(row)
@@ -668,7 +664,7 @@ func (s *Store) StepTemplateByKey(ctx context.Context, key string) (*model.StepT
 
 // GetStepTemplate loads a template by ID.
 func (s *Store) GetStepTemplate(ctx context.Context, id int64) (*model.StepTemplate, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
      FROM step_templates WHERE id = ?`, id)
 	return scanTemplate(row)
@@ -694,7 +690,7 @@ func scanTemplate(row *sql.Row) (*model.StepTemplate, error) {
 
 // ListStepTemplates returns all templates ordered by key.
 func (s *Store) ListStepTemplates(ctx context.Context) ([]*model.StepTemplate, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, key, label, description, params_json, powershell, builtin, created_at, updated_at
      FROM step_templates ORDER BY key`)
 	if err != nil {
@@ -739,7 +735,7 @@ func (s *Store) DeleteStepTemplate(ctx context.Context, id int64) error {
 	if refs > 0 {
 		return fmt.Errorf("template %q is used by %d flow(s)", t.Key, refs)
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM step_templates WHERE id = ?`, id)
+	_, err = s.qExec(ctx, `DELETE FROM step_templates WHERE id = ?`, id)
 	return err
 }
 
@@ -766,22 +762,18 @@ func (s *Store) flowRefsTemplate(ctx context.Context, key string) (int, error) {
 // CreatePairingCode stores a hashed one-shot code expiring after ttl.
 func (s *Store) CreatePairingCode(ctx context.Context, codeHash, nameHint string, ttl time.Duration) (*model.PairingCode, error) {
 	exp := time.Now().UTC().Add(ttl)
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		`INSERT INTO pairing_codes (code_hash, name_hint, expires_at) VALUES (?, ?, ?)`,
 		codeHash, nameHint, fmtTime(exp))
 	if err != nil {
 		return nil, fmt.Errorf("create pairing code: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, err
 	}
 	return s.GetPairingCode(ctx, id)
 }
 
 // GetPairingCode loads one code by ID.
 func (s *Store) GetPairingCode(ctx context.Context, id int64) (*model.PairingCode, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE id = ?`, id)
 	return scanPairing(row)
 }
@@ -801,7 +793,7 @@ func scanPairing(row *sql.Row) (*model.PairingCode, error) {
 // used codes are reported distinctly, and transient DB errors propagate as
 // such instead of being disguised as auth failures.
 func (s *Store) PeekPairingCode(ctx context.Context, codeHash string) (*model.PairingCode, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.qRow(ctx,
 		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`,
 		codeHash)
 	p, err := scanPairing(row)
@@ -831,8 +823,7 @@ func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID 
 
 	var p model.PairingCode
 	var expires, createdAt string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`,
+	err = tx.QueryRowContext(ctx, s.q(`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes WHERE code_hash = ?`),
 		codeHash).Scan(&p.ID, &p.CodeHash, &p.NameHint, &expires, &p.UsedBy, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("unknown pairing code")
@@ -849,8 +840,7 @@ func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID 
 	if time.Now().UTC().After(p.ExpiresAt) {
 		return nil, fmt.Errorf("pairing code expired")
 	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE pairing_codes SET used_by = ? WHERE id = ?`, nodeID, p.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, s.q(`UPDATE pairing_codes SET used_by = ? WHERE id = ?`), nodeID, p.ID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -862,7 +852,7 @@ func (s *Store) ConsumePairingCode(ctx context.Context, codeHash string, nodeID 
 
 // ListPairingCodes returns active (unused, unexpired) codes for the UI.
 func (s *Store) ListPairingCodes(ctx context.Context) ([]*model.PairingCode, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, code_hash, name_hint, expires_at, used_by, created_at FROM pairing_codes
      WHERE used_by = 0 AND expires_at > ? ORDER BY id DESC`, fmtTime(time.Now().UTC()))
 	if err != nil {
@@ -886,7 +876,7 @@ func (s *Store) ListPairingCodes(ctx context.Context) ([]*model.PairingCode, err
 // ---------- Users & sessions (management-plane login) ----------
 
 func (s *Store) migrateAuth(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.qExec(ctx, `
 CREATE TABLE IF NOT EXISTS users (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	username TEXT NOT NULL UNIQUE,
@@ -907,13 +897,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
 // CreateUser inserts a user with a pre-hashed (bcrypt) password.
 func (s *Store) CreateUser(ctx context.Context, username, passwordHash, role string) (*model.User, error) {
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		"INSERT INTO users(username, password_hash, role, created_at) VALUES (?, ?, ?, datetime('now'))",
 		username, passwordHash, role)
-	if err != nil {
-		return nil, err
-	}
-	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
@@ -924,7 +910,7 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash, role str
 func (s *Store) UserByUsername(ctx context.Context, username string) (*model.User, error) {
 	var u model.User
 	var created sql.NullString
-	err := s.db.QueryRowContext(ctx,
+	err := s.qRow(ctx,
 		"SELECT id, username, password_hash, role, created_at FROM users WHERE username = ?", username).
 		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created)
 	if err == sql.ErrNoRows {
@@ -939,7 +925,7 @@ func (s *Store) UserByUsername(ctx context.Context, username string) (*model.Use
 
 // Users lists accounts (no hashes).
 func (s *Store) Users(ctx context.Context) ([]*model.User, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id, username, role, created_at FROM users ORDER BY id")
+	rows, err := s.qQuery(ctx, "SELECT id, username, role, created_at FROM users ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -959,7 +945,7 @@ func (s *Store) Users(ctx context.Context) ([]*model.User, error) {
 
 // CreateSession stores a hashed session token with its expiry.
 func (s *Store) CreateSession(ctx context.Context, tokenHash string, userID int64, expiresAt time.Time) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		"INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, datetime('now'), ?)",
 		tokenHash, userID, fmtTime(expiresAt))
 	return err
@@ -969,7 +955,7 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash string, userID int6
 func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (*model.Session, error) {
 	var sess model.Session
 	var created, expires sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := s.qRow(ctx, `
 SELECT s.token_hash, s.user_id, u.username, s.created_at, s.expires_at
 FROM sessions s JOIN users u ON u.id = s.user_id
 WHERE s.token_hash = ? AND s.expires_at > datetime('now')`, tokenHash).
@@ -987,26 +973,26 @@ WHERE s.token_hash = ? AND s.expires_at > datetime('now')`, tokenHash).
 
 // SlideSession extends an active session's expiry.
 func (s *Store) SlideSession(ctx context.Context, tokenHash string, expiresAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+	_, err := s.qExec(ctx, "UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
 		fmtTime(expiresAt), tokenHash)
 	return err
 }
 
 // DeleteSession revokes one session (logout).
 func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token_hash = ?", tokenHash)
+	_, err := s.qExec(ctx, "DELETE FROM sessions WHERE token_hash = ?", tokenHash)
 	return err
 }
 
 // PruneSessions removes expired sessions.
 func (s *Store) PruneSessions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at <= datetime('now')")
+	_, err := s.qExec(ctx, "DELETE FROM sessions WHERE expires_at <= datetime('now')")
 	return err
 }
 
 // UpdateUserPassword replaces a user's bcrypt hash.
 func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHash string) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, userID)
+	_, err := s.qExec(ctx, "UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, userID)
 	return err
 }
 
@@ -1014,7 +1000,7 @@ func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHa
 // identified by keepTokenHash (the session performing the action). Used on
 // password change so stale or stolen sessions die immediately.
 func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keepTokenHash string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		"DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", userID, keepTokenHash)
 	return err
 }
@@ -1032,7 +1018,7 @@ func (s *Store) PruneOldJobs(ctx context.Context, days int) (int64, error) {
 		return 0, nil
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.qExec(ctx,
 		`DELETE FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at < ?`,
 		cutoff)
 	if err != nil {
@@ -1045,7 +1031,7 @@ func (s *Store) PruneOldJobs(ctx context.Context, days int) (int64, error) {
 // caller logs errors but never fails the audited operation because the
 // audit write failed.
 func (s *Store) AppendAudit(ctx context.Context, actor, action, object, detail string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.qExec(ctx,
 		`INSERT INTO audit_events (actor, action, object, detail) VALUES (?, ?, ?, ?)`,
 		actor, action, object, detail)
 	return err
@@ -1057,7 +1043,7 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]*model.AuditEvent, 
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, at, actor, action, object, detail FROM audit_events ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -1082,13 +1068,12 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]*model.AuditEvent, 
 // uniqueness are enforced by the table constraints (duplicate name returns
 // an error so callers can 409).
 func (s *Store) CreateAPIToken(ctx context.Context, tok *model.APIToken) error {
-	res, err := s.db.ExecContext(ctx,
+	id, err := s.insertID(ctx,
 		`INSERT INTO api_tokens (name, scope, token_hash) VALUES (?, ?, ?)`,
 		tok.Name, tok.Scope, tok.TokenHash)
 	if err != nil {
 		return err
 	}
-	id, _ := res.LastInsertId()
 	tok.ID = id
 	created := time.Now().UTC()
 	tok.CreatedAt = &created
@@ -1100,7 +1085,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, tok *model.APIToken) error {
 func (s *Store) APITokenByHash(ctx context.Context, hash string) (*model.APIToken, error) {
 	var tok model.APIToken
 	var lastUsed, createdAt sql.NullString
-	err := s.db.QueryRowContext(ctx,
+	err := s.qRow(ctx,
 		`SELECT id, name, scope, token_hash, last_used_at, created_at FROM api_tokens WHERE token_hash = ?`, hash).
 		Scan(&tok.ID, &tok.Name, &tok.Scope, &tok.TokenHash, &lastUsed, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1122,7 +1107,7 @@ func (s *Store) APITokenByHash(ctx context.Context, hash string) (*model.APIToke
 
 // ListAPITokens returns all tokens (hashes omitted via json:"-" anyway).
 func (s *Store) ListAPITokens(ctx context.Context) ([]*model.APIToken, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.qQuery(ctx,
 		`SELECT id, name, scope, token_hash, last_used_at, created_at FROM api_tokens ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -1151,14 +1136,14 @@ func (s *Store) ListAPITokens(ctx context.Context) ([]*model.APIToken, error) {
 // DeleteAPIToken removes a token. Deleting an unknown ID is not an error
 // (idempotent), so a double-click in the UI doesn't surface a failure.
 func (s *Store) DeleteAPIToken(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM api_tokens WHERE id = ?`, id)
+	_, err := s.qExec(ctx, `DELETE FROM api_tokens WHERE id = ?`, id)
 	return err
 }
 
 // TouchAPIToken stamps last_used_at (best-effort bookkeeping; callers
 // ignore errors).
 func (s *Store) TouchAPIToken(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`,
+	_, err := s.qExec(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`,
 		time.Now().UTC().Format(time.RFC3339), id)
 	return err
 }
@@ -1167,11 +1152,16 @@ func (s *Store) TouchAPIToken(ctx context.Context, id int64) error {
 
 // BackupTo writes a consistent snapshot of the database to dest using
 // SQLite's VACUUM INTO — an online, transaction-safe copy that needs no
-// write lock beyond the vacuum itself and produces a standalone, compacted
-// SQLite file (restore = stop controller, replace encode.db, start).
 // Fails if dest already exists so a caller bug can't clobber a previous
 // good backup.
+//
+// Postgres note: this method is SQLite-only (VACUUM INTO). On Postgres it
+// returns an error — the PG backup path (pg_dump or COPY-based dump) is a
+// separate task. The API layer's backup endpoint must branch on backend.
 func (s *Store) BackupTo(ctx context.Context, dest string) error {
+	if s.dialect == dialectPostgres {
+		return fmt.Errorf("BackupTo is not supported on Postgres; use pg_dump or a COPY-based dump")
+	}
 	if _, err := os.Stat(dest); err == nil {
 		return fmt.Errorf("backup destination exists: %s", dest)
 	}

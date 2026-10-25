@@ -60,7 +60,7 @@
 | Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, bitrate, durations, sizes) reported by the flow script. |
 | Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
 | Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs`. |
-| Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore = stop container, replace `encode.db` in the data volume, start. |
+| Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore = stop container, replace `encode.db` in the data volume, start. On Postgres the snapshot is a logical JSON-lines `.dump` (not a `.db`); restore is via `pgimport -force` into a fresh PG, or `pg_restore`-equivalent from the JSON. See "Postgres backup & rollback" below. |
 | Automate against the API | Settings → API tokens: create a scoped token (`read` or `admin`, shown once) and send it as `Authorization: Bearer <token>`. Delete tokens when done; usage is audited as `api-token:<name>`. |
 | Review who changed what | UI → **Audit** page (`GET /api/audit`): every mutating admin action with actor, action, object, detail. |
 | Pause assignment fleet-wide (drain) | UI → Settings → **Drain mode** toggle. Running jobs finish, nothing new dispatches; toggle off to resume. Use before pushing a bin package or host maintenance. |
@@ -71,6 +71,42 @@
 | Follow a Discord alert straight to the job | Alert links open `<controller_url>/jobs?job=<id>` — the Jobs page auto-opens that job's log viewer. |
 | Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
+
+## Postgres backup & rollback
+
+When the controller runs against Postgres (`ENCODE_DATABASE_URL` set), the
+backup endpoint produces a logical **table-walk JSON-lines dump**
+(`encode-<ts>-<kind>.dump`), not a `VACUUM INTO` `.db` file:
+
+- Each line is a JSON object: a header record (`{"_format":"encode-pg-dump","_version":1}`),
+  a table marker (`{"_table":"<name>"}`), or a row record
+  (`{"_table":"<name>","_row":{...}}`). Tables are walked in FK order so the
+  dump can be re-imported with FKs satisfied.
+- **No-secrets contract (parity with SQLite):** the `shares.password` column
+  is copied verbatim — it holds the AES-GCM ciphertext (`v1:<hex>`), never
+  plaintext. The encryption key file lives beside the SQLite DB / at
+  `ENCODE_SHARES_KEY_FILE` on PG and is never inside the database, so neither
+  backup format leaks the key. Back the key file up out of band; without it,
+  stored share passwords can't be decrypted after a restore.
+- The dump is human-inspectable and streamable (the writer never holds the
+  whole DB in memory). Download via `GET /api/backup/<name>` (same endpoint,
+  same `Content-Disposition: attachment` as SQLite snapshots).
+
+**Restore (PG → PG):** point the controller at a fresh PG database
+(`migratePG` builds the schema on boot), then re-import the dump. The dump's
+JSON-lines format restores via a small INSERT loop (or `pgimport -force` from
+a SQLite source if you're crossing backends).
+
+**Rollback (PG → SQLite):** to roll back to the SQLite backend, unset
+`ENCODE_DATABASE_URL` in `.env` and redeploy the old image — the controller
+reopens the SQLite file in the `encode-state` volume. **Caveat:** once new
+jobs have run on PG after the cutover, rolling back to SQLite loses every
+write that landed on PG (jobs, heartbeats, settings edits, audit rows).
+The safe rollback once PG has taken writes is to **re-import forward** (run
+`pgimport` from the SQLite file into a fresh PG, or restore a PG `.dump`
+snapshot into a fresh PG and repoint the controller) rather than revert to
+the stale SQLite file. Roll back to SQLite only when no writes have occurred
+on PG (immediate post-cutover rollback window).
 
 ## Known failure modes
 

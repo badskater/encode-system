@@ -13,6 +13,76 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Postgres backend, 2026-10-25)
+
+- Controller backend selection via `ENCODE_DATABASE_URL`
+  (`backend/cmd/controller/main.go`): empty (default) keeps the SQLite file
+  behavior byte-for-byte; a `postgres://` DSN switches to the Postgres
+  backend via `store.Open`. One log line states which backend is active,
+  with the DSN **redacted** — only scheme+host+db survive, never the
+  password (`redactDSN`). Startup health: `store.Open` already errors on
+  an unreachable PG; main exits non-zero with the error logged (same
+  fail-fast path as today's SQLite failure).
+- Compose postgres profile (`docker/docker-compose.runtime.yml`): an
+  **optional** `postgres:16-alpine` service, profile-gated
+  (`profiles: [postgres]`) so the default `docker compose up -d` is
+  byte-identical to the SQLite-only deploy. Named volume `encode-pgdata`;
+  `POSTGRES_USER/PASSWORD/DB` from `.env` (`ENCODE_PG_*` with sane
+  defaults); healthcheck `pg_isready` matching the controller's user/db.
+  The controller does NOT hard-`depends_on` postgres (a non-profiled
+  service may not depend_on a profiled one — compose errors in default
+  mode); ordering is handled by bringing the profile up explicitly
+  (`--profile postgres`), and the controller fail-fast-exits if PG is
+  unreachable so a misordered `up` self-corrects on restart.
+- `docker/.env.example`: documents `ENCODE_DATABASE_URL` (empty = SQLite),
+  `ENCODE_PG_USER/PASSWORD/DB` (password default `changeme-encode-pg` +
+  comment to change it), `ENCODE_PG_CONTAINER_NAME`,
+  `ENCODE_SHARES_KEY_FILE` (PG shares key path on the state volume so it
+  survives container recreation).
+- `docker/install.sh --postgres` flag: brings up the postgres profile,
+  waits healthy, and if an existing SQLite DB is present in the state
+  volume AND the target PG is empty, runs the bundled `pgimport` binary
+  (dry-run validates counts first, then the real import); fresh install
+  (no SQLite) just wires the DSN (controller migrates fresh PG on boot).
+  Sets `ENCODE_DATABASE_URL` in `.env` idempotently (grep/sed `|| true`
+  pattern matching the existing `ENCODE_VERSION` block — robust to
+  `set -euo pipefail` aborting on no-match). Without `--postgres`,
+  behavior is byte-identical to today.
+- PG-mode backup endpoint (`backend/internal/api/backup.go` +
+  `backup_pg.go`): SQLite stays `VACUUM INTO` (`.db`); Postgres writes a
+  logical table-walk JSON-lines dump (`.dump`) — header record, per-table
+  markers, row records `{"_table":...,"_row":{...}}`, tables in FK order
+  (the `pgBackupTables` list mirrors `cmd/pgimport`'s `importOrder`,
+  implemented locally — no `cmd/` import). `List`/`Delete`/download
+  handlers accept both `.db` and `.dump`. **No-secrets contract
+  preserved (parity finding):** the SQLite `VACUUM INTO` backup already
+  contains `shares.password` as the AES-GCM ciphertext (`v1:<hex>`); the
+  key file lives beside the DB, not in it. The PG dump copies the same
+  ciphertext column verbatim — never plaintext, never the key. Tests
+  assert the ciphertext survives and the plaintext never appears in the
+  dump (`TestPGBackupDumpFormatAndSecretsParity`).
+- Tests: SQLite path unchanged (`store_backup_test.go` + api
+  `backup_test.go` green); PG mode env-gated on `ENCODE_TEST_PG_DSN`,
+  derives `encode_backup_test` per-test (drop+create via maintenance DSN,
+  no psql) — `TestPGBackupDumpFormatAndSecretsParity`,
+  `TestPGBackupDownloadStream`, `TestPGBackupDeleteLifecycle`,
+  `TestPGBackupEmptyDB` (fresh-install path: every table section present,
+  zero rows).
+- Release workflow (`.github/workflows/release.yml`): `pgimport`
+  linux/amd64 binary added to the build matrix, `SHA256SUMS`, the deploy
+  tarball, the GitHub release asset list, and the provenance attestation
+  `subject-path` (follows the existing agent/controller pattern exactly).
+  actionlint clean. `Dockerfile.runtime` COPYs `pgimport` to `/app/pgimport`
+  (chmod +x) so `install.sh --postgres` can run it from the controller image.
+- Docs: `Deployment.md` — Postgres mode section (compose profile,
+  `install.sh --postgres`, `pgimport` standalone usage, `ENCODE_DATABASE_URL`,
+  shares key file location for PG); `Architecture.md` — store dialect layer
+  + PG option (q() rebind, migratePG, TEXT timestamps, compat funcs,
+  backup branch); `Operations.md` — PG backup behavior (JSON-lines `.dump`,
+  no-secrets parity) + rollback procedure (unset `ENCODE_DATABASE_URL` →
+  redeploy old image; writes on PG after cutover are lost → re-import
+  forward rather than rollback once new jobs ran).
+
 ## Done (Linux node support, 2026-10-24)
 
 - Node platform field (`nodes.platform`, `"windows"|"linux"`, empty =

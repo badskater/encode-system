@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 )
@@ -172,7 +173,12 @@ func normalizePGValue(v any) any {
 		if !t.Valid {
 			return nil
 		}
-		return t.Float64
+		return sanitizeFloat(t.Float64)
+	case float64:
+		// REAL columns (node_metrics progress/cpu_pct/encode_fps) scan as
+		// float64; json.Marshal aborts on NaN/±Inf, so a single malformed
+		// metric row would fail the whole backup. Render them as null.
+		return sanitizeFloat(t)
 	case sql.NullBool:
 		if !t.Valid {
 			return nil
@@ -181,6 +187,15 @@ func normalizePGValue(v any) any {
 	default:
 		return v
 	}
+}
+
+// sanitizeFloat maps NaN/±Inf to nil (JSON null): encoding/json refuses to
+// marshal them, and one corrupt REAL value must not abort the whole dump.
+func sanitizeFloat(f float64) any {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	return f
 }
 
 // quoteIdent quotes a SQL identifier for safe interpolation — defensive

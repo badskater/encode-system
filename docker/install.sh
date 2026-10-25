@@ -163,10 +163,14 @@ if [ "$USE_POSTGRES" = "1" ]; then
     else
         echo "ENCODE_DATABASE_URL=${PG_DSN}" >> "$HOME_DIR/.env"
     fi
-    # Default the shares key file to a path on the state volume so it
-    # survives container recreation (only if not already set).
+    # Reuse the SQLite controller's shares key file by default: it lives on
+    # the state volume at /data/encode.db.shares-key (store_share.go derives
+    # <dbPath>.shares-key). Pointing ENCODE_SHARES_KEY_FILE at a DIFFERENT
+    # path would leave the migrated share ciphertexts undecryptable (the
+    # controller would generate a fresh key), so the default is the same file
+    # both backends already agree on. Only written when not already set.
     if ! grep -q '^ENCODE_SHARES_KEY_FILE=' "$HOME_DIR/.env" 2>/dev/null; then
-        echo "ENCODE_SHARES_KEY_FILE=/data/encode.pg.shares-key" >> "$HOME_DIR/.env"
+        echo "ENCODE_SHARES_KEY_FILE=/data/encode.db.shares-key" >> "$HOME_DIR/.env"
     fi
     log "Postgres backend enabled — ENCODE_DATABASE_URL wired (host=postgres db=${PG_DB})"
 fi
@@ -240,22 +244,34 @@ if [ "$USE_POSTGRES" = "1" ]; then
             log "running pgimport: SQLite → Postgres (dry-run first)"
             # Dry-run validates counts before any write; a failure here stops
             # the install rather than importing a half-read source.
+            SHARE_KEY_ENV="$(grep -E '^ENCODE_SHARES_KEY_FILE=' .env 2>/dev/null | cut -d= -f2 || true)"; SHARE_KEY_ENV="${SHARE_KEY_ENV:-/data/encode.db.shares-key}"
             compose -f docker-compose.runtime.yml run --rm \
                 -v "${STATE_VOL}":/data \
                 -e PGPASSWORD="${PG_PASS}" \
+                -e ENCODE_SHARES_KEY_FILE="${SHARE_KEY_ENV}" \
                 controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" -dry-run \
                 || die "pgimport dry-run failed — refusing to migrate a source that does not validate"
             # Real import (target was confirmed empty, no -force needed).
             compose -f docker-compose.runtime.yml run --rm \
                 -v "${STATE_VOL}":/data \
                 -e PGPASSWORD="${PG_PASS}" \
+                -e ENCODE_SHARES_KEY_FILE="${SHARE_KEY_ENV}" \
                 controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" \
                 || die "pgimport failed — SQLite DB not migrated; controller will boot against an empty PG"
             log "SQLite → Postgres migration complete"
-            # Reminder: the shares key file must be copied to where the PG
-            # controller resolves it (ENCODE_SHARES_KEY_FILE). pgimport prints
-            # this reminder itself; repeat it here for the install log.
-            log "REMINDER: copy <sqlite>.shares-key to the ENCODE_SHARES_KEY_FILE path so share passwords decrypt"
+            # Shares key: the SQLite controller kept its AES-GCM key at
+            # /data/encode.db.shares-key on the state volume. The PG-mode
+            # controller reads ENCODE_SHARES_KEY_FILE (defaulted above to the
+            # SAME path), so the key needs no copy in the default wiring.
+            # Verify it exists when shares were migrated; a missing key with
+            # share rows means passwords would be permanently undecryptable
+            # (the controller would silently generate a fresh key).
+            KEY_FILE="$(grep -E '^ENCODE_SHARES_KEY_FILE=' .env 2>/dev/null | cut -d= -f2 || true)"; KEY_FILE="${KEY_FILE:-/data/encode.db.shares-key}"
+            if docker run --rm -v "${STATE_VOL}":/data alpine sh -c "[ -f '${KEY_FILE}' ]" 2>/dev/null; then
+                log "shares key present at ${KEY_FILE} — migrated share passwords will decrypt"
+            else
+                log "WARNING: shares key NOT found at ${KEY_FILE} — if the old deployment had shares, locate <sqlite-db>.shares-key and place it at that path BEFORE starting the controller, or share passwords will be lost"
+            fi
         else
             log "no existing SQLite DB in state volume — fresh PG install (controller migrates fresh on boot)"
         fi

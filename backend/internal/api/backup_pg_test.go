@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -401,5 +403,35 @@ func TestPGBackupEmptyDB(t *testing.T) {
 	}
 	if gotTableMarkers != len(pgBackupTables) {
 		t.Fatalf("table markers: got %d, want %d (schema must be present)", gotTableMarkers, len(pgBackupTables))
+	}
+}
+
+// TestNormalizePGValueSanitizesFloats guards the JSON-marshal breaker class:
+// REAL columns scan as float64, and encoding/json refuses NaN/±Inf — one
+// corrupt metric row must not abort the whole dump. No PG needed (pure fn).
+func TestNormalizePGValueSanitizesFloats(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want any
+	}{
+		{"nan float64", math.NaN(), nil},
+		{"+inf float64", math.Inf(1), nil},
+		{"-inf float64", math.Inf(-1), nil},
+		{"normal float64", 1.5, 1.5},
+		{"zero float64", 0.0, 0.0},
+		{"nan NullFloat64", sql.NullFloat64{Float64: math.NaN(), Valid: true}, nil},
+		{"valid NullFloat64", sql.NullFloat64{Float64: 2.25, Valid: true}, 2.25},
+		{"invalid NullFloat64", sql.NullFloat64{Valid: false}, nil},
+	}
+	for _, tc := range cases {
+		got := normalizePGValue(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+		// The point of the sanitization: the result must JSON-marshal.
+		if _, err := json.Marshal(got); err != nil {
+			t.Errorf("%s: json.Marshal(%v) failed: %v", tc.name, got, err)
+		}
 	}
 }

@@ -135,14 +135,17 @@ overridden (it is hardcoded in the HA compose — do not override it).
 
 A replica killed mid-loop releases its Postgres advisory lock on
 connection close. The surviving replica's singleton loop acquires the lock
-on its next retry (~30s interval), so background loops (scanner, prune,
-orphan recovery, backup scheduler) re-home automatically. Job dispatch is
-unaffected: the `FOR UPDATE` row lock means only one replica can assign a
-given job, so killing a replica mid-heartbeat never double-assigns. Agents
+on its next retry (15s poll interval; total failover ≈ 10s keepalive
+detection + 15s retry ≈ ≤25s), so background loops (scanner, prune,
+digest flush, backup scheduler) re-home automatically. Job dispatch is
+unaffected: the conditional `UPDATE … WHERE status='pending'` guard means
+only one replica can flip a given job, and the `FOR UPDATE` node-row lock
+serializes capacity checks — killing a replica mid-heartbeat never
+double-assigns. Agents
 heartbeating the dead replica's Traefik backend get a connection error and
 retry on the next heartbeat interval (default 15s); Traefik v3's
 load-balancer stops routing to the dead container once its healthcheck
-fails. Expect ~30s for the lock retry + up to one heartbeat interval for
+fails. Expect ≤25s for the lock failover + up to one heartbeat interval for
 agent reconnect.
 
 ### Rollback

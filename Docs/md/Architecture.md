@@ -102,13 +102,14 @@ remains the default). The HA facts:
   run when `ENCODE_DATABASE_URL` is empty/SQLite.
 
 - **Advisory-lock singleton loops.** Background loops that must run exactly
-  once across the fleet (scanner, retention prune, orphan recovery, backup
-  scheduler) take a Postgres advisory lock (`pg_advisory_lock`) before each
+  once across the fleet (scanner, retention prune, digest flush, backup
+  scheduler) take a Postgres advisory lock (`pg_try_advisory_lock`) before each
   iteration. On SQLite this is a no-op (always-locked) because there is only
   ever one writer; on PG only the replica holding the lock runs the loop,
   the other skips. A replica killed mid-loop releases its advisory lock on
   connection close, and the other replica's loop acquires it on its next
-  retry (~30s). This makes the singleton behavior safe under failover: no
+  retry (15s poll; total failover ≈ keepalive 10s + retry 15s ≈ ≤25s).
+  This makes the singleton behavior safe under failover: no
   loop runs twice concurrently, and a dead replica's loop is re-homed
   automatically.
 
@@ -120,7 +121,7 @@ remains the default). The HA facts:
 
 - **SSE live log streaming is per-replica.** The log hub
   (`internal/api/logstream.go`) is in-memory per-process —
-  `Server.logHub` is constructed once in `newServer()` and lives only in
+  `Server.logHub` is constructed once in `New()` and lives only in
   that replica's address space. `publishProgress` is called from the
   heartbeat handler after the DB update lands, so it fires **only on the
   replica that received the heartbeat**. Consequence: an SSE client attached

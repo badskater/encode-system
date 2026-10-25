@@ -453,3 +453,112 @@ only detonates as ERESOLVE inside the CI/Docker image build
 - Scanner misses folders: episode folder needs both a source media file and a `.avs`/`.vpy`; check scanner logs for the rejection reason. For S3, keys must be `<series>/<episode>/…` exactly two levels deep, and objects newer than 2 minutes are deferred by the stability gate.
 - Controller exits at boot with SQLite "out of memory (14)": the fresh `/data` volume is owned by root instead of the runtime user — `chown` the volume (fixed in the image since v1.17.4; only reappears after base-image changes).
 - `docker compose up` recreated the wrong controller: project-name collision — see the isolated-test-deploy gotcha above.
+
+## High-availability (active/active, Postgres required)
+
+The default deploy is a single controller instance with a SQLite backend.
+For deployments that need controller-side redundancy, the controller can
+run as **two replicas behind one Traefik v3 load-balanced service**, both
+sharing a single Postgres backend. HA is **opt-in and Postgres-only** —
+SQLite is single-writer and cannot serve two replicas, so the SQLite
+single-instance deploy remains the fully supported default.
+
+### Prerequisites
+
+- A Postgres backend. Point `ENCODE_DATABASE_URL` at a `postgres://` DSN
+  (the bundled `postgres:16-alpine` in `docker-compose.ha.yml` is for
+  trials only — production HA should use a managed/external PG such as
+  RDS, Cloud SQL, or a Patroni cluster, since a single bundled postgres
+  container is itself the remaining SPOF).
+- An existing Traefik v3 stack on the host (the HA compose attaches to the
+  operator's external Traefik network; it does **not** bring up Traefik).
+- The HA vars set in `.env` (see `docker/.env.example`): `ENCODE_DOMAIN`
+  (required — the Traefik Host rule has no default), `ENCODE_TRAEFIK_NETWORK`,
+  `ENCODE_TRAEFIK_ENTRYPOINT`, `ENCODE_TRAEFIK_RESOLVER`, optional
+  `ENCODE_AUTH_MIDDLEWARE` (Authelia forwardAuth).
+
+### `docker-compose.ha.yml`
+
+The HA compose (`docker/docker-compose.ha.yml`) defines:
+
+- `controller-1` / `controller-2` — two replicas of the same GHCR image
+  (`ghcr.io/badskater/encode-system:<ver>`), each with a **distinct
+  hardcoded `ENCODE_INSTANCE_ID`** (`controller-1` / `controller-2`) so the
+  advisory-lock singleton loops and the `/api/health` `instance` field
+  distinguish them. Both carry the **required** `ENCODE_DATABASE_URL` (no
+  default — compose fails fast if unset), `ENCODE_SHARES_KEY_FILE`, and the
+  shared `encode-state` / `encode-scripts` / `encode-release` volumes (same
+  named volumes as `docker-compose.runtime.yml` so publish, backup, and
+  shares-key behavior match the single-instance deploy).
+- A `postgres:16-alpine` service (no profile gate — HA requires PG) with
+  the `encode-pgdata` volume, for trials. Point `ENCODE_DATABASE_URL`
+  elsewhere to use an external PG; the bundled service is then unused.
+- **Traefik v3 load balancing**: both replicas use the **identical** Traefik
+  router+service name (`encode-controller` / `encode-controller-svc`) via
+  Docker labels. Traefik v3 coalesces services with the same name across
+  providers into one load-balanced backend accumulating the server entries
+  from both containers — this is the idiomatic v3 multi-container LB pattern
+  (a single compose service's labels can only describe one Traefik service,
+  so the shared-name coalescing is what spans the two replicas). The Host
+  rule, entrypoint, resolver, and domain come from `.env` `${VARS}`;
+  an optional Authelia forwardAuth middleware is chained when
+  `ENCODE_AUTH_MIDDLEWARE` is set.
+
+```bash
+cd docker
+cp .env.example .env   # set ENCODE_DATABASE_URL + HA/Traefik vars
+docker compose -f docker-compose.ha.yml up -d
+```
+
+### `install.sh --ha`
+
+`install.sh --ha` automates the HA deploy: it **refuses** to run when
+`ENCODE_DATABASE_URL` is empty/SQLite with the message
+`HA requires Postgres: set ENCODE_DATABASE_URL (see --postgres)`, brings up
+the HA compose (postgres first, waits healthy, then both replicas), applies
+the same `COMPOSE_PROJECT_NAME` safety guard to both replica container names,
+and **health-checks BOTH replicas** (polling each container's
+`/api/health` via `docker exec` so the check works regardless of Traefik
+routing state). Without `--ha`, behavior is byte-identical to the
+single-instance deploy.
+
+```bash
+sudo ./install.sh --ha        # refuses if ENCODE_DATABASE_URL is empty/SQLite
+```
+
+### Rolling upgrades
+
+Upgrade one replica at a time to keep the controller available through the
+swap:
+
+```bash
+docker compose -f docker-compose.ha.yml up -d --no-deps controller-1
+# wait for encode-controller-1 healthy, then:
+docker compose -f docker-compose.ha.yml up -d --no-deps controller-2
+```
+
+`migratePG` is idempotent (no-op on an existing schema), so a replica booting
+against an already-migrated PG is safe. The advisory-lock singleton loops
+re-acquire on each boot; a replica killed mid-loop releases its advisory lock
+on connection close and the other replica's loop takes over within its retry
+interval.
+
+### Rollback from HA
+
+To roll back to the single-instance SQLite deploy: stop the HA stack, unset
+`ENCODE_DATABASE_URL` in `.env`, and bring up `docker-compose.runtime.yml`.
+**Caveat:** once new writes have landed on PG after the HA cutover, rolling
+back to SQLite loses those writes (the safe rollback is to re-import
+forward — see `Operations.md` §Postgres backup & rollback). Roll back to
+SQLite only in the immediate post-cutover window when no writes have occurred.
+
+### HA limitations
+
+- **SSE live log streaming is per-replica.** The log hub is in-memory
+  per-process; an SSE client attached to replica A only sees progress
+  events for heartbeats that landed on A. If a heartbeat lands on replica B,
+  the progress update is written to the shared PG DB but A's SSE stream only
+  re-syncs on its next 15s keepalive DB re-check. See `Architecture.md`
+  §Active/active.
+- **Postgres is the remaining SPOF.** Patroni/PG HA is deferred by user
+  decision; the bundled `postgres:16-alpine` is for trials only.

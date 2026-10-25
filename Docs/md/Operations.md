@@ -108,6 +108,67 @@ snapshot into a fresh PG and repoint the controller) rather than revert to
 the stale SQLite file. Roll back to SQLite only when no writes have occurred
 on PG (immediate post-cutover rollback window).
 
+## HA runbook (active/active, Postgres required)
+
+The HA deploy (`docker-compose.ha.yml` / `install.sh --ha`) runs two
+controller replicas behind one Traefik v3 load-balanced service, both
+sharing a single Postgres backend. SQLite is single-writer and cannot serve
+two replicas — `install.sh --ha` refuses when `ENCODE_DATABASE_URL` is
+empty/SQLite.
+
+### Verify both replicas healthy + distinct instance ids
+
+```bash
+# Both containers reporting healthy:
+docker inspect -f '{{.Name}} {{.State.Health.Status}}' encode-controller-1 encode-controller-2
+# Distinct instance ids (the /api/health `instance` field):
+docker exec encode-controller-1 wget -qO- http://localhost:8080/api/health
+docker exec encode-controller-2 wget -qO- http://localhost:8080/api/health
+```
+
+The two `instance` values must differ (`controller-1` / `controller-2`) —
+that is how the advisory-lock singleton loops and failover logs distinguish
+the replicas. If both report the same id, the `ENCODE_INSTANCE_ID` env was
+overridden (it is hardcoded in the HA compose — do not override it).
+
+### Failover (`kill -9` expectations)
+
+A replica killed mid-loop releases its Postgres advisory lock on
+connection close. The surviving replica's singleton loop acquires the lock
+on its next retry (15s poll interval; total failover ≈ 10s keepalive
+detection + 15s retry ≈ ≤25s), so background loops (scanner, prune,
+digest flush, backup scheduler) re-home automatically. Job dispatch is
+unaffected: the conditional `UPDATE … WHERE status='pending'` guard means
+only one replica can flip a given job, and the `FOR UPDATE` node-row lock
+serializes capacity checks — killing a replica mid-heartbeat never
+double-assigns. Agents
+heartbeating the dead replica's Traefik backend get a connection error and
+retry on the next heartbeat interval (default 15s); Traefik v3's
+load-balancer stops routing to the dead container once its healthcheck
+fails. Expect ≤25s for the lock failover + up to one heartbeat interval for
+agent reconnect.
+
+### Rollback
+
+- **Scale to one replica** (degrade to single-controller-with-PG):
+  `docker compose -f docker-compose.ha.yml up -d --scale controller-2=0`
+  (or stop `controller-2` outright). The remaining replica is a
+  single-instance PG-backed controller — fully functional, no longer HA.
+- **Roll back to SQLite single-instance:** stop the HA stack, unset
+  `ENCODE_DATABASE_URL` in `.env`, bring up `docker-compose.runtime.yml`.
+  Caveat: writes on PG after the HA cutover are lost on this path — roll
+  back to SQLite only in the immediate post-cutover window; otherwise
+  re-import forward (see Postgres backup & rollback above).
+
+### Postgres is the remaining SPOF
+
+Patroni / PG-side HA is deferred by user decision. A single bundled
+`postgres:16-alpine` container is itself a SPOF — it is for trials only.
+Production HA should point `ENCODE_DATABASE_URL` at a managed/external PG
+(RDS, Cloud SQL, a Patroni cluster). If the PG dies, both replicas
+fail-fast-exit on boot (same path as a corrupt SQLite file); bring PG back
+and the replicas reconnect + re-acquire their advisory locks on restart.
+
 ## Known failure modes
 
 - **Share mount dropped on a Windows node** (NFS/SMB): jobs fail at source read; remount via the Ansible play (`ansible-playbook site.yml --tags nfs-client`) or the provisioning "mount shares" option. On Linux: `mount -a` or `systemctl restart mnt-*.automount` (the CIFS/NFS mounts use `x-systemd.automount` so they auto-remount on first access; check the 0600 credential files at `/etc/encode-agent/cifs-*.cred` if a mount refuses).

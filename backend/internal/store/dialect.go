@@ -158,3 +158,24 @@ func (s *Store) qExec(ctx context.Context, query string, args ...any) (sql.Resul
 func (s *Store) qQuery(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	return s.db.QueryContext(ctx, s.q(query), args...)
 }
+
+// forUpdate appends " FOR UPDATE" on Postgres and returns the SQL unchanged
+// on SQLite. Used inside a transaction to take a row lock that serializes
+// concurrent access to the same row across replicas — e.g. the per-node
+// capacity check in AssignJob SELECTs the node row FOR UPDATE so two
+// controllers dispatching to the same node cannot both pass the capacity
+// count and overshoot max_concurrent_jobs.
+//
+// FOR UPDATE is a syntax error on SQLite, and SQLite's single-writer
+// (MaxOpenConns=1) model already serializes every transaction, so the lock
+// is unnecessary there — the helper is a no-op that keeps call sites
+// identical across backends.
+//
+// Only valid inside a transaction (BEGIN … COMMIT); outside a tx the lock
+// is released immediately and serializes nothing.
+func (s *Store) forUpdate(sqlText string) string {
+	if s.dialect != dialectPostgres {
+		return sqlText
+	}
+	return sqlText + " FOR UPDATE"
+}

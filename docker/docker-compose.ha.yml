@@ -1,0 +1,205 @@
+# encode-system controller — high-availability active/active compose.
+#
+# Two controller replicas (encode-controller-1/-2) behind one Traefik v3
+# load-balanced service, both sharing a single Postgres backend. This is the
+# HA path: SQLite (single-writer) cannot serve two replicas, so PG is
+# REQUIRED — install.sh --ha refuses to run without ENCODE_DATABASE_URL set
+# to a postgres:// DSN.
+#
+# Quick start:
+#   cp .env.example .env   # set ENCODE_DATABASE_URL + HA/Traefik vars
+#   docker compose -f docker-compose.ha.yml up -d
+# or:
+#   ./install.sh --ha        # refuses if ENCODE_DATABASE_URL is empty/SQLite
+#
+# --- Traefik v3 load-balancing approach (comment) -------------------------
+# Each replica is its own compose service with its OWN router
+# (`router-encode-controller-1`, `router-encode-controller-2`) on the SAME
+# entrypoint. Traefik v3 has no `loadBalancer` service type that takes two
+# servers from two services — a Traefik "service" with `loadBalancer.servers`
+# lists URLs, and pointing one service at two containers requires either a
+# shared service (Docker labels can only be attached to one container) or a
+# `weighted` service referencing two named services. The idiomatic v3
+# approach for two same-image containers behind one domain is: ONE router
+# rule (Host) attached to replica-1's service, and a `weighted` Traefik
+# service (`traefik.http.services.<svc>.loadBalancer.server` won't span two
+# compose services). The simplest correct, single-domain setup is: each
+# replica carries the SAME Host rule on its own router, and Traefik v3
+# load-balances across all routers matching the host automatically? No —
+# Traefik does not merge routers. So the actual idiomatic v3 pattern here is:
+#
+#   traefik.http.routers.<r>.rule=Host(`${ENCODE_DOMAIN}`)   (on replica-1)
+#   traefik.http.routers.<r>.service=<svc>                   (shared name)
+#   traefik.http.services.<svc>.loadBalancer.server=...
+#
+# But a compose service's labels can only describe ONE Traefik service.
+# Therefore the load-balancing that spans BOTH replicas is achieved by giving
+# each replica an IDENTICAL router+service name via labels: Traefik v3
+# coalesces services with the same name across providers into one
+# load-balanced backend with multiple servers. This is the documented v3
+# multi-container LB pattern (same `traefik.http.services.<name>` across
+# containers → Traefik accumulates the server entries).
+#
+# We attach the shared network to both replicas so Traefik can reach each.
+# Entryoint/resolver/router/service/domain names come from .env (${VARS}).
+
+services:
+  controller-1:
+    image: ghcr.io/badskater/encode-system:${ENCODE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    container_name: encode-controller-1
+    restart: unless-stopped
+    # Distinct instance identity so the advisory-lock singleton loops and
+    # /api/health `instance` field distinguish the two replicas. Hardcoded
+    # (not a ${VAR}) — the two replicas MUST have stable, different names so
+    # lock ownership and failover logs are unambiguous. See Architecture.md
+    # §Active/active.
+    environment:
+      ENCODE_INSTANCE_ID: controller-1
+      ENCODE_ADMIN_USER: ${ENCODE_ADMIN_USER:-admin}
+      ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:-}
+      ENCODE_ADMIN_FORCE_PASSWORD: ${ENCODE_ADMIN_FORCE_PASSWORD:-}
+      ENCODE_DATA: /data
+      ENCODE_SCRIPTS_ROOT: /data/scripts
+      ENCODE_RELEASE_ROOT: /data/release
+      ENCODE_SCAN_INTERVAL: ${ENCODE_SCAN_INTERVAL:-30}
+      ENCODE_TASKS_BEFORE_REBOOT: ${ENCODE_TASKS_BEFORE_REBOOT:-10}
+      ENCODE_GROUP: ${ENCODE_GROUP:-OldFartsSubs}
+      ENCODE_TAG: ${ENCODE_TAG:-1080p}
+      ENCODE_DEFAULT_FLOW: ${ENCODE_DEFAULT_FLOW:-default-1080}
+      ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
+      # REQUIRED (no default) — HA needs Postgres; SQLite cannot serve two
+      # replicas. install.sh --ha refuses if this is empty. Set in .env to a
+      # managed/external PG for production; the bundled postgres service
+      # below is for trials only.
+      ENCODE_DATABASE_URL: ${ENCODE_DATABASE_URL:?HA requires Postgres — set ENCODE_DATABASE_URL in .env (see install.sh --postgres)}
+      ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-/data/encode.db.shares-key}
+    volumes:
+      # Shared state volume (update payloads + shares key file + backups).
+      # Same named volume names as docker-compose.runtime.yml so publish,
+      # backup, and shares-key behavior match the single-instance deploy.
+      # PG data lives in the postgres container's own volume (encode-pgdata),
+      # NOT here — the DB is remote to both replicas.
+      - encode-state:/data
+      - encode-scripts:/data/scripts
+      - encode-release:/data/release
+    networks:
+      - encode-ha-net
+      - traefik
+    labels:
+      # --- Traefik v3 router (shared name → LB coalescing) ---------------
+      # Both replicas use the SAME router+service name so Traefik v3
+      # accumulates their server entries into one load-balanced backend.
+      # Host rule + domain from .env; entrypoint/resolver from .env.
+      traefik.enable: "true"
+      traefik.docker.network: ${ENCODE_TRAEFIK_NETWORK:-traefik}
+      traefik.http.routers.encode-controller.rule: Host(`${ENCODE_DOMAIN:?set ENCODE_DOMAIN in .env}`)
+      traefik.http.routers.encode-controller.entryPoints: ${ENCODE_TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.encode-controller.tls: "true"
+      traefik.http.routers.encode-controller.tls.certresolver: ${ENCODE_TRAEFIK_RESOLVER:-letsencrypt}
+      traefik.http.routers.encode-controller.service: encode-controller-svc
+      # Optional Authelia forwardAuth middleware (set ENCODE_AUTH_MIDDLEWARE
+      # in .env to the middleware name; unset = no auth proxy).
+      traefik.http.routers.encode-controller.middlewares: ${ENCODE_AUTH_MIDDLEWARE:-}
+      # Service: same name on both replicas → Traefik v3 LB coalescing.
+      # server.port points at the controller's in-container 8080.
+      traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  controller-2:
+    image: ghcr.io/badskater/encode-system:${ENCODE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    container_name: encode-controller-2
+    restart: unless-stopped
+    environment:
+      ENCODE_INSTANCE_ID: controller-2
+      ENCODE_ADMIN_USER: ${ENCODE_ADMIN_USER:-admin}
+      ENCODE_ADMIN_PASSWORD: ${ENCODE_ADMIN_PASSWORD:-}
+      ENCODE_ADMIN_FORCE_PASSWORD: ${ENCODE_ADMIN_FORCE_PASSWORD:-}
+      ENCODE_DATA: /data
+      ENCODE_SCRIPTS_ROOT: /data/scripts
+      ENCODE_RELEASE_ROOT: /data/release
+      ENCODE_SCAN_INTERVAL: ${ENCODE_SCAN_INTERVAL:-30}
+      ENCODE_TASKS_BEFORE_REBOOT: ${ENCODE_TASKS_BEFORE_REBOOT:-10}
+      ENCODE_GROUP: ${ENCODE_GROUP:-OldFartsSubs}
+      ENCODE_TAG: ${ENCODE_TAG:-1080p}
+      ENCODE_DEFAULT_FLOW: ${ENCODE_DEFAULT_FLOW:-default-1080}
+      ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
+      ENCODE_DATABASE_URL: ${ENCODE_DATABASE_URL:?HA requires Postgres — set ENCODE_DATABASE_URL in .env (see install.sh --postgres)}
+      ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-/data/encode.db.shares-key}
+    volumes:
+      - encode-state:/data
+      - encode-scripts:/data/scripts
+      - encode-release:/data/release
+    networks:
+      - encode-ha-net
+      - traefik
+    labels:
+      # Identical router+service name to controller-1 so Traefik v3
+      # coalesces both into one load-balanced backend for the domain.
+      traefik.enable: "true"
+      traefik.docker.network: ${ENCODE_TRAEFIK_NETWORK:-traefik}
+      traefik.http.routers.encode-controller.rule: Host(`${ENCODE_DOMAIN:?set ENCODE_DOMAIN in .env}`)
+      traefik.http.routers.encode-controller.entryPoints: ${ENCODE_TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.encode-controller.tls: "true"
+      traefik.http.routers.encode-controller.tls.certresolver: ${ENCODE_TRAEFIK_RESOLVER:-letsencrypt}
+      traefik.http.routers.encode-controller.service: encode-controller-svc
+      traefik.http.routers.encode-controller.middlewares: ${ENCODE_AUTH_MIDDLEWARE:-}
+      traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Bundled Postgres for TRIALS. Production HA should point
+  # ENCODE_DATABASE_URL at a managed/external PG (RDS, Cloud SQL, or a
+  # Patroni cluster) — a single bundled postgres container is the remaining
+  # SPOF and is NOT HA on its own. No profile gate here (HA requires PG);
+  # the service starts unconditionally with the HA stack. Override
+  # ENCODE_DATABASE_URL to point elsewhere and this service is simply unused
+  # (compose starts it but the controller connects to the external DSN).
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${ENCODE_PG_CONTAINER_NAME:-encode-postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ENCODE_PG_USER:-encode}
+      POSTGRES_PASSWORD: ${ENCODE_PG_PASSWORD:-changeme-encode-pg}
+      POSTGRES_DB: ${ENCODE_PG_DB:-encode}
+    volumes:
+      - encode-pgdata:/var/lib/postgresql/data
+    networks:
+      - encode-ha-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ENCODE_PG_USER:-encode} -d ${ENCODE_PG_DB:-encode}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  # Internal network so both replicas + the bundled PG can reach each other.
+  encode-ha-net:
+    name: encode-ha-net
+  # External Traefik network — created by the Traefik stack, NOT here.
+  # The compose service key is fixed (`traefik`); the ACTUAL external
+  # network name is resolved via ENCODE_TRAEFIK_NETWORK (default `traefik`).
+  # Override when the operator's Traefik stack uses a different network name.
+  traefik:
+    name: ${ENCODE_TRAEFIK_NETWORK:-traefik}
+    external: true
+
+volumes:
+  encode-state:
+  encode-scripts:
+  encode-release:
+  encode-pgdata:

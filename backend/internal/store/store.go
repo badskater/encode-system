@@ -875,6 +875,27 @@ func (s *Store) JobExistsForEpisode(ctx context.Context, episodeDir string) (boo
 
 // AssignJob atomically hands a pending job to a node. It fails if the node
 // already has an active (assigned/running) job — the one-job-per-node rule.
+//
+// Race-safety under active/active replicas (Phase 3 HA):
+//
+// The capacity check SELECTs the node row FOR UPDATE on Postgres (a no-op on
+// SQLite). This serializes the per-node capacity check across replicas: two
+// controllers dispatching DIFFERENT jobs to the SAME node at once cannot both
+// pass the active-count guard and overshoot max_concurrent_jobs — the second
+// tx blocks on the row lock until the first commits, then re-reads the now-
+// higher active count and rejects. SQLite's single-writer pool already
+// serializes every transaction, so forUpdate is a no-op there.
+//
+// The job flip itself relies on the conditional UPDATE + RowsAffected==1
+// guard below: `UPDATE jobs SET status='assigned' … WHERE status='pending'`
+// is atomic on both backends, so even if two replicas select the same pending
+// job (NextAssignableJobForNode is an unlocked read), exactly one UPDATE
+// matches (RowsAffected==1) and the other gets 0 rows → error → the handler
+// breaks the assignment loop and re-evaluates on the next heartbeat. This is
+// why SKIP LOCKED on NextAssignableJob* is NOT needed: the handler's
+// select-then-AssignJob pattern already de-races via the conditional UPDATE,
+// and a lost race is a clean error + retry, never a double-assignment. See
+// the 3.2 decision note in ha_notes.go.
 func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -884,9 +905,12 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 
 	// Capacity check inside the transaction: the count AND the row flip
 	// must be atomic or two concurrent heartbeats could both pass the
-	// guard and overshoot max_concurrent_jobs.
+	// guard and overshoot max_concurrent_jobs. The FOR UPDATE on PG takes
+	// a row lock on the node row so a concurrent AssignJob to the same
+	// node blocks here until this tx commits, then re-reads the committed
+	// active count — preventing two replicas from both passing the guard.
 	var active, maxConc, enabled int
-	if err := tx.QueryRowContext(ctx, s.q(`SELECT enabled, max_concurrent_jobs FROM nodes WHERE id = ?`), nodeID).Scan(&enabled, &maxConc); err != nil {
+	if err := tx.QueryRowContext(ctx, s.q(s.forUpdate(`SELECT enabled, max_concurrent_jobs FROM nodes WHERE id = ?`)), nodeID).Scan(&enabled, &maxConc); err != nil {
 		return fmt.Errorf("assign to unknown node %d: %w", nodeID, err)
 	}
 	// The node must exist and be enabled; otherwise the job would be handed

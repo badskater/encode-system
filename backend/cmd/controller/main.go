@@ -41,7 +41,26 @@ func main() {
 	dataDir := flag.String("data", env("ENCODE_DATA", "./data"), "data directory (db, updates, static ui)")
 	flag.Parse()
 
+	// ENCODE_INSTANCE_ID identifies THIS controller replica for HA. Defaults
+	// to the hostname; in a two-replica compose each container's hostname
+	// already differs (encode-controller-1 / -2), but operators running two
+	// processes on one host MUST set ENCODE_INSTANCE_ID explicitly so two
+	// replicas are distinguishable in logs and /api/health. Empty/legacy
+	// controllers get "controller" via New's fallback.
+	instanceID := env("ENCODE_INSTANCE_ID", "")
+	if instanceID == "" {
+		if hn, err := os.Hostname(); err == nil && hn != "" {
+			instanceID = hn
+		}
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Stamp the instance id into every log line as a default attr so a
+	// mixed log stream (two replicas behind one LB writing to the same sink)
+	// can be grepped per-replica. WithAttrs (not With) attaches the attr to
+	// the handler without re-wrapping, so SetDefault below propagates it.
+	if instanceID != "" {
+		log = log.With("instance", instanceID)
+	}
 	slog.SetDefault(log)
 
 	// Management-plane admin account. Username defaults to "admin". The
@@ -118,6 +137,7 @@ func main() {
 		TasksBeforeReboot:   envInt("ENCODE_TASKS_BEFORE_REBOOT", 10),
 		ScanIntervalSeconds: envInt("ENCODE_SCAN_INTERVAL", 30),
 		DiscordWebhook:      env("ENCODE_DISCORD_WEBHOOK", ""),
+		InstanceID:          instanceID,
 	}
 
 	srv, err := api.New(st, up, log, cfg)
@@ -161,43 +181,63 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// HA singleton loops: every background loop is wrapped in
+	// store.RunLoopSupervisor so that on Postgres (active/active replicas)
+	// exactly ONE replica runs each loop at a time — scanner, digest,
+	// retention, backup. A replica that loses the lock (crash, network
+	// split detected by the keepalive) stops its loop; the standby that
+	// wins the lock starts it within one reAcquireDelay (15s). On SQLite
+	// the lock is a no-op always-succeed, so the loops run unchanged —
+	// byte-for-byte the same single-instance behavior as before Phase 3.
+	//
+	// The digest and retention loops are wrapped inside their Start* methods
+	// (see server.go / retention.go). The scanner and backup loops are
+	// launched directly here because their bodies are inline closures.
+	//
+	// SIGTERM semantics are preserved: signal.NotifyContext cancels ctx,
+	// the supervisor cancels each body's sub-ctx, every loop's existing
+	// ctx.Done() exit path fires, the supervisor releases the lock and
+	// returns. No loop is left running after shutdown.
+
 	// Scanner loop: watch the scripts share for new episode folders. The
 	// root, cadence, and default flow come from the LIVE settings store so
 	// Settings-page edits apply on the next cycle without a restart.
-	go scanner.RunLoop(ctx, log, st, func(scanCtx context.Context) (scanner.Target, time.Duration, string) {
-		root := cfg.ScriptsRoot
-		interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
-		defaultFlow := cfg.DefaultFlowName
-		if st2, err := st.GetSettings(scanCtx); err == nil && st2 != nil {
-			if st2.ScriptsRoot != "" {
-				root = st2.ScriptsRoot
+	go store.RunLoopSupervisor(ctx, st, log, store.LockKeyScanner, "scanner", func(scanCtx context.Context) {
+		scanner.RunLoop(scanCtx, log, st, func(scanCtx context.Context) (scanner.Target, time.Duration, string) {
+			root := cfg.ScriptsRoot
+			interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
+			defaultFlow := cfg.DefaultFlowName
+			if st2, err := st.GetSettings(scanCtx); err == nil && st2 != nil {
+				if st2.ScriptsRoot != "" {
+					root = st2.ScriptsRoot
+				}
+				// Mirror validateSettings' bounds so a hand-edited DB row cannot
+				// push the cadence outside [5s, 1h] even if it bypassed the API.
+				if st2.ScanIntervalSeconds >= 5 && st2.ScanIntervalSeconds <= 3600 {
+					interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
+				}
 			}
-			// Mirror validateSettings' bounds so a hand-edited DB row cannot
-			// push the cadence outside [5s, 1h] even if it bypassed the API.
-			if st2.ScanIntervalSeconds >= 5 && st2.ScanIntervalSeconds <= 3600 {
-				interval = time.Duration(st2.ScanIntervalSeconds) * time.Second
+			// An enabled s3 share owning the scripts role switches discovery to
+			// bucket listing (full s3 autonomy: no mount on the controller).
+			// Client construction is per-cycle so credential rotation applies
+			// without restart; it is cheap (no network round-trip).
+			if sh, err := st.ShareForRole(scanCtx, model.ShareRoleScripts); err == nil &&
+				sh != nil && sh.Kind == model.ShareS3 {
+				store, serr := s3.New(&model.S3Transfer{
+					Endpoint:  s3.EndpointFromShare(sh),
+					Region:    sh.Region,
+					AccessKey: sh.Username,
+					SecretKey: sh.Password,
+					UseTLS:    sh.UseTLS,
+				})
+				if serr != nil {
+					log.Warn("s3 scanner client failed; scanning disabled", "share", sh.Name, "err", serr)
+					return scanner.Target{}, interval, defaultFlow
+				}
+				return scanner.Target{S3Bucket: sh.Path, S3Store: store}, interval, defaultFlow
 			}
-		}
-		// An enabled s3 share owning the scripts role switches discovery to
-		// bucket listing (full s3 autonomy: no mount on the controller).
-		// Client construction is per-cycle so credential rotation applies
-		// without restart; it is cheap (no network round-trip).
-		if sh, err := st.ShareForRole(scanCtx, model.ShareRoleScripts); err == nil &&
-			sh != nil && sh.Kind == model.ShareS3 {
-			store, serr := s3.New(&model.S3Transfer{
-				Endpoint:  s3.EndpointFromShare(sh),
-				Region:    sh.Region,
-				AccessKey: sh.Username,
-				SecretKey: sh.Password,
-				UseTLS:    sh.UseTLS,
-			})
-			if serr != nil {
-				log.Warn("s3 scanner client failed; scanning disabled", "share", sh.Name, "err", serr)
-				return scanner.Target{}, interval, defaultFlow
-			}
-			return scanner.Target{S3Bucket: sh.Path, S3Store: store}, interval, defaultFlow
-		}
-		return scanner.Target{Root: root}, interval, defaultFlow
+			return scanner.Target{Root: root}, interval, defaultFlow
+		})
 	})
 
 	// Digest loop: when settings.NotifyDigest is ON, buffer job-outcome
@@ -214,12 +254,14 @@ func main() {
 	// ctx as the scanner/digest loops so SIGTERM stops all of them cleanly.
 	srv.StartRetentionLoop(ctx)
 
-	// DB backup scheduler: periodic VACUUM INTO snapshots under
-	// <dataDir>/backups (keeps the newest 24 scheduled ones; manual
-	// snapshots are never auto-pruned). Enabled/interval live-adjustable
+	// DB backup scheduler: periodic snapshots under <dataDir>/backups (SQLite
+	// VACUUM INTO or PG logical dump), keeps the newest 24 scheduled ones;
+	// manual snapshots are never auto-pruned. Enabled/interval live-adjustable
 	// via the Settings UI (PUT /api/backup/settings); env sets the boot
-	// defaults. The loop polls every 30s so changes apply without a
-	// restart.
+	// defaults. The loop polls every 30s so changes apply without a restart.
+	// HA: wrapped in store.RunLoopSupervisor (LockKeyBackup) so only one
+	// replica snapshots at a time on PG — two concurrent pg_dump handles on
+	// the same DB work but waste resources and could race on file names.
 	srv.Backup = &api.BackupManager{
 		Store:    st,
 		Postgres: databaseURL != "" && (strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://")),
@@ -248,7 +290,9 @@ func main() {
 		log.Info("migrated NFS settings into shares", "count", n)
 	}
 
-	go srv.Backup.Run(ctx)
+	go store.RunLoopSupervisor(ctx, st, log, store.LockKeyBackup, "backup", func(ctx context.Context) {
+		srv.Backup.Run(ctx)
+	})
 
 	// Serve UI static files (built frontend) if present, then the API.
 	// ENCODE_UI_DIR overrides the default <data>/ui (the Docker image bakes

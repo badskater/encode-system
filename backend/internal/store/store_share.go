@@ -170,7 +170,7 @@ INSERT INTO shares (name, kind, role, server, path, port, username, password,
   region, use_tls, endpoint, enabled, mount_path)
 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sh.Name, sh.Kind, sh.Role, sh.Server, sh.Path, sh.Port, sh.Username, ct,
-		sh.Region, boolInt(sh.UseTLS), sh.Endpoint, boolInt(sh.Enabled), sh.MountPath)
+		sh.Region, boolToInt(sh.UseTLS), sh.Endpoint, boolToInt(sh.Enabled), sh.MountPath)
 	if err != nil {
 		return nil, err
 	}
@@ -265,8 +265,8 @@ LIMIT 1`, role)
 func (s *Store) UpdateShare(ctx context.Context, sh *model.Share) error {
 	pwSQL := "password=password"
 	args := []any{sh.Name, sh.Kind, sh.Role, sh.Server, sh.Path, sh.Port,
-		sh.Username, sh.Region, boolInt(sh.UseTLS), sh.Endpoint,
-		boolInt(sh.Enabled), sh.MountPath}
+		sh.Username, sh.Region, boolToInt(sh.UseTLS), sh.Endpoint,
+		boolToInt(sh.Enabled), sh.MountPath}
 	if sh.Password != "" {
 		ct, err := s.encryptSharePassword(sh.Password)
 		if err != nil {
@@ -275,8 +275,8 @@ func (s *Store) UpdateShare(ctx context.Context, sh *model.Share) error {
 		pwSQL = "password=?"
 		// password arg slot goes right after username to match the SET order
 		args = []any{sh.Name, sh.Kind, sh.Role, sh.Server, sh.Path, sh.Port,
-			sh.Username, ct, sh.Region, boolInt(sh.UseTLS), sh.Endpoint,
-			boolInt(sh.Enabled), sh.MountPath}
+			sh.Username, ct, sh.Region, boolToInt(sh.UseTLS), sh.Endpoint,
+			boolToInt(sh.Enabled), sh.MountPath}
 	}
 	q := `UPDATE shares SET name=?, kind=?, role=?, server=?, path=?, port=?, username=?, ` +
 		pwSQL + `, region=?, use_tls=?, endpoint=?, enabled=?, mount_path=?,
@@ -344,15 +344,6 @@ func (s *Store) MigrateSettingsShares(ctx context.Context) int {
 		}
 	}
 	return created
-}
-
-// boolInt maps a bool to 0/1 (SQLite has no BOOLEAN type; Postgres columns
-// mirror this so boolToInt/==1 scan code is identical on both backends).
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // sharesKeyPathForDSN derives a key-file path from a Postgres DSN. The

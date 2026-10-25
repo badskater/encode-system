@@ -555,36 +555,10 @@ func TestMigratePGFresh(t *testing.T) {
 // the DROP+CREATE. The error from DROP (if the DB doesn't exist yet) is
 // tolerated.
 func dropAndRecreateTestDB(dsn string) error {
-	// Parse the DSN to extract user, host, port, and dbname.
-	// Expected form: postgres://user@host:port/dbname?params
-	rest := dsn
-	if i := indexStr(rest, "://"); i >= 0 {
-		rest = rest[i+3:]
+	dbName, maintDSN, err := parseTestDBName(dsn)
+	if err != nil {
+		return err
 	}
-	// Split userinfo@hostport from path.
-	var userinfo, hostport, pathPart string
-	atIdx := indexStr(rest, "@")
-	if atIdx >= 0 {
-		userinfo = rest[:atIdx]
-		hostport = rest[atIdx+1:]
-	} else {
-		hostport = rest
-	}
-	if slashIdx := indexStr(hostport, "/"); slashIdx >= 0 {
-		pathPart = hostport[slashIdx+1:]
-		hostport = hostport[:slashIdx]
-	}
-	// Strip query string from pathPart.
-	dbName := pathPart
-	if q := indexStr(dbName, "?"); q >= 0 {
-		dbName = dbName[:q]
-	}
-	if dbName == "" {
-		return fmt.Errorf("could not parse database name from DSN")
-	}
-	// Build a maintenance DSN pointing at the "postgres" database, preserving
-	// the userinfo (user) from the original DSN.
-	maintDSN := fmt.Sprintf("postgres://%s@%s/postgres?sslmode=disable", userinfo, hostport)
 	maintDB, err := sql.Open("pgx", maintDSN)
 	if err != nil {
 		return fmt.Errorf("open maintenance: %w", err)
@@ -598,14 +572,4 @@ func dropAndRecreateTestDB(dsn string) error {
 		return fmt.Errorf("create database: %w", err)
 	}
 	return nil
-}
-
-// indexStr finds the first index of substr in s, or -1.
-func indexStr(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }

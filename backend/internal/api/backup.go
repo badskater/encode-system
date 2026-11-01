@@ -474,10 +474,15 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// Capture the exit function NOW, not when the delayed goroutine runs:
+	// tests override exitFn and restore it in cleanup, and a 200ms-delayed
+	// read could observe the real os.Exit after cleanup already ran (killed
+	// the test binary in CI).
+	exit := exitFn
 	go func() {
 		time.Sleep(200 * time.Millisecond) // let the response hit the wire
 		s.Log.Info("controller exiting after DB restore (Docker restart policy reboots on restored DB)")
-		exitFn(0)
+		exit(0)
 	}()
 }
 

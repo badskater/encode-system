@@ -81,10 +81,17 @@ type Flow struct {
 type User struct {
 	ID           int64      `json:"id"`
 	Username     string     `json:"username"`
-	Role         string     `json:"role"` // "admin"
+	Role         string     `json:"role"` // admin | viewer
 	PasswordHash string     `json:"-"`    // never serialized
 	CreatedAt    *time.Time `json:"created_at,omitempty"`
 }
+
+// Role constants for management-plane accounts. "admin" has full management
+// API access; "viewer" is read-only (GET/HEAD routes) with no mutation.
+const (
+	RoleAdmin  = "admin"
+	RoleViewer = "viewer"
+)
 
 // ProvisionRun is one controller-driven Ansible provisioning attempt of a
 // Windows node. The WinRM password is NEVER stored: it lives only in the
@@ -226,6 +233,7 @@ type Session struct {
 	TokenHash string     `json:"-"`
 	UserID    int64      `json:"user_id"`
 	Username  string     `json:"username"`
+	Role      string     `json:"role"` // propagated from the user row for middleware
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	CreatedAt *time.Time `json:"created_at,omitempty"`
 }

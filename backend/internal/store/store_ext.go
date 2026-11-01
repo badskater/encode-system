@@ -956,10 +956,10 @@ func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (*mode
 	var sess model.Session
 	var created, expires sql.NullString
 	err := s.qRow(ctx, `
-SELECT s.token_hash, s.user_id, u.username, s.created_at, s.expires_at
+SELECT s.token_hash, s.user_id, u.username, u.role, s.created_at, s.expires_at
 FROM sessions s JOIN users u ON u.id = s.user_id
 WHERE s.token_hash = ? AND s.expires_at > datetime('now')`, tokenHash).
-		Scan(&sess.TokenHash, &sess.UserID, &sess.Username, &created, &expires)
+		Scan(&sess.TokenHash, &sess.UserID, &sess.Username, &sess.Role, &created, &expires)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -996,6 +996,16 @@ func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHa
 	return err
 }
 
+// CountActiveJobs returns the number of jobs that are pending, assigned, or
+// running — i.e. not in a terminal state. Used by the backup-restore guard
+// to refuse a restore while work is in flight.
+func (s *Store) CountActiveJobs(ctx context.Context) (int, error) {
+	var n int
+	err := s.qRow(ctx,
+		"SELECT COUNT(*) FROM jobs WHERE status IN ('pending','assigned','running')").Scan(&n)
+	return n, err
+}
+
 // DeleteUserSessions revokes every session of a user except the one
 // identified by keepTokenHash (the session performing the action). Used on
 // password change so stale or stolen sessions die immediately.
@@ -1003,6 +1013,47 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keepTokenH
 	_, err := s.qExec(ctx,
 		"DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", userID, keepTokenHash)
 	return err
+}
+
+// DBPath returns the SQLite database file path (for backup restore's file
+// swap) or the raw DSN string on Postgres. Callers branch on IsPostgres()
+// before using the SQLite path.
+func (s *Store) DBPath() string { return s.dbPath }
+
+// IsPostgres reports whether the store is backed by Postgres.
+func (s *Store) IsPostgres() bool { return s.isPostgres() }
+
+// DeleteUser removes a user account. The sessions table has ON DELETE
+// CASCADE so the user's sessions die with the row. Does NOT guard against
+// last-admin deletion — the handler enforces that policy before calling.
+func (s *Store) DeleteUser(ctx context.Context, userID int64) error {
+	_, err := s.qExec(ctx, "DELETE FROM users WHERE id = ?", userID)
+	return err
+}
+
+// CountUsersByRole counts accounts with the given role. Used by the
+// last-admin guard before a delete or role downgrade.
+func (s *Store) CountUsersByRole(ctx context.Context, role string) (int, error) {
+	var n int
+	err := s.qRow(ctx, "SELECT COUNT(*) FROM users WHERE role = ?", role).Scan(&n)
+	return n, err
+}
+
+// UserByID loads one account by its numeric id (nil when absent).
+func (s *Store) UserByID(ctx context.Context, id int64) (*model.User, error) {
+	var u model.User
+	var created sql.NullString
+	err := s.qRow(ctx,
+		"SELECT id, username, password_hash, role, created_at FROM users WHERE id = ?", id).
+		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.CreatedAt = ptrTime(created.String)
+	return &u, nil
 }
 
 // PruneOldJobs deletes terminal job rows finished more than days ago and

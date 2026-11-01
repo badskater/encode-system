@@ -93,7 +93,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if user != nil {
 		hash = []byte(user.PasswordHash)
 	}
-	if user == nil || user.Role != "admin" || bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
+	// Any valid management account (admin or viewer) can log in. Viewers
+	// get read-only access via withAnyUser; the old admin-only gate here
+	// would have blocked viewer accounts from authenticating at all.
+	if user == nil || bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
 		s.throttle.fail()
 		s.Log.Warn("failed login", "username", req.Username)
 		writeErr(w, http.StatusUnauthorized, "invalid username or password")
@@ -136,6 +139,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFromCtx(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"username":   sess.Username,
+		"role":       sess.Role,
 		"expires_at": sess.ExpiresAt,
 	})
 }
@@ -240,11 +244,12 @@ func sessionFromCtx(r *http.Request) *model.Session {
 	return nil
 }
 
-// withAdmin requires a valid management credential (Bearer): either an
-// interactive session (renewed on each request — sliding expiry) or a
-// scoped API token. Read-scope tokens may only use safe methods (GET/HEAD);
-// everything else requires an admin-scope token or a session. Agent
-// endpoints have their own token auth and never go through this wrapper.
+// withAdmin requires a valid management credential (Bearer) with admin
+// privileges: either an interactive session whose user has role "admin",
+// or a scoped API token. Read-scope tokens may only use safe methods
+// (GET/HEAD); admin-scope tokens have full access. A viewer-role session
+// is rejected (403) — viewer sessions use withAnyUser for read-only routes.
+// Agent endpoints have their own token auth and never go through this wrapper.
 func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, apiTok, ok := s.authenticateBearer(r)
@@ -263,6 +268,14 @@ func (s *Server) withAdmin(h http.HandlerFunc) http.HandlerFunc {
 				s.Log.Warn("touch api token", "err", err)
 			}
 			h(w, contextWithAPIToken(r, apiTok))
+			return
+		}
+		// Session auth: only admin sessions pass. Viewer sessions are
+		// rejected so mutation routes (POST/PUT/PATCH/DELETE) and
+		// admin-only GETs (/api/users, /api/tokens, /api/audit) stay
+		// admin-exclusive even though they share this wrapper.
+		if sess.Role != model.RoleAdmin {
+			writeErr(w, http.StatusForbidden, "admin role required")
 			return
 		}
 		h(w, contextWithSession(r, sess))

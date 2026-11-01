@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +22,11 @@ import (
 // taking a snapshot before a risky deploy shouldn't have it silently
 // deleted an hour later; they list and delete explicitly.
 const maxBackups = 24
+
+// exitFn is os.Exit by default; overridden in tests so the SQLite restore
+// path (which exits the process so Docker's restart policy reboots on the
+// restored DB) doesn't kill the test binary.
+var exitFn = os.Exit
 
 // BackupManager owns DB snapshot scheduling. Snapshots live in
 // <dataDir>/backups. On SQLite they are VACUUM INTO .db files; on Postgres
@@ -356,4 +363,137 @@ func (s *Server) handleUpdateBackupSettings(w http.ResponseWriter, r *http.Reque
 		"enabled": s.Backup.Enabled, "every_seconds": int(s.Backup.Every.Seconds()),
 	})
 	writeJSON(w, http.StatusOK, s.Backup.Status())
+}
+
+// ---------- Backup restore ----------
+
+// handleBackupRestore: POST /api/backup/{name}/restore — admin-only.
+//
+// Guards:
+//   - name must be a plain filename (no path separators, no "..") and must
+//     exist in the backups dir
+//   - extension must match the active backend (.db for SQLite, .dump for PG)
+//   - any pending OR running job → 409 "cancel or drain active jobs first"
+//
+// SQLite: snapshots the current DB to encode.db.pre-restore-<unix-ts>, then
+// copies the backup to a temp file and atomically renames it over the live
+// db file. The shares-key file is never touched. Responds 200 with
+// {"restored":true,"restart":true}, then exits the process (Docker restart
+// policy reboots on the restored DB). exitFn is injectable for tests.
+//
+// PG: replays the dump in one transaction (TRUNCATE in reverse FK order,
+// INSERT per row, setval per serial). Responds 200 with
+// {"restored":true,"restart":false} — no restart needed.
+//
+// Audit backup.restore BEFORE the swap so the audit row survives even if
+// the process exits immediately after.
+func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	if s.Backup == nil {
+		writeErr(w, http.StatusServiceUnavailable, "backups unavailable")
+		return
+	}
+	name := r.PathValue("name")
+	// Path traversal guard: name must be a plain filename.
+	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+		writeErr(w, http.StatusBadRequest, "invalid backup name")
+		return
+	}
+	// Extension must be valid.
+	if !strings.HasSuffix(name, ".db") && !strings.HasSuffix(name, ".dump") {
+		writeErr(w, http.StatusBadRequest, "invalid backup name")
+		return
+	}
+	// Existence check.
+	srcPath := filepath.Join(s.Backup.Dir, name)
+	if !fileExists(srcPath) {
+		writeErr(w, http.StatusNotFound, "backup not found")
+		return
+	}
+	// Extension must match the active backend.
+	wantSuffix := ".db"
+	if s.Backup.Postgres {
+		wantSuffix = ".dump"
+	}
+	if !strings.HasSuffix(name, wantSuffix) {
+		writeErr(w, http.StatusConflict, "backup extension does not match active database backend")
+		return
+	}
+	// Active-job guard: a restore mid-flight would lose in-flight work.
+	active, err := s.Store.CountActiveJobs(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "check active jobs")
+		return
+	}
+	if active > 0 {
+		writeErr(w, http.StatusConflict, "cancel or drain active jobs first")
+		return
+	}
+	// Audit BEFORE the swap (the process may exit immediately after on SQLite).
+	s.audit(r, "backup.restore", "db", map[string]string{"name": name})
+
+	if s.Backup.Postgres {
+		if err := s.restorePG(r.Context(), srcPath); err != nil {
+			s.Log.Error("PG restore failed", "err", err, "name", name)
+			writeErr(w, http.StatusInternalServerError, "restore failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"restored": true, "restart": false})
+		return
+	}
+
+	// SQLite: snapshot current DB, then swap.
+	dbPath := s.Store.DBPath()
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	snapPath := dbPath + ".pre-restore-" + ts
+	if err := copyFile(dbPath, snapPath); err != nil {
+		s.Log.Error("snapshot before restore failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "pre-restore snapshot failed: "+err.Error())
+		return
+	}
+	// Copy backup → temp, then atomic rename over the live db file.
+	// os.Rename requires same filesystem; the backups dir is under the same
+	// data dir, so this is safe. A temp file beside the db avoids cross-FS.
+	tmpPath := dbPath + ".restore-tmp"
+	if err := copyFile(srcPath, tmpPath); err != nil {
+		s.Log.Error("copy backup to temp failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "restore copy failed: "+err.Error())
+		return
+	}
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		s.Log.Error("rename over live db failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "restore swap failed: "+err.Error())
+		return
+	}
+	// Respond first, then exit so Docker's restart policy reboots on the
+	// restored DB. The response is flushed before exit.
+	s.Log.Info("SQLite DB restored from backup; exiting for restart", "name", name, "snapshot", snapPath)
+	writeJSON(w, http.StatusOK, map[string]any{"restored": true, "restart": true, "snapshot": filepath.Base(snapPath)})
+	// Flush the response before exiting. The statusRecorder/WriteHeader path
+	// already wrote the JSON to the wire via writeJSON; give the writer a
+	// final flush if it supports it.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond) // let the response hit the wire
+		s.Log.Info("controller exiting after DB restore (Docker restart policy reboots on restored DB)")
+		exitFn(0)
+	}()
+}
+
+// copyFile copies src to dst, creating or truncating dst. Used by the
+// SQLite restore path for the pre-restore snapshot and the backup→temp copy.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }

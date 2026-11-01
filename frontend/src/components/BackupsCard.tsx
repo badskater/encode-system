@@ -14,6 +14,12 @@ export default function BackupsCard() {
   const [busy, setBusy] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [everyH, setEveryH] = useState(6);
+  // restoreConfirm holds the snapshot name awaiting the operator's confirm
+  // click. null = no restore dialog open. The 409 "active jobs" error from
+  // the backend surfaces inline in the dialog.
+  const [restoreConfirm, setRestoreConfirm] = useState<string | null>(null);
+  const [restoreMsg, setRestoreMsg] = useState('');
+  const [restoreNotice, setRestoreNotice] = useState('');
 
   const load = useCallback(() => {
     api
@@ -83,6 +89,29 @@ export default function BackupsCard() {
     }
   }
 
+  // restore swaps a snapshot into the live DB. SQLite restarts the process
+  // (Docker restart policy); PG replays in-place. A 409 means active jobs
+  // are in flight — the message surfaces in the confirm dialog so the
+  // operator knows to drain/cancel first.
+  async function restore(name: string) {
+    setBusy(true);
+    setRestoreMsg('');
+    try {
+      const res = await api.restoreBackup(name);
+      setRestoreNotice(
+        res.restart
+          ? 'Restored — the controller is restarting on the restored database.'
+          : 'Restored — the database was replayed in place (no restart needed).',
+      );
+      setRestoreConfirm(null);
+      load();
+    } catch (err) {
+      setRestoreMsg(String(err instanceof Error ? err.message.replace(/^\d+:\s*/, '') : err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="card">
       <h3 style={{ marginTop: 0 }}>Controller DB backups</h3>
@@ -93,6 +122,11 @@ export default function BackupsCard() {
         newest 24 scheduled snapshots; manual snapshots are never auto-pruned.
       </p>
       {error && <div className="error-box">{error}</div>}
+      {restoreNotice && (
+        <div className="card" style={{ borderColor: 'var(--green)', marginBottom: 14 }}>
+          {restoreNotice}
+        </div>
+      )}
 
       <div className="toolbar" style={{ alignItems: 'flex-end', margin: '12px 0' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -143,6 +177,7 @@ export default function BackupsCard() {
               <th>Taken</th>
               <th />
               <th />
+              <th />
             </tr>
           </thead>
           <tbody>
@@ -154,6 +189,16 @@ export default function BackupsCard() {
                 </td>
                 <td>{(snap.size_bytes / 1024).toFixed(0)} KiB</td>
                 <td>{fmtTime(snap.created_at)}</td>
+                <td>
+                  <button
+                    aria-label={`Restore ${snap.name}`}
+                    disabled={busy}
+                    onClick={() => { setRestoreConfirm(snap.name); setRestoreMsg(''); }}
+                    title="Stop the controller, replace encode.db with this snapshot, restart"
+                  >
+                    Restore
+                  </button>
+                </td>
                 <td>
                   <button aria-label={`Download ${snap.name}`} onClick={() => download(snap.name)}>
                     Download
@@ -168,6 +213,30 @@ export default function BackupsCard() {
             ))}
           </tbody>
         </table>
+      )}
+
+      {restoreConfirm && (
+        <div className="card" style={{ borderColor: 'var(--yellow)' }}>
+          <strong>Restore {restoreConfirm}?</strong>
+          <p className="muted" style={{ fontSize: 12, margin: '6px 0' }}>
+            This replaces the live database with this snapshot. SQLite: the
+            controller restarts (Docker policy). PostgreSQL: the dump replays
+            in place. Active jobs must be drained or cancelled first.
+          </p>
+          {restoreMsg && <div className="error-box">{restoreMsg}</div>}
+          <div className="toolbar" style={{ marginBottom: 0 }}>
+            <button
+              className="btn danger"
+              disabled={busy}
+              onClick={() => restore(restoreConfirm)}
+            >
+              {busy ? 'Restoring…' : 'Confirm restore'}
+            </button>
+            <button disabled={busy} onClick={() => { setRestoreConfirm(null); setRestoreMsg(''); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { Settings, UpdateManifest } from '../types';
+import type { Settings, UpdateCheck, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
+import { useIsAdmin } from '../hooks/useRole';
 import APITokensCard from '../components/APITokensCard';
 import BackupsCard from '../components/BackupsCard';
 import SharesCard from '../components/SharesCard';
+import UsersCard from '../components/UsersCard';
 
 // StringSettingKey = the Settings keys whose values are strings — the only
 // keys the free-text field() helper may edit. Number fields go through their
@@ -60,6 +62,17 @@ export default function SettingsPage() {
   const [binUrlVersion, setBinUrlVersion] = useState('');
   const [binUrlSha, setBinUrlSha] = useState('');
   const [publishing, setPublishing] = useState('');
+  // Agent publish platform picker: "windows" (default, .exe) or "linux".
+  // Governs which slot the publish/rollback targets and which manifest rows
+  // are highlighted. Windows and Linux slots are independent on the backend.
+  const [platform, setPlatform] = useState<'windows' | 'linux'>('windows');
+  // Update check state: null = not checked yet, result = last check, error
+  // string = check failed (502 upstream). The check is best-effort and never
+  // blocks other settings — it's a muted inline notice, not an error-box.
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
+  const [updateError, setUpdateError] = useState('');
+  const [checking, setChecking] = useState(false);
+  const isAdmin = useIsAdmin();
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
   // reset its value too so the UI matches reality.
@@ -90,6 +103,23 @@ export default function SettingsPage() {
       setManifest(await api.manifest());
     } catch {
       /* non-fatal */
+    }
+  }
+
+  // checkForUpdate compares the running controller version to the latest
+  // GitHub release tag. Best-effort — a 502 (upstream failure, rate-limit)
+  // surfaces as a muted inline error, never an error-box.
+  async function checkForUpdate() {
+    setChecking(true);
+    setUpdateError('');
+    try {
+      const res = await api.checkUpdate();
+      setUpdateCheck(res);
+    } catch (e) {
+      setUpdateCheck(null);
+      setUpdateError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -153,7 +183,7 @@ export default function SettingsPage() {
         if (!agentFile || !agentVersion.trim()) throw new Error('agent version + file are required');
         const tooBig = checkPayload(agentFile, MAX_AGENT_BYTES, 'agent binary');
         if (tooBig) throw new Error(tooBig);
-        await api.publishAgent(agentVersion.trim(), agentFile);
+        await api.publishAgent(agentVersion.trim(), agentFile, platform);
         setAgentFile(null);
         setAgentVersion('');
         if (agentFileRef.current) agentFileRef.current.value = '';
@@ -207,8 +237,9 @@ export default function SettingsPage() {
     setNotice(null);
     setPublishing('rollback');
     try {
-      const m = await api.rollbackAgent();
-      setNotice(`Rolled back to agent ${m.agent_version} — idle nodes adopt it on their next heartbeat.`);
+      const m = await api.rollbackAgent(platform);
+      const ver = platform === 'linux' ? (m.linux_agent_version || '—') : m.agent_version;
+      setNotice(`Rolled back to agent ${ver} — idle nodes adopt it on their next heartbeat.`);
       await refreshManifest();
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
@@ -413,6 +444,21 @@ export default function SettingsPage() {
         <span className="muted" style={{ display: 'block', fontSize: 12 }}>
           Summarizes done/failed outcomes hourly; untick for per-job alerts.
         </span>
+        {/* Node status alerts: post a Discord alert when a node transitions
+            between online/offline/busy. Off by default; only fires when
+            the webhook is set. Saved via the same PUT flow. */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="Notify node status"
+            checked={!!settings.notify_node_status}
+            onChange={(e) => set('notify_node_status', e.target.checked)}
+          />
+          <span>Node status alerts — Discord alert when a node goes offline or comes back</span>
+        </label>
+        <span className="muted" style={{ display: 'block', fontSize: 12 }}>
+          Fires on online/offline/busy transitions; requires the webhook above.
+        </span>
         <button className="btn primary" disabled={saving} onClick={save}>
           {saving ? 'Saving…' : 'Save settings'}
         </button>
@@ -432,37 +478,140 @@ export default function SettingsPage() {
       <APITokensCard />
 
       {/* Controller DB backups: scheduled VACUUM INTO snapshots with
-          manual trigger + download. Formalizes the pre-deploy `cp
-          encode.db` habit. */}
+          manual trigger + download + restore. Formalizes the pre-deploy
+          `cp encode.db` habit. */}
       <BackupsCard />
+
+      {/* User management: admin-only card for creating/deleting accounts
+          and resetting passwords. Rendered only when the logged-in user is
+          an admin (see useRole / RoleContext in App.tsx). */}
+      {isAdmin && <UsersCard />}
+
+      {/* Version + update check: current controller version with a
+          best-effort "Check for update" button. A 502 upstream failure
+          surfaces as a muted inline error — never an error-box. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Controller version</h3>
+        <div className="toolbar" style={{ marginBottom: 0 }}>
+          <span className="chip">
+            <span className="chip-label">current</span>
+            <span className="chip-value">{updateCheck?.current ?? '—'}</span>
+          </span>
+          <button
+            className="btn"
+            disabled={checking}
+            onClick={checkForUpdate}
+          >
+            {checking ? 'Checking…' : 'Check for update'}
+          </button>
+          {updateCheck && updateCheck.update_available && (
+            <span className="badge" style={{ background: 'var(--accent-soft)', color: 'var(--accent-hi)', borderColor: 'rgba(157,107,255,0.2)' }}>
+              v{updateCheck.latest} available
+            </span>
+          )}
+          {updateCheck && !updateCheck.update_available && (
+            <span className="muted">Up to date</span>
+          )}
+          {updateError && <span className="muted">Update check failed</span>}
+        </div>
+        {updateCheck && updateCheck.update_available && (
+          <div style={{ marginTop: 12 }}>
+            <p className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+              <a href={updateCheck.release_url} target="_blank" rel="noopener noreferrer">
+                Release notes
+              </a>
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <code style={{ fontSize: 11, flex: 1, wordBreak: 'break-all' }} data-testid="upgrade-cmd">
+                curl -fsSL {updateCheck.release_url.replace('/tag/', '/download/')}/install.sh | sudo ENCODE_HOME=/opt/encode-system bash -s v{updateCheck.latest}
+              </code>
+              <button
+                aria-label="Copy upgrade command"
+                onClick={() => navigator.clipboard?.writeText(
+                  `curl -fsSL ${updateCheck.release_url.replace('/tag/', '/download/')}/install.sh | sudo ENCODE_HOME=/opt/encode-system bash -s v${updateCheck.latest}`,
+                )}
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Push to nodes</h3>
         <p className="muted">
           Publish a payload here and every enabled node adopts it on its next
-          idle heartbeat (SHA-256 verified on the node). Current manifest:{' '}
-          {manifest
-            ? `agent ${manifest.agent_version || '—'} · lib v${manifest.lib_version || '—'} · bin v${manifest.bin_version || '—'}${manifest.bin_size ? ` (${(manifest.bin_size / 1048576).toFixed(1)} MiB)` : ''}`
-            : 'loading…'}
+          idle heartbeat (SHA-256 verified on the node).
         </p>
+
+        {/* Platform picker: segmented Windows/Linux control. Governs which
+            agent slot publish/rollback targets and which manifest rows are
+            highlighted. Lib/bin are shared across platforms (not slotted). */}
+        <div className="toolbar" style={{ marginBottom: 12 }}>
+          <div role="group" aria-label="Agent platform" data-testid="platform-picker">
+            <button
+              className={`btn${platform === 'windows' ? ' primary' : ''}`}
+              aria-pressed={platform === 'windows'}
+              onClick={() => setPlatform('windows')}
+              style={{ borderRadius: '6px 0 0 6px' }}
+            >
+              <span className="chip-value">WIN</span>
+            </button>
+            <button
+              className={`btn${platform === 'linux' ? ' primary' : ''}`}
+              aria-pressed={platform === 'linux'}
+              onClick={() => setPlatform('linux')}
+              style={{ borderRadius: '0 6px 6px 0', marginLeft: -1 }}
+            >
+              <span className="chip-value">LINUX</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Manifest rows: show BOTH Windows and Linux agent slots side by
+            side. Mono chips for version strings. */}
+        {manifest && (
+          <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+            <div>
+              <span className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.7, display: 'block', marginBottom: 4 }}>Windows agent</span>
+              <span className="chip"><span className="chip-label">current</span><span className="chip-value">{manifest.agent_version || '—'}</span></span>
+              {manifest.prev_agent_version && (
+                <span className="chip" style={{ marginLeft: 4 }}><span className="chip-label">prev</span><span className="chip-value">{manifest.prev_agent_version}</span></span>
+              )}
+            </div>
+            <div>
+              <span className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.7, display: 'block', marginBottom: 4 }}>Linux agent</span>
+              <span className="chip"><span className="chip-label">current</span><span className="chip-value">{manifest.linux_agent_version || '—'}</span></span>
+              {manifest.prev_linux_agent_version && (
+                <span className="chip" style={{ marginLeft: 4 }}><span className="chip-label">prev</span><span className="chip-value">{manifest.prev_linux_agent_version}</span></span>
+              )}
+            </div>
+            <div>
+              <span className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.7, display: 'block', marginBottom: 4 }}>Shared</span>
+              <span className="chip"><span className="chip-label">lib</span><span className="chip-value">v{manifest.lib_version || '—'}</span></span>
+              <span className="chip" style={{ marginLeft: 4 }}><span className="chip-label">bin</span><span className="chip-value">v{manifest.bin_version || '—'}{manifest.bin_size ? ` (${(manifest.bin_size / 1048576).toFixed(1)} MiB)` : ''}</span></span>
+            </div>
+          </div>
+        )}
 
         <div className="toolbar" style={{ alignItems: 'flex-end' }}>
           <label style={{ flex: 1 }}>
-            <span style={{ display: 'block', marginBottom: 2 }}>Agent version</span>
+            <span style={{ display: 'block', marginBottom: 2 }}>Agent version ({platform})</span>
             <input style={{ width: '100%' }} value={agentVersion} onChange={(e) => setAgentVersion(e.target.value)} placeholder="e.g. 0.8.0" />
           </label>
-          <input ref={agentFileRef} type="file" accept=".exe" onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)} />
+          <input ref={agentFileRef} type="file" accept={platform === 'linux' ? '.bin,application/octet-stream' : '.exe'} onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)} />
           <button className="btn primary" disabled={publishing !== '' || !agentFile || !agentVersion.trim()} onClick={() => publish('agent')}>
             {publishing === 'agent' ? 'Publishing…' : 'Publish agent'}
           </button>
-          {manifest?.prev_agent_version && (
+          {(platform === 'windows' ? manifest?.prev_agent_version : manifest?.prev_linux_agent_version) && (
             <button
               className="btn danger"
               disabled={publishing !== ''}
               onClick={rollback}
-              title={`Promote the previous release (${manifest.prev_agent_version}) back to current; nodes self-downgrade on their next idle heartbeat`}
+              title={`Promote the previous ${platform} release back to current; nodes self-downgrade on their next idle heartbeat`}
             >
-              {publishing === 'rollback' ? 'Rolling back…' : `Rollback to ${manifest.prev_agent_version}`}
+              {publishing === 'rollback' ? 'Rolling back…' : `Rollback to ${platform === 'windows' ? manifest!.prev_agent_version : manifest!.prev_linux_agent_version}`}
             </button>
           )}
         </div>

@@ -10,6 +10,7 @@ vi.mock('../api/client', () => ({
     backupSettings: vi.fn(),
     deleteBackup: vi.fn(),
     downloadBackup: vi.fn(),
+    restoreBackup: vi.fn(),
   },
 }));
 
@@ -105,5 +106,68 @@ describe('BackupsCard', () => {
     await waitFor(() => expect(clickSpy).toHaveBeenCalled());
     clickSpy.mockRestore();
     URL.createObjectURL = origCreate;
+  });
+
+  it('shows a Restore button per snapshot row', async () => {
+    mockedApi.backupStatus.mockResolvedValue({
+      ...baseStatus,
+      snapshots: [
+        { name: 'snap.db', size_bytes: 1024, created_at: '2026-09-27T22:00:00Z', scheduled: false },
+      ],
+    } as never);
+    render(<BackupsCard />);
+    await waitFor(() => expect(screen.getByText('snap.db')).toBeTruthy());
+    expect(screen.getByLabelText('Restore snap.db')).toBeTruthy();
+  });
+
+  it('opens a confirm dialog when Restore is clicked', async () => {
+    mockedApi.backupStatus.mockResolvedValue({
+      ...baseStatus,
+      snapshots: [
+        { name: 'snap.db', size_bytes: 1024, created_at: '2026-09-27T22:00:00Z', scheduled: false },
+      ],
+    } as never);
+    render(<BackupsCard />);
+    await waitFor(() => expect(screen.getByText('snap.db')).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText('Restore snap.db'));
+    await waitFor(() => expect(screen.getByText(/Restore snap\.db\?/)).toBeTruthy());
+    expect(screen.getByRole('button', { name: /confirm restore/i })).toBeTruthy();
+  });
+
+  it('calls restoreBackup on confirm and shows the restart notice', async () => {
+    mockedApi.backupStatus.mockResolvedValue({
+      ...baseStatus,
+      snapshots: [
+        { name: 'snap.db', size_bytes: 1024, created_at: '2026-09-27T22:00:00Z', scheduled: false },
+      ],
+    } as never);
+    mockedApi.restoreBackup.mockResolvedValue({ restored: true, restart: true } as never);
+    render(<BackupsCard />);
+    await waitFor(() => expect(screen.getByText('snap.db')).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText('Restore snap.db'));
+    fireEvent.click(screen.getByRole('button', { name: /confirm restore/i }));
+
+    await waitFor(() => expect(mockedApi.restoreBackup).toHaveBeenCalledWith('snap.db'));
+    await waitFor(() => expect(screen.getByText(/restarting on the restored database/)).toBeTruthy());
+  });
+
+  it('surfaces a 409 active-jobs error inline in the dialog', async () => {
+    mockedApi.backupStatus.mockResolvedValue({
+      ...baseStatus,
+      snapshots: [
+        { name: 'snap.db', size_bytes: 1024, created_at: '2026-09-27T22:00:00Z', scheduled: false },
+      ],
+    } as never);
+    mockedApi.restoreBackup.mockRejectedValue(new Error('409: cancel or drain active jobs first'));
+    render(<BackupsCard />);
+    await waitFor(() => expect(screen.getByText('snap.db')).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText('Restore snap.db'));
+    fireEvent.click(screen.getByRole('button', { name: /confirm restore/i }));
+
+    await waitFor(() => expect(mockedApi.restoreBackup).toHaveBeenCalledWith('snap.db'));
+    await waitFor(() => expect(screen.getByText(/cancel or drain active jobs first/)).toBeTruthy());
   });
 });

@@ -94,6 +94,11 @@ type Server struct {
 	// only the leader replica's scanner holds the advisory lock, so a
 	// trigger on a non-leader is a no-op (the channel is never consumed).
 	scanTrigger chan struct{}
+	// nodeAlert holds the in-memory baseline of node online/offline states
+	// for the node-status alert loop (StartNodeAlertLoop). Built in New
+	// (never nil) so nodeAlertTick can use it without a nil check. The
+	// baseline is seeded silently on the first tick after a restart.
+	nodeAlert *nodeAlertState
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -134,6 +139,7 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 		logHub:      newLogHub(),
 		diskGuard:   &diskGuardState{last: map[int64]time.Time{}},
 		scanTrigger: make(chan struct{}, 1),
+		nodeAlert:   &nodeAlertState{prev: map[int64]bool{}},
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")

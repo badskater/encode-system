@@ -205,6 +205,12 @@ type Settings struct {
 	// when true; false keeps the immediate per-job alert behavior. Persisted
 	// in the settings JSON blob (not a SQL column).
 	NotifyDigest bool `json:"notify_digest"`
+	// NotifyNodeStatus sends Discord alerts when a node transitions between
+	// online and offline (last seen exceeds StaleAfter). The 30s loop diffs
+	// the live node list against an in-memory baseline, so a restart seeds
+	// silently (no alert storm) and only real transitions notify. Persisted
+	// in the settings JSON blob (not a SQL column).
+	NotifyNodeStatus bool `json:"notify_node_status"`
 
 	// JobRetentionDays bounds job history: terminal jobs (done/failed/
 	// cancelled) finished more than this many days ago are pruned by the

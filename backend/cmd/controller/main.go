@@ -247,6 +247,15 @@ func main() {
 	// ctx as the scanner so SIGTERM stops both cleanly.
 	srv.StartDigestLoop(ctx)
 
+	// Node-status alert loop: when settings.NotifyNodeStatus is ON and a
+	// Discord webhook is set, send alerts on node online↔offline
+	// transitions (detected by diffing the node list against an in-memory
+	// baseline every 30s). The first tick after a restart seeds silently
+	// (no alert storm). Bound to the same ctx as the other loops so
+	// SIGTERM stops it cleanly. HA: wrapped in RunLoopSupervisor
+	// (LockKeyNodeAlert) so only one replica alerts per transition.
+	srv.StartNodeAlertLoop(ctx)
+
 	// Retention loop: hourly pass that deletes terminal jobs older than
 	// settings.JobRetentionDays (0 = keep forever, the default). Each tick
 	// reads live settings, so enabling/adjusting retention on the Settings

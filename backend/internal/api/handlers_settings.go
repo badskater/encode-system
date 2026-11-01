@@ -81,6 +81,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		"tasks_before_reboot":   req.TasksBeforeReboot,
 		"drain_mode":            req.DrainMode,
 		"notify_digest":         req.NotifyDigest,
+		"notify_node_status":    req.NotifyNodeStatus,
 		"job_retention_days":    req.JobRetentionDays,
 		"disk_alert_gb":         req.DiskAlertGB,
 		"webhook_set":           req.DiscordWebhook != "",

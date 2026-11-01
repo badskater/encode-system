@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-X main.Version=${AGENT_VERSION}" \
     && CGO_ENABLED=0 go build -ldflags "-X main.Version=${AGENT_VERSION}" \
     -o /out/pgimport ./cmd/pgimport
 
-FROM node:22-alpine AS frontend
+FROM node:26-alpine AS frontend
 WORKDIR /src
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm ci

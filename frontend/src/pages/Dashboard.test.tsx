@@ -1,5 +1,6 @@
-import { render, screen } from '@testing-library/react';
-import { describe, it, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, vi, beforeEach, expect } from 'vitest';
+import { RoleContext } from '../hooks/useRole';
 import Dashboard from './Dashboard';
 import { api } from '../api/client';
 import type { Node, Settings } from '../types';
@@ -101,3 +102,48 @@ function waitForText(match: string | RegExp) {
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+
+describe('Dashboard scan now', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(settings);
+    vi.spyOn(api, 'jobs').mockResolvedValue([]);
+  });
+
+  it('renders a Scan now button for admins', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    render(<RoleContext.Provider value="admin"><Dashboard /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByRole('button', { name: /scan now/i })).toBeInTheDocument());
+  });
+
+  it('hides the Scan now button for viewers', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    render(<RoleContext.Provider value="viewer"><Dashboard /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText(/Dashboard/)).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /scan now/i })).not.toBeInTheDocument();
+  });
+
+  it('calls scanNow and shows Scan triggered on click', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    const scanSpy = vi.spyOn(api, 'scanNow').mockResolvedValue({ triggered: true });
+    render(<RoleContext.Provider value="admin"><Dashboard /></RoleContext.Provider>);
+    
+    const btn = await screen.findByRole('button', { name: /scan now/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect(scanSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/scan triggered/i)).toBeInTheDocument());
+  });
+
+  it('disables the button while scanning', async () => {
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    // Make scanNow hang so we can observe the disabled state
+    vi.spyOn(api, 'scanNow').mockReturnValue(new Promise(() => {}));
+    render(<RoleContext.Provider value="admin"><Dashboard /></RoleContext.Provider>);
+    
+    const btn = await screen.findByRole('button', { name: /scan now/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect((btn as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText(/scanning/i)).toBeInTheDocument();
+  });
+});

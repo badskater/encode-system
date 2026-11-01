@@ -313,6 +313,184 @@ describe('Jobs page viewer gating', () => {
   });
 });
 
+
+
+// Job delete: row action visible only for terminal jobs, with confirm dialog.
+describe('Jobs page job delete', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows a Delete button for terminal jobs (done)', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 50, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('50')).toBeInTheDocument());
+
+    expect(screen.getByLabelText('Delete job 50')).toBeInTheDocument();
+  });
+
+  it('shows a Delete button for failed jobs', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 51, status: 'failed' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('51')).toBeInTheDocument());
+
+    expect(screen.getByLabelText('Delete job 51')).toBeInTheDocument();
+  });
+
+  it('does not show a Delete button for non-terminal jobs (running)', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 52, status: 'running' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('52')).toBeInTheDocument());
+
+    expect(screen.queryByLabelText('Delete job 52')).not.toBeInTheDocument();
+  });
+
+  it('opens a confirm dialog and calls deleteJob on confirm', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 53, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const deleteSpy = vi.spyOn(api, 'deleteJob').mockResolvedValue({ deleted: true });
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('53')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Delete job 53'));
+    await waitFor(() => expect(screen.getByText(/Delete job #53/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /confirm delete/i }));
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith(53));
+  });
+
+  it('surfaces a 409 error inline in the delete dialog', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 54, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    vi.spyOn(api, 'deleteJob').mockRejectedValue(new Error('409: only terminal jobs can be deleted'));
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('54')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Delete job 54'));
+    fireEvent.click(screen.getByRole('button', { name: /confirm delete/i }));
+
+    await waitFor(() => expect(api.deleteJob).toHaveBeenCalledWith(54));
+    await waitFor(() =>
+      expect(screen.getByText(/only terminal jobs can be deleted/)).toBeInTheDocument(),
+    );
+  });
+});
+
+// Bulk extensions: Delete, Set priority, Set flow
+describe('Jobs page bulk extensions', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows Delete/Set priority/Set flow buttons when rows are selected', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 60, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('60')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 60'));
+    expect(screen.getByRole('button', { name: /delete selected/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /set priority/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /set flow/i })).toBeInTheDocument();
+  });
+
+  it('bulk delete calls bulkJobs with delete action', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 61, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'delete', affected: 1, skipped: [],
+    });
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('61')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 61'));
+    fireEvent.click(screen.getByRole('button', { name: /delete selected/i }));
+
+    await waitFor(() => expect(bulkSpy).toHaveBeenCalledWith('delete', [61]));
+    await waitFor(() => expect(screen.getByText(/delete: 1 affected/)).toBeInTheDocument());
+  });
+
+  it('bulk set priority prompts and calls bulkJobs with set_priority', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 62, status: 'pending' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'set_priority', affected: 1, skipped: [],
+    });
+    vi.stubGlobal('prompt', vi.fn(() => '1'));
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('62')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 62'));
+    fireEvent.click(screen.getByRole('button', { name: /set priority/i }));
+
+    await waitFor(() =>
+      expect(bulkSpy).toHaveBeenCalledWith('set_priority', [62], { priority: 1 }),
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('bulk set flow prompts and calls bulkJobs with set_flow', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 63, status: 'pending' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([
+      { id: 3, name: 'test-flow', steps: [], is_default: false, created_at: '', updated_at: '' },
+    ]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'set_flow', affected: 1, skipped: [],
+    });
+    vi.stubGlobal('prompt', vi.fn(() => '3'));
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('63')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 63'));
+    fireEvent.click(screen.getByRole('button', { name: /set flow/i }));
+
+    await waitFor(() =>
+      expect(bulkSpy).toHaveBeenCalledWith('set_flow', [63], { flow_id: 3 }),
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('does not call bulk set_priority when prompt is cancelled', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 64, status: 'pending' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+    const bulkSpy = vi.spyOn(api, 'bulkJobs').mockResolvedValue({
+      action: 'set_priority', affected: 0, skipped: [],
+    });
+    vi.stubGlobal('prompt', vi.fn(() => null));
+
+    render(<JobsPage />);
+    await waitFor(() => expect(screen.getByText('64')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Select job 64'));
+    fireEvent.click(screen.getByRole('button', { name: /set priority/i }));
+
+    expect(bulkSpy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+});
+
 // Deep-link handling (Phase F2): when the Jobs page mounts with ?job=<id> in
 // the URL (e.g. clicked from a Discord alert), it auto-opens that job's log
 // dialog. The param is consumed once via a ref so it never re-triggers on

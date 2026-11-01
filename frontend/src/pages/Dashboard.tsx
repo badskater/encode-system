@@ -1,13 +1,35 @@
+import { useState } from 'react';
 import { api } from '../api/client';
 import type { Job, Node, Settings } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { jobBadge, nodeBadge, timeAgo } from '../components/helpers';
+import { useIsAdmin } from '../hooks/useRole';
 
 // Dashboard gives the at-a-glance farm view: node health + active queue.
 export default function Dashboard() {
   const { data: nodes, error: nodesErr } = usePolling<Node[]>(() => api.nodes(), 4000);
   const { data: jobs } = usePolling<Job[]>(() => api.jobs(), 4000);
   const { data: settings } = usePolling<Settings>(() => api.settings(), 60000);
+  const isAdmin = useIsAdmin();
+  const [scanning, setScanning] = useState(false);
+  const [scanMsg, setScanMsg] = useState('');
+
+  // scanNow triggers an out-of-cycle scan of the scripts share. Returns 202
+  // immediately (the scan is async). Brief inline "Scan triggered" notice
+  // fades after 3s — same terse ops voice as the rest of the UI.
+  async function scanNow() {
+    setScanning(true);
+    setScanMsg('');
+    try {
+      await api.scanNow();
+      setScanMsg('Scan triggered');
+      setTimeout(() => setScanMsg(''), 3000);
+    } catch (e) {
+      setScanMsg(String(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : e));
+    } finally {
+      setScanning(false);
+    }
+  }
 
   const active = (jobs ?? []).filter((j) => ['assigned', 'running'].includes(j.status));
   const pending = (jobs ?? []).filter((j) => j.status === 'pending');
@@ -31,7 +53,22 @@ export default function Dashboard() {
 
   return (
     <>
-      <h2>Dashboard</h2>
+      <div className="toolbar" style={{ justifyContent: 'space-between', marginBottom: 0 }}>
+        <h2 style={{ margin: 0 }}>Dashboard</h2>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {scanMsg && <span className="muted" style={{ fontSize: 12 }}>{scanMsg}</span>}
+          {isAdmin && (
+            <button
+              className="btn primary"
+              disabled={scanning}
+              onClick={scanNow}
+              aria-label="Scan now"
+            >
+              {scanning ? 'Scanning…' : 'Scan now'}
+            </button>
+          )}
+        </div>
+      </div>
       {nodesErr && <div className="error-box">{nodesErr}</div>}
 
       {/* Fleet summary strip: busy/idle/online counts + fleet avg encode

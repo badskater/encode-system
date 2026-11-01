@@ -28,6 +28,11 @@ export default function JobsPage() {
   const [checked, setChecked] = useState<Set<number>>(new Set());
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
   const isAdmin = useIsAdmin();
+  // deleteConfirm holds the job id awaiting the operator's confirm click
+  // for a single-job delete. null = no dialog open. The 409 "only terminal
+  // jobs can be deleted" error surfaces inline in the dialog.
+  const [deleteConfirm, setDeleteConfirm] = useState<Job | null>(null);
+  const [deleteMsg, setDeleteMsg] = useState('');
 
   const { data: jobs } = usePolling<Job[]>(
     () => api.jobs(filter || undefined),
@@ -105,6 +110,88 @@ export default function JobsPage() {
     }
   }
 
+  // deleteJob removes a terminal job after confirmation. The 409
+  // "only terminal jobs can be deleted" error surfaces inline in the
+  // confirm dialog so the operator knows why it was refused.
+  async function deleteJobConfirm(job: Job) {
+    setDeleteMsg('');
+    try {
+      await api.deleteJob(job.id);
+      setDeleteConfirm(null);
+      setError(null);
+    } catch (e) {
+      setDeleteMsg(String(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : e));
+    }
+  }
+
+  // bulkDelete runs the bulk delete action over the checked ids.
+  async function bulkDelete() {
+    const ids = [...checked];
+    if (ids.length === 0) return;
+    try {
+      const res = await api.bulkJobs('delete', ids);
+      setBulkMsg(
+        `delete: ${res.affected} affected` +
+          (res.skipped.length > 0 ? `, ${res.skipped.length} skipped` : ''),
+      );
+      setChecked(new Set());
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  // bulkSetPriority prompts for a priority value and applies it to the
+  // checked pending jobs via the bulk set_priority action.
+  async function bulkSetPriority() {
+    const ids = [...checked];
+    if (ids.length === 0) return;
+    const raw = prompt('Set priority for selected jobs (0=Normal, 1=High):', '1');
+    if (raw === null) return;
+    const priority = Number(raw);
+    if (!Number.isFinite(priority) || priority < 0) {
+      setError('Priority must be a non-negative number');
+      return;
+    }
+    try {
+      const res = await api.bulkJobs('set_priority', ids, { priority });
+      setBulkMsg(
+        `set_priority: ${res.affected} affected` +
+          (res.skipped.length > 0 ? `, ${res.skipped.length} skipped` : ''),
+      );
+      setChecked(new Set());
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  // bulkSetFlow prompts for a flow id and applies it to the checked
+  // pending jobs via the bulk set_flow action.
+  async function bulkSetFlow() {
+    const ids = [...checked];
+    if (ids.length === 0) return;
+    const options = (flows ?? []).map((f) => `${f.id}: ${f.name}${f.is_default ? ' (default)' : ''}`).join('\n');
+    const raw = prompt(`Set flow for selected jobs:\n${options}`, '');
+    if (raw === null) return;
+    const flowId = Number(raw);
+    if (!Number.isFinite(flowId) || flowId <= 0) {
+      setError('Flow id must be a positive number');
+      return;
+    }
+    try {
+      const res = await api.bulkJobs('set_flow', ids, { flow_id: flowId });
+      setBulkMsg(
+        `set_flow: ${res.affected} affected` +
+          (res.skipped.length > 0 ? `, ${res.skipped.length} skipped` : ''),
+      );
+      setChecked(new Set());
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
   // bulk runs one bulk action over the checked ids, then reports the
   // affected/skipped counts and clears the selection. The server's guard
   // does the real work (skipped = wrong-state or missing rows), so the UI
@@ -175,6 +262,15 @@ export default function JobsPage() {
                 </button>
                 <button className="btn danger" onClick={() => bulk('cancel')}>
                   Cancel selected
+                </button>
+                <button className="btn danger" onClick={bulkDelete}>
+                  Delete selected
+                </button>
+                <button className="btn" onClick={bulkSetPriority}>
+                  Set priority
+                </button>
+                <button className="btn" onClick={bulkSetFlow}>
+                  Set flow
                 </button>
               </>
             )}
@@ -296,6 +392,16 @@ export default function JobsPage() {
                 >
                   Log
                 </button>
+                {isAdmin && TERMINAL.has(j.status) && (
+                  <button
+                    className="btn danger"
+                    aria-label={`Delete job ${j.id}`}
+                    onClick={() => { setDeleteConfirm(j); setDeleteMsg(''); }}
+                    title="Delete this terminal job from the history"
+                  >
+                    Delete
+                  </button>
+                )}
               </td>
             </tr>
           ))}
@@ -343,6 +449,32 @@ export default function JobsPage() {
           metrics={logJob.metrics}
           onClose={() => setLogJob(null)}
         />
+      )}
+
+      {/* Delete confirm dialog: shows the job id + series/episode and the
+          409 error inline if the job is no longer terminal. */}
+      {deleteConfirm && (
+        <div className="modal-backdrop" onClick={() => !deleteMsg && setDeleteConfirm(null)}>
+          <div className="modal card" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>Delete job #{deleteConfirm.id}?</h3>
+            <p className="muted" style={{ fontSize: 12 }}>
+              {deleteConfirm.series} Ep {deleteConfirm.episode} · status: {deleteConfirm.status}
+            </p>
+            <p className="muted" style={{ fontSize: 12 }}>
+              Removes the job from the history. Only terminal jobs (done/failed/
+              cancelled) can be deleted.
+            </p>
+            {deleteMsg && <div className="error-box">{deleteMsg}</div>}
+            <div className="toolbar" style={{ marginBottom: 0 }}>
+              <button className="btn danger" onClick={() => deleteJobConfirm(deleteConfirm)}>
+                Confirm delete
+              </button>
+              <button onClick={() => { setDeleteConfirm(null); setDeleteMsg(''); }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </>
   );

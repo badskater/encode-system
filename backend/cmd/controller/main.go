@@ -29,6 +29,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql (backup PG dump handle)
 )
 
+// Version is the controller build version, set via ldflags
+// (-X main.Version=...) in CI (see .github/workflows/release.yml). Empty
+// in dev builds; /api/health and /api/updates/check report it as-is.
+var Version = ""
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -138,6 +143,10 @@ func main() {
 		ScanIntervalSeconds: envInt("ENCODE_SCAN_INTERVAL", 30),
 		DiscordWebhook:      env("ENCODE_DISCORD_WEBHOOK", ""),
 		InstanceID:          instanceID,
+		GitHubToken:         os.Getenv("ENCODE_GITHUB_TOKEN"),
+		GitHubRepo:          env("ENCODE_GITHUB_REPO", "badskater/encode-system"),
+		GitHubAPI:           env("ENCODE_GITHUB_API", "https://api.github.com"),
+		Version:             Version,
 	}
 
 	srv, err := api.New(st, up, log, cfg)

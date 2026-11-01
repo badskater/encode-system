@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateManifest } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -77,11 +77,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 // publishUpload POSTs a payload file + version as multipart form-data with
 // the session credential. Used by the Settings page to publish a new agent
-// binary, EncodeLib.ps1, or bin-package zip to the fleet.
-async function publishUpload(path: string, version: string, file: File): Promise<UpdateManifest> {
+// binary, EncodeLib.ps1, or bin-package zip to the fleet. The optional
+// platform ("windows" default, or "linux") targets the agent slot for that
+// OS — publishing to one platform never disturbs the other's slot.
+async function publishUpload(path: string, version: string, file: File, platform?: 'windows' | 'linux'): Promise<UpdateManifest> {
   const form = new FormData();
   form.append('version', version);
   form.append('file', file);
+  if (platform) form.append('platform', platform);
   const res = await fetch(path, {
     method: 'POST',
     headers: { Authorization: AUTH_PREFIX + sessionValue() },
@@ -102,6 +105,31 @@ async function publishUpload(path: string, version: string, file: File): Promise
   return data as UpdateManifest;
 }
 
+
+// rollbackUpload POSTs a multipart rollback request with the session
+// credential and optional platform field. Mirrors publishUpload's auth/error
+// handling but sends no file — the endpoint promotes the previous release
+// slot back to current.
+async function rollbackUpload(path: string, platform?: 'windows' | 'linux'): Promise<UpdateManifest> {
+  const form = new FormData();
+  if (platform) form.append('platform', platform);
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { Authorization: AUTH_PREFIX + ' ' + sessionValue() },
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 401) {
+      clearToken();
+      expiredHook?.();
+      throw new Error('401: session expired — log in again');
+    }
+    throw new Error(data.error ?? `${res.status}: rollback failed`);
+  }
+  return data as UpdateManifest;
+}
+
 export const api = {
   health: () => request<{ status: string }>('GET', '/api/health'),
   settings: () => request<Settings>('GET', '/api/settings'),
@@ -118,7 +146,7 @@ export const api = {
       return data as { token: string; username: string; expires_at: string };
     }),
   logout: () => request<void>('POST', '/api/auth/logout'),
-  me: () => request<{ username: string; expires_at: string }>('GET', '/api/auth/me'),
+  me: () => request<{ username: string; role: 'admin' | 'viewer'; expires_at: string }>('GET', '/api/auth/me'),
   // Raw fetch (not the request() wrapper): this endpoint's 401 means "wrong
   // CURRENT password", which must surface as an inline error — not trigger
   // the session-expired bounce that request() applies to every other 401.
@@ -145,11 +173,16 @@ export const api = {
 
   // ---------- Update publishing (agent / EncodeLib / bin package) ----------
   manifest: () => request<UpdateManifest>('GET', '/api/updates/manifest'),
-  publishAgent: (version: string, file: File) => publishUpload('/api/updates/agent', version, file),
+  publishAgent: (version: string, file: File, platform?: 'windows' | 'linux') =>
+    publishUpload('/api/updates/agent', version, file, platform),
   // rollbackAgent promotes the previous agent release back to current
   // (POST /api/updates/agent/rollback). Nodes self-downgrade on their next
   // idle heartbeat via the normal sync; returns the post-rollback manifest.
-  rollbackAgent: () => request<UpdateManifest>('POST', '/api/updates/agent/rollback'),
+  rollbackAgent: (platform?: 'windows' | 'linux') =>
+    // Rollback sends the platform as a multipart form field (same as
+    // publish) — a raw fetch, not request(), because the endpoint expects
+    // multipart not JSON. platform omitted = Windows (back-compat).
+    rollbackUpload('/api/updates/agent/rollback', platform),
   // jobETA fetches the remaining-time prediction for a live job.
   jobETA: (id: number) => request<JobETA>('GET', `/api/jobs/${id}/eta`),
   // listAudit fetches the newest audit events (default 200, max 1000).
@@ -257,11 +290,20 @@ export const api = {
   // (POST /api/jobs/bulk). Ids that do not match the action's state guard
   // come back in "skipped" — the server never fails a batch over a
   // mixed-status selection.
-  bulkJobs: (action: 'retry' | 'cancel', ids: number[]) =>
+  // bulkJobs applies one guarded action to a list of job ids
+  // (POST /api/jobs/bulk). Extended actions: delete (terminal jobs only),
+  // set_priority (pending jobs), set_flow (pending jobs). Ids that do not
+  // match the action's state guard come back in "skipped" — the server
+  // never fails a batch over a mixed-status selection.
+  bulkJobs: (
+    action: 'retry' | 'cancel' | 'delete' | 'set_priority' | 'set_flow',
+    ids: number[],
+    opts?: { priority?: number; flow_id?: number },
+  ) =>
     request<{ action: string; affected: number; skipped: number[] }>(
       'POST',
       '/api/jobs/bulk',
-      { action, ids },
+      opts ? { action, ids, ...opts } : { action, ids },
     ),
   // streamJobLog opens the SSE live-progress stream for one job and invokes
   // onEvent per parsed frame. Uses fetch + ReadableStream (not EventSource):
@@ -354,4 +396,49 @@ export const api = {
   // the four canonical labels without validating.
   getStats: (range: '24h' | '7d' | '30d' | 'all') =>
     request<Stats>('GET', `/api/stats?range=${range}`),
+
+  // ---------- Scan trigger ----------
+  // scanNow requests an out-of-cycle scan of the scripts share (POST /api/scan).
+  // Returns 202 {triggered: true} — the scan is asynchronous and may coalesce
+  // with an already-pending trigger.
+  scanNow: () => request<{ triggered: boolean }>('POST', '/api/scan'),
+
+  // ---------- Job delete ----------
+  // deleteJob removes a TERMINAL job (done/failed/cancelled) from the jobs
+  // table. Non-terminal jobs get 409 "only terminal jobs can be deleted".
+  deleteJob: (id: number) =>
+    request<{ deleted: boolean }>('DELETE', `/api/jobs/${id}`),
+
+  // ---------- Flow duplicate ----------
+  // duplicateFlow copies a flow and its steps verbatim under a new name
+  // (POST /api/flows/{id}/duplicate). The default name is "<original> (copy)";
+  // pass an explicit name to override. The copy is never the default flow.
+  duplicateFlow: (id: number, name?: string) =>
+    request<Flow>('POST', `/api/flows/${id}/duplicate`, name ? { name } : {}),
+
+  // ---------- User management (admin-only) ----------
+  listUsers: () => request<User[]>('GET', '/api/users'),
+  createUser: (username: string, password: string, role: 'admin' | 'viewer') =>
+    request<User>('POST', '/api/users', { username, password, role }),
+  deleteUser: (id: number) => request<void>('DELETE', `/api/users/${id}`),
+  resetUserPassword: (id: number, password: string) =>
+    request<{ status: string }>('PUT', `/api/users/${id}/password`, { password }),
+
+  // ---------- Backup restore ----------
+  // restoreBackup swaps a snapshot into the live DB (POST /api/backup/{name}/restore).
+  // 200 {restored: true, restart: bool} — restart=true means the controller
+  // exits (Docker restart policy reboots on the restored DB); restart=false
+  // (PG backend) needs no restart. 409 when active jobs are in flight.
+  restoreBackup: (name: string) =>
+    request<{ restored: boolean; restart: boolean }>(
+      'POST',
+      `/api/backup/${encodeURIComponent(name)}/restore`,
+    ),
+
+  // ---------- Update check ----------
+  // checkUpdate compares the running controller version to the latest GitHub
+  // release tag (GET /api/updates/check). Returns 200 with the comparison, or
+  // 502 on any upstream failure (rate-limited, offline) — the UI shows a muted
+  // inline error rather than an error-box, since this is best-effort.
+  checkUpdate: () => request<UpdateCheck>('GET', '/api/updates/check'),
 };

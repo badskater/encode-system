@@ -53,7 +53,13 @@ type LiveConfig func(ctx context.Context) (target Target, interval time.Duration
 // slow scan (NFS stall) skips a beat but never pushes every subsequent scan
 // back — the schedule recovers on the next tick. The ticker is stopped via
 // defer at function exit, so a panic in scanOnce cannot leak it.
-func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfig) {
+//
+// trigger, when non-nil, is a buffered channel that an admin can push to via
+// POST /api/scan to request an immediate scan out-of-cycle. The select listens
+// on both the ticker and the trigger so a manual request fires on the next
+// loop iteration without waiting for the next tick. A nil trigger (tests that
+// don't exercise the feature) is a no-op: the select only watches the ticker.
+func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfig, trigger <-chan struct{}) {
 	var tick *time.Ticker
 	var curInterval time.Duration
 	defer func() {
@@ -77,6 +83,8 @@ func RunLoop(ctx context.Context, log *slog.Logger, st JobCreator, cfg LiveConfi
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			scanOnce(ctx, log, st, target, defaultFlow)
+		case <-trigger:
 			scanOnce(ctx, log, st, target, defaultFlow)
 		}
 	}

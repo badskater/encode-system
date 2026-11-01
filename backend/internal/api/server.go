@@ -86,6 +86,14 @@ type Server struct {
 	// Built in New (never nil). In-memory only — a restart resets cooldowns
 	// (acceptable: worst case one extra alert after a restart).
 	diskGuard *diskGuardState
+	// scanTrigger is a buffered-1 channel fed by POST /api/scan to request
+	// an immediate scan out-of-cycle. The scanner loop's select listens on
+	// it alongside its ticker. Buffered-1 so a non-blocking send always
+	// succeeds (a second request while one is pending coalesces — the loop
+	// drains one signal and the next scan covers both). On HA (Postgres)
+	// only the leader replica's scanner holds the advisory lock, so a
+	// trigger on a non-leader is a no-op (the channel is never consumed).
+	scanTrigger chan struct{}
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -122,9 +130,10 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
-		digest:    &digestState{buf: notify.NewDigestBuffer()},
-		logHub:    newLogHub(),
-		diskGuard: &diskGuardState{last: map[int64]time.Time{}},
+		digest:      &digestState{buf: notify.NewDigestBuffer()},
+		logHub:      newLogHub(),
+		diskGuard:   &diskGuardState{last: map[int64]time.Time{}},
+		scanTrigger: make(chan struct{}, 1),
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
@@ -403,6 +412,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs/bulk", s.withAdmin(s.handleBulkJobs))
 	mux.HandleFunc("POST /api/jobs/prune", s.withAdmin(s.handlePruneJobs))
 	mux.HandleFunc("GET /api/jobs/{id}/eta", s.withAdmin(s.handleJobETA))
+
+	// Scan-now trigger: admin requests an immediate scan of the scripts
+	// share out-of-cycle. Non-blocking: 202 even when already queued. On HA
+	// only the leader's scanner consumes the channel; a non-leader trigger
+	// is a no-op (the request still succeeds — the operator's intent is
+	// "scan now" and the leader will do it on its own schedule regardless).
+	mux.HandleFunc("POST /api/scan", s.withAdmin(s.handleScanNow))
 	// Prometheus scrape endpoint: unauthenticated by design (aggregate
 	// operational numbers only; scrapers authenticate at network layer).
 	mux.HandleFunc("GET /metrics", s.handlePrometheus)

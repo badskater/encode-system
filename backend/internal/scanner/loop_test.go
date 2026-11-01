@@ -16,6 +16,7 @@ import (
 
 // fakeStore captures CreateJob calls for loop tests.
 type fakeStore struct {
+	mu       sync.Mutex
 	existing map[string]bool
 	flow     *model.Flow
 	created  []*model.Job
@@ -28,6 +29,8 @@ func (f *fakeStore) JobExistsForEpisode(_ context.Context, dir string) (bool, er
 }
 
 func (f *fakeStore) CreateJob(_ context.Context, j *model.Job) (*model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	j.ID = int64(len(f.created) + 1)
 	f.created = append(f.created, j)
 	return j, nil
@@ -136,7 +139,7 @@ func TestRunLoopLiveConfigAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		RunLoop(ctx, log, st, cfg)
+		RunLoop(ctx, log, st, cfg, nil)
 		close(done)
 	}()
 

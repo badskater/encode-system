@@ -237,7 +237,7 @@ func main() {
 				return scanner.Target{S3Bucket: sh.Path, S3Store: store}, interval, defaultFlow
 			}
 			return scanner.Target{Root: root}, interval, defaultFlow
-		})
+		}, srv.ScanTrigger())
 	})
 
 	// Digest loop: when settings.NotifyDigest is ON, buffer job-outcome

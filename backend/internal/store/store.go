@@ -1234,6 +1234,29 @@ func (s *Store) RetryJob(ctx context.Context, id int64) (int64, error) {
 	return res.RowsAffected()
 }
 
+// DeleteJob removes a TERMINAL job (done/failed/cancelled) from the jobs
+// table. Non-terminal jobs (pending/assigned/running) are refused so an
+// in-flight encode is never orphaned by a delete. Returns changed=true when
+// exactly one row was deleted; changed=false when the job was missing or
+// non-terminal (the caller distinguishes via a prior GetJob or answers 404 vs
+// 409). The guard is a WHERE status IN ('done','failed','cancelled') clause
+// so the check and the delete are atomic — a job that went terminal between
+// the handler's pre-check and this call is safely deleted, and a job that
+// went non-terminal is safely left alone.
+func (s *Store) DeleteJob(ctx context.Context, id int64) (bool, error) {
+	res, err := s.qExec(ctx,
+		`DELETE FROM jobs WHERE id = ? AND status IN ('done','failed','cancelled')`,
+		id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ScheduleJobRetry silently re-queues a failed job for automatic retry: it
 // flips the job back to pending, stamps retry_count, and sets next_retry_at
 // to the computed backoff time. The UPDATE is guarded by status='failed'

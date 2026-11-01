@@ -123,6 +123,10 @@ export interface Settings {
   // A node below it fires a Discord alert (1/hour per node) and takes no
   // new jobs until it recovers. 0/absent = disabled.
   disk_alert_gb?: number;
+  // Node status alerts: when true the controller posts a Discord alert
+  // when a node transitions between online/offline/busy states. Off by
+  // default — only meaningful when discord_webhook is also set.
+  notify_node_status?: boolean;
   updated_at?: string;
 }
 
@@ -221,6 +225,9 @@ export interface JobETA {
 }
 
 // UpdateManifest: the agent/lib/bin versions the controller wants deployed.
+// Windows slots (agent_version/prev_agent_version) and Linux slots
+// (linux_agent_version/prev_linux_agent_version) are independent: publishing
+// to one platform never disturbs the other.
 export interface UpdateManifest {
   agent_version: string;
   agent_sha256: string;
@@ -228,11 +235,36 @@ export interface UpdateManifest {
   // second publish has rotated a payload into the rollback slot).
   prev_agent_version?: string;
   prev_agent_sha256?: string;
+  // Linux agent slots — independent from the Windows slots above. Absent
+  // when no Linux agent has been published yet.
+  linux_agent_version?: string;
+  linux_agent_sha256?: string;
+  prev_linux_agent_version?: string;
+  prev_linux_agent_sha256?: string;
   lib_version: number;
   lib_sha256: string;
   bin_version: number;
   bin_sha256: string;
   bin_size?: number;
+}
+
+// User is a management-plane account (login-based). PasswordHash is never
+// serialized by the backend (json:"-"), so the API never exposes it.
+export interface User {
+  id: number;
+  username: string;
+  role: 'admin' | 'viewer';
+  created_at?: string;
+}
+
+// UpdateCheck is the response of GET /api/updates/check: compares the running
+// controller version to the latest GitHub release tag. A 502 means the
+// upstream check failed (rate-limited, offline) — the UI shows a muted error.
+export interface UpdateCheck {
+  current: string;
+  latest: string;
+  update_available: boolean;
+  release_url: string;
 }
 
 export interface StepTemplate {

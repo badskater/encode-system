@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -213,4 +214,213 @@ func quoteIdentList(cols []string) string {
 		q[i] = quoteIdent(c)
 	}
 	return strings.Join(q, ", ")
+}
+
+// ---------- PG restore ----------
+
+// restorePG replays a JSON-lines dump file into the Postgres database in a
+// single transaction. It TRUNCATEs every table in reverse FK order (children
+// before parents), INSERTs each row with parameterized columns (rebound via
+// the store's q() helper for $N placeholders), and advances each table's id
+// serial sequence via setval/pg_get_serial_sequence (skipping non-serial
+// tables like settings). The shares-key file is never touched — it lives
+// outside the DB and is unaffected by table data.
+//
+// The dump format is one JSON object per line: {"_table":"name"} marks a
+// table boundary, {"_table":"name","_row":{...}} is a data row. The header
+// {"_format":"encode-pg-dump","_version":1} is skipped.
+func (s *Server) restorePG(ctx context.Context, srcPath string) error {
+	if s.Backup == nil || s.Backup.PGDump == nil {
+		return fmt.Errorf("PGDump handle not set on BackupManager")
+	}
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open dump file: %w", err)
+	}
+	defer f.Close()
+
+	// Read all lines first so we can process within a single transaction
+	// without holding the file open across the tx (cleaner rollback).
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // 4 MiB max line
+	type rowEntry struct {
+		table string
+		row   map[string]any
+	}
+	var rows []rowEntry
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return fmt.Errorf("parse dump line: %w", err)
+		}
+		if _, ok := rec["_format"]; ok {
+			continue // header record
+		}
+		table, _ := rec["_table"].(string)
+		if table == "" {
+			continue
+		}
+		if row, ok := rec["_row"].(map[string]any); ok {
+			rows = append(rows, rowEntry{table: table, row: row})
+		}
+		// A bare {"_table":"name"} marker (no _row) just signals the table
+		// boundary — nothing to do per-row; TRUNCATE handles the table.
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read dump file: %w", err)
+	}
+
+	db := s.Backup.PGDump
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() // safe: a committed tx makes this a no-op
+
+	// TRUNCATE all tables in one statement with CASCADE so FK constraints
+	// don't block. We list every table explicitly (not CASCADE on one) so
+	// only the known tables are affected. RESTART IDENTITY resets sequences,
+	// but we setval explicitly below to match the imported max id.
+	// Tables absent from the schema (older DB) are filtered out first.
+	var presentTables []string
+	for _, table := range pgBackupTables {
+		cols, err := pgColumnsTx(ctx, tx, table)
+		if err != nil {
+			return fmt.Errorf("columns for %s: %w", table, err)
+		}
+		if len(cols) > 0 {
+			presentTables = append(presentTables, quoteIdent(table))
+		}
+	}
+	if len(presentTables) > 0 {
+		truncSQL := "TRUNCATE TABLE " + strings.Join(presentTables, ", ") + " RESTART IDENTITY"
+		if _, err := tx.ExecContext(ctx, truncSQL); err != nil {
+			return fmt.Errorf("truncate tables: %w", err)
+		}
+	}
+
+	// INSERT rows grouped by table (the dump writes them in FK order, but
+	// grouping is not required — FK constraints are satisfied as long as
+	// parents come before children, which the dump guarantees). We insert
+	// in the order they appear in the file.
+	for _, entry := range rows {
+		cols, err := pgColumnsTx(ctx, tx, entry.table)
+		if err != nil {
+			return fmt.Errorf("columns for %s: %w", entry.table, err)
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		// Build the column list from the row's keys (intersect with catalog
+		// to guard against schema drift). Values are positional in catalog
+		// order — a column absent from the row inserts as NULL.
+		colList := make([]string, 0, len(cols))
+		vals := make([]any, 0, len(cols))
+		for _, c := range cols {
+			if v, ok := entry.row[c]; ok {
+				colList = append(colList, quoteIdent(c))
+				vals = append(vals, v)
+			}
+			// Columns absent from the row are omitted from the INSERT
+			// (defaults apply).
+		}
+		if len(colList) == 0 {
+			continue // empty row, nothing to insert
+		}
+		// Build parameterized INSERT: INSERT INTO "t" ("c1","c2") VALUES ($1,$2)
+		ph := make([]string, len(vals))
+		for i := range vals {
+			ph[i] = fmt.Sprintf("$%d", i+1)
+		}
+		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+			quoteIdent(entry.table), strings.Join(colList, ", "), strings.Join(ph, ", "))
+		if _, err := tx.ExecContext(ctx, query, vals...); err != nil {
+			return fmt.Errorf("insert into %s: %w", entry.table, err)
+		}
+	}
+
+	// Advance id sequences so the next controller insert gets an id above
+	// the imported max. Tables without a serial (settings uses INTEGER PK)
+	// are skipped — pg_get_serial_sequence returns NULL.
+	for _, table := range pgBackupTables {
+		if err := advanceSequenceTx(ctx, tx, table); err != nil {
+			return fmt.Errorf("advance sequence %s: %w", table, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit restore: %w", err)
+	}
+	return nil
+}
+
+// pgColumnsTx is the transaction-scoped version of pgColumns.
+func pgColumnsTx(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT column_name FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1
+		 ORDER BY ordinal_position`, table)
+	if err != nil {
+		return nil, fmt.Errorf("read columns: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// advanceSequenceTx runs setval so the serial's next value is above the max
+// imported id, within the restore transaction. Mirrors cmd/pgimport's
+// advanceSequence pattern. Tables without a serial sequence (settings uses
+// INTEGER PK, sessions has no id column) are no-ops — pg_get_serial_sequence
+// returns NULL or the column lookup fails. We check the column exists first
+// to avoid a hard error on tables without an id column.
+func advanceSequenceTx(ctx context.Context, tx *sql.Tx, table string) error {
+	// Check the table has an "id" column before querying pg_get_serial_sequence,
+	// which errors on a missing column (sessions has token_hash PK, no id).
+	hasID, err := txHasColumn(ctx, tx, table, "id")
+	if err != nil {
+		return fmt.Errorf("check id column for %s: %w", table, err)
+	}
+	if !hasID {
+		return nil // no id column — no sequence to advance
+	}
+	var seqName sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		"SELECT pg_get_serial_sequence($1, 'id')", table).Scan(&seqName); err != nil {
+		return fmt.Errorf("lookup sequence for %s: %w", table, err)
+	}
+	if !seqName.Valid || seqName.String == "" {
+		return nil // no serial sequence (e.g. settings uses INTEGER PK)
+	}
+	var result int64
+	if err := tx.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT setval('%s'::regclass, COALESCE((SELECT MAX(id) FROM %s), 1))",
+			seqName.String, quoteIdent(table))).Scan(&result); err != nil {
+		return fmt.Errorf("setval %s: %w", table, err)
+	}
+	return nil
+}
+
+// txHasColumn reports whether a table has a column with the given name.
+func txHasColumn(ctx context.Context, tx *sql.Tx, table, col string) (bool, error) {
+	var n int
+	err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+		table, col).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

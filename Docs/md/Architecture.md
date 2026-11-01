@@ -53,7 +53,7 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 - **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained script — PowerShell (`.ps1`) for Windows nodes or bash (`.sh`) for Linux nodes, selected at dispatch time via `DialectForPlatform(node.Platform)`. PowerShell scripts call functions from `EncodeLib.ps1` (dot-sourced by the preamble); bash scripts are self-contained (the shared `find_source_file` helper is emitted into every render). For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
-- **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel, prune, SSE log stream), flows, step templates, series, shares, scanner config, settings, stats, metrics, audit log, API tokens, DB backups, updates (agent/lib/bin + rollback). Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session. A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA).
+- **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel/delete/set-priority/set-flow, single-job delete, prune, SSE log stream), flows (incl. duplicate), step templates, series, shares, scanner config, scan-now trigger, settings, stats, metrics, audit log, API tokens, DB backups (incl. restore), updates (agent/lib/bin + rollback + GitHub release check), user CRUD. Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). Two roles: **admin** (full access) and **viewer** (read-only — sees all monitoring surfaces, no mutations); read routes use `withAnyUser`, mutations and management surfaces stay `withAdmin`. **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session (read-scope maps to viewer-equivalent, restricted to GET/HEAD). A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA, unauthenticated).
 
 ### Store: dialect layer (SQLite default, Postgres optional)
 
@@ -103,7 +103,7 @@ remains the default). The HA facts:
 
 - **Advisory-lock singleton loops.** Background loops that must run exactly
   once across the fleet (scanner, retention prune, digest flush, backup
-  scheduler) take a Postgres advisory lock (`pg_try_advisory_lock`) before each
+  scheduler, node-status alert) take a Postgres advisory lock (`pg_try_advisory_lock`) before each
   iteration. On SQLite this is a no-op (always-locked) because there is only
   ever one writer; on PG only the replica holding the lock runs the loop,
   the other skips. A replica killed mid-loop releases its advisory lock on
@@ -530,6 +530,108 @@ controller re-caps `log_full` at 1 MiB defensively.
   beside the DB stay out of downloads. UI: Settings → DB backups card.
 - **Storage shares CRUD** — see "Storage shares" above (nfs/smb/s3,
   encrypted write-only credentials, S3 scanner autonomy).
+
+## Usability batch (2026-11 feature set)
+
+- **Viewer role + user CRUD** — management-plane accounts carry a role
+  (`model.RoleAdmin` / `model.RoleViewer`). **`withAnyUser`** is the
+  middleware on read routes: it admits any authenticated admin OR viewer
+  session, and maps API-token scope to an effective role (read-scope →
+  viewer-equivalent, restricted to GET/HEAD; admin-scope → admin). **`withAdmin`**
+  stays on every mutation (POST/PUT/PATCH/DELETE) and on management surfaces
+  that must stay admin-only even for GET: `/api/users`, `/api/tokens`,
+  `/api/audit`, `/api/backup*`, `/api/pairing`, `/api/provision*`, and
+  `/api/updates/manifest`. All other GET/HEAD routes moved to `withAnyUser` so
+  a viewer sees the dashboard, jobs, nodes, flows, series, stats, settings,
+  metrics, and the update check — but cannot change anything. The UI hides
+  mutation controls for viewers. User management is admin-only:
+  `GET /api/users`, `POST /api/users` (role validated `admin|viewer`, default
+  `viewer`; duplicate username → 409; bcrypt password, min length enforced),
+  `DELETE /api/users/{id}` (409 on self-delete or last-admin delete),
+  `PUT /api/users/{id}/password` (admin reset, revokes all of the target's
+  sessions). API tokens cannot manage users (no session in context → handlers
+  see nil and reject).
+- **Node online/offline alerts** — `StartNodeAlertLoop` runs a background
+  goroutine (30s tick) that lists every node, computes online with the same
+  `StaleAfter` rule as `handleListNodes`, and diffs against an in-memory
+  baseline (`nodeAlertState.prev`). Only real transitions (online↔offline)
+  between two consecutive ticks fire a Discord alert; a node new to the
+  baseline produces no transition, so the **first tick after a restart seeds
+  silently** (no alert storm for nodes that were already stale). Alerts fire
+  only when `settings.notify_node_status` is true (default false) **and**
+  `settings.discord_webhook` is non-empty — both read live each tick, so a
+  Settings-page toggle applies without a restart. The baseline updates every
+  tick regardless of whether alerts are enabled, so transitions are not missed
+  while disabled and then re-enabled mid-transition. **HA:** on Postgres the
+  loop body runs under `store.RunLoopSupervisor` with `LockKeyNodeAlert`
+  (`pg_try_advisory_lock` key 1006) so exactly one replica alerts per
+  transition; on SQLite the supervisor is a transparent always-locked wrapper.
+- **Backup restore** — `POST /api/backup/{name}/restore` (admin-only) swaps a
+  snapshot back into the live database. Guards: the name must be
+  traversal-safe (no path separators, no `..`), must exist in the backups dir,
+  and its extension must match the active backend (`.db` for SQLite, `.dump`
+  for Postgres) or the handler returns 409; any pending or running job returns
+  409 (restore mid-flight would lose in-flight work). The audit row is written
+  **before** the swap so it survives even when the process exits immediately
+  after. **SQLite:** snapshots the current DB to `encode.db.pre-restore-<unix-ts>`,
+  copies the backup to a temp file, atomically renames it over the live DB
+  file (same filesystem, so `os.Rename` is atomic), responds `200
+  {"restored":true,"restart":true,"snapshot":"…"}`, then **exits the process**
+  (Docker's restart policy reboots on the restored DB). The shares-key file is
+  never touched. **Postgres:** replays the JSON-lines dump in a single
+  transaction (TRUNCATE in reverse FK order, INSERT per row with parameterized
+  columns, `setval` per serial sequence), responds
+  `{"restored":true,"restart":false}` — no restart needed. See
+  `Docs/md/Operations.md` for the restore runbook.
+- **Update check** — `GET /api/updates/check` (viewer-readable, `withAnyUser`)
+  compares the running controller version (ldflags `-X main.Version`) to the
+  latest GitHub release tag. It calls
+  `{api}/repos/{repo}/releases/latest` with a 10s timeout, a Bearer token when
+  `ENCODE_GITHUB_TOKEN` is set, and falls back to **502** on any upstream
+  failure (network error, non-200, malformed JSON). Tag comparison strips a
+  leading `v` and compares dot-separated numeric segments (string fallback for
+  non-numeric like `-rc1`). Response: `{current, latest, update_available,
+  release_url}`. `/api/health` now carries `version` when the build stamp is
+  non-empty. Env vars: `ENCODE_GITHUB_TOKEN` (PAT — needed for private repos),
+  `ENCODE_GITHUB_REPO` (default `badskater/encode-system`), `ENCODE_GITHUB_API`
+  (test override / GitHub Enterprise).
+- **Scan-now trigger** — `POST /api/scan` (admin) sends a non-blocking signal
+  to the scanner loop's buffered-1 trigger channel; the response is always
+  `202 {"triggered":true}` (a second request while one is queued coalesces —
+  the single resulting scan covers both). On HA only the leader replica's
+  scanner holds the advisory lock and consumes the channel; a trigger on a
+  non-leader is a no-op (the request still succeeds — the leader scans on its
+  own schedule). Audit: `scan.trigger`.
+- **Flow duplication** — `POST /api/flows/{id}/duplicate` (admin) copies a flow
+  and its steps verbatim under a new name (default `<original> (copy)`,
+  overridable via `{"name":"…"}`). The copy is never the default flow
+  (`is_default=false`), so duplicating the flagged default does not create a
+  second default. The retry policy (`max_retries`, `retry_backoff_minutes`) is
+  copied alongside the steps. Audit: `flow.duplicate`.
+- **Single-job delete** — `DELETE /api/jobs/{id}` (admin) removes a **terminal**
+  job (done/failed/cancelled) from the jobs table; non-terminal jobs (pending/
+  assigned/running) return 409 — an in-flight encode must never be orphaned by
+  a delete. A missing job is 404. The store's `DeleteJob` guards on status
+  `IN ('done','failed','cancelled')` atomically, so the pre-check and the
+  delete cannot race. Audit: `job.delete`.
+- **Bulk job extensions** — `POST /api/jobs/bulk` (admin, max 500 ids) adds
+  three actions alongside the existing `retry`/`cancel`: `delete` (terminal jobs
+  only, same store guard as single delete; non-terminal/missing → `skipped`),
+  `set_priority` (requires `body.priority`; patches pending jobs via
+  `PatchPendingJob`; non-pending/missing → `skipped`), and `set_flow` (requires
+  `body.flow_id`, validated to exist; patches pending jobs; non-pending/
+  missing → `skipped`). Every action reuses the same guarded store call as the
+  single-job endpoints and returns `{action, affected, skipped}`.
+- **encodectl CLI** — `backend/cmd/encodectl`, a stdlib-only operator CLI that
+  wraps the controller REST API for shell/CI scripting. Global flags
+  `-server`/`-token` (or env `ENCODECTL_SERVER`/`ENCODECTL_TOKEN`) plus
+  `-json` (raw response passthrough). Commands: `health`, `scan`, `nodes`,
+  `jobs [-status S] [-limit N]`, `job-retry`/`job-cancel`/`job-delete <id>`,
+  `prune -days N`, `series`, `stats`, `publish-agent -platform windows|linux
+  -version V -file PATH`, `rollback-agent [-platform P]`, `manifest`,
+  `version`. Exit codes: 0 success, 1 API/transport error (message on
+  stderr), 2 usage. Built as `encodectl-linux-amd64` (version ldflags) and
+  shipped in the release assets + deploy tarball.
 
 ## Runtime flows
 

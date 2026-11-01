@@ -12,6 +12,7 @@ import AuditPage from './pages/Audit';
 import TokenGate from './components/TokenGate';
 import ChangePasswordDialog from './components/ChangePasswordDialog';
 import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './api/client';
+import { RoleContext, type Role } from './hooks/useRole';
 
 type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'stats' | 'audit' | 'settings' | 'provision';
 
@@ -50,6 +51,7 @@ export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
   const [authed, setAuthed] = useState<boolean | null>(() => (hasToken() ? null : false));
   const [who, setWho] = useState('');
+  const [role, setRole] = useState<Role>('admin');
   const [showChangePassword, setShowChangePassword] = useState(false);
 
   // If a session token is stored, validate it against the server before
@@ -58,6 +60,7 @@ export default function App() {
     onSessionExpired(() => {
       setAuthed(false);
       setWho('');
+      setRole('admin');
     });
     if (authed === null && hasToken()) {
       api
@@ -65,6 +68,7 @@ export default function App() {
         .then((me) => {
           setCurrentUser(me.username);
           setWho(me.username);
+          setRole(me.role);
           setAuthed(true);
         })
         .catch(() => {
@@ -83,6 +87,7 @@ export default function App() {
     clearToken();
     setCurrentUser('');
     setWho('');
+    setRole('admin');
     setAuthed(false);
   }
 
@@ -101,6 +106,7 @@ export default function App() {
   }
 
   return (
+    <RoleContext.Provider value={role}>
     <div className="app">
       <aside className="sidebar">
         <div className="sidebar-brand">
@@ -150,5 +156,6 @@ export default function App() {
       </main>
       {showChangePassword && <ChangePasswordDialog onClose={() => setShowChangePassword(false)} />}
     </div>
+    </RoleContext.Provider>
   );
 }

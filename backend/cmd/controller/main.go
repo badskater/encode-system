@@ -29,6 +29,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql (backup PG dump handle)
 )
 
+// Version is the controller build version, set via ldflags
+// (-X main.Version=...) in CI (see .github/workflows/release.yml). Empty
+// in dev builds; /api/health and /api/updates/check report it as-is.
+var Version = ""
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -138,6 +143,10 @@ func main() {
 		ScanIntervalSeconds: envInt("ENCODE_SCAN_INTERVAL", 30),
 		DiscordWebhook:      env("ENCODE_DISCORD_WEBHOOK", ""),
 		InstanceID:          instanceID,
+		GitHubToken:         os.Getenv("ENCODE_GITHUB_TOKEN"),
+		GitHubRepo:          env("ENCODE_GITHUB_REPO", "badskater/encode-system"),
+		GitHubAPI:           env("ENCODE_GITHUB_API", "https://api.github.com"),
+		Version:             Version,
 	}
 
 	srv, err := api.New(st, up, log, cfg)
@@ -237,7 +246,7 @@ func main() {
 				return scanner.Target{S3Bucket: sh.Path, S3Store: store}, interval, defaultFlow
 			}
 			return scanner.Target{Root: root}, interval, defaultFlow
-		})
+		}, srv.ScanTrigger())
 	})
 
 	// Digest loop: when settings.NotifyDigest is ON, buffer job-outcome
@@ -246,6 +255,15 @@ func main() {
 	// page applies on the next tick without a restart. Bound to the same
 	// ctx as the scanner so SIGTERM stops both cleanly.
 	srv.StartDigestLoop(ctx)
+
+	// Node-status alert loop: when settings.NotifyNodeStatus is ON and a
+	// Discord webhook is set, send alerts on node online↔offline
+	// transitions (detected by diffing the node list against an in-memory
+	// baseline every 30s). The first tick after a restart seeds silently
+	// (no alert storm). Bound to the same ctx as the other loops so
+	// SIGTERM stops it cleanly. HA: wrapped in RunLoopSupervisor
+	// (LockKeyNodeAlert) so only one replica alerts per transition.
+	srv.StartNodeAlertLoop(ctx)
 
 	// Retention loop: hourly pass that deletes terminal jobs older than
 	// settings.JobRetentionDays (0 = keep forever, the default). Each tick

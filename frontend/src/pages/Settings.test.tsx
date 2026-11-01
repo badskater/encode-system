@@ -266,3 +266,141 @@ describe('Settings linux node path overrides', () => {
     expect(binField.value).toBe('/opt/encode-bin');
   });
 });
+
+
+describe('Settings notify_node_status toggle', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the toggle bound to settings.notify_node_status (off by default)', async () => {
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/notify node status/i);
+    expect(toggle).toBeInTheDocument();
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('reflects settings.notify_node_status=true as checked on load', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({ notify_node_status: true }));
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/notify node status/i);
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('sends notify_node_status=true in the PUT body after toggling on and saving', async () => {
+    const saveSpy = vi
+      .spyOn(api, 'saveSettings')
+      .mockResolvedValue(baseSettings({ notify_node_status: true }));
+    render(<SettingsPage />);
+    const toggle = await screen.findByLabelText(/notify node status/i);
+    fireEvent.click(toggle);
+    // The toggle lives in the Discord notifications card — second Save button.
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[1]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.notify_node_status).toBe(true);
+  });
+});
+
+describe('Settings update check', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the version card with a Check for update button', async () => {
+    render(<SettingsPage />);
+    const btn = await screen.findByRole('button', { name: /check for update/i });
+    expect(btn).toBeInTheDocument();
+  });
+
+  it('shows an available update notice when update_available is true', async () => {
+    vi.spyOn(api, 'checkUpdate').mockResolvedValue({
+      current: '1.0.0',
+      latest: '1.1.0',
+      update_available: true,
+      release_url: 'https://github.com/badskater/encode-system/releases/tag/v1.1.0',
+    });
+    render(<SettingsPage />);
+    const btn = await screen.findByRole('button', { name: /check for update/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.getByText(/v1\.1\.0 available/)).toBeInTheDocument());
+    expect(screen.getByText(/Release notes/)).toBeInTheDocument();
+  });
+
+  it('shows Up to date when no update is available', async () => {
+    vi.spyOn(api, 'checkUpdate').mockResolvedValue({
+      current: '1.1.0',
+      latest: '1.1.0',
+      update_available: false,
+      release_url: '',
+    });
+    render(<SettingsPage />);
+    const btn = await screen.findByRole('button', { name: /check for update/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.getByText(/up to date/i)).toBeInTheDocument());
+  });
+
+  it('shows a muted Update check failed on a 502 error', async () => {
+    vi.spyOn(api, 'checkUpdate').mockRejectedValue(new Error('502: update check failed'));
+    render(<SettingsPage />);
+    const btn = await screen.findByRole('button', { name: /check for update/i });
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.getByText(/update check failed/i)).toBeInTheDocument());
+  });
+});
+
+describe('Settings publish platform picker', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue({
+      ...manifest,
+      agent_version: '1.0.0',
+      linux_agent_version: '0.9.0',
+      prev_agent_version: '0.8.0',
+      prev_linux_agent_version: '0.7.0',
+    });
+  });
+
+  it('renders both Windows and Linux manifest rows', async () => {
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    expect(screen.getByText('Windows agent')).toBeInTheDocument();
+    expect(screen.getByText('Linux agent')).toBeInTheDocument();
+  });
+
+  it('defaults to Windows platform and shows the WIN button as active', async () => {
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    const winBtn = screen.getByText('WIN').closest('button')!;
+    expect(winBtn.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('switches to Linux platform on click', async () => {
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    const linuxBtn = screen.getByText('LINUX').closest('button')!;
+    fireEvent.click(linuxBtn);
+    expect(linuxBtn.getAttribute('aria-pressed')).toBe('true');
+    // Agent version label now shows the platform
+    expect(screen.getByText(/Agent version \(linux\)/i)).toBeInTheDocument();
+  });
+
+  it('shows the Windows rollback button when a Windows prev exists', async () => {
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    expect(screen.getByRole('button', { name: /rollback to 0\.8\.0/i })).toBeInTheDocument();
+  });
+
+  it('shows the Linux rollback button after switching to Linux', async () => {
+    render(<SettingsPage />);
+    await screen.findByText(/push to nodes/i);
+    fireEvent.click(screen.getByText('LINUX').closest('button')!);
+    expect(screen.getByRole('button', { name: /rollback to 0\.7\.0/i })).toBeInTheDocument();
+  });
+});

@@ -48,6 +48,18 @@ type Config struct {
 	// field is never blank in logs/health). Purely additive — the existing
 	// {"status":"ok"} health field stays.
 	InstanceID string
+	// GitHubToken is an optional PAT for authenticated GitHub API calls
+	// (update check). Empty = unauthenticated requests (lower rate limit).
+	GitHubToken string
+	// GitHubRepo is the "owner/repo" to check for latest releases.
+	// Defaults to "badskater/encode-system".
+	GitHubRepo string
+	// GitHubAPI is the GitHub API base URL (default https://api.github.com).
+	// Overridable for tests or GitHub Enterprise (https://ghe.example/api/v3).
+	GitHubAPI string
+	// Version is the controller build version (set via ldflags -X main.Version
+	// in CI). Empty in dev builds; the update check reports it as "unknown".
+	Version string
 }
 
 // Server bundles dependencies for all handlers.
@@ -86,6 +98,19 @@ type Server struct {
 	// Built in New (never nil). In-memory only — a restart resets cooldowns
 	// (acceptable: worst case one extra alert after a restart).
 	diskGuard *diskGuardState
+	// scanTrigger is a buffered-1 channel fed by POST /api/scan to request
+	// an immediate scan out-of-cycle. The scanner loop's select listens on
+	// it alongside its ticker. Buffered-1 so a non-blocking send always
+	// succeeds (a second request while one is pending coalesces — the loop
+	// drains one signal and the next scan covers both). On HA (Postgres)
+	// only the leader replica's scanner holds the advisory lock, so a
+	// trigger on a non-leader is a no-op (the channel is never consumed).
+	scanTrigger chan struct{}
+	// nodeAlert holds the in-memory baseline of node online/offline states
+	// for the node-status alert loop (StartNodeAlertLoop). Built in New
+	// (never nil) so nodeAlertTick can use it without a nil check. The
+	// baseline is seeded silently on the first tick after a restart.
+	nodeAlert *nodeAlertState
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -122,9 +147,11 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
-		digest:    &digestState{buf: notify.NewDigestBuffer()},
-		logHub:    newLogHub(),
-		diskGuard: &diskGuardState{last: map[int64]time.Time{}},
+		digest:      &digestState{buf: notify.NewDigestBuffer()},
+		logHub:      newLogHub(),
+		diskGuard:   &diskGuardState{last: map[int64]time.Time{}},
+		scanTrigger: make(chan struct{}, 1),
+		nodeAlert:   &nodeAlertState{prev: map[int64]bool{}},
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
@@ -386,29 +413,39 @@ func (s *Server) Routes() http.Handler {
 
 	// Authentication — no session required to log in.
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
-	mux.HandleFunc("POST /api/auth/logout", s.withAdmin(s.handleLogout))
-	mux.HandleFunc("GET /api/auth/me", s.withAdmin(s.handleMe))
+	mux.HandleFunc("POST /api/auth/logout", s.withAnyUser(s.handleLogout))
+	mux.HandleFunc("GET /api/auth/me", s.withAnyUser(s.handleMe))
 	mux.HandleFunc("POST /api/auth/password", s.withAdmin(s.handleChangePassword))
 
-	// UI endpoints — session auth.
-	mux.HandleFunc("GET /api/nodes", s.withAdmin(s.handleListNodes))
+	// UI endpoints — session auth. GET routes use withAnyUser so viewers
+	// can read; all mutations (POST/PUT/PATCH/DELETE) stay withAdmin.
+	// Management surfaces (/api/users, /api/tokens, /api/audit, /api/backup*)
+	// remain admin-only even for GET.
+	mux.HandleFunc("GET /api/nodes", s.withAnyUser(s.handleListNodes))
 	mux.HandleFunc("POST /api/nodes", s.withAdmin(s.handleCreateNode))
 	mux.HandleFunc("PATCH /api/nodes/{id}", s.withAdmin(s.handlePatchNode))
 	mux.HandleFunc("DELETE /api/nodes/{id}", s.withAdmin(s.handleDeleteNode))
 	mux.HandleFunc("POST /api/nodes/{id}/reboot", s.withAdmin(s.handleRebootNode))
-	mux.HandleFunc("GET /api/nodes/{id}/metrics", s.withAdmin(s.handleNodeMetrics))
+	mux.HandleFunc("GET /api/nodes/{id}/metrics", s.withAnyUser(s.handleNodeMetrics))
 
-	mux.HandleFunc("GET /api/jobs", s.withAdmin(s.handleListJobs))
+	mux.HandleFunc("GET /api/jobs", s.withAnyUser(s.handleListJobs))
 	mux.HandleFunc("POST /api/jobs", s.withAdmin(s.handleCreateJob))
 	mux.HandleFunc("POST /api/jobs/bulk", s.withAdmin(s.handleBulkJobs))
 	mux.HandleFunc("POST /api/jobs/prune", s.withAdmin(s.handlePruneJobs))
-	mux.HandleFunc("GET /api/jobs/{id}/eta", s.withAdmin(s.handleJobETA))
+	mux.HandleFunc("GET /api/jobs/{id}/eta", s.withAnyUser(s.handleJobETA))
+
+	// Scan-now trigger: admin requests an immediate scan of the scripts
+	// share out-of-cycle. Non-blocking: 202 even when already queued. On HA
+	// only the leader's scanner consumes the channel; a non-leader trigger
+	// is a no-op (the request still succeeds — the operator's intent is
+	// "scan now" and the leader will do it on its own schedule regardless).
+	mux.HandleFunc("POST /api/scan", s.withAdmin(s.handleScanNow))
 	// Prometheus scrape endpoint: unauthenticated by design (aggregate
 	// operational numbers only; scrapers authenticate at network layer).
 	mux.HandleFunc("GET /metrics", s.handlePrometheus)
-	mux.HandleFunc("GET /api/shares", s.withAdmin(s.handleListShares))
+	mux.HandleFunc("GET /api/shares", s.withAnyUser(s.handleListShares))
 	mux.HandleFunc("POST /api/shares", s.withAdmin(s.handleCreateShare))
-	mux.HandleFunc("GET /api/shares/{id}", s.withAdmin(s.handleGetShare))
+	mux.HandleFunc("GET /api/shares/{id}", s.withAnyUser(s.handleGetShare))
 	mux.HandleFunc("PUT /api/shares/{id}", s.withAdmin(s.handleUpdateShare))
 	mux.HandleFunc("DELETE /api/shares/{id}", s.withAdmin(s.handleDeleteShare))
 	mux.HandleFunc("GET /api/audit", s.withAdmin(s.handleListAudit))
@@ -420,26 +457,29 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/backup/settings", s.withAdmin(s.handleUpdateBackupSettings))
 	mux.HandleFunc("GET /api/backup/{name}", s.withAdmin(s.handleBackupDownload))
 	mux.HandleFunc("DELETE /api/backup/{name}", s.withAdmin(s.handleBackupDelete))
-	mux.HandleFunc("GET /api/jobs/{id}", s.withAdmin(s.handleGetJob))
-	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAdmin(s.handleGetJobLog))
-	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAdmin(s.handleJobLogStream))
+	mux.HandleFunc("POST /api/backup/{name}/restore", s.withAdmin(s.handleBackupRestore))
+	mux.HandleFunc("GET /api/jobs/{id}", s.withAnyUser(s.handleGetJob))
+	mux.HandleFunc("GET /api/jobs/{id}/log", s.withAnyUser(s.handleGetJobLog))
+	mux.HandleFunc("GET /api/jobs/{id}/log/stream", s.withAnyUser(s.handleJobLogStream))
 	mux.HandleFunc("POST /api/jobs/{id}/retry", s.withAdmin(s.handleRetryJob))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.withAdmin(s.handleCancelJob))
 	mux.HandleFunc("PATCH /api/jobs/{id}", s.withAdmin(s.handlePatchJob))
+	mux.HandleFunc("DELETE /api/jobs/{id}", s.withAdmin(s.handleDeleteJob))
 
-	mux.HandleFunc("GET /api/flows", s.withAdmin(s.handleListFlows))
+	mux.HandleFunc("GET /api/flows", s.withAnyUser(s.handleListFlows))
 	mux.HandleFunc("POST /api/flows", s.withAdmin(s.handleCreateFlow))
 	mux.HandleFunc("PUT /api/flows/{id}", s.withAdmin(s.handleUpdateFlow))
 	mux.HandleFunc("DELETE /api/flows/{id}", s.withAdmin(s.handleDeleteFlow))
 	mux.HandleFunc("POST /api/flows/{id}/default", s.withAdmin(s.handleSetDefaultFlow))
-	mux.HandleFunc("GET /api/flows/{id}/export", s.withAdmin(s.handleExportFlow))
+	mux.HandleFunc("POST /api/flows/{id}/duplicate", s.withAdmin(s.handleDuplicateFlow))
+	mux.HandleFunc("GET /api/flows/{id}/export", s.withAnyUser(s.handleExportFlow))
 	mux.HandleFunc("POST /api/flows/import", s.withAdmin(s.handleImportFlow))
 
-	mux.HandleFunc("GET /api/series", s.withAdmin(s.handleListSeries))
+	mux.HandleFunc("GET /api/series", s.withAnyUser(s.handleListSeries))
 	mux.HandleFunc("POST /api/series", s.withAdmin(s.handleCreateSeries))
 	mux.HandleFunc("PATCH /api/series/{id}", s.withAdmin(s.handlePatchSeries))
 
-	mux.HandleFunc("GET /api/step-templates", s.withAdmin(s.handleListStepTemplates))
+	mux.HandleFunc("GET /api/step-templates", s.withAnyUser(s.handleListStepTemplates))
 	mux.HandleFunc("POST /api/step-templates", s.withAdmin(s.handleCreateStepTemplate))
 	mux.HandleFunc("PUT /api/step-templates/{id}", s.withAdmin(s.handleUpdateStepTemplate))
 	mux.HandleFunc("DELETE /api/step-templates/{id}", s.withAdmin(s.handleDeleteStepTemplate))
@@ -454,11 +494,23 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/provision/runs", s.withAdmin(s.handleListProvisionRuns))
 	mux.HandleFunc("GET /api/provision/runs/{id}", s.withAdmin(s.handleGetProvisionRunLog))
 
-	mux.HandleFunc("GET /api/settings", s.withAdmin(s.handleGetSettings))
+	mux.HandleFunc("GET /api/settings", s.withAnyUser(s.handleGetSettings))
 	mux.HandleFunc("PUT /api/settings", s.withAdmin(s.handleUpdateSettings))
 
 	// Fleet stats — aggregate job-history snapshot (Phase E).
-	mux.HandleFunc("GET /api/stats", s.withAdmin(s.handleStats))
+	mux.HandleFunc("GET /api/stats", s.withAnyUser(s.handleStats))
+
+	// Update check: compare the running controller version to the latest
+	// GitHub release. Viewer-readable (operators check for updates without
+	// needing admin). The handler falls back to 502 on upstream errors.
+	mux.HandleFunc("GET /api/updates/check", s.withAnyUser(s.handleUpdateCheck))
+
+	// User management — admin-only (even GET /api/users is admin so viewers
+	// can't enumerate accounts).
+	mux.HandleFunc("GET /api/users", s.withAdmin(s.handleListUsers))
+	mux.HandleFunc("POST /api/users", s.withAdmin(s.handleCreateUser))
+	mux.HandleFunc("DELETE /api/users/{id}", s.withAdmin(s.handleDeleteUser))
+	mux.HandleFunc("PUT /api/users/{id}/password", s.withAdmin(s.handleResetUserPassword))
 
 	// Agent payloads: the update store serves agent binary, EncodeLib.ps1,
 	// and the bin-folder zip package to nodes (auth: node token).
@@ -601,7 +653,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	// that checks for "ok" keeps passing. The "instance" field identifies
 	// this replica (Phase 3 HA) so an operator can tell two controllers apart
 	// behind a load balancer — both serve health, each reports its own id.
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "instance": s.Cfg.InstanceID})
+	// The "version" field exposes the controller build version (ldflags) so
+	// operators can tell at a glance what's running.
+	out := map[string]string{"status": "ok", "instance": s.Cfg.InstanceID}
+	if s.Cfg.Version != "" {
+		out["version"] = s.Cfg.Version
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // storeResolver resolves step templates from the store so rendered jobs link

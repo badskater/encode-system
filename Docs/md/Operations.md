@@ -15,7 +15,7 @@
 ## Alerts and signals
 
 - Job `failed` with non-zero exit code — UI job detail shows the tail; investigate `run.log`.
-- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle). On Linux: `systemctl status encode-agent` (or `journalctl -u encode-agent -f` for the live log) — the unit has `Restart=always` so a crash loop is the usual failure mode.
+- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle). On Linux: `systemctl status encode-agent` (or `journalctl -u encode-agent -f` for the live log) — the unit has `Restart=always` so a crash loop is the usual failure mode. If `settings.notify_node_status` is on, a stale node also fires a Discord alert on the online→offline transition (30s loop, leader-gated on HA).
 - Disk-space alert (Discord, per-node cooldown) — the node soft-drained: no new jobs until free space recovers above `settings.disk_alert_gb`. Free the node's work disk or raise the threshold.
 - Scanner backlog growing while nodes idle — usually all nodes disabled in the UI, token mismatch, every series paused, a node_group with no matching nodes, or drain mode left on.
 - Prometheus scrape endpoint: `GET /metrics` on the controller port (`encode_jobs_*`, `encode_node_*`).
@@ -60,7 +60,7 @@
 | Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, bitrate, durations, sizes) reported by the flow script. |
 | Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
 | Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs`. |
-| Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore = stop container, replace `encode.db` in the data volume, start. On Postgres the snapshot is a logical JSON-lines `.dump` (not a `.db`); restore is via `pgimport -force` into a fresh PG, or `pg_restore`-equivalent from the JSON. See "Postgres backup & rollback" below. |
+| Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore: click **Restore** on a snapshot (admin-only, `POST /api/backup/{name}/restore`) — on SQLite the controller swaps the backup over the live DB and exits for a restart (see restore runbook below); on Postgres the restore is an in-place single transaction (no restart). |
 | Automate against the API | Settings → API tokens: create a scoped token (`read` or `admin`, shown once) and send it as `Authorization: Bearer <token>`. Delete tokens when done; usage is audited as `api-token:<name>`. |
 | Review who changed what | UI → **Audit** page (`GET /api/audit`): every mutating admin action with actor, action, object, detail. |
 | Pause assignment fleet-wide (drain) | UI → Settings → **Drain mode** toggle. Running jobs finish, nothing new dispatches; toggle off to resume. Use before pushing a bin package or host maintenance. |
@@ -69,8 +69,132 @@
 | Silence a noisy series' alerts | UI → Series → 🔔/🔕 per row (mute applies to direct alerts and the digest). |
 | Batch job alerts into one hourly summary | UI → Settings → Discord notifications → **Hourly digest**. Per-job posts stop; one summary posts per hour with done/failed counts and per-job lines. |
 | Follow a Discord alert straight to the job | Alert links open `<controller_url>/jobs?job=<id>` — the Jobs page auto-opens that job's log viewer. |
+| Trigger a scan immediately | UI → Dashboard → **Scan now** (admin, `POST /api/scan` → `202 {"triggered":true}`), or `encodectl scan`. Non-blocking — a second request while one is queued coalesces. On HA only the leader's scanner consumes the trigger. |
+| Delete a finished job | UI → Jobs → **Delete** on a terminal job (done/failed/cancelled), or `encodectl job-delete <id>`. Non-terminal jobs (pending/assigned/running) are refused with 409; missing job → 404. |
+| Bulk set priority or flow on pending jobs | UI → Jobs → select rows → **Set priority** / **Set flow** (`POST /api/jobs/bulk` action `set_priority`/`set_flow`; max 500; wrong-state ids → `skipped`). |
+| Duplicate a flow | UI → Flows → **Duplicate** on a flow (admin, `POST /api/flows/{id}/duplicate`). Default name `<original> (copy)`; the copy is never the default flow. |
+| Manage user accounts | UI → **Users** card (admin-only): list, create (role admin/viewer), delete (409 on self-delete / last-admin), reset password. Viewers see no mutation controls. |
+| Check for a new release | UI → Dashboard / Settings → **Update check** card (`GET /api/updates/check`, any user): compares the running version to the latest GitHub release. Needs `ENCODE_GITHUB_TOKEN` for private repos. |
+| Alert on node online/offline | UI → Settings → **Node status alerts** toggle (`settings.notify_node_status`, default off). Fires Discord alerts on real online↔offline transitions (30s loop, leader-gated on HA). Requires `discord_webhook` to be set. |
 | Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
+
+## Restore runbook (in-place DB restore)
+
+`POST /api/backup/{name}/restore` (admin-only; UI: Settings → DB backups →
+**Restore**) swaps a snapshot back into the live database. The endpoint is
+backend-aware — the guards and the restore mechanism differ between SQLite
+and Postgres.
+
+### Guards (both backends)
+
+- **Name traversal-safe**: the backup name must be a plain filename — no path
+  separators (`/` or `\`), no `..`. A bad name returns 400.
+- **Extension matches the active backend**: `.db` for SQLite, `.dump` for
+  Postgres. A mismatch returns **409** (`backup extension does not match
+  active database backend`) so you can't restore a SQLite snapshot into PG or
+  vice versa.
+- **No active jobs**: any pending or running job returns **409** (`cancel or
+  drain active jobs first`) — a restore mid-flight would lose in-flight work.
+  Drain or cancel active jobs first (Settings → Drain mode, or Jobs → cancel).
+- The **audit row is written before the swap** (`backup.restore`) so it
+  survives even when the process exits immediately after (SQLite path).
+
+### SQLite restore
+
+1. The controller snapshots the current DB to
+   `encode.db.pre-restore-<unix-ts>` in the data dir (beside `encode.db`).
+   This is your rollback hatch if the restore is wrong.
+2. It copies the backup to a temp file, then atomically renames it over the
+   live `encode.db` (same filesystem — `os.Rename` is atomic).
+3. It responds `200 {"restored":true,"restart":true,"snapshot":"encode.db.pre-restore-<ts>"}`.
+4. The controller **exits the process** (after a 200ms flush so the response
+   hits the wire). The container's restart policy (`restart: unless-stopped`
+   in compose, `Restart=always` for systemd) reboots the controller on the
+   restored DB.
+
+**Restart-policy dependency:** the SQLite restore relies on the container
+orchestrator restarting the process. If the restart policy is `no` or
+`on-failure` (not `unless-stopped`/`always`), the controller stays down after
+the exit — restart it manually (`docker compose up -d` / `systemctl start
+encode-controller`). The response includes `"restart":true` so a caller can
+detect this path.
+
+The **shares-key file** (`encode.db.shares-key`) is never touched — encrypted
+share credentials remain decryptable after the restore.
+
+### Postgres restore
+
+1. The controller reads the JSON-lines dump file (header record +
+   `{"_table":"…"}` markers + `{"_table":"…","_row":{…}}` row records).
+2. In a **single transaction**: TRUNCATEs every table (reverse FK order,
+   `RESTART IDENTITY`), INSERTs each row with parameterized columns (rebound
+   via `q()` to `$N` placeholders), and advances each serial sequence via
+   `setval`/`pg_get_serial_sequence` (skipping non-serial tables like
+   `settings`).
+3. Commits. Responds `200 {"restored":true,"restart":false}` — **no restart
+   needed**. The controller continues serving on the restored data.
+
+If the transaction fails (e.g. a schema mismatch between the dump and the
+live DB), it rolls back and the handler returns 500 with the error — the live
+DB is untouched.
+
+### After any restore
+
+- Verify with `GET /api/health` (returns `version` + `instance`) and
+  `GET /api/nodes` / `GET /api/jobs` that the restored state looks right.
+- The pre-restore SQLite snapshot (`encode.db.pre-restore-<ts>`) can be
+  deleted once you've confirmed the restore is correct.
+
+## encodectl quickstart
+
+`encodectl` is a stdlib-only operator CLI shipped as
+`encodectl-linux-amd64` in the release assets and the deploy tarball. It
+wraps the controller REST API for shell/CI scripting. Server/token come from
+`-server`/`-token` flags or the `ENCODECTL_SERVER` / `ENCODECTL_TOKEN`
+environment variables (flags win). Use a scoped API token (Settings → API
+tokens → create `admin`-scope) as the token.
+
+```bash
+# Connection (use env vars for repeated calls):
+export ENCODECTL_SERVER=https://ctrl.example:8443
+export ENCODECTL_TOKEN=<api-token>      # admin-scope token from Settings
+
+# Health + version:
+encodectl health
+
+# Trigger a scan:
+encodectl scan
+
+# List nodes / jobs / series / stats:
+encodectl nodes
+encodectl jobs -status failed -limit 20
+encodectl series
+encodectl stats
+
+# Job lifecycle:
+encodectl job-retry 42
+encodectl job-cancel 17
+encodectl job-delete 99          # terminal jobs only
+
+# Prune old jobs:
+encodectl prune -days 30
+
+# Agent publish / rollback:
+encodectl publish-agent -platform linux -version 1.4.0 -file ./encode-agent-linux-amd64
+encodectl rollback-agent -platform linux
+
+# Raw JSON output for piping:
+encodectl -json jobs -status running | jq .
+
+# Version:
+encodectl version
+```
+
+Exit codes: **0** success, **1** API/transport error (the server's error
+message is printed to stderr), **2** usage error (missing flags, unknown
+command). `-json` dumps the raw response body verbatim instead of the
+tabular view.
 
 ## Postgres backup & rollback
 
@@ -180,3 +304,48 @@ and the replicas reconnect + re-acquire their advisory locks on restart.
 - **Node offline after an agent self-update**: the swap sidecar relaunches the task, but if it didn't fire, `Start-ScheduledTask -TaskName EncodeAgentDist` over WinRM; the agent stages the pending `.exe.new`, exits once more, and comes back on the new version (~1 min). Also check for a **stale pre-swap process**: two `encode-agent.exe` PIDs double-heartbeat — kill the one with the earlier StartTime. On Linux the `swap-update.sh` sidecar retries the `mv` (15 attempts, logged to `swap-update.log` in the data dir) then either exits to let systemd's `Restart=always` relaunch (detected via `INVOCATION_ID` + `systemctl is-active encode-agent`) or relaunches the new binary directly via `setsid`; check `swap-update.log` and `journalctl -u encode-agent` if the node never returns.
 - **Two jobs on one node beyond its slots**: impossible by store constraint (active jobs ≤ `max_concurrent_jobs`), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.
 - **SQLite "out of memory (14)" on a fresh volume**: the data dir is owned by the wrong user — `/data` must be chowned to the runtime user (fixed in the v1.17.4 image; reappears after base-image changes).
+
+## Monitoring with Grafana
+
+A pre-built Grafana dashboard ships under `docker/grafana/` and visualizes the
+controller's `/metrics` (Prometheus text exposition) endpoint — the same
+aggregate fleet state the Stats page and unauthenticated health endpoint
+surface. See `docker/grafana/README.md` for import instructions and a minimal
+`prometheus.yml` scrape snippet (target placeholder `CONTROLLER_HOST:8080`;
+the current farm host is `172.24.92.232:8080`).
+
+### What the dashboard covers
+
+- **Node Online State** — per-node `encode_node_online` (1=online, 0=stale) as
+  color-coded stat tiles.
+- **Queue Depth (by state)** — `encode_jobs_pending` / `assigned` / `running`
+  as current-value stat tiles; the **Queue Depth Over Time** time series
+  tracks backlog growth and dispatch stalls.
+- **Job Status Totals** — terminal counters `encode_jobs_done_total` /
+  `failed_total` / `cancelled_total` as stat tiles; the **Throughput
+  Counters** time series shows the completion/failure rate slope.
+- **Per-Node Slot Utilization** — `encode_node_active_jobs` vs
+  `encode_node_max_concurrent_jobs` overlaid so saturation is visible.
+- **Node Fleet Status** — a table joining online / enabled / active / max
+  per node (enabled=0 = paused).
+- **Per-Node Slot Saturation** — a gauge of `active_jobs /
+  max_concurrent_jobs` per node.
+
+The dashboard JSON lives at `docker/grafana/encode-system-dashboard.json`
+(uid `encode-system`, `schemaVersion` 39, 30s refresh, templated
+`${DS_PROMETHEUS}` datasource). It uses only `stat`, `timeseries`, `table`,
+and `gauge` panels — all built **only** from the 10 metrics the controller
+actually emits (verified against `backend/internal/api/prometheus.go`; no
+synthetic series).
+
+### Security note
+
+The `/metrics` endpoint is **unauthenticated** by design: the route
+`GET /metrics` is registered in `backend/internal/api/server.go` **without**
+the `withAdmin` wrapper (the comment on the preceding line states scrapers
+authenticate at the network layer). The endpoint exposes only aggregate
+operational numbers — queue depth, node liveness, terminal counters — the
+same data the unauthenticated health endpoint and the Stats page already
+surface to any admin. Restrict network access to the controller port
+(firewall, VPN, or management network) so only trusted Prometheus scrapers
+can reach it.

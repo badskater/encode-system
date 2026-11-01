@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { Flow, Series } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import CreateSeriesDialog from '../components/CreateSeriesDialog';
+import { useIsAdmin } from '../hooks/useRole';
 
 // SeriesPage manages per-series flow selection, tag overrides and enable
 // state. Episodes of an enabled series are queued automatically by the
@@ -13,6 +14,7 @@ export default function SeriesPage() {
   const { data: settings } = usePolling<{ tag: string }>(() => api.settings(), 60000);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const isAdmin = useIsAdmin();
 
   async function selectFlow(sr: Series, flowId: number) {
     try {
@@ -107,9 +109,11 @@ export default function SeriesPage() {
       </p>
 
       <div className="toolbar">
-        <button className="btn primary" onClick={() => setShowCreate(true)}>
-          Create series
-        </button>
+        {isAdmin && (
+          <button className="btn primary" onClick={() => setShowCreate(true)}>
+            Create series
+          </button>
+        )}
       </div>
 
       <table>
@@ -134,23 +138,27 @@ export default function SeriesPage() {
                 {sr.name}
               </td>
               <td>
-                <select
-                  value={sr.flow_id}
-                  onChange={(e) => selectFlow(sr, Number(e.target.value))}
-                >
-                  <option value={0}>
-                    Default flow
-                    {flows?.find((f) => f.is_default)
-                      ? ` (${flows.find((f) => f.is_default)!.name})`
-                      : ''}
-                  </option>
-                  {(flows ?? []).map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.name}
-                      {f.is_default ? ' (default)' : ''}
+                {isAdmin ? (
+                  <select
+                    value={sr.flow_id}
+                    onChange={(e) => selectFlow(sr, Number(e.target.value))}
+                  >
+                    <option value={0}>
+                      Default flow
+                      {flows?.find((f) => f.is_default)
+                        ? ` (${flows.find((f) => f.is_default)!.name})`
+                        : ''}
                     </option>
-                  ))}
-                </select>
+                    {(flows ?? []).map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                        {f.is_default ? ' (default)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="muted">{sr.flow_id ? flowName(sr.flow_id) : 'default'}</span>
+                )}
                 {sr.flow_id > 0 && (
                   <span className="muted"> → {flowName(sr.flow_id)}</span>
                 )}
@@ -181,29 +189,41 @@ export default function SeriesPage() {
               </td>
               <td>{sr.jobs ?? 0}</td>
               <td>
-                <input type="checkbox" checked={sr.enabled} onChange={() => toggle(sr)} />
+                {isAdmin ? (
+                  <input type="checkbox" checked={sr.enabled} onChange={() => toggle(sr)} />
+                ) : (
+                  <input type="checkbox" checked={sr.enabled} disabled />
+                )}
               </td>
               <td>
-                <button
-                  className="btn"
-                  style={{ padding: '2px 10px', fontSize: 12 }}
-                  title={sr.paused ? 'Resume scanning and dispatch' : 'Pause scanning and hold queued jobs'}
-                  aria-label={sr.paused ? 'Resume' : 'Pause'}
-                  onClick={() => togglePause(sr)}
-                >
-                  {sr.paused ? 'Resume' : 'Pause'}
-                </button>
+                {isAdmin ? (
+                  <button
+                    className="btn"
+                    style={{ padding: '2px 10px', fontSize: 12 }}
+                    title={sr.paused ? 'Resume scanning and dispatch' : 'Pause scanning and hold queued jobs'}
+                    aria-label={sr.paused ? 'Resume' : 'Pause'}
+                    onClick={() => togglePause(sr)}
+                  >
+                    {sr.paused ? 'Resume' : 'Pause'}
+                  </button>
+                ) : (
+                  <span className="muted">{sr.paused ? 'paused' : 'running'}</span>
+                )}
               </td>
               <td>
-                <button
-                  className="btn"
-                  style={{ padding: '2px 10px', fontSize: 12 }}
-                  title={sr.notify === false ? 'Unmute Discord alerts' : 'Mute Discord alerts'}
-                  aria-label={sr.notify === false ? 'Unmute' : 'Mute'}
-                  onClick={() => toggleNotify(sr)}
-                >
-                  {sr.notify === false ? 'Muted' : 'Alerts'}
-                </button>
+                {isAdmin ? (
+                  <button
+                    className="btn"
+                    style={{ padding: '2px 10px', fontSize: 12 }}
+                    title={sr.notify === false ? 'Unmute Discord alerts' : 'Mute Discord alerts'}
+                    aria-label={sr.notify === false ? 'Unmute' : 'Mute'}
+                    onClick={() => toggleNotify(sr)}
+                  >
+                    {sr.notify === false ? 'Muted' : 'Alerts'}
+                  </button>
+                ) : (
+                  <span className="muted">{sr.notify === false ? 'muted' : 'alerts'}</span>
+                )}
               </td>
               <td>
                 <WebhookCell

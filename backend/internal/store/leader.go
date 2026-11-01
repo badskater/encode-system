@@ -30,6 +30,10 @@ const (
 	LockKeyDiskAlert int64 = 1004
 	// LockKeyBackup guards the scheduled DB-snapshot loop.
 	LockKeyBackup int64 = 1005
+	// LockKeyNodeAlert guards the node online/offline alert loop. Each tick
+	// diffs node liveness against an in-memory baseline and sends Discord
+	// alerts on transitions (online→offline, offline→online).
+	LockKeyNodeAlert int64 = 1006
 )
 
 // advisoryLockKeepalive is how often the held-lock keepalive probes the

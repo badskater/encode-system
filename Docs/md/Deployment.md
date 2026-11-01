@@ -114,6 +114,9 @@ First-boot env:
 | `ENCODE_GROUP` / `ENCODE_TAG` / `ENCODE_DEFAULT_FLOW` | Seed release naming + the default flow name (live Settings afterwards). |
 | `ENCODE_DISCORD_WEBHOOK` | Seeds the live Settings webhook (saved blank turns notifications off). |
 | `ENCODE_NODE_SCRIPTS/RELEASE/BIN` | Seed the node path mapping used by the job renderer when there are no shares yet. |
+| `ENCODE_GITHUB_TOKEN` | PAT for authenticated GitHub API calls (update check). Needed for private repos; empty = unauthenticated (lower rate limit). |
+| `ENCODE_GITHUB_REPO` | GitHub `owner/repo` to check for latest releases (default `badskater/encode-system`). |
+| `ENCODE_GITHUB_API` | GitHub API base URL (default `https://api.github.com`; override for tests or GitHub Enterprise `https://ghe.example/api/v3`). |
 
 Compose/installer-only vars: `ENCODE_PORT` (host port), `ENCODE_VERSION`
 (GHCR image tag, set by install.sh), `ENCODE_CONTAINER_NAME` (container name
@@ -398,13 +401,16 @@ Two workflows in `.github/workflows/`:
 - **Release** (`release.yml`) — on a version tag (`git tag v1.4.0 && git push
   origin v1.4.0`): builds controller + `encode-agent.exe` (windows/amd64) +
   `encode-agent-linux-amd64` (`GOOS=linux GOARCH=amd64`, `-trimpath`,
-  version ldflags), the built SPA, packs the complete offline bundle
+  version ldflags) + `pgimport` + `encodectl-linux-amd64` (the operator CLI,
+  same ldflags) + the built SPA, packs the complete offline bundle
   `encode-system-<ver>-deploy.tar.gz` (binaries, ui/, `provision/`
   (provision.yml + linux-node.yml + roles/linux-node), `systemd/`
   (encode-agent.service), Dockerfile.runtime, compose, .env.example,
   installers, SHA256SUMS), pushes `ghcr.io/badskater/encode-system:<ver>`
   + `:latest`, and attaches everything plus loose `install.sh` /
-  `install-agent.ps1` / `install-agent.sh` to the GitHub release.
+  `install-agent.ps1` / `install-agent.sh` to the GitHub release. The
+  `encodectl-linux-amd64` binary is in the tarball, in `SHA256SUMS`, and as a
+  standalone release asset.
 
 Release-workflow operational notes:
 
@@ -442,7 +448,7 @@ only detonates as ERESOLVE inside the CI/Docker image build
 
 ## Rollback
 
-- Controller: pin image tag in compose; `docker compose pull && up -d` forward, restore previous tag to roll back. SQLite DB is a single file — snapshot before upgrades (manual copy, or use the built-in scheduled DB backups: Settings → DB backups → download).
+- Controller: pin image tag in compose; `docker compose pull && up -d` forward, restore previous tag to roll back. SQLite DB is a single file — snapshot before upgrades (manual copy, or use the built-in scheduled DB backups: Settings → DB backups → download). **In-place restore** (`POST /api/backup/{name}/restore`, admin-only, Settings → DB backups → Restore): on SQLite the controller snapshots the current DB to `encode.db.pre-restore-<ts>`, atomically swaps the backup over the live DB, then **exits the process** — the container's restart policy (`restart: unless-stopped` / `Restart=always`) must be in effect so the controller reboots on the restored DB. On Postgres the restore replays the JSON-lines dump in a single transaction (no restart). See `Operations.md` → restore runbook for guards and the pre-restore snapshot location.
 - Agents: `POST /api/updates/agent/rollback` (UI: Settings → Push to nodes → Rollback) re-promotes the one kept `.prev` agent; nodes self-downgrade through the normal version-diff sync on their next heartbeat.
 - Ansible plays are idempotent; revert folder/service changes by re-running with the previous playbook revision.
 

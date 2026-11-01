@@ -1257,6 +1257,44 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
+// handleDeleteJob removes a TERMINAL job (done/failed/cancelled) from the
+// jobs table. Non-terminal jobs (pending/assigned/running) are refused with
+// 409 — an in-flight encode must never be orphaned by a delete. A missing
+// job is a 404. The store's DeleteJob guards on status IN ('done','failed',
+// 'cancelled') atomically, so the pre-check and the delete cannot race.
+//
+// Audit: job.delete.
+func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad job id")
+		return
+	}
+	job, err := s.Store.GetJob(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if !job.Status.Terminal() {
+		writeErr(w, http.StatusConflict, "only terminal jobs can be deleted")
+		return
+	}
+	deleted, err := s.Store.DeleteJob(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete job")
+		return
+	}
+	if !deleted {
+		// The job existed and was terminal, but the guarded DELETE matched
+		// zero rows — it left the terminal state between the pre-check and
+		// the delete (concurrent retry/cancel). Answer 409 honestly.
+		writeErr(w, http.StatusConflict, "job is no longer terminal")
+		return
+	}
+	s.audit(r, "job.delete", auditObject("job", id), map[string]any{"episode_dir": job.EpisodeDir})
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
 // handleListFlows returns all flows.
 func (s *Server) handleListFlows(w http.ResponseWriter, r *http.Request) {
 	flows, err := s.Store.ListFlows(r.Context())

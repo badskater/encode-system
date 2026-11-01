@@ -448,6 +448,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/flows/{id}", s.withAdmin(s.handleUpdateFlow))
 	mux.HandleFunc("DELETE /api/flows/{id}", s.withAdmin(s.handleDeleteFlow))
 	mux.HandleFunc("POST /api/flows/{id}/default", s.withAdmin(s.handleSetDefaultFlow))
+	mux.HandleFunc("POST /api/flows/{id}/duplicate", s.withAdmin(s.handleDuplicateFlow))
 	mux.HandleFunc("GET /api/flows/{id}/export", s.withAdmin(s.handleExportFlow))
 	mux.HandleFunc("POST /api/flows/import", s.withAdmin(s.handleImportFlow))
 

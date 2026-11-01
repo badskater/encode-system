@@ -88,6 +88,17 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false
           -o ../dist/pgimport ./cmd/pgimport
 
+      # encodectl: operator CLI for common controller ops (health, scan,
+      # nodes, jobs, prune, series, stats, agent publish/rollback). Shipped
+      # beside the controller for fleet operators and in the deploy tarball
+      # for the controller host. Same flags as the other linux binaries.
+      - name: Build encodectl (linux/amd64)
+        working-directory: backend
+        run: >
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false
+          -ldflags "-X main.Version=${{ steps.ver.outputs.version }}"
+          -o ../dist/encodectl-linux-amd64 ./cmd/encodectl
+
       # Frontend SPA.
       - name: Build UI
         working-directory: frontend
@@ -123,12 +134,12 @@ jobs:
           cp docker/install-agent.sh dist/
           cp powershell/EncodeLib.ps1 dist/
           # Checksums cover the binaries (install.sh verifies these).
-          (cd dist && sha256sum controller encode-agent.exe encode-agent-linux-amd64 pgimport > SHA256SUMS)
+          (cd dist && sha256sum controller encode-agent.exe encode-agent-linux-amd64 pgimport encodectl-linux-amd64 > SHA256SUMS)
 
       - name: Pack bundle tarball
         run: |
           tar -czf "dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz" -C dist \
-            controller encode-agent.exe encode-agent-linux-amd64 pgimport ui provision systemd \
+            controller encode-agent.exe encode-agent-linux-amd64 pgimport encodectl-linux-amd64 ui provision systemd \
             Dockerfile.runtime docker-compose.runtime.yml .env.example \
             install.sh install-agent.ps1 install-agent.sh EncodeLib.ps1 SHA256SUMS
 
@@ -195,6 +206,7 @@ jobs:
             dist/encode-agent.exe \
             dist/encode-agent-linux-amd64 \
             dist/pgimport \
+            dist/encodectl-linux-amd64 \
             dist/install.sh \
             dist/install-agent.ps1 \
             dist/install-agent.sh \
@@ -212,6 +224,7 @@ jobs:
             dist/encode-agent.exe
             dist/encode-agent-linux-amd64
             dist/pgimport
+            dist/encodectl-linux-amd64
             dist/encode-system-${{ steps.ver.outputs.version }}-deploy.tar.gz
 
       - name: Upload UI bundle artifact

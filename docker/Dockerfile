@@ -18,7 +18,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM alpine:3.20
+FROM alpine:3.24
 # Provisioning capability: the GHCR image is the production controller for
 # installs that can reach ghcr.io (install.sh pulls it first, falling back to
 # building Dockerfile.runtime). The provision engine runs ansible-playbook

@@ -442,6 +442,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs/{id}/retry", s.withAdmin(s.handleRetryJob))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.withAdmin(s.handleCancelJob))
 	mux.HandleFunc("PATCH /api/jobs/{id}", s.withAdmin(s.handlePatchJob))
+	mux.HandleFunc("DELETE /api/jobs/{id}", s.withAdmin(s.handleDeleteJob))
 
 	mux.HandleFunc("GET /api/flows", s.withAdmin(s.handleListFlows))
 	mux.HandleFunc("POST /api/flows", s.withAdmin(s.handleCreateFlow))

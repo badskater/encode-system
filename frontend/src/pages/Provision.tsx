@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { ProvisionRun, Settings } from '../types';
 import { timeAgo } from '../components/helpers';
+import { useIsAdmin } from '../hooks/useRole';
 
 // ProvisionPage drives controller-side Ansible provisioning of fresh Windows
 // nodes. The WinRM password is sent once per run and never persisted (server
@@ -37,6 +38,7 @@ export default function ProvisionPage() {
   const [mountNFS, setMountNFS] = useState(true);
   const [pushBin, setPushBin] = useState(true);
   const [starting, setStarting] = useState(false);
+  const isAdmin = useIsAdmin();
 
   // Log viewer.
   const [openRunId, setOpenRunId] = useState<number | null>(null);
@@ -171,6 +173,9 @@ export default function ProvisionPage() {
           agent as a Windows service with a one-shot pairing code. The password
           is used for this run only and never stored.
         </p>
+        {!isAdmin && (
+          <div className="error-box">Viewer role — provisioning is admin-only. The run history below is read-only.</div>
+        )}
         {!settings?.controller_url && (
           <div className="error-box">
             No controller URL configured — open Settings and set it before provisioning.
@@ -229,7 +234,7 @@ export default function ProvisionPage() {
           <label><input type="checkbox" checked={pushBin} onChange={(e) => setPushBin(e.target.checked)} /> Push tools folder (bin package)</label>
           <label><input type="checkbox" checked={winrmHttps} onChange={(e) => setWinrmHttps(e.target.checked)} /> Enable WinRM HTTPS listener (self-signed)</label>
         </div>
-        <button className="btn primary" disabled={starting} onClick={start}>
+        <button className="btn primary" disabled={starting || !isAdmin} onClick={start}>
           {starting ? 'Starting…' : 'Provision node'}
         </button>
       </div>

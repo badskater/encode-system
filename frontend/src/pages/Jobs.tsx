@@ -4,6 +4,7 @@ import type { Flow, Job, JobStatus, Node } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import { jobBadge, fmtTime, parseTime } from '../components/helpers';
 import JobLogDialog from '../components/JobLogDialog';
+import { useIsAdmin } from '../hooks/useRole';
 import StepTimingsView from '../components/StepTimingsView';
 
 const FILTERS: (JobStatus | '')[] = ['', 'pending', 'assigned', 'running', 'done', 'failed'];
@@ -26,6 +27,7 @@ export default function JobsPage() {
   // longer see — dangerous for destructive ops).
   const [checked, setChecked] = useState<Set<number>>(new Set());
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
+  const isAdmin = useIsAdmin();
 
   const { data: jobs } = usePolling<Job[]>(
     () => api.jobs(filter || undefined),
@@ -166,12 +168,16 @@ export default function JobsPage() {
         {checked.size > 0 && (
           <>
             <span className="muted">{checked.size} selected</span>
-            <button className="btn" onClick={() => bulk('retry')}>
-              Retry selected
-            </button>
-            <button className="btn danger" onClick={() => bulk('cancel')}>
-              Cancel selected
-            </button>
+            {isAdmin && (
+              <>
+                <button className="btn" onClick={() => bulk('retry')}>
+                  Retry selected
+                </button>
+                <button className="btn danger" onClick={() => bulk('cancel')}>
+                  Cancel selected
+                </button>
+              </>
+            )}
           </>
         )}
       </div>
@@ -224,7 +230,7 @@ export default function JobsPage() {
               <td className="muted">{j.script_type}</td>
               <td>{jobBadge(j.status)}</td>
               <td>
-                {j.status === 'pending' && (flows ?? []).length > 0 ? (
+                {isAdmin && j.status === 'pending' && (flows ?? []).length > 0 ? (
                   <select
                     value={j.flow_id}
                     onChange={(e) => changeFlow(j.id, Number(e.target.value))}
@@ -242,7 +248,7 @@ export default function JobsPage() {
                 )}
               </td>
               <td>
-                {j.status === 'pending' ? (
+                {isAdmin && j.status === 'pending' ? (
                   <select
                     value={j.priority ?? 0}
                     onChange={(e) => changePriority(j.id, Number(e.target.value))}
@@ -272,12 +278,12 @@ export default function JobsPage() {
                 )}
               </td>
               <td>
-                {j.status === 'pending' && (
+                {isAdmin && j.status === 'pending' && (
                   <button className="btn" onClick={() => cancel(j.id)}>
                     Cancel
                   </button>
                 )}
-                {['failed', 'cancelled'].includes(j.status) && (
+                {isAdmin && ['failed', 'cancelled'].includes(j.status) && (
                   <button className="btn" onClick={() => retry(j.id)}>
                     Retry
                   </button>

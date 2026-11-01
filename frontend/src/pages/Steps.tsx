@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../api/client';
 import type { ParamType, StepTemplate } from '../types';
 import { usePolling } from '../hooks/usePolling';
+import { useIsAdmin } from '../hooks/useRole';
 
 // StepsPage manages step templates: each pipeline section owns its PowerShell
 // here. Built-ins are editable (their script is admin-owned) but not
@@ -9,6 +10,7 @@ import { usePolling } from '../hooks/usePolling';
 export default function StepsPage() {
   const { data: templates, error, refresh } = usePolling<StepTemplate[]>(() => api.stepTemplates(), 30000);
   const [editing, setEditing] = useState<StepTemplate | null>(null);
+  const isAdmin = useIsAdmin();
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -93,9 +95,11 @@ export default function StepsPage() {
       </p>
 
       <div className="toolbar">
-        <button className="btn primary" onClick={() => setCreating(true)}>
-          New step template
-        </button>
+        {isAdmin && (
+          <button className="btn primary" onClick={() => setCreating(true)}>
+            New step template
+          </button>
+        )}
       </div>
 
       <table>

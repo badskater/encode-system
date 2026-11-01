@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { Flow, FlowExport, Step } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import FlowBuilder, { type RetryPolicy } from '../components/FlowBuilder';
+import { useIsAdmin } from '../hooks/useRole';
 
 // FlowsPage lists saved flow sequences, marks the default flow, and hosts the
 // visual builder plus JSON import/export. Multiple flows can coexist; the
@@ -13,6 +14,7 @@ export default function FlowsPage() {
   const [editing, setEditing] = useState<Flow | null>(null);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const isAdmin = useIsAdmin();
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function save(name: string, steps: Step[], policy: RetryPolicy) {
@@ -48,6 +50,22 @@ export default function FlowsPage() {
   async function makeDefault(f: Flow) {
     try {
       await api.setDefaultFlow(f.id);
+      setActionError(null);
+    } catch (e) {
+      setActionError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  // duplicateFlow copies a flow under a new name. The name is prompted
+  // inline (prefilled "<name> (copy)" — the backend's default). The copy
+  // is never the default flow. Uses the browser prompt() — same terse UX
+  // as the Nodes page's confirm() for delete.
+  async function duplicateFlow(f: Flow) {
+    const defaultName = `${f.name} (copy)`;
+    const name = prompt('Duplicate flow — new name:', defaultName);
+    if (name === null) return; // cancelled
+    try {
+      await api.duplicateFlow(f.id, name.trim() || undefined);
       setActionError(null);
     } catch (e) {
       setActionError(String(e instanceof Error ? e.message : e));
@@ -111,12 +129,16 @@ export default function FlowsPage() {
       </p>
 
       <div className="toolbar">
-        <button className="btn primary" onClick={() => setCreating(true)}>
-          New flow
-        </button>
-        <button className="btn" onClick={() => fileRef.current?.click()}>
-          Import JSON
-        </button>
+        {isAdmin && (
+          <>
+            <button className="btn primary" onClick={() => setCreating(true)}>
+              New flow
+            </button>
+            <button className="btn" onClick={() => fileRef.current?.click()}>
+              Import JSON
+            </button>
+          </>
+        )}
         <input
           ref={fileRef}
           type="file"
@@ -162,22 +184,29 @@ export default function FlowsPage() {
               <td>
                 {f.is_default ? (
                   <span className="badge blue">default</span>
-                ) : (
+                ) : isAdmin ? (
                   <button className="btn" onClick={() => makeDefault(f)}>
                     Make default
                   </button>
+                ) : (
+                  <span className="muted">—</span>
                 )}
               </td>
               <td>
-                <button className="btn" onClick={() => setEditing(f)}>
-                  Edit
-                </button>{' '}
+                {isAdmin && <button className="btn" onClick={() => setEditing(f)}>Edit</button>}{' '}
                 <button className="btn" onClick={() => exportFlow(f)}>
                   Export
                 </button>{' '}
-                <button className="btn danger" onClick={() => remove(f)}>
-                  Delete
-                </button>
+                {isAdmin && (
+                  <>
+                    <button className="btn" onClick={() => duplicateFlow(f)}>
+                      Duplicate
+                    </button>{' '}
+                    <button className="btn danger" onClick={() => remove(f)}>
+                      Delete
+                    </button>
+                  </>
+                )}
               </td>
             </tr>
           ))}

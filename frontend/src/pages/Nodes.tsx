@@ -6,6 +6,7 @@ import { nodeBadge, timeAgo } from '../components/helpers';
 import NodeMetricChips from '../components/NodeMetricChips';
 import NodeMetricsPanel from '../components/NodeMetricsPanel';
 import AgentLogDialog from '../components/AgentLogDialog';
+import { useIsAdmin } from '../hooks/useRole';
 
 // NodesPage manages the fleet: register nodes (showing the one-time token),
 // enable/disable for work, and force reboots.
@@ -27,6 +28,7 @@ export default function NodesPage() {
   // none). The dialog renders the nodes.agent_log tail carried by the
   // poll — no extra fetch.
   const [logNode, setLogNode] = useState<Node | null>(null);
+  const isAdmin = useIsAdmin();
 
   async function register() {
     const name = newName.trim();
@@ -110,6 +112,7 @@ export default function NodesPage() {
       {error && <div className="error-box">{error}</div>}
       {actionError && <div className="error-box">{actionError}</div>}
 
+      {isAdmin && (
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Register node</h3>
         <div className="toolbar">
@@ -134,7 +137,9 @@ export default function NodesPage() {
           </div>
         )}
       </div>
+      )}
 
+      {isAdmin && (
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Or: one-shot pairing code</h3>
         <p className="muted">
@@ -183,6 +188,7 @@ export default function NodesPage() {
           </table>
         )}
       </div>
+      )}
 
       <table>
         <thead>
@@ -217,20 +223,28 @@ export default function NodesPage() {
                   <span className="muted" style={{ marginRight: 6 }}>
                     {n.active_jobs ?? 0}/{n.max_concurrent_jobs ?? 1}
                   </span>
-                  <select
-                    value={n.max_concurrent_jobs ?? 1}
-                    aria-label="Max concurrent jobs"
-                    onChange={(e) => changeConcurrency(n, Number(e.target.value))}
-                  >
-                    {[1, 2, 3, 4, 5, 6, 7, 8].map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
+                  {isAdmin ? (
+                    <select
+                      value={n.max_concurrent_jobs ?? 1}
+                      aria-label="Max concurrent jobs"
+                      onChange={(e) => changeConcurrency(n, Number(e.target.value))}
+                    >
+                      {[1, 2, 3, 4, 5, 6, 7, 8].map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="muted">{n.max_concurrent_jobs ?? 1}</span>
+                  )}
                 </td>
                 <td>
-                  <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
+                  {isAdmin ? (
+                    <input type="checkbox" checked={n.enabled} onChange={() => toggle(n)} />
+                  ) : (
+                    <input type="checkbox" checked={n.enabled} disabled />
+                  )}
                 </td>
                 <td>
                   <GroupCell
@@ -265,12 +279,8 @@ export default function NodesPage() {
                   >
                     Log
                   </button>{' '}
-                  <button className="btn" onClick={() => reboot(n)}>
-                    Reboot
-                  </button>{' '}
-                  <button className="btn danger" onClick={() => remove(n)}>
-                    Delete
-                  </button>
+                  {isAdmin && <button className="btn" onClick={() => reboot(n)}>Reboot</button>}{' '}
+                  {isAdmin && <button className="btn danger" onClick={() => remove(n)}>Delete</button>}
                 </td>
               </tr>
               {metricsNode?.id === n.id && (

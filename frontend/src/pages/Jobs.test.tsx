@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import JobsPage from './Jobs';
 import { api } from '../api/client';
+import { RoleContext } from '../hooks/useRole';
 import type { Job } from '../types';
 
 // usePolling resolves fn() immediately on mount; mocking the api methods is
@@ -241,6 +242,74 @@ describe('Jobs page', () => {
     fireEvent.click(screen.getByRole('button', { name: /cancel selected/i }));
     await waitFor(() => expect(bulkSpy).toHaveBeenCalledWith('cancel', [41]));
     await waitFor(() => expect(screen.getByText('cancel: 1 affected')).toBeInTheDocument());
+  });
+});
+
+
+// Viewer gating: mutation controls (retry/cancel/bulk/priority/flow selects)
+// must be hidden when the role is 'viewer'. Read-only controls (Log) stay.
+describe('Jobs page viewer gating', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('hides the Cancel button for viewers on pending jobs', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 10, status: 'pending' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText('10')).toBeInTheDocument());
+
+    expect(screen.queryByRole('button', { name: /cancel/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the Retry button for viewers on failed jobs', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 11, status: 'failed' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText('11')).toBeInTheDocument());
+
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps the Log button visible for viewers', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 12, status: 'done' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText('12')).toBeInTheDocument());
+
+    expect(screen.getByRole('button', { name: /log/i })).toBeInTheDocument();
+  });
+
+  it('hides bulk action buttons for viewers even when rows are selected', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 13, status: 'failed' })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText('13')).toBeInTheDocument());
+
+    // Select the row — the "N selected" text shows but no bulk buttons
+    fireEvent.click(screen.getByLabelText('Select job 13'));
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry selected/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /cancel selected/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the priority selector for viewers on pending jobs', async () => {
+    vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 14, status: 'pending', priority: 0 })]);
+    vi.spyOn(api, 'nodes').mockResolvedValue([]);
+    vi.spyOn(api, 'flows').mockResolvedValue([]);
+
+    render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
+    await waitFor(() => expect(screen.getByText('14')).toBeInTheDocument());
+
+    expect(screen.queryByTitle('Set job priority')).not.toBeInTheDocument();
   });
 });
 

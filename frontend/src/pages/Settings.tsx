@@ -255,6 +255,7 @@ export default function SettingsPage() {
         style={{ width: '100%' }}
         value={String(settings[key] ?? '')}
         placeholder={placeholder}
+        disabled={!isAdmin}
         onChange={(e) => setString(key, e.target.value)}
       />
       <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
@@ -332,7 +333,8 @@ export default function SettingsPage() {
               max={3600}
               style={{ width: '100%' }}
               value={settings.scan_interval_seconds}
-              onChange={(e) => set('scan_interval_seconds', Number(e.target.value))}
+              disabled={!isAdmin}
+            onChange={(e) => set('scan_interval_seconds', Number(e.target.value))}
             />
           </label>
           <label style={{ flex: 1 }}>
@@ -343,7 +345,8 @@ export default function SettingsPage() {
               max={1000}
               style={{ width: '100%' }}
               value={settings.tasks_before_reboot}
-              onChange={(e) => set('tasks_before_reboot', Number(e.target.value))}
+              disabled={!isAdmin}
+            onChange={(e) => set('tasks_before_reboot', Number(e.target.value))}
             />
           </label>
           <label style={{ flex: 1 }}>
@@ -356,7 +359,8 @@ export default function SettingsPage() {
               max={3650}
               style={{ width: '100%' }}
               value={settings.job_retention_days ?? 0}
-              onChange={(e) => set('job_retention_days', Number(e.target.value))}
+              disabled={!isAdmin}
+            onChange={(e) => set('job_retention_days', Number(e.target.value))}
               title="Terminal jobs older than this are pruned hourly. 0 keeps history forever."
             />
           </label>
@@ -370,7 +374,8 @@ export default function SettingsPage() {
               max={100000}
               style={{ width: '100%' }}
               value={settings.disk_alert_gb ?? 0}
-              onChange={(e) => set('disk_alert_gb', Number(e.target.value))}
+              disabled={!isAdmin}
+            onChange={(e) => set('disk_alert_gb', Number(e.target.value))}
               title="Nodes below this free space alert Discord (1/hour) and take no new jobs until they recover. 0 disables."
             />
           </label>
@@ -379,7 +384,8 @@ export default function SettingsPage() {
             <input
               style={{ width: '100%' }}
               value={settings.group}
-              onChange={(e) => set('group', e.target.value)}
+              disabled={!isAdmin}
+            onChange={(e) => set('group', e.target.value)}
             />
           </label>
           <label style={{ flex: 1 }}>
@@ -387,7 +393,8 @@ export default function SettingsPage() {
             <input
               style={{ width: '100%' }}
               value={settings.tag}
-              onChange={(e) => set('tag', e.target.value)}
+              disabled={!isAdmin}
+            onChange={(e) => set('tag', e.target.value)}
             />
           </label>
         </div>
@@ -399,16 +406,19 @@ export default function SettingsPage() {
           <input
             type="checkbox"
             checked={!!settings.drain_mode}
-            onChange={(e) => set('drain_mode', e.target.checked)}
+            disabled={!isAdmin}
+          onChange={(e) => set('drain_mode', e.target.checked)}
           />
           <span>Drain mode — finish running jobs, assign nothing</span>
         </label>
         <span className="muted" style={{ display: 'block', fontSize: 12 }}>
           Use for host maintenance or before pushing bin packages.
         </span>
+        {isAdmin && (
         <button className="btn primary" disabled={saving} onClick={save} style={{ marginTop: 12 }}>
           {saving ? 'Saving…' : 'Save settings'}
         </button>
+        )}
         {settings.updated_at && (
           <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
         )}
@@ -437,7 +447,8 @@ export default function SettingsPage() {
           <input
             type="checkbox"
             checked={!!settings.notify_digest}
-            onChange={(e) => set('notify_digest', e.target.checked)}
+            disabled={!isAdmin}
+          onChange={(e) => set('notify_digest', e.target.checked)}
           />
           <span>Hourly digest — batch job outcomes into one summary per hour</span>
         </label>
@@ -452,16 +463,19 @@ export default function SettingsPage() {
             type="checkbox"
             aria-label="Notify node status"
             checked={!!settings.notify_node_status}
-            onChange={(e) => set('notify_node_status', e.target.checked)}
+            disabled={!isAdmin}
+          onChange={(e) => set('notify_node_status', e.target.checked)}
           />
           <span>Node status alerts — Discord alert when a node goes offline or comes back</span>
         </label>
         <span className="muted" style={{ display: 'block', fontSize: 12 }}>
           Fires on online/offline/busy transitions; requires the webhook above.
         </span>
+        {isAdmin && (
         <button className="btn primary" disabled={saving} onClick={save}>
           {saving ? 'Saving…' : 'Save settings'}
         </button>
+        )}
         {settings.updated_at && (
           <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
         )}
@@ -473,14 +487,14 @@ export default function SettingsPage() {
       {/* Storage shares: nfs/smb/s3 sources per pipeline role. Replaces
           the legacy NFS settings fields (which the backend migrates into
           share rows on boot). */}
-      <SharesCard />
+      {isAdmin && <SharesCard />}
 
-      <APITokensCard />
+      {isAdmin && <APITokensCard />}
 
       {/* Controller DB backups: scheduled VACUUM INTO snapshots with
           manual trigger + download + restore. Formalizes the pre-deploy
           `cp encode.db` habit. */}
-      <BackupsCard />
+      {isAdmin && <BackupsCard />}
 
       {/* User management: admin-only card for creating/deleting accounts
           and resetting passwords. Rendered only when the logged-in user is
@@ -538,6 +552,7 @@ export default function SettingsPage() {
         )}
       </div>
 
+      {isAdmin && (
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Push to nodes</h3>
         <p className="muted">
@@ -678,6 +693,7 @@ export default function SettingsPage() {
           </button>
         </div>
       </div>
+      )}
     </>
   );
 }

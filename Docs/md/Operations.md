@@ -180,3 +180,48 @@ and the replicas reconnect + re-acquire their advisory locks on restart.
 - **Node offline after an agent self-update**: the swap sidecar relaunches the task, but if it didn't fire, `Start-ScheduledTask -TaskName EncodeAgentDist` over WinRM; the agent stages the pending `.exe.new`, exits once more, and comes back on the new version (~1 min). Also check for a **stale pre-swap process**: two `encode-agent.exe` PIDs double-heartbeat — kill the one with the earlier StartTime. On Linux the `swap-update.sh` sidecar retries the `mv` (15 attempts, logged to `swap-update.log` in the data dir) then either exits to let systemd's `Restart=always` relaunch (detected via `INVOCATION_ID` + `systemctl is-active encode-agent`) or relaunches the new binary directly via `setsid`; check `swap-update.log` and `journalctl -u encode-agent` if the node never returns.
 - **Two jobs on one node beyond its slots**: impossible by store constraint (active jobs ≤ `max_concurrent_jobs`), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.
 - **SQLite "out of memory (14)" on a fresh volume**: the data dir is owned by the wrong user — `/data` must be chowned to the runtime user (fixed in the v1.17.4 image; reappears after base-image changes).
+
+## Monitoring with Grafana
+
+A pre-built Grafana dashboard ships under `docker/grafana/` and visualizes the
+controller's `/metrics` (Prometheus text exposition) endpoint — the same
+aggregate fleet state the Stats page and unauthenticated health endpoint
+surface. See `docker/grafana/README.md` for import instructions and a minimal
+`prometheus.yml` scrape snippet (target placeholder `CONTROLLER_HOST:8080`;
+the current farm host is `172.24.92.232:8080`).
+
+### What the dashboard covers
+
+- **Node Online State** — per-node `encode_node_online` (1=online, 0=stale) as
+  color-coded stat tiles.
+- **Queue Depth (by state)** — `encode_jobs_pending` / `assigned` / `running`
+  as current-value stat tiles; the **Queue Depth Over Time** time series
+  tracks backlog growth and dispatch stalls.
+- **Job Status Totals** — terminal counters `encode_jobs_done_total` /
+  `failed_total` / `cancelled_total` as stat tiles; the **Throughput
+  Counters** time series shows the completion/failure rate slope.
+- **Per-Node Slot Utilization** — `encode_node_active_jobs` vs
+  `encode_node_max_concurrent_jobs` overlaid so saturation is visible.
+- **Node Fleet Status** — a table joining online / enabled / active / max
+  per node (enabled=0 = paused).
+- **Per-Node Slot Saturation** — a gauge of `active_jobs /
+  max_concurrent_jobs` per node.
+
+The dashboard JSON lives at `docker/grafana/encode-system-dashboard.json`
+(uid `encode-system`, `schemaVersion` 39, 30s refresh, templated
+`${DS_PROMETHEUS}` datasource). It uses only `stat`, `timeseries`, `table`,
+and `gauge` panels — all built **only** from the 10 metrics the controller
+actually emits (verified against `backend/internal/api/prometheus.go`; no
+synthetic series).
+
+### Security note
+
+The `/metrics` endpoint is **unauthenticated** by design: the route
+`GET /metrics` is registered in `backend/internal/api/server.go` **without**
+the `withAdmin` wrapper (the comment on the preceding line states scrapers
+authenticate at the network layer). The endpoint exposes only aggregate
+operational numbers — queue depth, node liveness, terminal counters — the
+same data the unauthenticated health endpoint and the Stats page already
+surface to any admin. Restrict network access to the controller port
+(firewall, VPN, or management network) so only trusted Prometheus scrapers
+can reach it.

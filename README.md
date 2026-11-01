@@ -11,7 +11,7 @@ Distributed encode farm: a Linux control plane queues and monitors encoding jobs
 - Enforces **reboot after 10 tasks**: the controller watches each node's `tasks_since_boot` and issues a reboot instruction when the limit is reached.
 - **Auto-updates** agents: controller pushes new `encode-agent.exe` and `EncodeLib.ps1` versions (with one-click rollback to the previous release); agents swap on next idle heartbeat. Linux agents self-update via a `swap-update.sh` sidecar (setsid-detached, systemd-aware — exits to let `Restart=always` relaunch, or relaunches directly in bare mode).
 - Visual flow builder in the web UI: reorder steps, set parameters (CRF, preset, Opus bitrate, x265 extra args), save named flows, pick a flow per job.
-- Operator conveniences: scheduled DB backups, scoped API tokens, bulk job retry/cancel, job-history retention, one-command installers for controller and nodes.
+- Operator conveniences: scheduled DB backups with one-click restore (SQLite exit-and-restart, Postgres in-place single transaction), scoped API tokens, bulk job retry/cancel/delete/set-priority/set-flow, single-job delete (terminal only), manual scan trigger (`POST /api/scan`), flow duplication, GitHub release update check (`GET /api/updates/check`), node online/offline Discord alerts, a **viewer role** (read-only management accounts — viewers see all monitoring surfaces, admins keep all mutations and user/token/audit/backup management), and `encodectl` — a CLI for scripting fleet ops from a shell or CI.
 
 ## Components
 
@@ -23,6 +23,8 @@ Distributed encode farm: a Linux control plane queues and monitors encoding jobs
 | `infra/ansible/` | Playbooks: Windows nodes (`site.yml` + WinRM roles), Linux nodes (`linux-node.yml` + `roles/linux-node` over SSH with CIFS/NFS mounts) |
 | `infra/systemd/` | `encode-agent.service` — the canonical systemd unit for Linux agents (single source of truth; the role and `install-agent.sh` both deploy it) |
 | `docker/` | Controller images, compose files, `install.sh` / `install-agent.ps1` / `install-agent.sh` one-command installers |
+| `docker/grafana/` | Pre-built Grafana dashboard JSON + README — imports into a stock Grafana 11+ to visualize all 10 `/metrics` series |
+| `backend/cmd/encodectl` | `encodectl` — stdlib-only operator CLI wrapping the controller REST API (health, scan, nodes, jobs, prune, series, stats, agent publish/rollback); shipped as `encodectl-linux-amd64` in releases and the deploy tarball |
 | `Docs/` | Architecture, Deployment, Operations |
 
 ## Quick start
@@ -74,7 +76,7 @@ See `Docs/md/Deployment.md` for the full deployment (Docker compose + Ansible) a
 
 ## Releases
 
-Push a `v*` tag → the Release workflow builds binaries + SPA, publishes a complete offline deploy bundle (`encode-system-<ver>-deploy.tar.gz`) and pushes the container image to GHCR. See `.github/workflows/release.yml`.
+Push a `v*` tag → the Release workflow builds the controller, `encode-agent.exe` (Windows), `encode-agent-linux-amd64`, `pgimport`, and `encodectl-linux-amd64` + SPA, publishes a complete offline deploy bundle (`encode-system-<ver>-deploy.tar.gz`) and pushes the container image to GHCR. See `.github/workflows/release.yml`.
 
 ## Status
 

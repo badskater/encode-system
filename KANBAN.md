@@ -13,6 +13,102 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Usability batch, 2026-11)
+
+- `POST /api/scan` (admin, `handlers_scan.go`): manual scanner trigger —
+  sends a non-blocking signal to the scanner loop's buffered-1 channel,
+  always `202 {"triggered":true}`. A second request while one is queued
+  coalesces. HA: only the leader replica's scanner holds the advisory lock
+  and consumes the channel; a non-leader trigger is a no-op (request still
+  succeeds). Audit `scan.trigger`. UI: Dashboard scan-now button.
+- `POST /api/flows/{id}/duplicate` (admin, `handlers_flows_dup.go`): copies
+  a flow + steps verbatim under a new name (default `<orig> (copy)`,
+  overridable via `{"name":"…"}`). `is_default=false` (duplicating the
+  flagged default does not create a second default). Retry policy
+  (`max_retries`, `retry_backoff_minutes`) copied alongside steps. Audit
+  `flow.duplicate`. UI: Flows duplicate button.
+- `DELETE /api/jobs/{id}` (admin, `handlers.go`): terminal jobs only
+  (done/failed/cancelled); 409 non-terminal, 404 missing. Store `DeleteJob`
+  guards on status `IN ('done','failed','cancelled')` atomically — pre-check
+  and delete cannot race. Audit `job.delete`. UI: Jobs delete button.
+- `POST /api/jobs/bulk` extended (`handlers_bulk.go`): actions now
+  `retry|cancel|delete|set_priority|set_flow`, same `{affected, skipped}`
+  pattern, max 500. `set_priority` requires `body.priority`; `set_flow`
+  requires `body.flow_id` (validated to exist). Both patch pending jobs via
+  `PatchPendingJob`; wrong-state/missing → `skipped`. Audit `jobs.bulk`.
+  UI: Jobs bulk set-priority / set-flow.
+- Node online/offline Discord alerts (`node_alert.go`):
+  `settings.notify_node_status` (default false, `model.Settings.NotifyNodeStatus`
+  json tag `notify_node_status`). 30s tick loop (`StartNodeAlertLoop`) lists
+  nodes, computes online with the same `StaleAfter` rule as `handleListNodes`,
+  diffs against in-memory baseline (`nodeAlertState.prev`). Only real
+  online↔offline transitions between consecutive ticks alert; first tick
+  after restart seeds silently (no storm). Alerts fire only when
+  `notify_node_status` AND `discord_webhook` are set (both read live each
+  tick). HA: loop body under `store.RunLoopSupervisor` with `LockKeyNodeAlert`
+  (advisory lock key 1006) — exactly one replica alerts per transition.
+  UI: Settings notify_node_status toggle.
+- Viewer role + user CRUD (`handlers_users.go`, `model.go`): roles
+  `admin|viewer` (`RoleAdmin`/`RoleViewer`). `withAnyUser` middleware admits
+  admin OR viewer sessions on GET/HEAD routes; maps read-scope API tokens →
+  viewer-equivalent (GET/HEAD only), admin-scope → admin. `withAdmin` stays
+  on all mutations + admin-only GETs: `/api/users`, `/api/tokens`,
+  `/api/audit`, `/api/backup*`, `/api/pairing`, `/api/provision*`,
+  `/api/updates/manifest`. ~18 read routes moved to `withAnyUser`. User CRUD:
+  `GET /api/users`, `POST /api/users` (role validated, default viewer;
+  409 duplicate username; bcrypt, min length), `DELETE /api/users/{id}` (409
+  self-delete / last-admin), `PUT /api/users/{id}/password` (admin reset,
+  revokes target's sessions). API tokens cannot manage users (nil session →
+  reject). UI: Users card (admin-only), viewer gating everywhere.
+- `POST /api/backup/{name}/restore` (admin, `backup.go`/`backup_pg.go`):
+  guards — name traversal-safe, extension must match backend (`.db` SQLite /
+  `.dump` PG) else 409, pending/running jobs → 409. Audit before swap.
+  SQLite: pre-restore snapshot `encode.db.pre-restore-<ts>`, atomic rename
+  over live DB, then controller **exits** (Docker restart policy reboots on
+  restored DB; `restart:true` in response). PG: single-tx truncate-replay +
+  `setval`, no restart (`restart:false`). Shares-key untouched. UI: backup
+  restore button.
+- `GET /api/updates/check` (any user, `handlers_updatecheck.go`): GitHub
+  latest release vs current version (`Config.Version`, ldflags). 10s timeout,
+  Bearer token when `ENCODE_GITHUB_TOKEN` set. 502 on upstream failure. Tag
+  compare strips `v`, numeric segments (string fallback for `-rc1`). Response
+  `{current, latest, update_available, release_url}`. `/api/health` now
+  carries `version`. Env: `ENCODE_GITHUB_TOKEN` (needed, private repo),
+  `ENCODE_GITHUB_REPO` (default `badskater/encode-system`), `ENCODE_GITHUB_API`
+  (test override). UI: version/update-check card.
+- encodectl CLI (`backend/cmd/encodectl/main.go`): stdlib-only operator CLI.
+  Env `ENCODECTL_SERVER`/`ENCODECTL_TOKEN` or `-server`/`-token` flags.
+  Commands: `health`, `scan`, `nodes`, `jobs [-status -limit]`,
+  `job-retry`/`job-cancel`/`job-delete <id>`, `prune -days N`, `series`,
+  `stats`, `publish-agent -platform windows|linux -version V -file PATH`,
+  `rollback-agent [-platform P]`, `manifest`, `version`. `-json` passthrough.
+  Exit codes: 0 ok, 1 API/transport error (stderr message), 2 usage. Shipped
+  as `encodectl-linux-amd64` release asset + in deploy tarball
+  (`.github/workflows/release.yml`).
+- Grafana dashboard (`docker/grafana/encode-system-dashboard.json` +
+  `README.md`): imports into stock Grafana 11+ (schemaVersion 39,
+  `${DS_PROMETHEUS}` input). All 10 `/metrics` series covered (verified
+  against `prometheus.go`). README has import steps + `prometheus.yml`
+  scrape snippet. `/metrics` unauthenticated (verified in `server.go`:
+  registered without `withAdmin`).
+- Frontend: publish platform picker (WIN/LINUX slots both shown in manifest),
+  Users card (admin-only), version/update-check card, notify_node_status
+  toggle, backup restore button, Dashboard scan-now, Jobs delete + bulk
+  set-priority/set-flow, Flows duplicate, viewer gating on all mutation
+  controls.
+- Docs sync: README (components table + encodectl + viewer role + operator
+  conveniences), Architecture (viewer/admin authz model, node-alert loop
+  lock 1006 + silent-seed, restore semantics, update-check, scan-now, flow
+  duplicate, job delete/bulk extensions, encodectl), Deployment (encodectl
+  release asset + tarball, GitHub env vars, restore SQLite exit-restart
+  dependency), Operations (restore runbook, encodectl quickstart, scan-now,
+  node-status toggle, new operator-task rows), KANBAN (this section).
+- Verification: live smoke on the test controller + two independent
+  adversarial reviews (GLM + DeepSeek). All endpoints exercised via curl +
+  UI; HA lock behavior confirmed against the advisory-lock constants in
+  `store/leader.go`. No code changes (docs-only batch — backend/frontend/
+  docker/.github frozen).
+
 ## Done (Active/active HA, 2026-10)
 
 - `docker/docker-compose.ha.yml`: two controller replicas

@@ -1,6 +1,6 @@
 # Controller image: multi-stage build compiles the Go controller, then serves
 # it with the pre-built frontend (if present in frontend/dist at build time).
-FROM golang:1.25-alpine AS backend
+FROM golang:1.27-alpine AS backend
 ARG AGENT_VERSION=dev
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./

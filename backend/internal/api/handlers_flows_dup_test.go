@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -126,5 +127,47 @@ func TestFlowDuplicateRejectsNonAdmin(t *testing.T) {
 	resp, _ := doJSON(t, "POST", ts.URL+"/api/flows/"+itoa(src.ID)+"/duplicate", "", map[string]any{})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("anonymous: status %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestFlowDuplicateNameCollision verifies a duplicate whose target name
+// already exists returns 409 (not 500): the UNIQUE-violation branch.
+func TestFlowDuplicateNameCollision(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	ctx := ctxBg()
+
+	if _, err := e.server.Store.CreateFlow(ctx, &model.Flow{Name: "taken-name", Steps: []model.Step{{Type: model.StepMux}}}); err != nil {
+		t.Fatal(err)
+	}
+	src, err := e.server.Store.CreateFlow(ctx, &model.Flow{Name: "collision-src", Steps: []model.Step{{Type: model.StepEncode}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := doJSON(t, "POST", ts.URL+"/api/flows/"+itoa(src.ID)+"/duplicate", adminTok, map[string]any{"name": "taken-name"})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409: %s", resp.StatusCode, body)
+	}
+}
+
+// TestIsUniqueConstraintErr pins the error classification used by the flow
+// create/duplicate handlers: only UNIQUE violations map to 409; anything
+// else must fall through to 500 (review P1-1 regression guard).
+func TestIsUniqueConstraintErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{errors.New(`create flow: UNIQUE constraint failed: flows.name`), true},
+		{errors.New(`pq: duplicate key value violates unique constraint "flows_name_key"`), true},
+		{errors.New("database disk image is malformed"), false},
+		{errors.New("connection refused"), false},
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := isUniqueConstraintErr(c.err); got != c.want {
+			t.Errorf("isUniqueConstraintErr(%v) = %v, want %v", c.err, got, c.want)
+		}
 	}
 }

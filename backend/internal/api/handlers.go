@@ -1327,6 +1327,11 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 	}
 	fl, err := s.Store.CreateFlow(r.Context(), &req)
 	if err != nil {
+		if !isUniqueConstraintErr(err) {
+			s.Log.Error("create flow failed", "err", err, "name", req.Name)
+			writeErr(w, http.StatusInternalServerError, "create failed: "+err.Error())
+			return
+		}
 		writeErr(w, http.StatusConflict, "flow name taken")
 		return
 	}

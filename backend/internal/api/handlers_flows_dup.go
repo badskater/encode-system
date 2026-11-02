@@ -48,6 +48,11 @@ func (s *Server) handleDuplicateFlow(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.Store.CreateFlow(r.Context(), dup)
 	if err != nil {
+		if !isUniqueConstraintErr(err) {
+			s.Log.Error("duplicate flow failed", "err", err, "source_id", src.ID)
+			writeErr(w, http.StatusInternalServerError, "duplicate failed: "+err.Error())
+			return
+		}
 		writeErr(w, http.StatusConflict, "flow name taken")
 		return
 	}

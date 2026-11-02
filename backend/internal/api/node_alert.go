@@ -148,12 +148,14 @@ func (s *Server) sendNodeStatusAlert(ctx context.Context, st *model.Settings, tr
 	default:
 		return
 	}
+	// Log the alert regardless of transport so events stay visible whether
+	// the injected Notifier (tests/future wiring) or the Discord fallback fires.
+	s.Log.Info("node status alert", "node", tr.name, "transition", tr.to)
 	if s.Notifier != nil {
 		s.Notifier.Alert(ctx, content)
 		return
 	}
 	notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).Alert(ctx, content)
-	s.Log.Info("node status alert", "node", tr.name, "transition", tr.to)
 }
 
 // diffNodeStates computes the set of online↔offline transitions between a

@@ -286,7 +286,7 @@ describe('Jobs page viewer gating', () => {
     expect(screen.getByRole('button', { name: /log/i })).toBeInTheDocument();
   });
 
-  it('hides bulk action buttons for viewers even when rows are selected', async () => {
+  it('hides the bulk-selection checkboxes entirely for viewers', async () => {
     vi.spyOn(api, 'jobs').mockResolvedValue([jobFixture({ id: 13, status: 'failed' })]);
     vi.spyOn(api, 'nodes').mockResolvedValue([]);
     vi.spyOn(api, 'flows').mockResolvedValue([]);
@@ -294,9 +294,10 @@ describe('Jobs page viewer gating', () => {
     render(<RoleContext.Provider value="viewer"><JobsPage /></RoleContext.Provider>);
     await waitFor(() => expect(screen.getByText('13')).toBeInTheDocument());
 
-    // Select the row — the "N selected" text shows but no bulk buttons
-    fireEvent.click(screen.getByLabelText('Select job 13'));
-    expect(screen.getByText('1 selected')).toBeInTheDocument();
+    // No per-row checkbox and no select-all header checkbox: bulk selection is
+    // an admin-only mutation surface, so viewers never see the controls at all.
+    expect(screen.queryByLabelText('Select job 13')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Select all jobs')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /retry selected/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /cancel selected/i })).not.toBeInTheDocument();
   });

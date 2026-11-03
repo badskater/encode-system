@@ -282,15 +282,17 @@ export default function JobsPage() {
       <table>
         <thead>
           <tr>
-            <th>
-              <input
-                type="checkbox"
-                checked={allChecked}
-                onChange={toggleSelectAll}
-                aria-label="Select all jobs"
-                title="Select all visible jobs"
-              />
-            </th>
+            {isAdmin && (
+              <th>
+                <input
+                  type="checkbox"
+                  checked={allChecked}
+                  onChange={toggleSelectAll}
+                  aria-label="Select all jobs"
+                  title="Select all visible jobs"
+                />
+              </th>
+            )}
             <th>#</th>
             <th>Series</th>
             <th>Ep</th>
@@ -308,14 +310,16 @@ export default function JobsPage() {
         <tbody>
           {(jobs ?? []).map((j) => (
             <tr key={j.id}>
-              <td>
-                <input
-                  type="checkbox"
-                  checked={checked.has(j.id)}
-                  onChange={() => toggleCheck(j.id)}
-                  aria-label={`Select job ${j.id}`}
-                />
-              </td>
+              {isAdmin && (
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={checked.has(j.id)}
+                    onChange={() => toggleCheck(j.id)}
+                    aria-label={`Select job ${j.id}`}
+                  />
+                </td>
+              )}
               <td>
                 <a href="#" onClick={(e) => { e.preventDefault(); setSelected(j); }}>
                   {j.id}

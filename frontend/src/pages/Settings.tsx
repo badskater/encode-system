@@ -114,7 +114,9 @@ export default function SettingsPage() {
     setUpdateError('');
     try {
       const res = await api.checkUpdate();
-      setUpdateCheck(res);
+      // GitHub tags carry the leading "v" (tag_name = "v1.23.0") but the UI
+      // renders its own "v" prefix — normalize here or the badge shows "vv1.23.0".
+      setUpdateCheck({ ...res, latest: res.latest.replace(/^v/, '') });
     } catch (e) {
       setUpdateCheck(null);
       setUpdateError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));

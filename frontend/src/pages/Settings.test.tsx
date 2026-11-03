@@ -319,9 +319,11 @@ describe('Settings update check', () => {
   });
 
   it('shows an available update notice when update_available is true', async () => {
+    // GitHub's tag_name carries the leading "v" (real API shape) — the UI must
+    // render exactly one "v" (regression: it once showed "vv1.1.0").
     vi.spyOn(api, 'checkUpdate').mockResolvedValue({
-      current: '1.0.0',
-      latest: '1.1.0',
+      current: 'v1.0.0',
+      latest: 'v1.1.0',
       update_available: true,
       release_url: 'https://github.com/badskater/encode-system/releases/tag/v1.1.0',
     });
@@ -330,6 +332,10 @@ describe('Settings update check', () => {
     fireEvent.click(btn);
     await waitFor(() => expect(screen.getByText(/v1\.1\.0 available/)).toBeInTheDocument());
     expect(screen.getByText(/Release notes/)).toBeInTheDocument();
+    // Guard the exact defect: no doubled "v", and the upgrade command uses one "v".
+    expect(screen.queryByText(/vv1\.1\.0/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('upgrade-cmd').textContent).toContain('bash -s v1.1.0');
+    expect(screen.getByTestId('upgrade-cmd').textContent).not.toContain('vv1.1.0');
   });
 
   it('shows Up to date when no update is available', async () => {

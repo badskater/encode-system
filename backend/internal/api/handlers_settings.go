@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strings"
 
@@ -10,6 +12,42 @@ import (
 )
 
 // ---------- Settings (NFS shares, roots, remote path mapping) ----------
+
+// settingsReq is the PUT request body. model.Settings hides the write-only
+// secrets (json:"-"), so the handler decodes into this shadow struct to read
+// them IN (same pattern as shareReq). The has_* output flags are accepted
+// and ignored so a verbatim GET→PUT round-trip keeps working.
+type settingsReq struct {
+	model.Settings
+	NtfyToken       string `json:"ntfy_token,omitempty"`
+	SMTPPassword    string `json:"smtp_password,omitempty"`
+	HasNtfyToken    bool   `json:"has_ntfy_token,omitempty"`    // output-only echo, ignored
+	HasSMTPPassword bool   `json:"has_smtp_password,omitempty"` // output-only echo, ignored
+}
+
+// settingsOut is the API-facing settings: identical to model.Settings plus
+// has_* flags for the write-only secrets (plaintext never leaves the
+// controller — same mask pattern as shareOut).
+type settingsOut struct {
+	*model.Settings
+	HasNtfyToken    bool `json:"has_ntfy_token"`
+	HasSMTPPassword bool `json:"has_smtp_password"`
+}
+
+// MarshalJSON implements the mask: embed Settings' fields (secrets already
+// json:"-" on the model) and add the has_* flags.
+func (o settingsOut) MarshalJSON() ([]byte, error) {
+	type alias model.Settings
+	return json.Marshal(struct {
+		alias
+		HasNtfyToken    bool `json:"has_ntfy_token"`
+		HasSMTPPassword bool `json:"has_smtp_password"`
+	}{alias(*o.Settings), o.HasNtfyToken, o.HasSMTPPassword})
+}
+
+func maskSettings(st *model.Settings) settingsOut {
+	return settingsOut{Settings: st, HasNtfyToken: st.NtfyToken != "", HasSMTPPassword: st.SMTPPassword != ""}
+}
 
 // defaultsSettings builds the settings baseline from the environment (the
 // values the controller booted with). Used as the merge source whenever no
@@ -49,45 +87,68 @@ func (s *Server) currentSettings(ctx context.Context) *model.Settings {
 }
 
 // handleGetSettings exposes the live settings (NFS share config, controller
-// roots, remote path mapping, behavior) to the UI.
+// roots, remote path mapping, behavior) to the UI. Write-only secrets are
+// masked to has_* flags.
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.currentSettings(r.Context()))
+	writeJSON(w, http.StatusOK, maskSettings(s.currentSettings(r.Context())))
 }
 
 // handleUpdateSettings replaces the settings row. Validation keeps the
 // operator from shooting themselves in the foot: paths must be absolute on
 // their respective OS, intervals sane, required fields present.
+//
+// Write-only secrets (ntfy_token, smtp_password) follow the shares pattern:
+// an EMPTY value on PUT keeps the stored credential (the API never echoes
+// plaintext, so the UI cannot round-trip it); a non-empty value replaces it.
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
-	var req model.Settings
+	var req settingsReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if err := validateSettings(&req); err != nil {
+	st := req.Settings
+	st.NtfyToken = req.NtfyToken
+	st.SMTPPassword = req.SMTPPassword
+	if err := validateSettings(&st); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.Store.SaveSettings(r.Context(), &req); err != nil {
+	// Keep-semantics for write-only secrets: blank = keep the stored value.
+	// Read the effective settings BEFORE the save so the merge sees the
+	// current row (or env defaults when no row exists yet).
+	prev := s.currentSettings(r.Context())
+	if st.NtfyToken == "" {
+		st.NtfyToken = prev.NtfyToken
+	}
+	if st.SMTPPassword == "" {
+		st.SMTPPassword = prev.SMTPPassword
+	}
+	if err := s.Store.SaveSettings(r.Context(), &st); err != nil {
 		writeErr(w, http.StatusInternalServerError, "save settings")
 		return
 	}
-	s.Log.Info("settings updated via UI", "scripts_root", req.ScriptsRoot,
-		"node_bin_dir", req.NodeBinDir, "scan_interval_s", req.ScanIntervalSeconds)
-	// Audit a secret-free subset: the webhook URL and any future credential
-	// fields must never land in the audit table — only the operational
-	// knobs plus a boolean for whether a webhook is set.
+	s.Log.Info("settings updated via UI", "scripts_root", st.ScriptsRoot,
+		"node_bin_dir", st.NodeBinDir, "scan_interval_s", st.ScanIntervalSeconds)
+	// Audit a secret-free subset: webhook URLs and credential fields must
+	// never land in the audit table — only the operational knobs plus
+	// booleans for whether each channel/secret is set or changed.
 	s.audit(r, "settings.update", "settings", map[string]any{
-		"scan_interval_seconds": req.ScanIntervalSeconds,
-		"tasks_before_reboot":   req.TasksBeforeReboot,
-		"drain_mode":            req.DrainMode,
-		"notify_digest":         req.NotifyDigest,
-		"notify_node_status":    req.NotifyNodeStatus,
-		"job_retention_days":    req.JobRetentionDays,
-		"disk_alert_gb":         req.DiskAlertGB,
-		"stall_timeout_minutes": req.StallTimeoutMinutes,
-		"webhook_set":           req.DiscordWebhook != "",
+		"scan_interval_seconds": st.ScanIntervalSeconds,
+		"tasks_before_reboot":   st.TasksBeforeReboot,
+		"drain_mode":            st.DrainMode,
+		"notify_digest":         st.NotifyDigest,
+		"notify_node_status":    st.NotifyNodeStatus,
+		"job_retention_days":    st.JobRetentionDays,
+		"disk_alert_gb":         st.DiskAlertGB,
+		"stall_timeout_minutes": st.StallTimeoutMinutes,
+		"webhook_set":           st.DiscordWebhook != "",
+		"generic_webhook_set":   st.GenericWebhookURL != "",
+		"ntfy_set":              st.NtfyTopicURL != "",
+		"smtp_set":              st.SMTPHost != "",
+		"ntfy_token_changed":    req.NtfyToken != "",
+		"smtp_password_changed": req.SMTPPassword != "",
 	})
-	writeJSON(w, http.StatusOK, s.currentSettings(r.Context()))
+	writeJSON(w, http.StatusOK, maskSettings(s.currentSettings(r.Context())))
 }
 
 // validateSettings checks invariants the renderer/scanner depend on.
@@ -157,6 +218,52 @@ func validateSettings(st *model.Settings) error {
 			return errSettings("discord_webhook must be a Discord webhook URL (https://discord.com/api/webhooks/...) or blank")
 		}
 	}
+	// Generic webhook + ntfy topic: optional (blank = channel disabled).
+	// When set they must be absolute http(s) URLs — the controller POSTs to
+	// them, so a typo or a non-HTTP scheme is caught at save time.
+	st.GenericWebhookURL = strings.TrimSpace(st.GenericWebhookURL)
+	if st.GenericWebhookURL != "" && !isHTTPURL(st.GenericWebhookURL) {
+		return errSettings("generic_webhook_url must be an http(s) URL or blank")
+	}
+	st.NtfyTopicURL = strings.TrimSpace(st.NtfyTopicURL)
+	if st.NtfyTopicURL != "" && !isHTTPURL(st.NtfyTopicURL) {
+		return errSettings("ntfy_topic_url must be an http(s) URL (e.g. https://ntfy.sh/mytopic) or blank")
+	}
+	// SMTP email channel: enabled when host+from+to are all set. Port 0
+	// defaults to 587 at send time; anything else must be a real port.
+	st.SMTPHost = strings.TrimSpace(st.SMTPHost)
+	st.SMTPUser = strings.TrimSpace(st.SMTPUser)
+	st.SMTPFrom = strings.TrimSpace(st.SMTPFrom)
+	st.SMTPTo = strings.TrimSpace(st.SMTPTo)
+	if st.SMTPPort < 0 || st.SMTPPort > 65535 {
+		return errSettings("smtp_port must be 0 (default 587) or 1-65535")
+	}
+	if st.SMTPHost != "" && (strings.ContainsAny(st.SMTPHost, " 	") || strings.Contains(st.SMTPHost, "://")) {
+		return errSettings("smtp_host must be a hostname (no scheme, no spaces)")
+	}
+	if st.SMTPHost != "" {
+		if st.SMTPFrom == "" || st.SMTPTo == "" {
+			return errSettings("smtp_from and smtp_to are required when smtp_host is set")
+		}
+	} else if st.SMTPFrom != "" || st.SMTPTo != "" {
+		return errSettings("smtp_host is required when smtp_from/smtp_to is set")
+	}
+	if st.SMTPFrom != "" {
+		if _, err := mail.ParseAddress(st.SMTPFrom); err != nil {
+			return errSettings("smtp_from must be a valid email address")
+		}
+	}
+	if st.SMTPTo != "" {
+		for _, addr := range strings.Split(st.SMTPTo, ",") {
+			addr = strings.TrimSpace(addr)
+			if addr == "" {
+				return errSettings("smtp_to contains an empty recipient")
+			}
+			if _, err := mail.ParseAddress(addr); err != nil {
+				return errSettings("smtp_to must be comma-separated valid email addresses")
+			}
+		}
+	}
 	// Controller URL (what nodes dial): required for provisioning, must be
 	// an absolute http(s) URL. Empty is tolerated until someone provisions.
 	st.ControllerURL = strings.TrimSpace(st.ControllerURL)
@@ -182,6 +289,13 @@ type settingsErr string
 
 func (e settingsErr) Error() string { return string(e) }
 func errSettings(msg string) error  { return settingsErr(msg) }
+
+// isHTTPURL reports whether raw is an absolute http(s) URL with a host —
+// the shared bound for the generic webhook and ntfy topic settings.
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
+}
 
 // isWindowsPath accepts C:\... and C:/... (separator after the drive
 // letter is REQUIRED — "C:bin" is drive-RELATIVE and must be rejected) plus

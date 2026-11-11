@@ -121,8 +121,21 @@ CREATE TABLE IF NOT EXISTS provision_runs (
 
 // ---------- Settings ----------
 
+// settingsBlob is the on-disk shape of the settings JSON blob. model.Settings
+// hides the write-only secrets (json:"-"), so the store marshals them here
+// as AES-GCM ciphertext under their API key names — the same shares-key
+// encryption used for share passwords (encryptSharePassword). The key file
+// lives BESIDE the DB, so backup downloads never carry usable secrets.
+type settingsBlob struct {
+	*model.Settings
+	NtfyToken    string `json:"ntfy_token,omitempty"`
+	SMTPPassword string `json:"smtp_password,omitempty"`
+}
+
 // GetSettings loads the persisted settings row. Returns nil (not an error)
 // when no row exists yet — callers merge environment defaults in that case.
+// Write-only secrets are decrypted back into the struct for internal use;
+// the API layer masks them (they are json:"-" and never marshal out).
 func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 	row := s.qRow(ctx, `SELECT json, updated_at FROM settings WHERE id = 1`)
 	var js, updatedAt string
@@ -132,10 +145,27 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 		}
 		return nil, err
 	}
-	var st model.Settings
-	if err := json.Unmarshal([]byte(js), &st); err != nil {
+	// The shadow embeds Settings by value so the secret keys (hidden on the
+	// model) land in the shadow fields instead of being dropped.
+	var blob struct {
+		model.Settings
+		NtfyToken    string `json:"ntfy_token"`
+		SMTPPassword string `json:"smtp_password"`
+	}
+	if err := json.Unmarshal([]byte(js), &blob); err != nil {
 		return nil, fmt.Errorf("unmarshal settings: %w", err)
 	}
+	st := blob.Settings
+	tok, err := s.decryptSharePassword(blob.NtfyToken)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings ntfy_token: %w", err)
+	}
+	pw, err := s.decryptSharePassword(blob.SMTPPassword)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings smtp_password: %w", err)
+	}
+	st.NtfyToken = tok
+	st.SMTPPassword = pw
 	st.UpdatedAt = ptrTime(updatedAt)
 	return &st, nil
 }
@@ -281,8 +311,19 @@ func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk strin
 }
 
 // SaveSettings persists the settings row (single-row upsert on id=1).
+// Write-only secrets (ntfy token, SMTP password) are encrypted with the
+// shares key before they enter the JSON blob — plaintext never touches the
+// DB (the backup endpoint hands the DB file to admins).
 func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
-	b, err := json.Marshal(st)
+	tok, err := s.encryptSharePassword(st.NtfyToken)
+	if err != nil {
+		return fmt.Errorf("encrypt settings ntfy_token: %w", err)
+	}
+	pw, err := s.encryptSharePassword(st.SMTPPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt settings smtp_password: %w", err)
+	}
+	b, err := json.Marshal(settingsBlob{Settings: st, NtfyToken: tok, SMTPPassword: pw})
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)
 	}

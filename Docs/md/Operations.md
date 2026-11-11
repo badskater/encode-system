@@ -15,8 +15,8 @@
 ## Alerts and signals
 
 - Job `failed` with non-zero exit code — UI job detail shows the tail; investigate `run.log`.
-- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle). On Linux: `systemctl status encode-agent` (or `journalctl -u encode-agent -f` for the live log) — the unit has `Restart=always` so a crash loop is the usual failure mode. If `settings.notify_node_status` is on, a stale node also fires a Discord alert on the online→offline transition (30s loop, leader-gated on HA).
-- Disk-space alert (Discord, per-node cooldown) — the node soft-drained: no new jobs until free space recovers above `settings.disk_alert_gb`. Free the node's work disk or raise the threshold.
+- Node stale — check the agent scheduled task (`Get-ScheduledTask EncodeAgentDist`, or `Get-Service encode-agent` on service installs), event log, or whether the node is mid-reboot (expected after the 10-task cycle). On Linux: `systemctl status encode-agent` (or `journalctl -u encode-agent -f` for the live log) — the unit has `Restart=always` so a crash loop is the usual failure mode. If `settings.notify_node_status` is on, a stale node also fires an alert on the online→offline transition (30s loop, leader-gated on HA) to every configured notification channel (Discord, generic webhook, ntfy, email).
+- Disk-space alert (all notification channels, per-node cooldown) — the node soft-drained: no new jobs until free space recovers above `settings.disk_alert_gb`. Free the node's work disk or raise the threshold.
 - Scanner backlog growing while nodes idle — usually all nodes disabled in the UI, token mismatch, every series paused, a node_group with no matching nodes, or drain mode left on.
 - Prometheus scrape endpoint: `GET /metrics` on the controller port (`encode_jobs_*`, `encode_node_*`).
 
@@ -49,6 +49,9 @@
 | Update the node tools (bin) folder | Zip a node's `C:\bin`, publish via Settings → Push to nodes (upload, or **Fetch from URL** for a `badskater/encode-bin` GitHub release asset + optional SHA-256 pin); nodes converge on next idle heartbeat. |
 | Register a node without copy-pasting tokens | UI → Nodes → Issue pairing code → `pairing_code` in the node's `agent.json`. |
 | Get job alerts in Discord | Settings → Discord notifications → webhook URL → Save (env `ENCODE_DISCORD_WEBHOOK` seeds the default); done/failed alerts post automatically with series/episode/node/error. Blank = off. |
+| Get job alerts in ntfy | Settings → **Notification channels** → ntfy topic URL (e.g. `https://ntfy.sh/encode-alerts`) + optional access token → Save. Failed jobs/alerts push at high priority, done jobs at default. Blank = off. |
+| Get job alerts on a generic webhook | Settings → **Notification channels** → generic webhook URL → Save. The controller POSTs structured JSON events (`job_finished` / `alert`) — payload shape in the Notification channels section below. Blank = off. |
+| Get job alerts by email | Settings → **Notification channels** → SMTP host + from + to (port 0 = 587, optional user/password) → Save. Plain-text mail with the same facts as the other channels. Blank host = off. |
 | Send one series' alerts to its own channel | UI → Series → alert-channel cell (per-series webhook URL; empty = global webhook). Digest mode always posts to the global channel. |
 | Push agent update | Settings → Push to nodes: upload new `encode-agent.exe`/`encode-agent`/`EncodeLib.ps1`/bin zip (SHA-256 hashed, version-gated), or **Fetch from URL** for a `badskater/encode-bin` release asset. Idle nodes self-swap on the next heartbeat — Windows via `swap-update.bat`, Linux via `swap-update.sh` (systemd-aware). |
 | Roll back a bad agent release | Settings → Push to nodes → **Rollback** (`POST /api/updates/agent/rollback`) — the previous published agent becomes current again; nodes self-downgrade through the same version-diff sync. One `.prev` slot only (409 when there is none). |
@@ -75,9 +78,57 @@
 | Duplicate a flow | UI → Flows → **Duplicate** on a flow (admin, `POST /api/flows/{id}/duplicate`). Default name `<original> (copy)`; the copy is never the default flow. |
 | Manage user accounts | UI → **Users** card (admin-only): list, create (role admin/viewer), delete (409 on self-delete / last-admin), reset password. Viewers see no mutation controls. |
 | Check for a new release | UI → Dashboard / Settings → **Update check** card (`GET /api/updates/check`, any user): compares the running version to the latest GitHub release. Needs `ENCODE_GITHUB_TOKEN` for private repos. |
-| Alert on node online/offline | UI → Settings → **Node status alerts** toggle (`settings.notify_node_status`, default off). Fires Discord alerts on real online↔offline transitions (30s loop, leader-gated on HA). Requires `discord_webhook` to be set. |
+| Alert on node online/offline | UI → Settings → **Node status alerts** toggle (`settings.notify_node_status`, default off). Fires alerts on real online↔offline transitions (30s loop, leader-gated on HA) to every configured channel. Requires at least one notification channel (Discord webhook, generic webhook, ntfy topic or SMTP email). |
 | Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
+
+## Notification channels
+
+Discord stays the default transport (unchanged). Three additive channels ship
+off-by-default, configured in Settings → **Notification channels**
+(`generic_webhook_url`, `ntfy_topic_url`/`ntfy_token`, `smtp_host`,
+`smtp_port`, `smtp_user`, `smtp_password`, `smtp_from`, `smtp_to`). All
+channels receive the SAME events with the same semantics: job outcomes
+(done/failed), node online/offline transitions, low-disk alerts and the
+hourly digest. The skip rules apply to every channel alike — a muted series,
+digest buffering and the silent auto-retry re-queue notify NO channel. One
+channel failing (timeout, HTTP error, SMTP refusal) is logged structured and
+never blocks the others.
+
+- **Generic webhook** — JSON POST per event:
+
+  ```json
+  {
+    "event": "job_finished",
+    "timestamp": "2026-11-11T12:00:00Z",
+    "job_id": 7, "series": "SomeShow", "episode": "03",
+    "status": "failed", "step": "encode", "error": "x265 crashed",
+    "node": "enc-01", "retry_count": 2, "duration_seconds": 90,
+    "link": "http://ctrl:8080/jobs?job=7"
+  }
+  ```
+
+  Operational alerts (node status, disk, digest summaries) post
+  `{"event":"alert","timestamp":…,"message":"<text>"}`. Job fields are
+  omitted on alert events; `link` requires `controller_url`.
+- **ntfy** — POST to the topic URL with the message as the body, `Title`
+  ("Encode done/failed — Series Ep NN", "Encode alert") and `Priority`
+  headers (failed jobs and alerts = 4/high, done jobs and digests =
+  3/default). A configured token is sent as `Authorization: Bearer`.
+- **Email** — plain-text mail via `net/smtp` (STARTTLS when the relay
+  offers it; authenticated relays must offer TLS). Subject matches the ntfy
+  title; the body carries series/episode/status/node/step/error/retries/
+  duration/link/timestamp. Port 0 defaults to 587; `smtp_to` is a
+  comma-separated recipient list.
+
+Secrets (`ntfy_token`, `smtp_password`) are WRITE-ONLY, following the storage
+shares pattern: never returned by `GET /api/settings` (the response carries
+`has_ntfy_token` / `has_smtp_password` booleans instead), AES-GCM encrypted
+at rest with the shares key file beside the DB (backup downloads never carry
+usable secrets). On `PUT /api/settings` an empty secret KEEPS the stored
+value; a non-empty value replaces it. Clear the topic URL / SMTP host to
+disable a channel. Channel URLs must be http(s); SMTP port 0 or 1-65535;
+from/to must parse as email addresses (host+from+to together enable email).
 
 ## Restore runbook (in-place DB restore)
 

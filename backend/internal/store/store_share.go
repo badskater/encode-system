@@ -98,6 +98,8 @@ func (s *Store) shareCipher() (cipher.AEAD, error) {
 }
 
 // encryptSharePassword returns a "v1:<hex>" ciphertext (empty stays empty).
+// Protects share passwords AND the write-only settings secrets (ntfy token,
+// SMTP password) — one AES-GCM key beside the DB for all at-rest credentials.
 func (s *Store) encryptSharePassword(plain string) (string, error) {
 	if plain == "" {
 		return "", nil

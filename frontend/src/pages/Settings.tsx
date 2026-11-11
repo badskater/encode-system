@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { Settings, UpdateCheck, UpdateManifest } from '../types';
+import type { Settings, SettingsSave, UpdateCheck, UpdateManifest } from '../types';
 import { timeAgo } from '../components/helpers';
 import { useIsAdmin } from '../hooks/useRole';
 import APITokensCard from '../components/APITokensCard';
@@ -33,6 +33,64 @@ function checkPayload(file: File, maxBytes: number, kind: string): string | null
 function clampInt(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;
   return Math.min(hi, Math.max(lo, Math.round(v)));
+}
+
+// isHttpUrl mirrors the server's http(s)-with-host bound for the webhook and
+// ntfy topic fields (new URL rejects scheme-less or host-less inputs).
+function isHttpUrl(v: string): boolean {
+  try {
+    const u = new URL(v);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+// isEmailAddr accepts a bare address or a "Name <addr>" display form — the
+// same shapes net/mail.ParseAddress accepts server-side.
+function isEmailAddr(v: string): boolean {
+  const m = v.match(/<([^>]+)>/);
+  const addr = (m ? m[1] : v).trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr);
+}
+
+// validateNotifyChannels mirrors the server's settings bounds for the three
+// new channels so a typo is caught before the PUT. Returns an error message
+// or null when valid. Empty fields = channel disabled (always valid).
+function validateNotifyChannels(s: Settings): string | null {
+  if (s.generic_webhook_url && !isHttpUrl(s.generic_webhook_url.trim())) {
+    return 'Generic webhook URL must be an http(s) URL';
+  }
+  if (s.ntfy_topic_url && !isHttpUrl(s.ntfy_topic_url.trim())) {
+    return 'ntfy topic URL must be an http(s) URL (e.g. https://ntfy.sh/mytopic)';
+  }
+  const port = s.smtp_port ?? 0;
+  if (port !== 0 && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    return 'SMTP port must be 0 (default 587) or 1-65535';
+  }
+  const host = (s.smtp_host ?? '').trim();
+  const from = (s.smtp_from ?? '').trim();
+  const to = (s.smtp_to ?? '').trim();
+  if (host && (/\s/.test(host) || host.includes('://'))) {
+    return 'SMTP host must be a hostname (no scheme, no spaces)';
+  }
+  if (host && (!from || !to)) {
+    return 'SMTP from and to are required when a host is set';
+  }
+  if (!host && (from || to)) {
+    return 'SMTP host is required when from/to are set';
+  }
+  if (from && !isEmailAddr(from)) {
+    return 'SMTP from must be a valid email address';
+  }
+  if (to) {
+    for (const addr of to.split(',')) {
+      if (!isEmailAddr(addr.trim())) {
+        return 'SMTP to must be comma-separated valid email addresses';
+      }
+    }
+  }
+  return null;
 }
 
 // SettingsPage edits the fleet's runtime configuration from the UI:
@@ -72,6 +130,11 @@ export default function SettingsPage() {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
   const [updateError, setUpdateError] = useState('');
   const [checking, setChecking] = useState(false);
+  // Write-only notification secrets: kept OUT of the settings object (the
+  // API never returns them). Empty on load; a typed value is sent once on
+  // save, then cleared — blank on the next save keeps the stored credential.
+  const [ntfyToken, setNtfyToken] = useState('');
+  const [smtpPassword, setSmtpPassword] = useState('');
   const isAdmin = useIsAdmin();
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
@@ -149,6 +212,13 @@ export default function SettingsPage() {
 
   async function save() {
     if (!settings) return;
+    // Client-side bounds mirror the server validation for the notification
+    // channels — surface the error before spending a round-trip.
+    const invalid = validateNotifyChannels(settings);
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -167,9 +237,25 @@ export default function SettingsPage() {
         disk_alert_gb: clampInt(settings.disk_alert_gb ?? 0, 0, 100000),
         // Stall watchdog: 0 = off; same NaN→0 safe default, ceiling 1 week.
         stall_timeout_minutes: clampInt(settings.stall_timeout_minutes ?? 0, 0, 10080),
+        // SMTP port: 0 = default 587; NaN (cleared) maps to 0.
+        smtp_port: clampInt(settings.smtp_port ?? 0, 0, 65535),
       };
-      const saved = await api.saveSettings(toSave);
+      // PUT payload: strip the GET-only has_* flags (the server tolerates
+      // them, but they are output-only) and attach typed write-only secrets.
+      // Omitted/empty secret = keep the stored value (shares pattern).
+      const payload = { ...toSave } as SettingsSave & {
+        has_ntfy_token?: boolean;
+        has_smtp_password?: boolean;
+      };
+      delete payload.has_ntfy_token;
+      delete payload.has_smtp_password;
+      if (ntfyToken.trim()) payload.ntfy_token = ntfyToken.trim();
+      if (smtpPassword) payload.smtp_password = smtpPassword;
+      const saved = await api.saveSettings(payload);
       setSettings(saved);
+      // Secrets were consumed: clear the inputs so the next save keeps them.
+      setNtfyToken('');
+      setSmtpPassword('');
       setNotice('Settings saved. Scanner and new jobs pick them up on the next cycle — no restart needed.');
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
@@ -261,6 +347,29 @@ export default function SettingsPage() {
         placeholder={placeholder}
         disabled={!isAdmin}
         onChange={(e) => setString(key, e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // secretField renders a write-only credential input (SharesCard pattern):
+  // never prefilled, password-type, and a "saved" placeholder when the API
+  // reports the credential exists (has_* flag). Blank on save = keep it.
+  const secretField = (
+    label: string, hint: string, value: string, onChange: (v: string) => void,
+    saved: boolean, placeholder: string,
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <input
+        type="password"
+        aria-label={label}
+        autoComplete="new-password"
+        style={{ width: '100%' }}
+        value={value}
+        placeholder={saved ? '•••• saved — leave blank to keep' : placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
       />
       <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
     </label>
@@ -490,6 +599,71 @@ export default function SettingsPage() {
         <span className="muted" style={{ display: 'block', fontSize: 12 }}>
           Fires on online/offline/busy transitions; requires the webhook above.
         </span>
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
+        )}
+        {settings.updated_at && (
+          <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Notification channels: additive transports for the same alerts the
+          Discord card configures (job outcomes, node status, disk space,
+          hourly digest). Each channel is off until configured and works
+          with or without Discord. Secrets are write-only (SharesCard
+          pattern): stored encrypted, never echoed back. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Notification channels (webhook · ntfy · email)</h3>
+        <p className="muted">
+          Extra transports for the same alerts — job outcomes, node status,
+          disk space and the hourly digest. Each channel is off until
+          configured; they work with or without Discord. Secrets are
+          write-only: stored encrypted, never shown again — leave blank to
+          keep the saved value.
+        </p>
+        {field(
+          'Generic webhook URL',
+          'Structured JSON event POSTs (job_finished / alert). http(s) only — payload shape in Docs/md/Operations.md.',
+          'generic_webhook_url',
+          'https://automation.example.com/hook',
+        )}
+        {field(
+          'ntfy topic URL',
+          'Full publish endpoint, e.g. https://ntfy.sh/encode-alerts (self-hosted servers work too).',
+          'ntfy_topic_url',
+          'https://ntfy.sh/encode-alerts',
+        )}
+        {secretField(
+          'ntfy access token (optional)',
+          'Bearer token for protected topics. Write-only — blank keeps the stored token.',
+          ntfyToken, setNtfyToken, !!settings.has_ntfy_token, 'optional',
+        )}
+        {field('SMTP host', 'Mail relay hostname (no scheme). Enables email when host + from + to are all set.', 'smtp_host', 'mail.example.com')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SMTP port (0 = default 587)</span>
+          <input
+            type="number"
+            min={0}
+            max={65535}
+            style={{ width: '100%' }}
+            value={settings.smtp_port ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => set('smtp_port', Number(e.target.value))}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Submission port; authenticated relays must offer STARTTLS.
+          </span>
+        </label>
+        {field('SMTP user (optional)', 'Leave blank for an unauthenticated relay.', 'smtp_user', 'encode-bot')}
+        {secretField(
+          'SMTP password',
+          'Write-only — blank keeps the stored password.',
+          smtpPassword, setSmtpPassword, !!settings.has_smtp_password, 'optional',
+        )}
+        {field('SMTP from', 'Envelope sender, e.g. encode@example.com.', 'smtp_from', 'encode@example.com')}
+        {field('SMTP to', 'Comma-separated recipients, e.g. ops@example.com, oncall@example.com.', 'smtp_to', 'ops@example.com')}
         {isAdmin && (
         <button className="btn primary" disabled={saving} onClick={save}>
           {saving ? 'Saving…' : 'Save settings'}

@@ -741,13 +741,16 @@ func (s *Server) notifyJobFinished(ctx context.Context, jobID int64, nodeName st
 		return
 	}
 	// Per-series webhook override wins over the global one (routed alerts
-	// go to that series' channel). The injected s.Notifier above still
-	// takes precedence so tests keep a single recording seam.
+	// go to that series' Discord channel). The injected s.Notifier above
+	// still takes precedence so tests keep a single recording seam. The
+	// fan-out delivers the SAME event to every configured channel (Discord,
+	// generic webhook, ntfy, email); the skip rules above (mute, digest,
+	// auto-retry) already ran, so a skipped event reaches no channel.
 	hook := st.DiscordWebhook
 	if seriesHook != "" {
 		hook = seriesHook
 	}
-	notify.NewDiscordWithLink(hook, st.ControllerURL, s.Log).JobFinished(ctx, j, nodeName)
+	notify.NewFanoutFromSettings(st, hook, s.mailSender(), s.Log).JobFinished(ctx, j, nodeName)
 }
 
 // discordWebhook returns the effective Discord webhook. The persisted

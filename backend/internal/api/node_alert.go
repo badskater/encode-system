@@ -48,10 +48,11 @@ type nodeAlertState struct {
 // alerts: "🔴 Node <name> went offline (last seen <RFC3339>)" and
 // "🟢 Node <name> is back online".
 //
-// Alerts fire ONLY when settings.NotifyNodeStatus is true AND
-// settings.DiscordWebhook is non-empty — both are read live each tick so a
-// Settings-page toggle applies without a restart. When either is off the tick
-// still updates the baseline (so transitions are not missed while disabled and
+// Alerts fire ONLY when settings.NotifyNodeStatus is true AND at least one
+// notification channel is configured (Discord webhook, generic webhook, ntfy
+// topic or SMTP email) — both are read live each tick so a Settings-page
+// toggle applies without a restart. When either is off the tick still
+// updates the baseline (so transitions are not missed while disabled and
 // then re-enabled mid-transition), but no alert is sent.
 //
 // HA: on Postgres the loop body runs under store.RunLoopSupervisor with
@@ -98,7 +99,10 @@ func (s *Server) nodeAlertTick(ctx context.Context) {
 // alerts on transitions. The first tick (empty prev) seeds silently.
 func (s *Server) nodeAlertTickWithState(ctx context.Context, state *nodeAlertState) {
 	st := s.currentSettings(ctx)
-	alertsEnabled := st.NotifyNodeStatus && st.DiscordWebhook != ""
+	// Alerts fire when the toggle is on AND at least one transport is
+	// configured (Discord, generic webhook, ntfy or email — the new channels
+	// carry node-status alerts too, not just Discord).
+	alertsEnabled := st.NotifyNodeStatus && notify.AnyConfigured(st)
 
 	nodes, err := s.Store.ListNodes(ctx)
 	if err != nil {
@@ -165,13 +169,14 @@ func (s *Server) sendNodeStatusAlert(ctx context.Context, st *model.Settings, tr
 		return
 	}
 	// Log the alert regardless of transport so events stay visible whether
-	// the injected Notifier (tests/future wiring) or the Discord fallback fires.
+	// the injected Notifier (tests/future wiring) or the live channel
+	// fan-out fires.
 	s.Log.Info("node status alert", "node", tr.name, "transition", tr.to)
 	if s.Notifier != nil {
 		s.Notifier.Alert(ctx, content)
 		return
 	}
-	notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).Alert(ctx, content)
+	notify.NewFanoutFromSettings(st, st.DiscordWebhook, s.mailSender(), s.Log).Alert(ctx, content)
 }
 
 // diffNodeStates computes the set of online↔offline transitions between a

@@ -99,7 +99,36 @@ func FlushDigest(log *slog.Logger, webhookURL, controllerURL string, buf *Digest
 	if webhookURL == "" {
 		return // notifications off; buffer already drained
 	}
+	content := truncate(buildDigestContent(entries, controllerURL), discordCap)
+	d := &Discord{WebhookURL: webhookURL, HTTP: sharedHTTP, Log: log}
+	d.post(context.Background(), content)
+}
 
+// FlushDigestTo is the multi-channel digest flush: it drains the buffer and
+// delivers ONE summary to every configured channel (Discord included) via
+// the fan-out. Discord receives the exact same truncated content as
+// FlushDigest (its Alert path applies the same cap); the other channels get
+// the multi-line summary text. With no channel configured the buffer is
+// still drained — events are not retained forever when there is nowhere to
+// send them. An empty buffer is a silent no-op.
+func FlushDigestTo(log *slog.Logger, st *model.Settings, mail SMTPSender, buf *DigestBuffer, _ time.Time) {
+	entries := buf.Drain()
+	if len(entries) == 0 {
+		return // silent tick — nothing to report
+	}
+	channels := BuildChannels(st, st.DiscordWebhook, mail, log)
+	if len(channels) == 0 {
+		return // notifications off; buffer already drained
+	}
+	content := buildDigestContent(entries, st.ControllerURL)
+	NewFanout(channels, log).Alert(context.Background(), content)
+}
+
+// buildDigestContent renders the digest summary text (header counts, capped
+// per-job lines, fleet link). It does NOT truncate — the Discord delivery
+// path applies the Discord cap itself, while the other channels carry the
+// multi-line text as-is.
+func buildDigestContent(entries []DigestEntry, controllerURL string) string {
 	// "failed" here means "not done" — the buffer only ever receives done/failed
 	// completions (cancelled jobs never reach notifyJobFinished), so the bucket
 	// is accurate in practice; the name is kept for the Discord message text.
@@ -134,8 +163,5 @@ func FlushDigest(log *slog.Logger, webhookURL, controllerURL string, buf *Digest
 	if link := fleetLink(controllerURL); link != "" {
 		fmt.Fprintf(&b, "%s", link)
 	}
-
-	content := truncate(b.String(), discordCap)
-	d := &Discord{WebhookURL: webhookURL, HTTP: sharedHTTP, Log: log}
-	d.post(context.Background(), content)
+	return b.String()
 }

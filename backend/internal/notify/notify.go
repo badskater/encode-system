@@ -113,6 +113,9 @@ func fleetLink(controllerURL string) string {
 // long error are truncated together so the whole payload always fits.
 const discordCap = 2000
 
+// Name identifies the channel in logs (Channel interface).
+func (d *Discord) Name() string { return "discord" }
+
 // JobFinished formats and posts the outcome. Failures carry the error and a
 // short log tail so the alert is actionable without opening the UI. When a
 // job failed after exhausting its automatic retry budget, the retry count is

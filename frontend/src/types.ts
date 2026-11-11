@@ -139,8 +139,34 @@ export interface Settings {
   // normal failure path, so flow retry policy applies). 0/absent = off.
   // Valid range on save: 0-10080.
   stall_timeout_minutes?: number;
+  // Notification channels (additive to Discord; each empty = disabled).
+  // Generic webhook: structured JSON event POSTs (job outcomes, operational
+  // alerts, digest summaries) — payload shape in Docs/md/Operations.md.
+  generic_webhook_url?: string;
+  // ntfy: full publish endpoint (scheme+host+topic). The access token is
+  // WRITE-ONLY: GET never returns it (has_ntfy_token flags its presence);
+  // send it via SettingsSave.ntfy_token — empty keeps the stored value.
+  ntfy_topic_url?: string;
+  has_ntfy_token?: boolean;
+  // SMTP email channel: enabled when host+from+to are all set; port 0
+  // defaults to 587. The password is WRITE-ONLY like the ntfy token.
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_user?: string;
+  has_smtp_password?: boolean;
+  smtp_from?: string;
+  smtp_to?: string; // comma-separated recipients
   updated_at?: string;
 }
+
+// SettingsSave is the PUT /api/settings payload: the settings blob plus the
+// write-only secrets (which never appear on GET). An empty/omitted secret
+// keeps the stored value (the shares pattern). The has_* output flags are
+// GET-only and must not be sent back.
+export type SettingsSave = Omit<Settings, 'has_ntfy_token' | 'has_smtp_password'> & {
+  ntfy_token?: string;
+  smtp_password?: string;
+};
 
 // ProvisionRun: one controller-driven Ansible provisioning attempt.
 export interface ProvisionRun {

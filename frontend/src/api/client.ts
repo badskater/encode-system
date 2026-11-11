@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, SettingsSave, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -169,7 +169,9 @@ export const api = {
 
   // ---------- Settings ----------
   // (settings GET lives near the top with health)
-  saveSettings: (s: Settings) => request<Settings>('PUT', '/api/settings', s),
+  // PUT takes SettingsSave: the blob plus optional write-only secrets
+  // (ntfy_token / smtp_password). Empty secret = keep the stored value.
+  saveSettings: (s: SettingsSave) => request<Settings>('PUT', '/api/settings', s),
 
   // ---------- Update publishing (agent / EncodeLib / bin package) ----------
   manifest: () => request<UpdateManifest>('GET', '/api/updates/manifest'),

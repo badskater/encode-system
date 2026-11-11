@@ -81,6 +81,11 @@ type Server struct {
 	// path must be silent). Production leaves this nil so notifyJobFinished
 	// resolves the webhook from currentSettings exactly as before.
 	Notifier notify.Notifier
+	// MailSender, when non-nil, overrides the net/smtp send seam used by the
+	// email notification channel. Tests inject a fake to assert envelope +
+	// content without a real relay. Production leaves this nil (real
+	// net/smtp.SendMail).
+	MailSender notify.SMTPSender
 	// digest holds buffered job-outcome events when settings.NotifyDigest is
 	// ON. A ticker started by StartDigestLoop flushes it hourly, posting one
 	// summary instead of per-job alerts. Built in New (never nil — the buffer
@@ -262,13 +267,19 @@ func (s *Server) runDigestLoop(ctx context.Context) {
 // flushDigestTick runs one digest flush. Live settings drive whether the
 // flush actually posts: digest OFF → the tick is silent (buffer retains
 // events from a previous ON period for the next ON tick); digest ON → drain
-// + post if non-empty.
+// + fan the summary out to every configured channel.
 func (s *Server) flushDigestTick(ctx context.Context) {
 	st := s.currentSettings(ctx)
 	if !st.NotifyDigest {
 		return // digest off; buffered events wait for the next ON tick
 	}
-	notify.FlushDigest(s.Log, st.DiscordWebhook, st.ControllerURL, s.digest.buf, time.Now().UTC())
+	notify.FlushDigestTo(s.Log, st, s.mailSender(), s.digest.buf, time.Now().UTC())
+}
+
+// mailSender returns the SMTP send seam: the injected fake when set (tests),
+// else nil so the notify package selects the production net/smtp sender.
+func (s *Server) mailSender() notify.SMTPSender {
+	return s.MailSender
 }
 
 // seedAdminUser ensures the management-plane admin account exists. On first

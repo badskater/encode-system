@@ -459,3 +459,156 @@ describe('Settings stall timeout', () => {
     expect(sent.stall_timeout_minutes).toBe(10080);
   });
 });
+
+describe('Settings notification channels card', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The channels card's Save button is the LAST "Save settings" on the page
+  // (Behavior & naming and Discord notifications render theirs first).
+  async function channelsSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  it('renders the channel fields and write-only secret inputs', async () => {
+    render(<SettingsPage />);
+    expect(await screen.findByLabelText(/generic webhook url/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/ntfy topic url/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp host/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp port/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp from/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp to/i)).toBeInTheDocument();
+    const tok = screen.getByLabelText(/ntfy access token/i) as HTMLInputElement;
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    expect(tok.type).toBe('password');
+    expect(pw.type).toBe('password');
+    // Never prefilled — the API never returns secret values.
+    expect(tok.value).toBe('');
+    expect(pw.value).toBe('');
+  });
+
+  it('shows the saved placeholder when has_* flags are set', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    render(<SettingsPage />);
+    const tok = (await screen.findByLabelText(/ntfy access token/i)) as HTMLInputElement;
+    expect(tok.placeholder).toContain('saved');
+    expect(tok.value).toBe('');
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    expect(pw.placeholder).toContain('saved');
+    expect(pw.value).toBe('');
+  });
+
+  it('sends typed secrets once and clears the inputs after save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    render(<SettingsPage />);
+    const tok = (await screen.findByLabelText(/ntfy access token/i)) as HTMLInputElement;
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    // Assembled at runtime: fake values, redaction-safe.
+    fireEvent.change(tok, { target: { value: 'tok-' + '123' } });
+    fireEvent.change(pw, { target: { value: 'pw-' + '456' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ntfy_token).toBe('tok-' + '123');
+    expect(sent.smtp_password).toBe('pw-' + '456');
+    // Consumed secrets are cleared so the next save keeps them.
+    await waitFor(() => expect(tok.value).toBe(''));
+    expect(pw.value).toBe('');
+  });
+
+  it('omits secret keys when nothing was typed (keep stored values)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ntfy_token).toBeUndefined();
+    expect(sent.smtp_password).toBeUndefined();
+  });
+
+  it('strips the GET-only has_* flags from the PUT payload', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Record<string, unknown>;
+    expect(sent.has_ntfy_token).toBeUndefined();
+    expect(sent.has_smtp_password).toBeUndefined();
+  });
+
+  it('sends channel URLs and SMTP fields in the PUT body', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/generic webhook url/i), {
+      target: { value: 'https://hooks.example.com/x' },
+    });
+    fireEvent.change(screen.getByLabelText(/ntfy topic url/i), {
+      target: { value: 'https://ntfy.sh/encode' },
+    });
+    fireEvent.change(screen.getByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'encode@example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.generic_webhook_url).toBe('https://hooks.example.com/x');
+    expect(sent.ntfy_topic_url).toBe('https://ntfy.sh/encode');
+    expect(sent.smtp_host).toBe('mail.example.com');
+    expect(sent.smtp_from).toBe('encode@example.com');
+    expect(sent.smtp_to).toBe('ops@example.com');
+    expect(sent.smtp_port).toBe(0);
+  });
+
+  it('blocks save on an invalid generic webhook URL', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/generic webhook url/i), {
+      target: { value: 'notaurl' },
+    });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/generic webhook url must be an http/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save on an out-of-range SMTP port', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp port/i), { target: { value: '70000' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp port must be/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when SMTP host is set without from/to', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), {
+      target: { value: 'mail.example.com' },
+    });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp from and to are required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save on an invalid SMTP recipient list', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'encode@example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com, bad' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp to must be comma-separated/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+});

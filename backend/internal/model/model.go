@@ -209,6 +209,26 @@ type Settings struct {
 	// job-outcome alerts and the discord_notify flow step (as the fallback
 	// when a flow omits its own webhook param). Empty = notifications off.
 	DiscordWebhook string `json:"discord_webhook"`
+	// GenericWebhookURL receives structured JSON event POSTs (job outcomes,
+	// operational alerts, digest summaries) — see notify.WebhookPayload for
+	// the wire shape. Empty = channel disabled (the default).
+	GenericWebhookURL string `json:"generic_webhook_url"`
+	// NtfyTopicURL is the full ntfy publish endpoint (scheme+host+topic).
+	// Empty = channel disabled. NtfyToken is the optional Bearer access
+	// token: WRITE-ONLY over the API (json:"-", masked as has_ntfy_token),
+	// AES-GCM encrypted at rest with the shares key.
+	NtfyTopicURL string `json:"ntfy_topic_url"`
+	NtfyToken    string `json:"-"`
+	// SMTP email channel. Enabled when host+from+to are all set; port 0
+	// defaults to 587. SMTPPassword is WRITE-ONLY over the API (json:"-",
+	// masked as has_smtp_password), AES-GCM encrypted at rest with the
+	// shares key. Empty host = channel disabled (the default).
+	SMTPHost     string `json:"smtp_host"`
+	SMTPPort     int    `json:"smtp_port"`
+	SMTPUser     string `json:"smtp_user"`
+	SMTPPassword string `json:"-"`
+	SMTPFrom     string `json:"smtp_from"`
+	SMTPTo       string `json:"smtp_to"` // comma-separated recipients
 	// DiskAlertGB is the free-disk threshold (GB) on the drive the agent
 	// measures. A heartbeat reporting less free space (1) fires a Discord
 	// alert with a per-node cooldown and (2) soft-drains the node: no new

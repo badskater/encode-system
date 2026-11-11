@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql
@@ -31,10 +32,13 @@ type Store struct {
 	dbPath string
 	// dialect selects the SQL backend so q() and friends branch correctly.
 	dialect dialect
-	// aead is the lazily-created cipher protecting share passwords (see
-	// store_share.go). Guarded by nothing: only touched from store methods
-	// which the sqlite pool serializes (MaxOpenConns=1).
-	aead cipher.AEAD
+	// aead is the lazily-created cipher protecting share passwords and the
+	// write-only settings secrets (see store_share.go). Guarded by cipherMu:
+	// encryption runs BEFORE any DB call, so the pool does not serialize it
+	// (and PG pools 10 connections) — concurrent first use must not generate
+	// two different keys.
+	aead     cipher.AEAD
+	cipherMu sync.Mutex
 }
 
 // Open opens (creating if needed) a SQLite database at the given file path or

@@ -31,13 +31,18 @@ type SMTPSender interface {
 // HTTP channels get from sharedHTTP. PlainAuth still refuses to send
 // credentials over an unencrypted non-loopback connection, so authenticated
 // relays must offer TLS (documented in Operations.md).
-type defaultSMTPSender struct{}
+type defaultSMTPSender struct {
+	// log, when set, receives a structured Warn if credentials are
+	// configured but the relay does not advertise AUTH (the send still
+	// proceeds for compatibility — the operator must know it is unauthenticated).
+	log *slog.Logger
+}
 
 // smtpTimeout bounds dial + the whole SMTP exchange. A var so tests can
 // shrink it against a silent fake relay.
 var smtpTimeout = 10 * time.Second
 
-func (defaultSMTPSender) SendMail(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+func (s defaultSMTPSender) SendMail(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
 	conn, err := net.DialTimeout("tcp", addr, smtpTimeout)
 	if err != nil {
 		return err
@@ -65,6 +70,12 @@ func (defaultSMTPSender) SendMail(addr string, auth smtp.Auth, from string, to [
 			if err := c.Auth(auth); err != nil {
 				return err
 			}
+		} else if s.log != nil {
+			// Credentials are configured but the relay offers no AUTH:
+			// sending unauthenticated is a compat fallback, not silence —
+			// the operator must know the credentials are not being used.
+			s.log.Warn("smtp credentials configured but relay does not advertise AUTH; sending unauthenticated",
+				"channel", "email", "host", host)
 		}
 	}
 	if err := c.Mail(from); err != nil {
@@ -109,7 +120,7 @@ type Email struct {
 // SMTPConfigured; a nil sender selects the production net/smtp seam.
 func NewEmail(st *model.Settings, sender SMTPSender, log *slog.Logger) *Email {
 	if sender == nil {
-		sender = defaultSMTPSender{}
+		sender = defaultSMTPSender{log: log}
 	}
 	return &Email{
 		Host:     st.SMTPHost,

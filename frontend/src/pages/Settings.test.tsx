@@ -611,4 +611,42 @@ describe('Settings notification channels card', () => {
     expect(await screen.findByText(/smtp to must be comma-separated/i)).toBeInTheDocument();
     expect(saveSpy).not.toHaveBeenCalled();
   });
+
+  // G6: the client must accept the same address shapes as the server's
+  // net/mail.ParseAddress — notably dotless domains (ops@localhost), which
+  // the old dot-requiring regex rejected while the server accepted them.
+  it('accepts dotless-domain SMTP addresses like the server (ops@localhost)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'ops@localhost' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'oncall@localhost' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.smtp_from).toBe('ops@localhost');
+    expect(sent.smtp_to).toBe('oncall@localhost');
+  });
+
+  it('accepts a display-name form with a dotless domain', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'Encode Bot <ops@localhost>' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].smtp_from).toBe('Encode Bot <ops@localhost>');
+  });
+
+  it('still blocks genuinely invalid SMTP addresses', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'not-an-email' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp from must be a valid email/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
 });

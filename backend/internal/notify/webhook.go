@@ -95,13 +95,13 @@ func (w *Webhook) post(ctx context.Context, p WebhookPayload) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
 	if err != nil {
-		w.Log.Warn("webhook notify failed", "channel", "webhook", "err", err)
+		w.Log.Warn("webhook notify failed", "channel", "webhook", "err", redactErr(err, w.URL))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := w.HTTP.Do(req)
 	if err != nil {
-		w.Log.Warn("webhook notify failed", "channel", "webhook", "err", err)
+		w.Log.Warn("webhook notify failed", "channel", "webhook", "err", redactErr(err, w.URL))
 		return
 	}
 	defer resp.Body.Close()

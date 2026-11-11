@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/url"
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 )
 
 // ---------- Settings (NFS shares, roots, remote path mapping) ----------
@@ -77,8 +79,11 @@ func (s *Server) currentSettings(ctx context.Context) *model.Settings {
 	if err != nil {
 		// Distinguish "no row yet" (nil, nil) from a real failure: a corrupt
 		// row or a broken DB must be visible, or jobs would silently render
-		// with env defaults instead of the operator's configured paths.
-		s.Log.Warn("settings load failed, falling back to env defaults", "err", err)
+		// with env defaults instead of the operator's configured paths. The
+		// read path stays available (fallback), but the failure is an ERROR:
+		// the usual cause is a lost shares key making stored secrets
+		// undecryptable, and the save path refuses to write until it is fixed.
+		s.Log.Error("settings load failed, falling back to env defaults — stored settings unreadable (restore the shares key if it was lost)", "err", err)
 	}
 	if st != nil {
 		return st
@@ -88,9 +93,29 @@ func (s *Server) currentSettings(ctx context.Context) *model.Settings {
 
 // handleGetSettings exposes the live settings (NFS share config, controller
 // roots, remote path mapping, behavior) to the UI. Write-only secrets are
-// masked to has_* flags.
+// masked to has_* flags. For NON-admin readers (viewer sessions, read-scope
+// API tokens) the channel URLs' query VALUES are masked too — ntfy topic and
+// generic webhook URLs can carry credentials (?auth=<token>), and this route
+// is reachable by any authenticated user. Admins see the full URLs.
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, maskSettings(s.currentSettings(r.Context())))
+	st := s.currentSettings(r.Context())
+	if !requestIsAdmin(r) {
+		st = maskSettingsURLsForNonAdmin(st)
+	}
+	writeJSON(w, http.StatusOK, maskSettings(st))
+}
+
+// maskSettingsURLsForNonAdmin returns a COPY of st with credential-bearing
+// query values masked in the two channel URLs (scheme/host/path stay visible
+// so the endpoint remains identifiable — the least-breaking mask; the only
+// non-admin consumer is the Settings page's read-only fields). The stored
+// settings are never mutated. Dedicated secret fields are already write-only
+// on the model (json:"-") for every role.
+func maskSettingsURLsForNonAdmin(st *model.Settings) *model.Settings {
+	cp := *st
+	cp.NtfyTopicURL = notify.RedactURL(cp.NtfyTopicURL)
+	cp.GenericWebhookURL = notify.RedactURL(cp.GenericWebhookURL)
+	return &cp
 }
 
 // handleUpdateSettings replaces the settings row. Validation keeps the
@@ -114,14 +139,36 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Keep-semantics for write-only secrets: blank = keep the stored value.
-	// Read the effective settings BEFORE the save so the merge sees the
-	// current row (or env defaults when no row exists yet).
-	prev := s.currentSettings(r.Context())
+	// Read the stored row DIRECTLY — never via currentSettings(), whose
+	// env-defaults fallback would merge from an UNKNOWN state: when the
+	// stored ciphertext is undecryptable (shares key lost), merging from
+	// the fallback silently wipes the stored secrets on the next unrelated
+	// PUT. Only a genuinely absent row (nil, nil) may merge from defaults;
+	// any read/decrypt error fails the save closed.
+	prev, err := s.Store.GetSettings(r.Context())
+	if err != nil {
+		s.Log.Error("refusing settings save: stored settings unreadable", "err", err)
+		writeErr(w, http.StatusInternalServerError,
+			"stored settings unreadable — restore the shares key before saving (secrets were NOT changed)")
+		return
+	}
+	if prev == nil {
+		prev = s.defaultsSettings()
+	}
 	if st.NtfyToken == "" {
 		st.NtfyToken = prev.NtfyToken
 	}
 	if st.SMTPPassword == "" {
 		st.SMTPPassword = prev.SMTPPassword
+	}
+	// G4: a configured SMTP user with no password AFTER the keep-merge
+	// would silently send unauthenticated — refuse it. (Checked post-merge
+	// so a stored password keeps the configuration valid when the PUT
+	// omits the password.)
+	if st.SMTPUser != "" && st.SMTPPassword == "" {
+		writeErr(w, http.StatusBadRequest,
+			"smtp_password is required when smtp_user is set (a blank password keeps the stored one; none is stored)")
+		return
 	}
 	if err := s.Store.SaveSettings(r.Context(), &st); err != nil {
 		writeErr(w, http.StatusInternalServerError, "save settings")
@@ -240,6 +287,15 @@ func validateSettings(st *model.Settings) error {
 	}
 	if st.SMTPHost != "" && (strings.ContainsAny(st.SMTPHost, " 	") || strings.Contains(st.SMTPHost, "://")) {
 		return errSettings("smtp_host must be a hostname (no scheme, no spaces)")
+	}
+	// A ':' in the host is only legal for a bracketed IPv6 literal — a
+	// bare "host:25" would produce a malformed net.JoinHostPort at send
+	// time (the port belongs in smtp_port). Brackets themselves are only
+	// valid around an IPv6 literal, so "[hostname]" is refused too.
+	if h := st.SMTPHost; strings.Contains(h, ":") || strings.HasPrefix(h, "[") || strings.HasSuffix(h, "]") {
+		if !strings.HasPrefix(h, "[") || !strings.HasSuffix(h, "]") || net.ParseIP(h[1:len(h)-1]) == nil {
+			return errSettings("smtp_host must be a hostname or a bracketed IPv6 literal like [::1] (set the port in smtp_port)")
+		}
 	}
 	if st.SMTPHost != "" {
 		if st.SMTPFrom == "" || st.SMTPTo == "" {

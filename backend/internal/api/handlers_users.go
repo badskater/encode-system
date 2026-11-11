@@ -61,6 +61,17 @@ func sessionIsAdmin(r *http.Request) bool {
 
 var _ = sessionIsAdmin // retained for future actor-distinguishing handlers
 
+// requestIsAdmin reports whether the request carries admin privileges:
+// an admin-role session OR an admin-scope API token. Viewer sessions and
+// read-scope tokens are non-admin (used for credential masking on read
+// surfaces that any authenticated user can reach).
+func requestIsAdmin(r *http.Request) bool {
+	if tok := apiTokenFromCtx(r); tok != nil {
+		return tok.Scope == model.TokenScopeAdmin
+	}
+	return sessionIsAdmin(r)
+}
+
 // ---------- User CRUD handlers ----------
 
 type createUserRequest struct {

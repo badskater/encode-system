@@ -195,7 +195,7 @@ func (d *Discord) post(ctx context.Context, content string) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
-		d.Log.Warn("discord notify failed", "err", err)
+		d.Log.Warn("discord notify failed", "channel", "discord", "err", redactErr(err, d.WebhookURL))
 		return
 	}
 	defer resp.Body.Close()

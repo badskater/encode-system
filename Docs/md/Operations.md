@@ -118,8 +118,12 @@ never blocks the others.
 - **Email** — plain-text mail via `net/smtp` (STARTTLS when the relay
   offers it; authenticated relays must offer TLS). Subject matches the ntfy
   title; the body carries series/episode/status/node/step/error/retries/
-  duration/link/timestamp. Port 0 defaults to 587; `smtp_to` is a
-  comma-separated recipient list.
+  duration/timestamp. There is NO Link line in email or ntfy bodies — the
+  deep link is a generic-webhook-only field (it requires `controller_url`,
+  which only the webhook payload carries). Port 0 defaults to 587; `smtp_to`
+  is a comma-separated recipient list. If `smtp_user`/`smtp_password` are
+  set but the relay does not advertise AUTH, the send still proceeds
+  (unauthenticated) and a structured warning is logged.
 
 Secrets (`ntfy_token`, `smtp_password`) are WRITE-ONLY, following the storage
 shares pattern: never returned by `GET /api/settings` (the response carries
@@ -128,7 +132,26 @@ at rest with the shares key file beside the DB (backup downloads never carry
 usable secrets). On `PUT /api/settings` an empty secret KEEPS the stored
 value; a non-empty value replaces it. Clear the topic URL / SMTP host to
 disable a channel. Channel URLs must be http(s); SMTP port 0 or 1-65535;
-from/to must parse as email addresses (host+from+to together enable email).
+from/to must parse as email addresses (host+from+to together enable email);
+`smtp_host` is a hostname or bracketed IPv6 literal (no `host:port` — the
+port goes in `smtp_port`); `smtp_user` requires a password (stored or new).
+
+Channel URLs can embed credentials in the query string (`?auth=<token>`).
+For NON-admin readers (viewer sessions, read-scope API tokens) `GET
+/api/settings` masks those query VALUES in `ntfy_topic_url` and
+`generic_webhook_url` (scheme/host/path stay visible); admins see the full
+URLs. Channel error logs never carry raw query credentials either — URLs
+are redacted before logging.
+
+**Key-loss failure mode (fail-closed save).** If the shares key file is lost
+or replaced, stored secrets become undecryptable. `GET /api/settings` still
+serves env defaults but logs an ERROR naming the shares key. `PUT
+/api/settings` REFUSES to save (500 `stored settings unreadable — restore
+the shares key before saving`) rather than silently overwriting the stored
+secrets with blanks — restore the original key file (e.g. from the offsite
+key bundle) and retry. Notification fan-out delivers to all channels in
+parallel, so one slow transport bounds the whole fan-out (~10s) instead of
+stacking per-channel timeouts.
 
 ## Restore runbook (in-place DB restore)
 

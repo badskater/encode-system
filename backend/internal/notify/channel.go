@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
@@ -29,11 +30,13 @@ type Channel interface {
 	Alert(ctx context.Context, content string)
 }
 
-// Fanout delivers every event to every configured channel, in order. It
+// Fanout delivers every event to every configured channel IN PARALLEL. It
 // implements Notifier so it drops into the existing notification seam.
 // Isolation is twofold: channels log-and-return on transport errors, and a
 // defensive recover contains a panicking channel so the remaining channels
-// (and the caller's loop) always continue.
+// (and the caller's loop) always continue. Parallel delivery keeps the
+// worst case at ≈ the SLOWEST channel's bound (10s) instead of the SUM of
+// all channel bounds (~50s) — the fan-out runs inside request handlers.
 type Fanout struct {
 	Channels []Channel
 	Log      *slog.Logger
@@ -49,18 +52,31 @@ func NewFanout(channels []Channel, log *slog.Logger) *Fanout {
 	return &Fanout{Channels: channels, Log: log}
 }
 
-// JobFinished fans a terminal job outcome out to every channel.
+// JobFinished fans a terminal job outcome out to every channel in parallel
+// and waits for all of them (the caller's ctx bounds each channel).
 func (f *Fanout) JobFinished(ctx context.Context, j *model.Job, nodeName string) {
-	for _, ch := range f.Channels {
-		f.deliver(ch.Name(), func() { ch.JobFinished(ctx, j, nodeName) })
-	}
+	f.fan(func(ch Channel) { ch.JobFinished(ctx, j, nodeName) })
 }
 
-// Alert fans a free-form operational alert out to every channel.
+// Alert fans a free-form operational alert out to every channel in parallel.
 func (f *Fanout) Alert(ctx context.Context, content string) {
+	f.fan(func(ch Channel) { ch.Alert(ctx, content) })
+}
+
+// fan runs fn on every channel concurrently, one goroutine per channel,
+// each panic-contained by deliver. It blocks until every channel finished
+// so callers keep the same synchronous semantics (a notification is fully
+// delivered — or failed — before the handler continues).
+func (f *Fanout) fan(fn func(Channel)) {
+	var wg sync.WaitGroup
 	for _, ch := range f.Channels {
-		f.deliver(ch.Name(), func() { ch.Alert(ctx, content) })
+		wg.Add(1)
+		go func(ch Channel) {
+			defer wg.Done()
+			f.deliver(ch.Name(), func() { fn(ch) })
+		}(ch)
 	}
+	wg.Wait()
 }
 
 // deliver runs one channel call, containing a panic so a broken transport
@@ -164,10 +180,30 @@ func jobFactsText(j *model.Job, nodeName, controllerURL string) string {
 }
 
 // jobTitle builds the shared subject/title for a job outcome ("Encode done
-// — Series Ep NN" / "Encode failed — Series Ep NN").
+// — Series Ep NN" / "Encode failed — Series Ep NN"). The result is sanitized
+// for header safety: series names can carry CRLF/control chars (the scanner
+// ingests folder names directly, bypassing API validation), which would
+// inject headers into the email Subject (Bcc exploit) or make Go reject the
+// ntfy Title header (per-series delivery loss).
 func jobTitle(j *model.Job) string {
 	if j.Status == model.JobDone {
-		return fmt.Sprintf("Encode done — %s Ep %s", j.Series, j.Episode)
+		return sanitizeHeader(fmt.Sprintf("Encode done — %s Ep %s", j.Series, j.Episode))
 	}
-	return fmt.Sprintf("Encode failed — %s Ep %s", j.Series, j.Episode)
+	return sanitizeHeader(fmt.Sprintf("Encode failed — %s Ep %s", j.Series, j.Episode))
+}
+
+// sanitizeHeader replaces CR/LF and every other C0 control char (plus DEL)
+// with a space so a value is safe to put in a single-line message header
+// (email Subject, ntfy Title). Spaces keep words separated; printable
+// Unicode (e.g. the em dash, CJK titles) passes through untouched.
+func sanitizeHeader(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			b.WriteRune(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

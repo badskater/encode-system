@@ -57,6 +57,16 @@ func TestValidateSeriesName(t *testing.T) {
 		".hidden",
 		"trailing ",
 		"trailing.",
+		// CRLF / control chars (Q6): the scanner ingests folder names
+		// directly, but the API path must refuse them too — they enable
+		// email header injection and break ntfy Title headers downstream.
+		"Show\r\nBcc: attacker@evil.example",
+		"Show\nname",
+		"Show\rname",
+		"Show\x00name",
+		"Show	name",
+		"Show\x1bname",
+		"Show\x7fname",
 	} {
 		if err := validateSeriesName(bad); err == nil {
 			t.Errorf("validateSeriesName(%q) accepted an invalid name", bad)
@@ -69,5 +79,19 @@ func TestValidateSeriesName(t *testing.T) {
 	}
 	if err := validateSeriesName(string(long)); err == nil {
 		t.Error("over-long name accepted")
+	}
+}
+
+// TestCreateSeriesRejectsCRLFName: the API path refuses a CRLF-bearing
+// series name with 400 (the scanner path is guarded by notify-side
+// sanitization; both layers are needed).
+func TestCreateSeriesRejectsCRLFName(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	resp, body := doJSON(t, "POST", ts.URL+"/api/series", adminTok, map[string]any{
+		"name": "Show\r\nBcc: attacker@evil.example", "episodes": 1,
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("CRLF series name: want 400, got %d %s", resp.StatusCode, body)
 	}
 }

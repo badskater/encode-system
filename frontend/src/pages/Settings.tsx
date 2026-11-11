@@ -47,11 +47,13 @@ function isHttpUrl(v: string): boolean {
 }
 
 // isEmailAddr accepts a bare address or a "Name <addr>" display form — the
-// same shapes net/mail.ParseAddress accepts server-side.
+// same shapes net/mail.ParseAddress accepts server-side. The domain does NOT
+// need a dot: ops@localhost is valid on the server (G6), so the client must
+// not be stricter. (Quoted local parts remain a server-only edge case.)
 function isEmailAddr(v: string): boolean {
   const m = v.match(/<([^>]+)>/);
   const addr = (m ? m[1] : v).trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr);
+  return /^[^\s@]+@[^\s@]+$/.test(addr);
 }
 
 // validateNotifyChannels mirrors the server's settings bounds for the three

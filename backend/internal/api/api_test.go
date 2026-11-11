@@ -30,6 +30,7 @@ type testEnv struct {
 	server *Server
 	node   *model.Node
 	token  string
+	dir    string // temp state dir (DB + shares key live here)
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -85,7 +86,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	ts := httptest.NewServer(s.Routes())
 	t.Cleanup(ts.Close)
 	// Store base URL on the server for request building via a wrapper.
-	return &testEnv{server: s, node: node, token: token}
+	return &testEnv{server: s, node: node, token: token, dir: dir}
 }
 
 // envRoutes serves the API through an httptest server per call set.

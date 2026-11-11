@@ -52,7 +52,7 @@ func (n *Ntfy) Alert(ctx context.Context, content string) {
 func (n *Ntfy) publish(ctx context.Context, title, body, priority string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.TopicURL, strings.NewReader(body))
 	if err != nil {
-		n.Log.Warn("ntfy notify failed", "channel", "ntfy", "err", err)
+		n.Log.Warn("ntfy notify failed", "channel", "ntfy", "err", redactErr(err, n.TopicURL))
 		return
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
@@ -63,7 +63,7 @@ func (n *Ntfy) publish(ctx context.Context, title, body, priority string) {
 	}
 	resp, err := n.HTTP.Do(req)
 	if err != nil {
-		n.Log.Warn("ntfy notify failed", "channel", "ntfy", "err", err)
+		n.Log.Warn("ntfy notify failed", "channel", "ntfy", "err", redactErr(err, n.TopicURL))
 		return
 	}
 	defer resp.Body.Close()

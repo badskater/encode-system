@@ -93,6 +93,38 @@ func TestSettingsNotifyChannelValidation(t *testing.T) {
 			m["smtp_from"] = "encode@example.com"
 			m["smtp_to"] = "ops@example.com"
 		}, 400},
+		// G3: a port appended to the host breaks net.JoinHostPort at send
+		// time — reject ':' unless the host is a bracketed IPv6 literal.
+		{"smtp host with port rejected", func(m map[string]any) {
+			m["smtp_host"] = "mail.example.com:25"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 400},
+		{"smtp host bracketed ipv6 accepted", func(m map[string]any) {
+			m["smtp_host"] = "[::1]"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 200},
+		{"smtp host bracketed ipv6 full accepted", func(m map[string]any) {
+			m["smtp_host"] = "[2001:db8::25]"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 200},
+		{"smtp host unbracketed ipv6 rejected", func(m map[string]any) {
+			m["smtp_host"] = "::1"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 400},
+		{"smtp host bracketed ipv6 with port rejected", func(m map[string]any) {
+			m["smtp_host"] = "[::1]:25"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 400},
+		{"smtp host bracketed non-ip rejected", func(m map[string]any) {
+			m["smtp_host"] = "[mail.example.com]"
+			m["smtp_from"] = "encode@example.com"
+			m["smtp_to"] = "ops@example.com"
+		}, 400},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

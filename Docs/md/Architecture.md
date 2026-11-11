@@ -205,16 +205,18 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
   (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
   render error; `Write-Output` is the one translated cmdlet (→ `echo`).
-- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 14
-  of 16 built-in templates carry bash-native sources
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 15
+  of 17 built-in templates carry bash-native sources
   (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
   `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
-  `encode_4k`, `mux`, `verify_output`, `crc32_rename`, `release_copy`,
-  `discord_notify`. Tool mappings: `vspipe -c y4m | x265` (video, args
-  mirrored verbatim from the PS template — ffmpeg never video-encodes),
-  `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac` (audio),
-  `mkvmerge`/`mediainfo`/`jq` verify (`bc` required — `verify_output`
-  fail-fasts if absent), `cksum` CRC32, `sha256sum` hashing, `curl` notify.
+  `encode_4k`, `mux`, `verify_output`, `quality_gate`, `crc32_rename`,
+  `release_copy`, `discord_notify`. Tool mappings: `vspipe -c y4m | x265`
+  (video, args mirrored verbatim from the PS template — ffmpeg never
+  video-encodes), `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac`
+  (audio), `ffmpeg` libvmaf/ssim comparison (`quality_gate` — measurement,
+  not encoding), `mkvmerge`/`mediainfo`/`jq` verify (`bc` required —
+  `verify_output` and `quality_gate` fail-fast if absent), `cksum` CRC32,
+  `sha256sum` hashing, `curl` notify.
   2 templates are refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
   Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
   index needed) and `keyframes` (no faithful SCXvid Linux equivalent yet).
@@ -222,8 +224,8 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
-  `verify_output`, `crc32_rename`, `release_copy`, `keyframes`,
-  `discord_notify`.
+  `verify_output`, `quality_gate`, `crc32_rename`, `release_copy`,
+  `keyframes`, `discord_notify`.
 - **Discord notification step**: `discord_notify` posts an episode-progress
   message to a Discord webhook when the flow reaches it (e.g. after mux or
   release copy). Webhook resolution: flow param first, then the controller's
@@ -478,6 +480,21 @@ controller re-caps `log_full` at 1 MiB defensively.
   and ≥1 audio track (`mkvmerge -J`), and pass a duration check — compared
   against the source media via MediaInfo (±2s) when discoverable, else a
   sanity floor (>60s). Factory text is byte-guarded like the other built-ins.
+- **`quality_gate` step** — perceptual quality check seeded into NEW
+  default flows immediately after `verify_output` (name-guarded seeding
+  never modifies existing flows). Compares the muxed encode against the
+  source with ffmpeg: sampled every Nth frame (`select` + `setpts` on both
+  inputs, default N=12), 10-bit 4:2:0 normalization, source scaled to the
+  encode's dimensions (`scale2ref`), then libvmaf (JSON log →
+  `pooled_metrics.vmaf.mean`) or — when `ffmpeg -filters` shows no libvmaf —
+  a loud WARNING + SSIM fallback (`All:` summary). Params: `metric`
+  (vmaf|ssim), `threshold` (blank → 90 VMAF / 0.95 SSIM; bounds validated),
+  `sampling` (1–1000). Writes `quality.json` (metric, score, threshold,
+  sampled_frames, fallback_used) in the episode dir and emits
+  `ENCODE_METRIC quality_score` + `quality_metric` (numeric: 1=VMAF, 0=SSIM
+  — metrics_json is float-only). Score < threshold fails the step; tool
+  errors (ffmpeg missing/crash, unparseable score, missing inputs) fail
+  with distinct messages. Tuning: Docs/md/Operations.md § Quality gate.
 
 ## Queue control, storage & admin features (2026-09 feature set)
 

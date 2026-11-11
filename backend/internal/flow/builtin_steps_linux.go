@@ -68,6 +68,7 @@ var builtinBashSources = map[string]string{
 	"encode_4k":      bashSourceEncode4k,
 	"mux":            bashSourceMux,
 	"verify_output":  bashSourceVerifyOutput,
+	"quality_gate":   bashSourceQualityGate,
 	"crc32_rename":   bashSourceCrc32Rename,
 	"release_copy":   bashSourceReleaseCopy,
 	"discord_notify": bashSourceDiscordNotify,

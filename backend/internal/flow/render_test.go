@@ -162,9 +162,10 @@ func TestDefault4kFlowStepsResolve(t *testing.T) {
 	if fl.Name != "default-4k" {
 		t.Fatalf("name = %q", fl.Name)
 	}
-	// 9 steps: verify_output was added to the seeds (after mux, before release_copy).
-	if len(fl.Steps) != 9 {
-		t.Fatalf("want 9 steps, got %d", len(fl.Steps))
+	// 10 steps: verify_output + quality_gate were added to the seeds
+	// (after mux, before release_copy).
+	if len(fl.Steps) != 10 {
+		t.Fatalf("want 10 steps, got %d", len(fl.Steps))
 	}
 	for i, st := range fl.Steps {
 		if !have[st.TemplateKey()] {
@@ -183,9 +184,10 @@ func TestDefault4kCPUFlowStepsResolve(t *testing.T) {
 	if fl.Name != "default-4k-cpu" {
 		t.Fatalf("name = %q", fl.Name)
 	}
-	// 8 steps: verify_output was added to the seeds (after mux, before release_copy).
-	if len(fl.Steps) != 8 {
-		t.Fatalf("want 8 steps (no dgindex), got %d", len(fl.Steps))
+	// 9 steps: verify_output + quality_gate were added to the seeds
+	// (after mux, before release_copy).
+	if len(fl.Steps) != 9 {
+		t.Fatalf("want 9 steps (no dgindex), got %d", len(fl.Steps))
 	}
 	for _, st := range fl.Steps {
 		if st.TemplateKey() == "dgindex" {

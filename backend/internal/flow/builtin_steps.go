@@ -35,6 +35,7 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		encode4kTemplate(),
 		muxTemplate(),
 		verifyOutputTemplate(),
+		qualityGateTemplate(),
 		crc32RenameTemplate(),
 		releaseCopyTemplate(),
 		keyframesTemplate(),

@@ -355,3 +355,134 @@ describe('FlowBuilder timeouts', () => {
     expect(onSave).not.toHaveBeenCalled();
   });
 });
+
+// quality_gate (P5): the builtin surfaces through the same generic
+// ParamDef-driven rendering as every other builtin — no bespoke UI. The
+// fixture mirrors the REAL template params from
+// backend/internal/flow/builtin_steps_quality.go (metric/threshold/sampling).
+describe('FlowBuilder quality_gate params', () => {
+  function qualityGateTemplate(): StepTemplate {
+    return {
+      id: 0,
+      key: 'quality_gate',
+      label: 'Quality gate (VMAF/SSIM)',
+      description: 'Perceptual quality check against the source.',
+      params: [
+        { key: 'metric', label: 'Metric (vmaf or ssim)', default: 'vmaf' },
+        {
+          key: 'threshold',
+          label: 'Minimum score (blank: 90 VMAF / 0.95 SSIM)',
+          type: 'number',
+          placeholder: '90',
+        },
+        { key: 'sampling', label: 'Compare every Nth frame (1 = all)', type: 'number', default: '12' },
+      ],
+      powershell: '',
+      builtin: true,
+      created_at: '',
+      updated_at: '',
+    };
+  }
+
+  it('shows quality_gate in the palette and renders its three params with defaults', () => {
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={vi.fn()}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+
+    // metric + sampling prefilled from the declared defaults; threshold is
+    // metric-dependent so it stays blank (script-side default) with the
+    // VMAF placeholder visible.
+    expect((screen.getByLabelText('Metric (vmaf or ssim)') as HTMLInputElement).value).toBe('vmaf');
+    expect((screen.getByLabelText('Compare every Nth frame (1 = all)') as HTMLInputElement).value).toBe('12');
+    const threshold = screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)') as HTMLInputElement;
+    expect(threshold.value).toBe('');
+    expect(threshold.type).toBe('number');
+    expect(threshold.placeholder).toBe('90');
+  });
+
+  it('round-trips edited quality_gate params through onSave', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'gated-flow' },
+    });
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+    fireEvent.change(screen.getByLabelText('Metric (vmaf or ssim)'), { target: { value: 'ssim' } });
+    fireEvent.change(screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)'), {
+      target: { value: '0.9' },
+    });
+    fireEvent.change(screen.getByLabelText('Compare every Nth frame (1 = all)'), {
+      target: { value: '24' },
+    });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [name, steps] = onSave.mock.calls[0];
+    expect(name).toBe('gated-flow');
+    expect(steps).toEqual([
+      { type: 'quality_gate', params: { metric: 'ssim', threshold: '0.9', sampling: '24' } },
+    ]);
+  });
+
+  it('strips a blank threshold so the script applies the metric default', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'default-threshold' },
+    });
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    // threshold blank -> stripped; metric/sampling keep their visible defaults.
+    expect(steps).toEqual([
+      { type: 'quality_gate', params: { metric: 'vmaf', sampling: '12' } },
+    ]);
+  });
+
+  it('renders stored quality_gate params when editing an existing flow', () => {
+    const flow: Flow = {
+      id: 1,
+      name: 'existing',
+      steps: [
+        { type: 'mux' },
+        { type: 'quality_gate', params: { metric: 'ssim', threshold: '0.97', sampling: '6' } },
+      ],
+      is_default: false,
+      created_at: '',
+      updated_at: '',
+    };
+    render(
+      <FlowBuilder
+        initial={flow}
+        templates={[qualityGateTemplate()]}
+        onSave={vi.fn()}
+        onCancel={() => {}}
+      />,
+    );
+    expect((screen.getByLabelText('Metric (vmaf or ssim)') as HTMLInputElement).value).toBe('ssim');
+    expect((screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)') as HTMLInputElement).value).toBe('0.97');
+    expect((screen.getByLabelText('Compare every Nth frame (1 = all)') as HTMLInputElement).value).toBe('6');
+  });
+});

@@ -162,6 +162,7 @@ var builtinLinuxToolMap = map[string]string{
 	"encode_4k":      "x265",      // x265 encoder (vspipe pipes in)
 	"mux":            "mkvmerge",  // mkvmerge (same binary on Linux)
 	"verify_output":  "mkvmerge",  // mkvmerge -J (same binary)
+	"quality_gate":   "ffmpeg",    // ffmpeg libvmaf/ssim comparison (same binary)
 	"crc32_rename":   "cksum",     // POSIX cksum (CRC32) or python fallback
 	"release_copy":   "cp",        // bash cp replaces Copy-Item
 	"discord_notify": "curl",      // curl replaces WebClient

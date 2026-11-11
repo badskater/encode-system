@@ -60,7 +60,7 @@
 | See where jobs fail / how long they take | UI → Stats (24h/7d/30d): totals, per-node/per-flow durations, failures-by-step, episodes per day. The **Avg speedup** card and per-node/per-flow Speedup columns show duration-weighted media-seconds per encode-second ("—" = no jobs reported a duration metric). |
 | Spot stuck episodes | UI → Stats → **Stuck episodes (repeated failures)**: failed jobs that burned ≥1 auto-retry, worst-first (cap 25) with attempts, node, step, and error. |
 | Read a node's agent log without WinRM | UI → Nodes → **Log**: the tail the agent ships in its heartbeat (last ~40 lines, pretty-printed). Empty until the node runs agent ≥1.18. |
-| Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, bitrate, durations, sizes) reported by the flow script. |
+| Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, quality_score, bitrate, durations, sizes) reported by the flow script. |
 | Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
 | Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs`. |
 | Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore: click **Restore** on a snapshot (admin-only, `POST /api/backup/{name}/restore`) — on SQLite the controller swaps the backup over the live DB and exits for a restart (see restore runbook below); on Postgres the restore is an in-place single transaction (no restart). |
@@ -80,7 +80,51 @@
 | Check for a new release | UI → Dashboard / Settings → **Update check** card (`GET /api/updates/check`, any user): compares the running version to the latest GitHub release. Needs `ENCODE_GITHUB_TOKEN` for private repos. |
 | Alert on node online/offline | UI → Settings → **Node status alerts** toggle (`settings.notify_node_status`, default off). Fires alerts on real online↔offline transitions (30s loop, leader-gated on HA) to every configured channel. Requires at least one notification channel (Discord webhook, generic webhook, ntfy topic or SMTP email). |
 | Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
+| Gate encode quality | Default flows include `quality_gate` after `verify_output` (sampled VMAF vs source, SSIM fallback); see the quality gate section below for tuning. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
+
+## Quality gate (VMAF/SSIM)
+
+`quality_gate` is a builtin step seeded into NEW default flows immediately
+after `verify_output` (existing flows are never modified — add it manually
+from the step palette if wanted). It compares the muxed encode against the
+episode's source media (`src.*` in the episode dir) with ffmpeg and fails
+the job when the perceptual score is below the threshold. `verify_output`
+proves the file is structurally sound; `quality_gate` proves the encode
+looks like the source.
+
+- **Params** (Flow builder): `metric` = `vmaf` (default) or `ssim`;
+  `threshold` = minimum score, blank uses the metric default — **90 for
+  VMAF** (0–100 scale), **0.95 for SSIM** (0–1 scale); `sampling` = compare
+  every Nth frame, default **12** (~2 samples/sec at 24fps; a 24-minute
+  episode compares ~2,900 frames instead of ~34,500). Set `sampling=1` for
+  a full-frame comparison, raise it for speed.
+- **Sampling mechanics**: ffmpeg `select='not(mod(n\,N))'` keeps every Nth
+  decoded frame on BOTH inputs (identical indices → exact pairing),
+  re-timestamps, converts both streams to 10-bit 4:2:0 (the normal case is
+  an 8-bit source vs a 10-bit encode), and scales the source to the encode's
+  dimensions before running libvmaf/ssim.
+- **libvmaf fallback**: the step probes `ffmpeg -filters` for libvmaf. When
+  absent it logs a loud WARNING and falls back to SSIM; a blank threshold
+  then defaults to 0.95 (SSIM scale). An explicit VMAF-scale threshold
+  (>1) fails loudly instead of comparing SSIM against 90 — set an SSIM
+  threshold explicitly if you want the fallback to pass. `fallback_used`
+  is recorded in the artifact.
+- **Artifacts**: `quality.json` in the episode dir (`metric`, `score`,
+  `threshold`, `sampled_frames`, `fallback_used`) plus `ENCODE_METRIC
+  quality_score=<score>`. `metrics_json` is float-only, so
+  `ENCODE_METRIC quality_metric` is numeric: **1 = VMAF, 0 = SSIM** (the
+  readable name lives in `quality.json` and the job log).
+- **Failure classes**: missing ffmpeg / missing source or MKV / ffmpeg
+  crash / unparseable score are tool errors; only a parsed score below the
+  threshold is a quality rejection ("score X is below threshold Y"). Both
+  fail the step, but the log message tells you which happened. A rejected
+  encode still reports its score and writes `quality.json` before failing.
+- **Tuning**: VMAF 90 suits anime at CRF ~15; lower it (e.g. 85) for
+  grain-heavy sources, raise it for archive-grade encodes. SSIM 0.95 is a
+  structural-loss floor, not a perceptual target — prefer VMAF when the
+  node's ffmpeg has libvmaf. The gate runs before `release_copy`, so a
+  rejected encode never reaches the release folder.
 
 ## Notification channels
 

@@ -67,6 +67,12 @@ func (s *Store) shareKeyPath() string {
 	return sharesKeyPathForDSN(s.dbPath)
 }
 
+// SharesKeyPath exposes the shares-key file location (read-only accessor).
+// The offsite backup bundle (P4) needs it: the key must travel alongside the
+// snapshot for an offsite restore to decrypt DB secrets. Only the PATH is
+// exposed — key bytes never pass through the store API.
+func (s *Store) SharesKeyPath() string { return s.shareKeyPath() }
+
 // shareCipher returns (creating on first use) the AES-GCM cipher protecting
 // share passwords and the write-only settings secrets. Key is 32 random
 // bytes, stored 0600.

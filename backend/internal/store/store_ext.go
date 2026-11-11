@@ -122,14 +122,20 @@ CREATE TABLE IF NOT EXISTS provision_runs (
 // ---------- Settings ----------
 
 // settingsBlob is the on-disk shape of the settings JSON blob. model.Settings
-// hides the write-only secrets (json:"-"), so the store marshals them here
-// as AES-GCM ciphertext under their API key names — the same shares-key
-// encryption used for share passwords (encryptSharePassword). The key file
-// lives BESIDE the DB, so backup downloads never carry usable secrets.
+// hides the write-only secrets (json:"-" — including the nested offsite
+// destination secrets), so the store marshals them here as AES-GCM ciphertext
+// under flat key names — the same shares-key encryption used for share
+// passwords (encryptSharePassword). The key file lives BESIDE the DB, so
+// backup downloads never carry usable secrets.
 type settingsBlob struct {
 	*model.Settings
 	NtfyToken    string `json:"ntfy_token,omitempty"`
 	SMTPPassword string `json:"smtp_password,omitempty"`
+	// Offsite destination secrets (P4), flat siblings of the channel
+	// secrets above — same pattern, one encryption helper for all.
+	OffsiteS3SecretKey    string `json:"offsite_s3_secret_key,omitempty"`
+	OffsiteSFTPPassword   string `json:"offsite_sftp_password,omitempty"`
+	OffsiteSFTPPrivateKey string `json:"offsite_sftp_private_key,omitempty"`
 }
 
 // GetSettings loads the persisted settings row. Returns nil (not an error)
@@ -149,8 +155,11 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 	// model) land in the shadow fields instead of being dropped.
 	var blob struct {
 		model.Settings
-		NtfyToken    string `json:"ntfy_token"`
-		SMTPPassword string `json:"smtp_password"`
+		NtfyToken             string `json:"ntfy_token"`
+		SMTPPassword          string `json:"smtp_password"`
+		OffsiteS3SecretKey    string `json:"offsite_s3_secret_key"`
+		OffsiteSFTPPassword   string `json:"offsite_sftp_password"`
+		OffsiteSFTPPrivateKey string `json:"offsite_sftp_private_key"`
 	}
 	if err := json.Unmarshal([]byte(js), &blob); err != nil {
 		return nil, fmt.Errorf("unmarshal settings: %w", err)
@@ -166,6 +175,35 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 	}
 	st.NtfyToken = tok
 	st.SMTPPassword = pw
+	s3sk, err := s.decryptSharePassword(blob.OffsiteS3SecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings offsite_s3_secret_key: %w", err)
+	}
+	sftpPW, err := s.decryptSharePassword(blob.OffsiteSFTPPassword)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings offsite_sftp_password: %w", err)
+	}
+	sftpKey, err := s.decryptSharePassword(blob.OffsiteSFTPPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings offsite_sftp_private_key: %w", err)
+	}
+	st.BackupOffsite.S3.SecretKey = s3sk
+	st.BackupOffsite.SFTP.Password = sftpPW
+	st.BackupOffsite.SFTP.PrivateKey = sftpKey
+	// include_shares_key defaults to TRUE. A bool cannot distinguish
+	// "absent" from "false" after unmarshal, so probe the raw blob: rows
+	// written before the field existed (or before backup_offsite existed
+	// at all) read back as true; an explicit false is preserved.
+	var probe struct {
+		BackupOffsite *struct {
+			IncludeSharesKey *bool `json:"include_shares_key"`
+		} `json:"backup_offsite"`
+	}
+	if err := json.Unmarshal([]byte(js), &probe); err == nil {
+		if probe.BackupOffsite == nil || probe.BackupOffsite.IncludeSharesKey == nil {
+			st.BackupOffsite.IncludeSharesKey = true
+		}
+	}
 	st.UpdatedAt = ptrTime(updatedAt)
 	return &st, nil
 }
@@ -311,9 +349,10 @@ func (s *Store) AppendProvisionRunLog(ctx context.Context, id int64, chunk strin
 }
 
 // SaveSettings persists the settings row (single-row upsert on id=1).
-// Write-only secrets (ntfy token, SMTP password) are encrypted with the
-// shares key before they enter the JSON blob — plaintext never touches the
-// DB (the backup endpoint hands the DB file to admins).
+// Write-only secrets (ntfy token, SMTP password, offsite destination
+// credentials) are encrypted with the shares key before they enter the JSON
+// blob — plaintext never touches the DB (the backup endpoint hands the DB
+// file to admins).
 func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 	tok, err := s.encryptSharePassword(st.NtfyToken)
 	if err != nil {
@@ -323,7 +362,22 @@ func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 	if err != nil {
 		return fmt.Errorf("encrypt settings smtp_password: %w", err)
 	}
-	b, err := json.Marshal(settingsBlob{Settings: st, NtfyToken: tok, SMTPPassword: pw})
+	s3sk, err := s.encryptSharePassword(st.BackupOffsite.S3.SecretKey)
+	if err != nil {
+		return fmt.Errorf("encrypt settings offsite_s3_secret_key: %w", err)
+	}
+	sftpPW, err := s.encryptSharePassword(st.BackupOffsite.SFTP.Password)
+	if err != nil {
+		return fmt.Errorf("encrypt settings offsite_sftp_password: %w", err)
+	}
+	sftpKey, err := s.encryptSharePassword(st.BackupOffsite.SFTP.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("encrypt settings offsite_sftp_private_key: %w", err)
+	}
+	b, err := json.Marshal(settingsBlob{
+		Settings: st, NtfyToken: tok, SMTPPassword: pw,
+		OffsiteS3SecretKey: s3sk, OffsiteSFTPPassword: sftpPW, OffsiteSFTPPrivateKey: sftpKey,
+	})
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)
 	}

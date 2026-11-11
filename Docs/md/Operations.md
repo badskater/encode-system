@@ -153,6 +153,87 @@ key bundle) and retry. Notification fan-out delivers to all channels in
 parallel, so one slow transport bounds the whole fan-out (~10s) instead of
 stacking per-channel timeouts.
 
+## Offsite backups (S3 + SFTP)
+
+After **every successful local snapshot — scheduled AND manual** — the
+controller uploads the snapshot to each enabled offsite destination and
+prunes old copies to `keep_n` per destination. Upload failures **never fail
+the local backup**: they are logged (structured, credential-redacted),
+audited as `backup.offsite_failed`, and fanned out as an operational alert
+through the configured notification channels (Discord/webhook/ntfy/email).
+Successful copies audit as `backup.offsite`. The upload runs detached from
+the request/scheduler with a 10-minute bound, so a slow or hung destination
+never blocks the backup API or the scheduler tick.
+
+**Configuration** lives in the settings blob (`backup_offsite`), edited via
+Settings → **Offsite backups (S3 · SFTP)** or `PUT /api/settings`:
+
+- `s3`: `enabled`, `endpoint` (host:port or http(s) URL — normalized to
+  host:port on save), `bucket`, `prefix` (optional key namespace),
+  `access_key`, `secret_key` (WRITE-ONLY), `use_tls`. Reuses the shared
+  `internal/s3` minio client — any plain-S3 endpoint works (MinIO, Ceph RGW,
+  AWS).
+- `sftp`: `enabled`, `host` (hostname or bracketed IPv6 — no `host:port`),
+  `port` (0 = default 22), `user`, `password` (WRITE-ONLY), `private_key`
+  (WRITE-ONLY, unencrypted PEM — passphrase-protected keys are rejected at
+  save time), `path` (remote dir, empty = the SSH home dir; created if
+  missing).
+- `keep_n`: per-destination retention, 0 (default 30) or 1-365.
+- `include_shares_key`: bundle the shares key with each snapshot
+  (default **true**).
+
+The three destination secrets follow the shares pattern exactly: `json:"-"`
+on the model, `has_s3_secret_key` / `has_sftp_password` /
+`has_sftp_private_key` booleans on GET (block-level), AES-GCM encrypted at
+rest with the shares key. On PUT, a blank secret KEEPS the stored value; an
+OMITTED `backup_offsite` block keeps the stored block wholesale (pre-P4
+automation cannot wipe it). An enabled destination without a credential
+(stored or supplied) is refused at save time. Validation mirrors the
+notification-channel rules: port bounds, no bare-colon SFTP hosts, no
+traversal (`..`) in prefixes/paths, S3 endpoint ports 1-65535.
+
+**Remote layout and retention.** Objects are named exactly like the local
+snapshot — `encode-<YYYYMMDD>-<HHMMSS>-<sched|manual>[-N].db` (SQLite) or
+`.dump` (Postgres), UTC timestamp embedded so name order IS time order —
+under the S3 prefix / SFTP path. With key bundling on, each snapshot has a
+companion `<snapshot-name>.shares-key` (the raw 32-byte key file). After a
+successful upload the destination is listed and generations beyond the
+newest `keep_n` are deleted **snapshot + key companion together**; foreign
+objects under the same root are never touched. Note the difference from
+local retention: offsite `keep_n` applies to ALL uploaded snapshots,
+manual ones included (local retention never auto-prunes manual snapshots).
+
+**SECURITY — read before enabling.** The shares-key bundle contains the key
+that decrypts EVERY secret in the database (share passwords, ntfy tokens,
+SMTP passwords, the offsite credentials themselves). Anyone who can read
+the offsite destination can decrypt the backed-up DB's secrets. The
+destination MUST be trusted and access-controlled (private bucket policy /
+restricted SFTP account, ideally encrypted at rest by the provider). If
+that is not acceptable, untick `include_shares_key`: copies become
+snapshot-only, and a restore then needs the key file delivered out of band.
+Two further caveats: SFTP host keys are NOT pinned (the settings surface has
+no known_hosts field) — use trusted networks/destinations; and the key
+companion is uploaded as a separate object, so destination ACLs must cover
+both objects, not just the snapshot.
+
+**Offsite restore runbook.** Download the snapshot AND its `.shares-key`
+companion from the destination. Then either:
+
+1. *In-place*: copy the snapshot into the controller's backups dir and use
+   the normal restore endpoint/UI (see below). Place the key file where the
+   controller resolves it — SQLite: `<db path>.shares-key` beside the DB;
+   Postgres: `ENCODE_SHARES_KEY_FILE` (or the DSN-derived temp path) —
+   BEFORE restoring, or stored secrets become undecryptable.
+2. *Cold*: stop the controller, replace the DB file with the snapshot
+   (SQLite) or re-import the dump (`pgimport -force`, Postgres), place the
+   key file as above, start. Without the key the DB restores but every
+   encrypted secret is lost — the fail-closed settings save will refuse
+   writes until the original key is back.
+
+**HA note.** The scheduled loop runs on the leader replica only
+(advisory lock 1005); a manual backup on any replica also uploads.
+Overlapping uploads of the same snapshot name are idempotent overwrites.
+
 ## Restore runbook (in-place DB restore)
 
 `POST /api/backup/{name}/restore` (admin-only; UI: Settings → DB backups →

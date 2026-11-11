@@ -3,14 +3,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"golang.org/x/crypto/ssh"
 )
 
 // ---------- Settings (NFS shares, roots, remote path mapping) ----------
@@ -25,6 +28,39 @@ type settingsReq struct {
 	SMTPPassword    string `json:"smtp_password,omitempty"`
 	HasNtfyToken    bool   `json:"has_ntfy_token,omitempty"`    // output-only echo, ignored
 	HasSMTPPassword bool   `json:"has_smtp_password,omitempty"` // output-only echo, ignored
+	// BackupOffsite shadows the nested offsite block to capture its
+	// write-only secrets (the model's json:"-" drops them). nil = the PUT
+	// omitted the block entirely → the stored block is kept as-is.
+	BackupOffsite *offsiteReq `json:"backup_offsite,omitempty"`
+}
+
+// offsiteReq mirrors the FULL backup_offsite block for decoding: the
+// handler decodes with DisallowUnknownFields, and this shadow (shallower
+// than the embedded model.Settings field) is the sole decode target for
+// "backup_offsite" — so it must carry every non-secret field too (via the
+// embedded model types) plus the write-only secrets the model hides. The
+// has_* flags are GET-only echoes (block-level, matching offsiteOut),
+// accepted and ignored so a verbatim GET→PUT round-trip keeps working.
+type offsiteReq struct {
+	model.BackupOffsite
+	S3                offsiteS3Req   `json:"s3"`
+	SFTP              offsiteSFTPReq `json:"sftp"`
+	HasS3SecretKey    bool           `json:"has_s3_secret_key"`    // output-only echo, ignored
+	HasSFTPPassword   bool           `json:"has_sftp_password"`    // output-only echo, ignored
+	HasSFTPPrivateKey bool           `json:"has_sftp_private_key"` // output-only echo, ignored
+}
+
+// offsiteS3Req is the S3 sub-block: model fields + the write-only secret.
+type offsiteS3Req struct {
+	model.BackupOffsiteS3
+	SecretKey string `json:"secret_key"`
+}
+
+// offsiteSFTPReq is the SFTP sub-block: model fields + write-only secrets.
+type offsiteSFTPReq struct {
+	model.BackupOffsiteSFTP
+	Password   string `json:"password"`
+	PrivateKey string `json:"private_key"`
 }
 
 // settingsOut is the API-facing settings: identical to model.Settings plus
@@ -36,15 +72,32 @@ type settingsOut struct {
 	HasSMTPPassword bool `json:"has_smtp_password"`
 }
 
+// offsiteOut is the API-facing backup_offsite block: the model fields plus
+// has_* flags for the three write-only destination secrets.
+type offsiteOut struct {
+	model.BackupOffsite
+	HasS3SecretKey    bool `json:"has_s3_secret_key"`
+	HasSFTPPassword   bool `json:"has_sftp_password"`
+	HasSFTPPrivateKey bool `json:"has_sftp_private_key"`
+}
+
 // MarshalJSON implements the mask: embed Settings' fields (secrets already
-// json:"-" on the model) and add the has_* flags.
+// json:"-" on the model) and add the has_* flags. backup_offsite is
+// re-marshaled through offsiteOut so its nested secrets get flags too.
 func (o settingsOut) MarshalJSON() ([]byte, error) {
 	type alias model.Settings
+	off := o.Settings.BackupOffsite
 	return json.Marshal(struct {
 		alias
-		HasNtfyToken    bool `json:"has_ntfy_token"`
-		HasSMTPPassword bool `json:"has_smtp_password"`
-	}{alias(*o.Settings), o.HasNtfyToken, o.HasSMTPPassword})
+		HasNtfyToken    bool       `json:"has_ntfy_token"`
+		HasSMTPPassword bool       `json:"has_smtp_password"`
+		BackupOffsite   offsiteOut `json:"backup_offsite"`
+	}{alias(*o.Settings), o.HasNtfyToken, o.HasSMTPPassword, offsiteOut{
+		BackupOffsite:     off,
+		HasS3SecretKey:    off.S3.SecretKey != "",
+		HasSFTPPassword:   off.SFTP.Password != "",
+		HasSFTPPrivateKey: off.SFTP.PrivateKey != "",
+	}})
 }
 
 func maskSettings(st *model.Settings) settingsOut {
@@ -134,6 +187,17 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	st := req.Settings
 	st.NtfyToken = req.NtfyToken
 	st.SMTPPassword = req.SMTPPassword
+	// Offsite secrets arrive in the nested shadow (the model's json:"-"
+	// drops them). An absent block keeps the stored one wholesale — see
+	// the keep-merge below.
+	if req.BackupOffsite != nil {
+		st.BackupOffsite = req.BackupOffsite.BackupOffsite
+		st.BackupOffsite.S3 = req.BackupOffsite.S3.BackupOffsiteS3
+		st.BackupOffsite.SFTP = req.BackupOffsite.SFTP.BackupOffsiteSFTP
+		st.BackupOffsite.S3.SecretKey = req.BackupOffsite.S3.SecretKey
+		st.BackupOffsite.SFTP.Password = req.BackupOffsite.SFTP.Password
+		st.BackupOffsite.SFTP.PrivateKey = req.BackupOffsite.SFTP.PrivateKey
+	}
 	if err := validateSettings(&st); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -161,6 +225,23 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if st.SMTPPassword == "" {
 		st.SMTPPassword = prev.SMTPPassword
 	}
+	// Offsite keep-semantics: an OMITTED backup_offsite block keeps the
+	// stored block wholesale (a partial PUT from automation that predates
+	// P4 must not wipe destination config). A PRESENT block replaces the
+	// non-secret fields; each blank secret keeps its stored value.
+	if req.BackupOffsite == nil {
+		st.BackupOffsite = prev.BackupOffsite
+	} else {
+		if st.BackupOffsite.S3.SecretKey == "" {
+			st.BackupOffsite.S3.SecretKey = prev.BackupOffsite.S3.SecretKey
+		}
+		if st.BackupOffsite.SFTP.Password == "" {
+			st.BackupOffsite.SFTP.Password = prev.BackupOffsite.SFTP.Password
+		}
+		if st.BackupOffsite.SFTP.PrivateKey == "" {
+			st.BackupOffsite.SFTP.PrivateKey = prev.BackupOffsite.SFTP.PrivateKey
+		}
+	}
 	// G4: a configured SMTP user with no password AFTER the keep-merge
 	// would silently send unauthenticated — refuse it. (Checked post-merge
 	// so a stored password keeps the configuration valid when the PUT
@@ -168,6 +249,19 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if st.SMTPUser != "" && st.SMTPPassword == "" {
 		writeErr(w, http.StatusBadRequest,
 			"smtp_password is required when smtp_user is set (a blank password keeps the stored one; none is stored)")
+		return
+	}
+	// Same post-merge rule for the offsite destinations: an enabled
+	// destination without its credential (none stored, none supplied)
+	// would fail every upload — refuse at save time instead.
+	if st.BackupOffsite.S3.Enabled && st.BackupOffsite.S3.SecretKey == "" {
+		writeErr(w, http.StatusBadRequest,
+			"backup_offsite.s3.secret_key is required when the S3 destination is enabled (a blank value keeps the stored one; none is stored)")
+		return
+	}
+	if st.BackupOffsite.SFTP.Enabled && st.BackupOffsite.SFTP.Password == "" && st.BackupOffsite.SFTP.PrivateKey == "" {
+		writeErr(w, http.StatusBadRequest,
+			"backup_offsite.sftp needs a password or private_key when enabled (blank values keep the stored ones; none are stored)")
 		return
 	}
 	if err := s.Store.SaveSettings(r.Context(), &st); err != nil {
@@ -194,6 +288,15 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		"smtp_set":              st.SMTPHost != "",
 		"ntfy_token_changed":    req.NtfyToken != "",
 		"smtp_password_changed": req.SMTPPassword != "",
+		// Offsite: operational knobs + booleans only — endpoints, keys and
+		// passwords never land in the audit table.
+		"offsite_s3_enabled":         st.BackupOffsite.S3.Enabled,
+		"offsite_sftp_enabled":       st.BackupOffsite.SFTP.Enabled,
+		"offsite_keep_n":             st.BackupOffsite.KeepN,
+		"offsite_include_shares_key": st.BackupOffsite.IncludeSharesKey,
+		"offsite_s3_secret_changed":  req.BackupOffsite != nil && req.BackupOffsite.S3.SecretKey != "",
+		"offsite_sftp_pw_changed":    req.BackupOffsite != nil && req.BackupOffsite.SFTP.Password != "",
+		"offsite_sftp_key_changed":   req.BackupOffsite != nil && req.BackupOffsite.SFTP.PrivateKey != "",
 	})
 	writeJSON(w, http.StatusOK, maskSettings(s.currentSettings(r.Context())))
 }
@@ -337,6 +440,170 @@ func validateSettings(st *model.Settings) error {
 	}
 	if !isUnixPath(st.ScriptsRoot) || !isUnixPath(st.ReleaseRoot) {
 		return errSettings("scripts_root/release_root must be absolute Unix paths (e.g. /data/scripts)")
+	}
+	if err := validateBackupOffsite(&st.BackupOffsite); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateBackupOffsite checks the offsite destination block (P4). Both
+// destinations are optional; an ENABLED one must carry its connection
+// fields. Credential presence is checked post-merge in the handler (a
+// blank secret keeps the stored one). Normalization (endpoint form, prefix
+// slashes) happens here so the stored value is always upload-ready.
+func validateBackupOffsite(o *model.BackupOffsite) error {
+	if o.KeepN < 0 || o.KeepN > 365 {
+		return errSettings("backup_offsite.keep_n must be 0 (default 30) or 1-365")
+	}
+	s3 := &o.S3
+	s3.Endpoint = strings.TrimSpace(s3.Endpoint)
+	s3.Bucket = strings.TrimSpace(s3.Bucket)
+	s3.Prefix = strings.TrimSpace(s3.Prefix)
+	s3.AccessKey = strings.TrimSpace(s3.AccessKey)
+	if s3.Enabled {
+		if s3.Endpoint == "" {
+			return errSettings("backup_offsite.s3.endpoint is required when the S3 destination is enabled")
+		}
+		ep, err := normalizeS3Endpoint(s3.Endpoint)
+		if err != nil {
+			return errSettings("backup_offsite.s3.endpoint: " + err.Error())
+		}
+		s3.Endpoint = ep
+		if s3.Bucket == "" {
+			return errSettings("backup_offsite.s3.bucket is required when the S3 destination is enabled")
+		}
+		if strings.ContainsAny(s3.Bucket, "/\\ 	") {
+			return errSettings("backup_offsite.s3.bucket must be a plain bucket name (no slashes or spaces)")
+		}
+		if s3.AccessKey == "" {
+			return errSettings("backup_offsite.s3.access_key is required when the S3 destination is enabled")
+		}
+	}
+	// Prefix: optional key namespace. Normalize to no leading slash and a
+	// trailing slash so uploads land at <prefix><name>; reject traversal.
+	if s3.Prefix != "" {
+		p := strings.Trim(s3.Prefix, "/")
+		for _, seg := range strings.Split(p, "/") {
+			if seg == ".." || seg == "." {
+				return errSettings("backup_offsite.s3.prefix must not contain . or .. segments")
+			}
+		}
+		if p != "" {
+			s3.Prefix = p + "/"
+		} else {
+			s3.Prefix = ""
+		}
+	}
+	sf := &o.SFTP
+	sf.Host = strings.TrimSpace(sf.Host)
+	sf.User = strings.TrimSpace(sf.User)
+	sf.Path = strings.TrimSpace(sf.Path)
+	if sf.Port < 0 || sf.Port > 65535 {
+		return errSettings("backup_offsite.sftp.port must be 0 (default 22) or 1-65535")
+	}
+	if sf.Enabled {
+		if sf.Host == "" {
+			return errSettings("backup_offsite.sftp.host is required when the SFTP destination is enabled")
+		}
+		if err := validateOffsiteHost("backup_offsite.sftp.host", sf.Host); err != nil {
+			return err
+		}
+		if sf.User == "" {
+			return errSettings("backup_offsite.sftp.user is required when the SFTP destination is enabled")
+		}
+	}
+	if sf.Path != "" {
+		for _, seg := range strings.Split(sf.Path, "/") {
+			if seg == ".." {
+				return errSettings("backup_offsite.sftp.path must not contain .. segments")
+			}
+		}
+	}
+	// A supplied private key must parse NOW (catch paste errors at save
+	// time, not mid-backup). Passphrase-protected keys are unsupported —
+	// there is no passphrase field in the settings surface.
+	if sf.PrivateKey != "" {
+		if _, err := ssh.ParseRawPrivateKey([]byte(sf.PrivateKey)); err != nil {
+			var missing *ssh.PassphraseMissingError
+			if errors.As(err, &missing) {
+				return errSettings("backup_offsite.sftp.private_key must be unencrypted (passphrase-protected keys are not supported)")
+			}
+			return errSettings("backup_offsite.sftp.private_key must be a valid SSH private key (PEM)")
+		}
+	}
+	return nil
+}
+
+// validateOffsiteHost applies the P3 hostname rules (same as smtp_host):
+// no scheme, no spaces, and a ':' only inside a bracketed IPv6 literal —
+// the port belongs in the dedicated port field.
+func validateOffsiteHost(field, h string) error {
+	if strings.ContainsAny(h, " 	") || strings.Contains(h, "://") {
+		return errSettings(field + " must be a hostname (no scheme, no spaces)")
+	}
+	if strings.Contains(h, ":") || strings.HasPrefix(h, "[") || strings.HasSuffix(h, "]") {
+		if !strings.HasPrefix(h, "[") || !strings.HasSuffix(h, "]") || net.ParseIP(h[1:len(h)-1]) == nil {
+			return errSettings(field + " must be a hostname or a bracketed IPv6 literal like [::1] (set the port in the port field)")
+		}
+	}
+	return nil
+}
+
+// normalizeS3Endpoint accepts host, host:port or a full http(s) URL and
+// returns the host[:port] form minio-go wants (no scheme). Unlike the SMTP
+// host rule, a colon IS legal here as the port separator — that is the
+// native S3 endpoint form; a bare colon without a valid port is rejected.
+func normalizeS3Endpoint(raw string) (string, error) {
+	ep := raw
+	if strings.Contains(ep, "://") {
+		u, err := url.Parse(ep)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return "", errors.New("must be host[:port] or an http(s) URL")
+		}
+		if u.Path != "" && u.Path != "/" {
+			return "", errors.New("must not include a path")
+		}
+		ep = u.Host
+	}
+	if strings.ContainsAny(ep, " 	") {
+		return "", errors.New("must not contain spaces")
+	}
+	if strings.HasPrefix(ep, "[") {
+		// Bracketed IPv6, with or without a port.
+		host, port, err := net.SplitHostPort(ep)
+		if err != nil {
+			if !strings.HasSuffix(ep, "]") || net.ParseIP(ep[1:len(ep)-1]) == nil {
+				return "", errors.New("invalid bracketed IPv6 literal")
+			}
+			return ep, nil
+		}
+		if net.ParseIP(host) == nil {
+			return "", errors.New("invalid IPv6 literal")
+		}
+		if err := validatePort(port); err != nil {
+			return "", err
+		}
+		return ep, nil
+	}
+	if strings.Contains(ep, ":") {
+		host, port, err := net.SplitHostPort(ep)
+		if err != nil || host == "" {
+			return "", errors.New("invalid host:port")
+		}
+		if err := validatePort(port); err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(host, port), nil
+	}
+	return ep, nil
+}
+
+// validatePort checks a numeric port string is 1-65535.
+func validatePort(port string) error {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("port must be 1-65535")
 	}
 	return nil
 }

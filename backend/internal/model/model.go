@@ -264,7 +264,69 @@ type Settings struct {
 	// value old settings rows unmarshal to). Validated 0-10080.
 	StallTimeoutMinutes int `json:"stall_timeout_minutes"`
 
+	// BackupOffsite configures offsite copies of DB snapshots (P4): after
+	// every successful snapshot (scheduled AND manual) the controller uploads
+	// the snapshot — plus, by default, the shares-key file needed to decrypt
+	// DB secrets on restore — to each enabled destination and prunes old
+	// generations to KeepN. Upload failures never fail the local backup.
+	BackupOffsite BackupOffsite `json:"backup_offsite"`
+
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// BackupOffsite is the offsite-backup configuration block. Both destinations
+// are disabled by default; enabling one requires its connection fields (see
+// validateSettings). Secrets inside the sub-structs are WRITE-ONLY over the
+// API (json:"-", masked as has_* flags) and AES-GCM encrypted at rest with
+// the shares key — the same pattern as NtfyToken/SMTPPassword.
+type BackupOffsite struct {
+	S3   BackupOffsiteS3   `json:"s3"`
+	SFTP BackupOffsiteSFTP `json:"sftp"`
+	// KeepN is the per-destination offsite retention: after each successful
+	// upload, snapshot generations beyond the newest KeepN are deleted
+	// (snapshot + its key companion together). 0 = default (30); validated
+	// 0 or 1-365. Applies to ALL uploaded snapshots, manual ones included —
+	// unlike local retention, which never auto-prunes manual snapshots.
+	KeepN int `json:"keep_n"`
+	// IncludeSharesKey bundles the shares-key file alongside each snapshot
+	// so an offsite restore can decrypt DB secrets. Default TRUE (rows
+	// written before the field existed read back as true). SECURITY: the
+	// key decrypts every secret in the DB — the destination must be trusted
+	// and access-controlled. Operators can opt out (snapshot-only copies).
+	IncludeSharesKey bool `json:"include_shares_key"`
+}
+
+// BackupOffsiteS3 is the S3 offsite destination. Reuses internal/s3
+// (minio-go): any plain-S3 endpoint works (MinIO, Ceph RGW, AWS). Endpoint
+// is stored normalized to host[:port] (no scheme); UseTLS selects https.
+type BackupOffsiteS3 struct {
+	Enabled   bool   `json:"enabled"`
+	Endpoint  string `json:"endpoint"`
+	Bucket    string `json:"bucket"`
+	Prefix    string `json:"prefix"` // optional key prefix, stored with trailing "/"
+	AccessKey string `json:"access_key"`
+	// SecretKey is WRITE-ONLY over the API (json:"-", masked as
+	// has_secret_key inside backup_offsite), AES-GCM encrypted at rest.
+	SecretKey string `json:"-"`
+	UseTLS    bool   `json:"use_tls"`
+}
+
+// BackupOffsiteSFTP is the SFTP offsite destination (pkg/sftp over
+// x/crypto/ssh). Port 0 defaults to 22. Password and PrivateKey are
+// WRITE-ONLY (json:"-", masked as has_password / has_private_key), AES-GCM
+// encrypted at rest; at least one is required when enabled. PrivateKey must
+// be an unencrypted PEM key (passphrase-protected keys are rejected at save
+// time — there is no passphrase field).
+type BackupOffsiteSFTP struct {
+	Enabled bool   `json:"enabled"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	User    string `json:"user"`
+	// Password is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	Password string `json:"-"`
+	// PrivateKey is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	PrivateKey string `json:"-"`
+	Path       string `json:"path"` // remote dir; empty = the SSH home dir (".")
 }
 
 // Session is an issued management session (token stored hashed at rest).

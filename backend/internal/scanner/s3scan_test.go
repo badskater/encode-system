@@ -31,6 +31,7 @@ func (f *fakeS3Store) List(ctx context.Context, bucket, prefix string) ([]model.
 }
 func (f *fakeS3Store) Get(context.Context, string, string, string) error { return nil }
 func (f *fakeS3Store) Put(context.Context, string, string, string) error { return nil }
+func (f *fakeS3Store) Delete(context.Context, string, string) error      { return nil }
 
 func obj(key string, mtime time.Time) model.S3Object {
 	return model.S3Object{Key: key, Size: 100, LastModified: mtime}

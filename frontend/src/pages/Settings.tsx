@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { Settings, SettingsSave, UpdateCheck, UpdateManifest } from '../types';
+import type {
+  Settings, SettingsSave, UpdateCheck, UpdateManifest,
+  OffsiteS3, OffsiteSFTP, OffsiteS3Save, OffsiteSFTPSave,
+} from '../types';
 import { timeAgo } from '../components/helpers';
 import { useIsAdmin } from '../hooks/useRole';
 import APITokensCard from '../components/APITokensCard';
@@ -95,6 +98,43 @@ function validateNotifyChannels(s: Settings): string | null {
   return null;
 }
 
+// validateOffsite mirrors the server's backup_offsite bounds so a typo is
+// caught before the PUT. Disabled destinations need nothing; enabled ones
+// require their connection fields. Credential presence is checked in save()
+// (it needs the typed secret inputs + has_* flags).
+function validateOffsite(s: Settings): string | null {
+  const off = s.backup_offsite;
+  if (!off) return null;
+  const keepN = off.keep_n ?? 0;
+  if (keepN !== 0 && (!Number.isInteger(keepN) || keepN < 1 || keepN > 365)) {
+    return 'Offsite keep_n must be 0 (default 30) or 1-365';
+  }
+  const s3 = off.s3;
+  if (s3?.enabled) {
+    const ep = (s3.endpoint ?? '').trim();
+    if (!ep) return 'S3 endpoint is required when the destination is enabled';
+    if (/\s/.test(ep)) return 'S3 endpoint must not contain spaces';
+    if (!(s3.bucket ?? '').trim()) return 'S3 bucket is required when the destination is enabled';
+    if (/[/\\\s]/.test(s3.bucket ?? '')) return 'S3 bucket must be a plain bucket name (no slashes or spaces)';
+    if (!(s3.access_key ?? '').trim()) return 'S3 access key is required when the destination is enabled';
+  }
+  const sf = off.sftp;
+  if (sf?.enabled) {
+    const host = (sf.host ?? '').trim();
+    if (!host) return 'SFTP host is required when the destination is enabled';
+    if (/\s/.test(host) || host.includes('://')) return 'SFTP host must be a hostname (no scheme, no spaces)';
+    if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) {
+      return 'SFTP host must not carry a port — set it in the port field (bracketed IPv6 like [::1] is allowed)';
+    }
+    const port = sf.port ?? 0;
+    if (port !== 0 && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+      return 'SFTP port must be 0 (default 22) or 1-65535';
+    }
+    if (!(sf.user ?? '').trim()) return 'SFTP user is required when the destination is enabled';
+  }
+  return null;
+}
+
 // SettingsPage edits the fleet's runtime configuration from the UI:
 //  - NFS shares (documentation-grade: which exports, where they mount)
 //  - Controller roots (scan + release dirs inside the container)
@@ -137,6 +177,11 @@ export default function SettingsPage() {
   // save, then cleared — blank on the next save keeps the stored credential.
   const [ntfyToken, setNtfyToken] = useState('');
   const [smtpPassword, setSmtpPassword] = useState('');
+  // Write-only offsite destination secrets (P4): same keep-semantics —
+  // empty on load, sent once on save, then cleared.
+  const [offsiteS3Secret, setOffsiteS3Secret] = useState('');
+  const [offsiteSFTPPassword, setOffsiteSFTPPassword] = useState('');
+  const [offsiteSFTPKey, setOffsiteSFTPKey] = useState('');
   const isAdmin = useIsAdmin();
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
@@ -212,6 +257,24 @@ export default function SettingsPage() {
     setSettings((s) => (s ? { ...s, [key]: value } : s));
   }
 
+  // Nested offsite setters (P4): merge into settings.backup_offsite without
+  // disturbing the other destination's fields or the write-only has_* flags.
+  function setOffsite(patch: { keep_n?: number; include_shares_key?: boolean }) {
+    setSettings((s) => (s ? { ...s, backup_offsite: { ...(s.backup_offsite ?? {}), ...patch } } : s));
+  }
+  function setOffS3(patch: Partial<OffsiteS3>) {
+    setSettings((s) => (s ? {
+      ...s,
+      backup_offsite: { ...(s.backup_offsite ?? {}), s3: { ...(s.backup_offsite?.s3 ?? {}), ...patch } },
+    } : s));
+  }
+  function setOffSFTP(patch: Partial<OffsiteSFTP>) {
+    setSettings((s) => (s ? {
+      ...s,
+      backup_offsite: { ...(s.backup_offsite ?? {}), sftp: { ...(s.backup_offsite?.sftp ?? {}), ...patch } },
+    } : s));
+  }
+
   async function save() {
     if (!settings) return;
     // Client-side bounds mirror the server validation for the notification
@@ -219,6 +282,24 @@ export default function SettingsPage() {
     const invalid = validateNotifyChannels(settings);
     if (invalid) {
       setError(invalid);
+      return;
+    }
+    const invalidOffsite = validateOffsite(settings);
+    if (invalidOffsite) {
+      setError(invalidOffsite);
+      return;
+    }
+    // Enabled offsite destinations need a credential: either one already
+    // stored (has_* flag) or one typed now. Mirrors the server's post-merge
+    // check so the operator gets the error before the round-trip.
+    const off = settings.backup_offsite;
+    if (off?.s3?.enabled && !off.has_s3_secret_key && !offsiteS3Secret.trim()) {
+      setError('S3 secret key is required when the destination is enabled (blank keeps the stored one; none is stored)');
+      return;
+    }
+    if (off?.sftp?.enabled && !off.has_sftp_password && !off.has_sftp_private_key &&
+        !offsiteSFTPPassword && !offsiteSFTPKey.trim()) {
+      setError('SFTP needs a password or private key when enabled (blank keeps the stored ones; none are stored)');
       return;
     }
     setSaving(true);
@@ -253,11 +334,43 @@ export default function SettingsPage() {
       delete payload.has_smtp_password;
       if (ntfyToken.trim()) payload.ntfy_token = ntfyToken.trim();
       if (smtpPassword) payload.smtp_password = smtpPassword;
+      // Offsite block: strip the GET-only has_* flags, clamp numeric
+      // bounds, attach typed write-only secrets (blank = keep stored).
+      if (toSave.backup_offsite) {
+        const o = toSave.backup_offsite;
+        const s3Save: OffsiteS3Save = {
+          enabled: o.s3?.enabled,
+          endpoint: o.s3?.endpoint,
+          bucket: o.s3?.bucket,
+          prefix: o.s3?.prefix,
+          access_key: o.s3?.access_key,
+          use_tls: o.s3?.use_tls,
+        };
+        if (offsiteS3Secret.trim()) s3Save.secret_key = offsiteS3Secret.trim();
+        const sftpSave: OffsiteSFTPSave = {
+          enabled: o.sftp?.enabled,
+          host: o.sftp?.host,
+          port: clampInt(o.sftp?.port ?? 0, 0, 65535),
+          user: o.sftp?.user,
+          path: o.sftp?.path,
+        };
+        if (offsiteSFTPPassword) sftpSave.password = offsiteSFTPPassword;
+        if (offsiteSFTPKey.trim()) sftpSave.private_key = offsiteSFTPKey.trim();
+        payload.backup_offsite = {
+          s3: s3Save,
+          sftp: sftpSave,
+          keep_n: clampInt(o.keep_n ?? 0, 0, 365),
+          include_shares_key: o.include_shares_key ?? true,
+        };
+      }
       const saved = await api.saveSettings(payload);
       setSettings(saved);
       // Secrets were consumed: clear the inputs so the next save keeps them.
       setNtfyToken('');
       setSmtpPassword('');
+      setOffsiteS3Secret('');
+      setOffsiteSFTPPassword('');
+      setOffsiteSFTPKey('');
       setNotice('Settings saved. Scanner and new jobs pick them up on the next cycle — no restart needed.');
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
@@ -367,6 +480,48 @@ export default function SettingsPage() {
         type="password"
         aria-label={label}
         autoComplete="new-password"
+        style={{ width: '100%' }}
+        value={value}
+        placeholder={saved ? '•••• saved — leave blank to keep' : placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // offField is field() for the nested offsite block (values live under
+  // settings.backup_offsite, not at the top level).
+  const offField = (
+    label: string, hint: string, value: string | undefined,
+    onChange: (v: string) => void, placeholder = '',
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <input
+        aria-label={label}
+        style={{ width: '100%' }}
+        value={value ?? ''}
+        placeholder={placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // secretTextarea is secretField for multi-line write-only values (the
+  // SFTP private key PEM): never prefilled, "saved" placeholder, blank keeps.
+  const secretTextarea = (
+    label: string, hint: string, value: string, onChange: (v: string) => void,
+    saved: boolean, placeholder: string,
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <textarea
+        aria-label={label}
+        autoComplete="off"
+        rows={4}
         style={{ width: '100%' }}
         value={value}
         placeholder={saved ? '•••• saved — leave blank to keep' : placeholder}
@@ -666,6 +821,131 @@ export default function SettingsPage() {
         )}
         {field('SMTP from', 'Envelope sender, e.g. encode@example.com.', 'smtp_from', 'encode@example.com')}
         {field('SMTP to', 'Comma-separated recipients, e.g. ops@example.com, oncall@example.com.', 'smtp_to', 'ops@example.com')}
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
+        )}
+        {settings.updated_at && (
+          <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Offsite backups (P4): S3 + SFTP destinations for DB snapshots.
+          Config lives in the settings blob (same Save flow as the channels
+          above); the upload runs after every successful snapshot — the
+          snapshot list itself stays in the DB backups card below. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Offsite backups (S3 · SFTP)</h3>
+        <p className="muted">
+          After every successful snapshot — scheduled or manual — the
+          controller uploads it to each enabled destination and keeps the
+          newest N copies per destination. Upload failures never fail the
+          local backup: they are logged, audited and alerted through the
+          notification channels above. Secrets are write-only: stored
+          encrypted, never shown again — leave blank to keep the saved value.
+        </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="Include shares key in offsite bundle"
+            checked={settings.backup_offsite?.include_shares_key ?? true}
+            disabled={!isAdmin}
+            onChange={(e) => setOffsite({ include_shares_key: e.target.checked })}
+          />
+          <span>Include the shares key in the offsite bundle</span>
+        </label>
+        <span className="muted" style={{ display: 'block', fontSize: 12, marginBottom: 12 }}>
+          The key decrypts every secret stored in the database (share
+          passwords, channel tokens). Bundling it makes an offsite restore
+          self-contained — but the destination must be trusted and
+          access-controlled. Untick for snapshot-only copies (a restore then
+          needs the key file out of band).
+        </span>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Keep N snapshots per destination (0 = default 30)</span>
+          <input
+            type="number"
+            aria-label="Offsite keep N"
+            min={0}
+            max={365}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.keep_n ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setOffsite({ keep_n: Number(e.target.value) })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            After each upload, the oldest generations beyond N are deleted
+            (snapshot and its key together). Valid range 1-365.
+          </span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="S3 destination enabled"
+            checked={!!settings.backup_offsite?.s3?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setOffS3({ enabled: e.target.checked })}
+          />
+          <span><strong>S3 destination</strong> — any plain-S3 endpoint (MinIO, Ceph RGW, AWS)</span>
+        </label>
+        {offField('S3 endpoint', 'host:port or http(s) URL — normalized on save.', settings.backup_offsite?.s3?.endpoint, (v) => setOffS3({ endpoint: v }), 'minio.example.com:9000')}
+        {offField('S3 bucket', 'Bucket that receives the snapshots.', settings.backup_offsite?.s3?.bucket, (v) => setOffS3({ bucket: v }), 'encode-backups')}
+        {offField('S3 prefix (optional)', 'Key namespace inside the bucket, e.g. encode/farm.', settings.backup_offsite?.s3?.prefix, (v) => setOffS3({ prefix: v }), 'encode/')}
+        {offField('S3 access key', 'Access key ID (the secret key below is write-only).', settings.backup_offsite?.s3?.access_key, (v) => setOffS3({ access_key: v }), 'AKIA…')}
+        {secretField(
+          'S3 secret key',
+          'Write-only — blank keeps the stored secret.',
+          offsiteS3Secret, setOffsiteS3Secret, !!settings.backup_offsite?.has_s3_secret_key, 'required when enabled',
+        )}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            aria-label="S3 use TLS"
+            checked={!!settings.backup_offsite?.s3?.use_tls}
+            disabled={!isAdmin}
+            onChange={(e) => setOffS3({ use_tls: e.target.checked })}
+          />
+          <span>Use TLS (https)</span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="SFTP destination enabled"
+            checked={!!settings.backup_offsite?.sftp?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ enabled: e.target.checked })}
+          />
+          <span><strong>SFTP destination</strong> — SSH file transfer</span>
+        </label>
+        {offField('SFTP host', 'Hostname only — the port goes in the field below.', settings.backup_offsite?.sftp?.host, (v) => setOffSFTP({ host: v }), 'backup.example.com')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SFTP port (0 = default 22)</span>
+          <input
+            type="number"
+            aria-label="SFTP port"
+            min={0}
+            max={65535}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.sftp?.port ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ port: Number(e.target.value) })}
+          />
+        </label>
+        {offField('SFTP user', 'SSH account that owns the backup directory.', settings.backup_offsite?.sftp?.user, (v) => setOffSFTP({ user: v }), 'backup')}
+        {offField('SFTP path (optional)', 'Remote directory; empty = the SSH home dir. Created if missing.', settings.backup_offsite?.sftp?.path, (v) => setOffSFTP({ path: v }), '/backups/encode')}
+        {secretField(
+          'SFTP password',
+          'Write-only — blank keeps the stored password. A password or a private key is required.',
+          offsiteSFTPPassword, setOffsiteSFTPPassword, !!settings.backup_offsite?.has_sftp_password, 'optional if a key is set',
+        )}
+        {secretTextarea(
+          'SFTP private key (PEM)',
+          'Write-only, unencrypted PEM (passphrase-protected keys are not supported). Blank keeps the stored key.',
+          offsiteSFTPKey, setOffsiteSFTPKey, !!settings.backup_offsite?.has_sftp_private_key, '-----BEGIN OPENSSH PRIVATE KEY-----',
+        )}
         {isAdmin && (
         <button className="btn primary" disabled={saving} onClick={save}>
           {saving ? 'Saving…' : 'Save settings'}

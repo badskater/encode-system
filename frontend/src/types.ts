@@ -156,16 +156,24 @@ export interface Settings {
   has_smtp_password?: boolean;
   smtp_from?: string;
   smtp_to?: string; // comma-separated recipients
+  // Offsite backups (P4): S3 + SFTP destinations for DB snapshots. The
+  // block's secrets are write-only (has_* flags on GET); see BackupOffsite.
+  backup_offsite?: BackupOffsite;
   updated_at?: string;
 }
 
 // SettingsSave is the PUT /api/settings payload: the settings blob plus the
 // write-only secrets (which never appear on GET). An empty/omitted secret
 // keeps the stored value (the shares pattern). The has_* output flags are
-// GET-only and must not be sent back.
-export type SettingsSave = Omit<Settings, 'has_ntfy_token' | 'has_smtp_password'> & {
+// GET-only and must not be sent back. An OMITTED backup_offsite block keeps
+// the stored block wholesale; a present block replaces non-secret fields.
+export type SettingsSave = Omit<
+  Settings,
+  'has_ntfy_token' | 'has_smtp_password' | 'backup_offsite'
+> & {
   ntfy_token?: string;
   smtp_password?: string;
+  backup_offsite?: BackupOffsiteSave;
 };
 
 // ProvisionRun: one controller-driven Ansible provisioning attempt.
@@ -199,6 +207,54 @@ export interface BackupStatus {
   last_run?: string;
   last_error?: string;
   next_run?: string;
+}
+
+// Offsite backup destinations (P4). GET shape: the destination secrets are
+// WRITE-ONLY — has_* flags report presence, values never echo back. Send
+// credentials via SettingsSave.backup_offsite (blank keeps the stored one).
+export interface OffsiteS3 {
+  enabled?: boolean;
+  endpoint?: string; // host[:port] or http(s) URL; stored normalized
+  bucket?: string;
+  prefix?: string;
+  access_key?: string;
+  use_tls?: boolean;
+}
+export interface OffsiteSFTP {
+  enabled?: boolean;
+  host?: string;
+  port?: number; // 0 = default 22
+  user?: string;
+  path?: string; // empty = the SSH home dir
+}
+export interface BackupOffsite {
+  s3?: OffsiteS3;
+  sftp?: OffsiteSFTP;
+  // Per-destination retention: newest N snapshot generations kept
+  // (snapshot + key companion together). 0 = default 30; range 1-365.
+  keep_n?: number;
+  // Bundle the shares key with each snapshot so offsite restore can
+  // decrypt DB secrets. Default true. SECURITY: the key decrypts every
+  // secret in the DB — only use trusted, access-controlled destinations.
+  include_shares_key?: boolean;
+  has_s3_secret_key?: boolean; // GET only
+  has_sftp_password?: boolean; // GET only
+  has_sftp_private_key?: boolean; // GET only
+}
+// Save shapes: write-only secrets in, has_* flags out (flags live at the
+// block level on BackupOffsite, mirroring the top-level has_ntfy_token).
+export interface OffsiteS3Save extends OffsiteS3 {
+  secret_key?: string;
+}
+export interface OffsiteSFTPSave extends OffsiteSFTP {
+  password?: string;
+  private_key?: string; // unencrypted PEM
+}
+export interface BackupOffsiteSave {
+  s3?: OffsiteS3Save;
+  sftp?: OffsiteSFTPSave;
+  keep_n?: number;
+  include_shares_key?: boolean;
 }
 
 // ShareKind is the transport backing a share mount.

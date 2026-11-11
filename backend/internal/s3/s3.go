@@ -17,11 +17,13 @@ import (
 )
 
 // ObjectStore is the object-storage surface the pipeline needs. Kept
-// minimal so both consumers unit-test against in-memory fakes.
+// minimal so both consumers unit-test against in-memory fakes. Delete was
+// added for offsite backup retention (P4) — pruning old snapshots.
 type ObjectStore interface {
 	List(ctx context.Context, bucket, prefix string) ([]model.S3Object, error)
 	Get(ctx context.Context, bucket, key, dest string) error
 	Put(ctx context.Context, bucket, key, src string) error
+	Delete(ctx context.Context, bucket, key string) error
 }
 
 // EndpointFromShare normalizes a share's connection fields to the
@@ -88,4 +90,8 @@ func (m *client) Get(ctx context.Context, bucket, key, dest string) error {
 func (m *client) Put(ctx context.Context, bucket, key, src string) error {
 	_, err := m.c.FPutObject(ctx, bucket, key, src, minio.PutObjectOptions{})
 	return err
+}
+
+func (m *client) Delete(ctx context.Context, bucket, key string) error {
+	return m.c.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{})
 }

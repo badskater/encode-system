@@ -51,6 +51,18 @@ type BackupManager struct {
 	lastRun   time.Time
 	lastError string
 	nextRun   time.Time
+
+	// AfterSnapshot, when non-nil, runs after EVERY successful snapshot —
+	// scheduled and manual alike. It cannot fail the backup: the local
+	// snapshot is already durable when it fires, and the hook returns
+	// nothing. Production wires the offsite upload here (P4); tests inject
+	// a recorder. The hook gets a COPY of the info and a background ctx.
+	AfterSnapshot func(ctx context.Context, info *BackupInfo)
+	// afterSnapshotGo launches the hook. Default (nil): a goroutine, so
+	// remote uploads never block the scheduler tick or the manual-backup
+	// HTTP response. Tests override it to run synchronously. Same injectable
+	// seam pattern as exitFn.
+	afterSnapshotGo func(fn func())
 }
 
 // BackupInfo describes one snapshot for the UI/API.
@@ -107,7 +119,7 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 			return nil, fmt.Errorf("vacuum into: %w", err)
 		}
 	}
-	info, err := os.Stat(dest)
+	info0, err := os.Stat(dest)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +128,21 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 	}
 	// Reflect the actual filename (counter suffix may have advanced it).
 	base := filepath.Base(dest)
-	return &BackupInfo{Name: base, SizeBytes: info.Size(), CreatedAt: info.ModTime().UTC(), Scheduled: scheduled}, nil
+	info := &BackupInfo{Name: base, SizeBytes: info0.Size(), CreatedAt: info0.ModTime().UTC(), Scheduled: scheduled}
+	// Offsite hook (P4): fires for scheduled AND manual snapshots, after
+	// the local file is durable. Launch is a seam so tests run it
+	// synchronously; production detaches so remote I/O never blocks the
+	// scheduler or the HTTP response. Capture the hook + info copy NOW —
+	// the delayed goroutine must not read fields that tests may restore.
+	if b.AfterSnapshot != nil {
+		hook, snap := b.AfterSnapshot, *info
+		launch := b.afterSnapshotGo
+		if launch == nil {
+			launch = func(fn func()) { go fn() }
+		}
+		launch(func() { hook(ctxBg(), &snap) })
+	}
+	return info, nil
 }
 
 // List returns all snapshots newest-first.

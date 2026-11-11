@@ -17,6 +17,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/flow"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/offsite"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -86,6 +87,12 @@ type Server struct {
 	// content without a real relay. Production leaves this nil (real
 	// net/smtp.SendMail).
 	MailSender notify.SMTPSender
+	// OffsiteDestinations, when non-nil, overrides offsite destination
+	// construction (P4). Tests inject fakes to assert upload/retention
+	// behavior without real S3/SSH endpoints; production leaves this nil
+	// (offsite.BuildDestinations from live settings). Same seam pattern as
+	// Notifier/MailSender.
+	OffsiteDestinations func(st *model.Settings) ([]offsite.Destination, []offsite.Result)
 	// digest holds buffered job-outcome events when settings.NotifyDigest is
 	// ON. A ticker started by StartDigestLoop flushes it hourly, posting one
 	// summary instead of per-job alerts. Built in New (never nil — the buffer

@@ -650,3 +650,156 @@ describe('Settings notification channels card', () => {
     expect(saveSpy).not.toHaveBeenCalled();
   });
 });
+
+// ---------- Offsite backups card (P4) ----------
+
+describe('Settings offsite backups card', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The offsite card renders the LAST "Save settings" button on the page.
+  async function offsiteSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  // Fake credentials assembled at runtime (redaction-safe).
+  const s3Secret = 'super' + '-secret-1';
+  const sftpPw = 'sf' + 'tp-pw-1';
+
+  it('renders both destinations disabled and include-key default on', async () => {
+    render(<SettingsPage />);
+    const s3 = (await screen.findByLabelText('S3 destination enabled')) as HTMLInputElement;
+    const sftp = screen.getByLabelText('SFTP destination enabled') as HTMLInputElement;
+    expect(s3.checked).toBe(false);
+    expect(sftp.checked).toBe(false);
+    const inc = screen.getByLabelText('Include shares key in offsite bundle') as HTMLInputElement;
+    expect(inc.checked).toBe(true);
+    // Write-only inputs are password-type / textarea and never prefilled.
+    const sk = screen.getByLabelText('S3 secret key') as HTMLInputElement;
+    expect(sk.type).toBe('password');
+    expect(sk.value).toBe('');
+    const key = screen.getByLabelText('SFTP private key (PEM)') as HTMLTextAreaElement;
+    expect(key.tagName).toBe('TEXTAREA');
+    expect(key.value).toBe('');
+  });
+
+  it('blocks save when S3 is enabled without required fields', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('S3 destination enabled'));
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/S3 endpoint is required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the offsite block with the typed secret, flags stripped', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('S3 destination enabled'));
+    fireEvent.change(screen.getByLabelText('S3 endpoint'), { target: { value: 'minio.example.com:9000' } });
+    fireEvent.change(screen.getByLabelText('S3 bucket'), { target: { value: 'encode-backups' } });
+    fireEvent.change(screen.getByLabelText('S3 access key'), { target: { value: 'AK' + 'IATEST' } });
+    fireEvent.change(screen.getByLabelText('S3 secret key'), { target: { value: s3Secret } });
+    fireEvent.change(screen.getByLabelText('Offsite keep N'), { target: { value: '14' } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    const off = sent.backup_offsite;
+    expect(off).toBeDefined();
+    expect(off!.s3?.enabled).toBe(true);
+    expect(off!.s3?.endpoint).toBe('minio.example.com:9000');
+    expect(off!.s3?.secret_key).toBe(s3Secret);
+    expect(off!.keep_n).toBe(14);
+    expect(off!.include_shares_key).toBe(true);
+    // GET-only has_* flags must not be sent back.
+    expect((off as Record<string, unknown>).has_s3_secret_key).toBeUndefined();
+    expect((off!.s3 as Record<string, unknown>).has_secret_key).toBeUndefined();
+  });
+
+  it('shows the saved placeholder and keeps the stored secret on blank', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      backup_offsite: {
+        has_s3_secret_key: true,
+        keep_n: 7,
+        include_shares_key: true,
+        s3: { enabled: true, endpoint: 'minio.example.com:9000', bucket: 'b', access_key: 'AK' + 'X' },
+      },
+    }));
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const sk = (await screen.findByLabelText('S3 secret key')) as HTMLInputElement;
+    expect(sk.placeholder).toContain('saved');
+    expect(sk.value).toBe('');
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const off = saveSpy.mock.calls[0][0].backup_offsite;
+    expect(off!.s3?.enabled).toBe(true);
+    // Blank secret = keep stored: no secret_key key in the payload at all.
+    expect(off!.s3?.secret_key).toBeUndefined();
+    expect(off!.keep_n).toBe(7);
+  });
+
+  it('rejects an SFTP host carrying a bare-port colon', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com:22' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/set it in the port field/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('requires SFTP credentials when none are stored', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/SFTP needs a password or private key/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects out-of-range keep_n and SFTP port (mirrors the server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText('Offsite keep N'), { target: { value: '999' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/keep_n must be 0 \(default 30\) or 1-365/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('accepts the boundary values keep_n=365 and port=65535', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+    fireEvent.change(screen.getByLabelText('SFTP port'), { target: { value: '65535' } });
+    fireEvent.change(screen.getByLabelText('Offsite keep N'), { target: { value: '365' } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const off = saveSpy.mock.calls[0][0].backup_offsite;
+    expect(off!.keep_n).toBe(365);
+    expect(off!.sftp?.port).toBe(65535);
+    expect(off!.sftp?.password).toBe(sftpPw);
+  });
+
+  it('flows the include-shares-key opt-out into the payload', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const inc = await screen.findByLabelText('Include shares key in offsite bundle');
+    fireEvent.click(inc);
+    expect((inc as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].backup_offsite!.include_shares_key).toBe(false);
+  });
+});

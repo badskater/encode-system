@@ -298,6 +298,13 @@ func main() {
 		Enabled:  env("ENCODE_BACKUP_ENABLED", "false") == "true",
 		Every:    time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
 	}
+	// Offsite backups (P4): after every successful snapshot — scheduled AND
+	// manual — copy it (plus the shares key, unless opted out) to each
+	// enabled destination in settings.backup_offsite and prune to keep_n.
+	// Upload failures are logged/audited/notified, never fail the local
+	// backup. The hook detaches its own goroutine, so this never blocks the
+	// scheduler tick or the manual-backup HTTP response.
+	srv.Backup.AfterSnapshot = srv.OffsiteAfterSnapshot
 	// On Postgres, open a second *sql.DB over the same DSN for the backup
 	// dump path (catalog + SELECT * per table). The store keeps its own
 	// private *sql.DB (no exported accessor), so the backup opens its own

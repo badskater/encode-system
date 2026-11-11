@@ -141,18 +141,18 @@ func TestBuildDestinationsS3(t *testing.T) {
 		Enabled: true, Endpoint: "minio.example.com:9000", Bucket: "b",
 		AccessKey: "AK" + "TEST", SecretKey: "SK" + "TEST",
 	}
-	dests, errs := BuildDestinations(st, nil)
+	dests, errs := BuildDestinations(context.Background(), st, nil)
 	if len(dests) != 1 || len(errs) != 0 || dests[0].Name() != "s3" {
 		t.Fatalf("want 1 s3 destination: %v %v", dests, errs)
 	}
 	st.BackupOffsite.S3.Enabled = false
-	dests, errs = BuildDestinations(st, nil)
+	dests, errs = BuildDestinations(context.Background(), st, nil)
 	if len(dests) != 0 || len(errs) != 0 {
 		t.Fatalf("disabled destination must not build: %v %v", dests, errs)
 	}
 	st.BackupOffsite.S3.Enabled = true
 	st.BackupOffsite.S3.Endpoint = ""
-	dests, errs = BuildDestinations(st, nil)
+	dests, errs = BuildDestinations(context.Background(), st, nil)
 	if len(dests) != 0 || len(errs) != 1 || errs[0].Destination != "s3" || errs[0].Err == "" {
 		t.Fatalf("build failure must be an error result: %v %v", dests, errs)
 	}

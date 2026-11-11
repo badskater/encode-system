@@ -226,6 +226,10 @@ export interface OffsiteSFTP {
   port?: number; // 0 = default 22
   user?: string;
   path?: string; // empty = the SSH home dir
+  // Public host key pinned on every connection (REQUIRED when enabled).
+  // Known-hosts style "ssh-ed25519 AAAA…" or bare base64; public material,
+  // so it round-trips over the API (unlike the write-only secrets).
+  host_key?: string;
 }
 export interface BackupOffsite {
   s3?: OffsiteS3;

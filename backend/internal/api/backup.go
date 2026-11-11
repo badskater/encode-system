@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -104,20 +106,32 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 	}
 	name := fmt.Sprintf("encode-%s-%s%s", time.Now().UTC().Format("20060102-150405"), kind, suffix)
 	dest := filepath.Join(b.Dir, name)
-	// A name collision means two snapshots in the same second — append a
-	// counter rather than failing the backup.
-	for i := 1; fileExists(dest); i++ {
+	// A name collision means two snapshots in the same second (HA replicas
+	// share the naming clock) — append a counter rather than failing the
+	// backup. SQLite's VACUUM INTO refuses an existing output file, so the
+	// pre-check suffices there; PG's dump creates O_EXCL and returns
+	// os.ErrExist on the race the pre-check cannot see (P4 review Q8).
+	for i := 1; ; i++ {
+		if pg {
+			err := b.dumpPG(ctx, dest)
+			if errors.Is(err, os.ErrExist) {
+				dest = filepath.Join(b.Dir, fmt.Sprintf("encode-%s-%s-%d%s",
+					time.Now().UTC().Format("20060102-150405"), kind, i, suffix))
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("pg dump: %w", err)
+			}
+			break
+		}
+		if !fileExists(dest) {
+			if err := b.Store.BackupTo(ctx, dest); err != nil {
+				return nil, fmt.Errorf("vacuum into: %w", err)
+			}
+			break
+		}
 		dest = filepath.Join(b.Dir, fmt.Sprintf("encode-%s-%s-%d%s",
 			time.Now().UTC().Format("20060102-150405"), kind, i, suffix))
-	}
-	if pg {
-		if err := b.dumpPG(ctx, dest); err != nil {
-			return nil, fmt.Errorf("pg dump: %w", err)
-		}
-	} else {
-		if err := b.Store.BackupTo(ctx, dest); err != nil {
-			return nil, fmt.Errorf("vacuum into: %w", err)
-		}
 	}
 	info0, err := os.Stat(dest)
 	if err != nil {
@@ -140,9 +154,41 @@ func (b *BackupManager) TakeSnapshot(ctx context.Context, scheduled bool) (*Back
 		if launch == nil {
 			launch = func(fn func()) { go fn() }
 		}
-		launch(func() { hook(ctxBg(), &snap) })
+		// The recover lives INSIDE the launched closure so it applies to
+		// BOTH the detached production goroutine and the synchronous test
+		// seam: a panicking hook must never crash the controller (P4
+		// review Q5). The failure is logged and audited like any other
+		// offsite failure.
+		launch(func() {
+			defer func() {
+				if p := recover(); p != nil {
+					b.containHookPanic(snap.Name, p)
+				}
+			}()
+			hook(ctxBg(), &snap)
+		})
 	}
 	return info, nil
+}
+
+// containHookPanic records a panicked AfterSnapshot hook: structured Error
+// log + backup.offsite_failed audit with reason=panic. Fire-and-forget like
+// every audit write — losing the row is bad, crashing over it is worse.
+func (b *BackupManager) containHookPanic(name string, p any) {
+	msg := fmt.Sprint(p)
+	b.Log.Error("offsite hook panicked", "name", name, "panic", msg)
+	detail, err := json.Marshal(map[string]any{
+		"name": name, "reason": "panic", "error": msg,
+	})
+	if err != nil {
+		return
+	}
+	if len(detail) > 512 {
+		detail = detail[:512]
+	}
+	if err := b.Store.AppendAudit(ctxBg(), "controller", "backup.offsite_failed", "db", string(detail)); err != nil {
+		b.Log.Warn("audit write failed", "err", err, "action", "backup.offsite_failed")
+	}
 }
 
 // List returns all snapshots newest-first.

@@ -89,9 +89,11 @@ manual) an offsite hook (`internal/offsite`) copies the snapshot — plus, by
 default, the shares-key file needed to decrypt DB secrets on restore — to
 each enabled S3/SFTP destination in `settings.backup_offsite` and prunes to
 `keep_n` per destination; upload failures are logged/audited/alerted but
-never fail the local backup. See `Docs/md/Operations.md` for backup behavior
-(incl. the offsite security tradeoff) and `Docs/md/Deployment.md` for the PG
-deploy path.
+never fail the local backup. SFTP host keys are pinned (required
+`host_key` setting, `ssh.FixedHostKey`); uploads are temp+rename with 0600
+perms, and retention never deletes the just-uploaded generation. See
+`Docs/md/Operations.md` for backup behavior (incl. the offsite security
+tradeoff) and `Docs/md/Deployment.md` for the PG deploy path.
 
 ## Active/active (HA)
 
@@ -539,9 +541,10 @@ controller re-caps `log_full` at 1 MiB defensively.
   beside the DB stay out of downloads. UI: Settings → DB backups card.
   **Offsite copies (P4)**: S3 (shared `internal/s3` minio client) + SFTP
   (`pkg/sftp` over `x/crypto/ssh`) destinations configured in
-  `settings.backup_offsite`, write-only encrypted credentials, shares-key
-  bundle with opt-out, `keep_n` retention per destination. UI: Settings →
-  Offsite backups card.
+  `settings.backup_offsite`, write-only encrypted credentials, required
+  pinned SFTP host key, shares-key bundle with opt-out, `keep_n` retention
+  per destination (crash-safe temp+rename uploads, 0600 perms). UI:
+  Settings → Offsite backups card.
 - **Storage shares CRUD** — see "Storage shares" above (nfs/smb/s3,
   encrypted write-only credentials, S3 scanner autonomy).
 

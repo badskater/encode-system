@@ -275,18 +275,19 @@ func TestPruneList(t *testing.T) {
 		"unrelated.txt",
 		"encode-not-a-snapshot.txt",
 	}
-	got := pruneList(names, 2)
+	got := pruneList(names, 2, "")
+	// Companion-first (G2): a failed pair delete leaves snapshot-only.
 	want := []string{
-		"encode-20261101-000000-manual.db",
 		"encode-20261101-000000-manual.db" + KeySuffix,
+		"encode-20261101-000000-manual.db",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pruneList = %v, want %v", got, want)
 	}
-	if pruneList(names, 10) != nil {
+	if pruneList(names, 10, "") != nil {
 		t.Fatal("keepN >= generations must prune nothing")
 	}
-	if pruneList(nil, 1) != nil {
+	if pruneList(nil, 1, "") != nil {
 		t.Fatal("empty listing must prune nothing")
 	}
 }

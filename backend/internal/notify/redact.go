@@ -15,6 +15,12 @@ import (
 // redactedValue replaces credential-bearing URL parts in log output.
 const redactedValue = "REDACTED"
 
+// embeddedURLRe finds http(s) URLs inside a larger message (transport
+// errors quote the URL: `Put "https://…": dial tcp …`). The match stops at
+// whitespace, quotes, angle brackets, backticks and closing brackets/parens
+// so the surrounding diagnostic text is preserved.
+var embeddedURLRe = regexp.MustCompile("https?://[^\\s\"'`<>\\[\\]()]+")
+
 // RedactURL returns raw with credential-bearing parts masked while keeping
 // scheme, host and path for diagnostics:
 //   - query VALUES are replaced with REDACTED (keys are kept),
@@ -23,17 +29,47 @@ const redactedValue = "REDACTED"
 //   - Discord webhook path tokens (…/api/webhooks/<id>/<token>) are masked —
 //     Discord's credential lives in the path, not the query.
 //
-// Unparseable input is truncated at the first '?' so a raw query can never
-// survive. Exported because the API layer reuses it to mask credential-
-// bearing settings URLs for non-admin readers.
+// It handles BOTH shapes: a bare URL, and URLs EMBEDDED in a larger error
+// string (url.Parse of the whole message yields an empty Scheme, so each
+// embedded http(s) substring is redacted in place — P4 review Q3: the old
+// whole-string parse failed open on exactly that shape). Unparseable input
+// with no embedded URL is truncated at the first '?' so a raw query can
+// never survive. Exported because the API layer reuses it to mask
+// credential-bearing settings URLs for non-admin readers.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil {
-		if i := strings.IndexByte(raw, '?'); i >= 0 {
-			return raw[:i] + "?<redacted>"
+	if err == nil && u.Scheme != "" {
+		return redactParsedURL(u) // raw IS an absolute URL
+	}
+	if embeddedURLRe.MatchString(raw) {
+		return embeddedURLRe.ReplaceAllStringFunc(raw, func(m string) string {
+			mu, merr := url.Parse(m)
+			if merr != nil {
+				if i := strings.IndexByte(m, '?'); i >= 0 {
+					return m[:i] + "?<redacted>"
+				}
+				return m
+			}
+			return redactParsedURL(mu)
+		})
+	}
+	if err == nil {
+		// Relative/opaque URL — legacy behavior, but only when there is
+		// actually something to mask; plain text passes through verbatim.
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return redactParsedURL(u)
 		}
 		return raw
 	}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i] + "?<redacted>"
+	}
+	return raw
+}
+
+// redactParsedURL masks the credential-bearing parts of an already-parsed
+// URL (userinfo, query values, fragment, Discord path token).
+func redactParsedURL(u *url.URL) string {
 	u.User = nil
 	u.Fragment = ""
 	if u.RawQuery != "" {

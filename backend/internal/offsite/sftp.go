@@ -2,6 +2,8 @@ package offsite
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -24,13 +26,16 @@ type sftpAPI interface {
 	OpenFile(path string, flags int) (io.WriteCloser, error)
 	ReadDir(path string) ([]os.FileInfo, error)
 	Remove(path string) error
+	Chmod(path string, mode os.FileMode) error
+	Rename(oldpath, newpath string) error
 	Close() error
 }
 
 // DialSFTP opens an SFTP session for the given config. Production passes
 // nil (dialSFTP below); tests inject a fake returning an in-memory sftpAPI
-// or an auth error.
-type DialSFTP func(cfg model.BackupOffsiteSFTP) (sftpAPI, error)
+// or an auth error. The context bounds the whole construction (dial +
+// handshake + subsystem exchange) — P4 review Q4.
+type DialSFTP func(ctx context.Context, cfg model.BackupOffsiteSFTP) (sftpAPI, error)
 
 // SFTPDestination stores snapshots under Root on an SFTP server. It owns
 // the connection: Run closes it when the destination run finishes (or the
@@ -44,6 +49,12 @@ type SFTPDestination struct {
 func (d *SFTPDestination) Name() string { return "sftp" }
 
 // Put uploads one local file to Root/name, creating Root when missing.
+// The upload is atomic-safe (P4 review Q7): bytes go to a unique temp name,
+// are chmodded 0600 (Q1 — the bundle carries the shares key; server-default
+// 0644 would expose it), and are renamed onto the final name only after a
+// fully successful copy+flush. Any failure removes the partial, so a
+// corrupt upload can never sit at the final name and be counted as a valid
+// generation by retention.
 func (d *SFTPDestination) Put(ctx context.Context, name, localPath string) error {
 	if err := validName(name); err != nil {
 		return err
@@ -56,16 +67,47 @@ func (d *SFTPDestination) Put(ctx context.Context, name, localPath string) error
 		return err
 	}
 	defer src.Close()
-	dst, err := d.Client.OpenFile(path.Join(d.Root, name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	tmp := name + ".partial-" + partialSuffix()
+	tmpPath := path.Join(d.Root, tmp)
+	finalPath := path.Join(d.Root, name)
+	dst, err := d.Client.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return err
 	}
+	// From here on, every failure path cleans the partial (best-effort).
+	cleanup := func() { _ = d.Client.Remove(tmpPath) }
 	if _, err := io.Copy(dst, src); err != nil {
 		dst.Close()
+		cleanup()
 		return err
 	}
 	// SFTP buffers writes — Close flushes and is where write errors land.
-	return dst.Close()
+	if err := dst.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := d.Client.Chmod(tmpPath, 0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	if err := d.Client.Rename(tmpPath, finalPath); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %s: %w", tmpPath, err)
+	}
+	return nil
+}
+
+// partialSuffix returns a short random hex tag making temp names unique per
+// upload, so overlapping uploads of the same snapshot (two HA replicas)
+// never write into each other's temp file.
+func partialSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand never fails in practice; fall back to the pid so a
+		// temp name still exists (uniqueness degrades, safety does not).
+		return strconv.Itoa(os.Getpid())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // List returns the file names directly under Root (directories skipped).
@@ -95,14 +137,39 @@ func (d *SFTPDestination) Delete(ctx context.Context, name string) error {
 func (d *SFTPDestination) Close() error { return d.Client.Close() }
 
 // BuildSFTP dials and wraps one SFTP destination. dial nil = production
-// dialer. An empty Path defaults to "." (the SSH user's home dir).
-func BuildSFTP(cfg model.BackupOffsiteSFTP, dial DialSFTP) (*SFTPDestination, error) {
+// dialer. An empty Path defaults to "." (the SSH user's home dir). The dial
+// runs under ctx: construction is bounded even when the seam ignores the
+// context (P4 review Q4 — BuildDestinations used to run OUTSIDE the run
+// bound, so a stalling server hung the hook indefinitely).
+func BuildSFTP(ctx context.Context, cfg model.BackupOffsiteSFTP, dial DialSFTP) (*SFTPDestination, error) {
 	if dial == nil {
 		dial = dialSFTP
 	}
-	client, err := dial(cfg)
-	if err != nil {
-		return nil, err
+	type dialResult struct {
+		client sftpAPI
+		err    error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		c, err := dial(ctx, cfg)
+		ch <- dialResult{c, err}
+	}()
+	var client sftpAPI
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, r.err
+		}
+		client = r.client
+	case <-ctx.Done():
+		// The dial may still complete later — close whatever it returns
+		// so an abandoned connection never leaks.
+		go func() {
+			if r := <-ch; r.client != nil {
+				r.client.Close()
+			}
+		}()
+		return nil, fmt.Errorf("sftp dial: %w", ctx.Err())
 	}
 	root := cfg.Path
 	if root == "" {
@@ -112,10 +179,11 @@ func BuildSFTP(cfg model.BackupOffsiteSFTP, dial DialSFTP) (*SFTPDestination, er
 }
 
 // BuildDestinations constructs every enabled destination from live
-// settings. A destination that fails to build (bad key, dial/auth failure)
-// becomes an error Result — the other destinations still run. dial is the
-// SFTP connection seam (nil = production dialer).
-func BuildDestinations(st *model.Settings, dial DialSFTP) ([]Destination, []Result) {
+// settings, bounded by ctx (P4 review Q4). A destination that fails to
+// build (bad key, dial/auth failure, timeout) becomes an error Result —
+// the other destinations still run. dial is the SFTP connection seam
+// (nil = production dialer).
+func BuildDestinations(ctx context.Context, st *model.Settings, dial DialSFTP) ([]Destination, []Result) {
 	var dests []Destination
 	var errs []Result
 	o := st.BackupOffsite
@@ -128,7 +196,7 @@ func BuildDestinations(st *model.Settings, dial DialSFTP) ([]Destination, []Resu
 		}
 	}
 	if o.SFTP.Enabled {
-		d, err := BuildSFTP(o.SFTP, dial)
+		d, err := BuildSFTP(ctx, o.SFTP, dial)
 		if err != nil {
 			errs = append(errs, Result{Destination: "sftp", Err: err.Error()})
 		} else {
@@ -138,16 +206,19 @@ func BuildDestinations(st *model.Settings, dial DialSFTP) ([]Destination, []Resu
 	return dests, errs
 }
 
-// sshTimeout bounds the TCP dial and the SSH handshake. Transfer hangs are
-// bounded separately by Run's context (cancellation closes the connection).
-const sshTimeout = 15 * time.Second
+// sshTimeout bounds the TCP dial, the SSH handshake AND the SFTP subsystem
+// exchange (the conn deadline stays set across all three). Transfer hangs
+// are bounded separately by Run's context (cancellation closes the
+// connection). A var so tests can shorten it.
+var sshTimeout = 15 * time.Second
 
 // dialSFTP is the production DialSFTP: TCP dial → SSH handshake → SFTP
-// session. Auth offers the private key first (when set), then the password.
-// Host keys are NOT pinned: the settings surface has no known_hosts field,
-// so operators must use trusted networks/destinations (Operations.md states
-// the tradeoff alongside the shares-key bundle warning).
-func dialSFTP(cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
+// session, all under ctx and a conn deadline. Auth offers the private key
+// first (when set), then the password. The server's host key is PINNED
+// (P4 review D1): the bundle carries the shares key, so an unpinned
+// connection would let a MITM steal it. host_key is required configuration
+// (validated at save time; re-checked here as defense in depth).
+func dialSFTP(ctx context.Context, cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
 	var auths []ssh.AuthMethod
 	if cfg.PrivateKey != "" {
 		key, err := ssh.ParseRawPrivateKey([]byte(cfg.PrivateKey))
@@ -166,19 +237,38 @@ func dialSFTP(cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
 	if len(auths) == 0 {
 		return nil, errors.New("sftp: no credentials configured")
 	}
+	if cfg.HostKey == "" {
+		return nil, errors.New("sftp: host_key is required — pin the server's host key (get it with: ssh-keyscan <host>)")
+	}
+	hostKey, err := ParseHostKey(cfg.HostKey)
+	if err != nil {
+		return nil, fmt.Errorf("sftp host_key: %w", err)
+	}
 	port := cfg.Port
 	if port == 0 {
 		port = 22
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", addr, sshTimeout)
+	dialer := net.Dialer{Timeout: sshTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("sftp dial: %w", err)
 	}
+	// One deadline across the handshake AND the subsystem exchange:
+	// sftp.NewClient does its own I/O on the same conn after the handshake,
+	// and a stalling server must not hang either phase (Q4).
+	deadline := time.Now().Add(sshTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+	// ctx cancellation aborts a blocked handshake immediately.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            auths,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.FixedHostKey(hostKey),
 		Timeout:         sshTimeout,
 	})
 	if err != nil {
@@ -191,6 +281,9 @@ func dialSFTP(cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
 		sshClient.Close()
 		return nil, fmt.Errorf("sftp session: %w", err)
 	}
+	// Construction done: clear the deadline — transfers are bounded by
+	// Run's ctx (which closes the connection on cancellation).
+	_ = conn.SetDeadline(time.Time{})
 	return &sftpConn{ssh: sshClient, sftp: sc}, nil
 }
 
@@ -207,6 +300,13 @@ func (c *sftpConn) OpenFile(p string, flags int) (io.WriteCloser, error) {
 }
 func (c *sftpConn) ReadDir(p string) ([]os.FileInfo, error) { return c.sftp.ReadDir(p) }
 func (c *sftpConn) Remove(p string) error                   { return c.sftp.Remove(p) }
+func (c *sftpConn) Chmod(p string, mode os.FileMode) error  { return c.sftp.Chmod(p, mode) }
+
+// Rename uses the posix-rename@openssh.com extension: it atomically
+// REPLACES an existing target, keeping same-name re-uploads (two HA
+// replicas racing on one snapshot) idempotent. Plain SSH_FXP_RENAME would
+// fail on an existing target.
+func (c *sftpConn) Rename(old, new string) error { return c.sftp.PosixRename(old, new) }
 func (c *sftpConn) Close() error {
 	_ = c.sftp.Close()
 	return c.ssh.Close()

@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"os"
@@ -39,8 +40,19 @@ func offsiteBlock() map[string]any {
 	return offsiteBlockWith(sk, pw, key)
 }
 
-// offsiteBlockWith builds the block from explicit credentials.
+// offsiteBlockWith builds the block from explicit credentials. The SFTP
+// host key is a freshly generated ed25519 PUBLIC key (D1: required when
+// enabled; public material, not a secret).
 func offsiteBlockWith(sk, pw, key string) map[string]any {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		panic(err)
+	}
+	hostKey := "ssh-ed25519 " + base64.StdEncoding.EncodeToString(sshPub.Marshal())
 	return map[string]any{
 		"keep_n":             14,
 		"include_shares_key": true,
@@ -51,6 +63,7 @@ func offsiteBlockWith(sk, pw, key string) map[string]any {
 		"sftp": map[string]any{
 			"enabled": true, "host": "sftp.example.com", "port": 22, "user": "backup",
 			"password": pw, "private_key": key, "path": "/backups/encode",
+			"host_key": hostKey,
 		},
 	}
 }

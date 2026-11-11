@@ -139,9 +139,11 @@ port goes in `smtp_port`); `smtp_user` requires a password (stored or new).
 Channel URLs can embed credentials in the query string (`?auth=<token>`).
 For NON-admin readers (viewer sessions, read-scope API tokens) `GET
 /api/settings` masks those query VALUES in `ntfy_topic_url` and
-`generic_webhook_url` (scheme/host/path stay visible); admins see the full
-URLs. Channel error logs never carry raw query credentials either — URLs
-are redacted before logging.
+`generic_webhook_url` (scheme/host/path stay visible), and empties
+`backup_offsite.s3.access_key` (`has_s3_access_key` reports presence);
+admins see the full values. Channel error logs never carry raw query
+credentials either — URLs are redacted before logging, including URLs
+EMBEDDED in larger transport-error strings.
 
 **Key-loss failure mode (fail-closed save).** If the shares key file is lost
 or replaced, stored secrets become undecryptable. `GET /api/settings` still
@@ -163,7 +165,12 @@ audited as `backup.offsite_failed`, and fanned out as an operational alert
 through the configured notification channels (Discord/webhook/ntfy/email).
 Successful copies audit as `backup.offsite`. The upload runs detached from
 the request/scheduler with a 10-minute bound, so a slow or hung destination
-never blocks the backup API or the scheduler tick.
+never blocks the backup API or the scheduler tick. Destination
+CONSTRUCTION is inside that bound too: the SFTP dial, SSH handshake and
+subsystem exchange each carry a 15s deadline (and abort immediately on
+cancellation), so a stalling server fails the run instead of hanging it.
+A panicked hook is contained — it is logged and audited as
+`backup.offsite_failed` (`reason=panic`), never crashing the controller.
 
 **Configuration** lives in the settings blob (`backup_offsite`), edited via
 Settings → **Offsite backups (S3 · SFTP)** or `PUT /api/settings`:
@@ -177,7 +184,8 @@ Settings → **Offsite backups (S3 · SFTP)** or `PUT /api/settings`:
   `port` (0 = default 22), `user`, `password` (WRITE-ONLY), `private_key`
   (WRITE-ONLY, unencrypted PEM — passphrase-protected keys are rejected at
   save time), `path` (remote dir, empty = the SSH home dir; created if
-  missing).
+  missing), `host_key` (**REQUIRED** when enabled — the server's public SSH
+  host key, pinned on every connection; see the security note below).
 - `keep_n`: per-destination retention, 0 (default 30) or 1-365.
 - `include_shares_key`: bundle the shares key with each snapshot
   (default **true**).
@@ -190,18 +198,41 @@ OMITTED `backup_offsite` block keeps the stored block wholesale (pre-P4
 automation cannot wipe it). An enabled destination without a credential
 (stored or supplied) is refused at save time. Validation mirrors the
 notification-channel rules: port bounds, no bare-colon SFTP hosts, no
-traversal (`..`) in prefixes/paths, S3 endpoint ports 1-65535.
+traversal (`..`) in prefixes/paths, S3 endpoint ports 1-65535. The SFTP
+`host_key` is parsed at save time (`ssh.ParsePublicKey`) and stored
+normalized to `<type> <base64>`; accepted shapes are known-hosts style
+(`ssh-ed25519 AAAA… [comment]`, including raw `ssh-keyscan` output with a
+leading hostname) or a bare base64 blob. Garbage is refused with an
+`ssh-keyscan` hint.
 
 **Remote layout and retention.** Objects are named exactly like the local
 snapshot — `encode-<YYYYMMDD>-<HHMMSS>-<sched|manual>[-N].db` (SQLite) or
 `.dump` (Postgres), UTC timestamp embedded so name order IS time order —
 under the S3 prefix / SFTP path. With key bundling on, each snapshot has a
-companion `<snapshot-name>.shares-key` (the raw 32-byte key file). After a
-successful upload the destination is listed and generations beyond the
-newest `keep_n` are deleted **snapshot + key companion together**; foreign
-objects under the same root are never touched. Note the difference from
-local retention: offsite `keep_n` applies to ALL uploaded snapshots,
-manual ones included (local retention never auto-prunes manual snapshots).
+companion `<snapshot-name>.shares-key` (the raw 32-byte key file). Uploads
+are crash-safe: S3 PUTs are atomic; SFTP writes to a unique
+`<name>.partial-<tag>` temp object, chmods it **0600** (both snapshot and
+key companion — server-default 0644 would expose the key), and renames it
+onto the final name only after a fully successful copy. A failed upload
+removes the partial, so a corrupt file can never sit at a generation name.
+After a successful upload the destination is listed and generations beyond
+the newest `keep_n` are deleted **key companion first, then the snapshot**
+(a failed pair delete leaves snapshot-only, never a key-only orphan).
+Retention only counts names matching the EXACT snapshot format above
+(real timestamp, `sched|manual` kind, optional `-N` counter) — nested or
+foreign `encode-*` objects are ignored, and the generation just uploaded is
+**never** a delete candidate, even if a newer generation from another
+replica (clock skew) sorts ahead of it. Foreign objects under the same root
+are never touched. Note the difference from local retention: offsite
+`keep_n` applies to ALL uploaded snapshots, manual ones included (local
+retention never auto-prunes manual snapshots).
+
+**Key bundling failure modes.** A MISSING shares-key file is normal on a
+fresh install (the cipher creates it lazily) — the run uploads
+snapshot-only and audits success with `shares_key_bundled:false`. Any OTHER
+read error (permissions, I/O, corruption) FAILS the offsite run
+(`backup.offsite_failed` + alert): a bundle that cannot decrypt on restore
+must never be reported as a successful backup.
 
 **SECURITY — read before enabling.** The shares-key bundle contains the key
 that decrypts EVERY secret in the database (share passwords, ntfy tokens,
@@ -211,8 +242,12 @@ destination MUST be trusted and access-controlled (private bucket policy /
 restricted SFTP account, ideally encrypted at rest by the provider). If
 that is not acceptable, untick `include_shares_key`: copies become
 snapshot-only, and a restore then needs the key file delivered out of band.
-Two further caveats: SFTP host keys are NOT pinned (the settings surface has
-no known_hosts field) — use trusted networks/destinations; and the key
+SFTP host keys ARE pinned: `host_key` is required configuration and every
+dial verifies the server against it (`ssh.FixedHostKey`) — a mismatch
+aborts the backup with an audited failure. Get the key once from a trusted
+network: `ssh-keyscan <host>` (paste the `ssh-ed25519` line). If the server
+is reinstalled and its host key changes, update `host_key` deliberately —
+that is exactly the MITM signal pinning exists to surface. The key
 companion is uploaded as a separate object, so destination ACLs must cover
 both objects, not just the snapshot.
 
@@ -223,7 +258,11 @@ companion from the destination. Then either:
    the normal restore endpoint/UI (see below). Place the key file where the
    controller resolves it — SQLite: `<db path>.shares-key` beside the DB;
    Postgres: `ENCODE_SHARES_KEY_FILE` (or the DSN-derived temp path) —
-   BEFORE restoring, or stored secrets become undecryptable.
+   BEFORE restoring, or stored secrets become undecryptable. The PG
+   in-place restore re-reads the key file automatically after the swap
+   (the cached cipher is invalidated); the SQLite path exits and reboots,
+   which also picks the key up. If you replace the key file WITHOUT a
+   restore, restart the controller — see the Postgres restore note below.
 2. *Cold*: stop the controller, replace the DB file with the snapshot
    (SQLite) or re-import the dump (`pgimport -force`, Postgres), place the
    key file as above, start. Without the key the DB restores but every
@@ -232,7 +271,12 @@ companion from the destination. Then either:
 
 **HA note.** The scheduled loop runs on the leader replica only
 (advisory lock 1005); a manual backup on any replica also uploads.
-Overlapping uploads of the same snapshot name are idempotent overwrites.
+Same-second local name collisions are handled by the counter suffix
+(`-1`, `-2`, …): SQLite's VACUUM INTO and the PG dump's exclusive create
+both refuse to clobber an existing snapshot. Overlapping uploads of the
+same snapshot name are safe: S3 PUT is atomic, SFTP uses temp+rename with
+per-upload unique temp names, so the last complete upload wins and no
+partial is ever visible at a generation name.
 
 ## Restore runbook (in-place DB restore)
 
@@ -293,6 +337,16 @@ share credentials remain decryptable after the restore.
 If the transaction fails (e.g. a schema mismatch between the dump and the
 live DB), it rolls back and the handler returns 500 with the error — the live
 DB is untouched.
+
+**Shares-key swap on PG.** The restore never touches the key file, but the
+restored rows may be sealed with a DIFFERENT key (offsite bundle). After a
+successful commit the controller invalidates its cached shares cipher, so
+the next secret read re-reads the key file — placing the bundle's key at
+`ENCODE_SHARES_KEY_FILE` BEFORE restoring is picked up automatically, no
+restart needed. If you replace the key file WITHOUT running a restore
+(manual swap), **restart the controller**: the cached cipher otherwise
+keeps using the old key and restored/rotated secrets stay undecryptable.
+(The SQLite in-place restore exits the process, so it always re-reads.)
 
 ### After any restore
 

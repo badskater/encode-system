@@ -45,7 +45,7 @@ func (s *Server) OffsiteAfterSnapshot(ctx context.Context, info *BackupInfo) {
 	build := s.OffsiteDestinations
 	if build == nil {
 		build = func(st *model.Settings) ([]offsite.Destination, []offsite.Result) {
-			return offsite.BuildDestinations(st, nil)
+			return offsite.BuildDestinations(ctx, st, nil)
 		}
 	}
 	dests, results := build(st)

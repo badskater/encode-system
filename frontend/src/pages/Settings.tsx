@@ -118,6 +118,12 @@ function validateOffsite(s: Settings): string | null {
     if (/[/\\\s]/.test(s3.bucket ?? '')) return 'S3 bucket must be a plain bucket name (no slashes or spaces)';
     if (!(s3.access_key ?? '').trim()) return 'S3 access key is required when the destination is enabled';
   }
+  // Prefix traversal parity with the server (checked even when disabled —
+  // the stored value must always be upload-ready).
+  const prefix = (s3?.prefix ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (prefix && prefix.split('/').some((seg) => seg === '.' || seg === '..')) {
+    return 'S3 prefix must not contain . or .. segments';
+  }
   const sf = off.sftp;
   if (sf?.enabled) {
     const host = (sf.host ?? '').trim();
@@ -131,6 +137,19 @@ function validateOffsite(s: Settings): string | null {
       return 'SFTP port must be 0 (default 22) or 1-65535';
     }
     if (!(sf.user ?? '').trim()) return 'SFTP user is required when the destination is enabled';
+    // D1: the bundle carries the shares key — pinning is mandatory. Shape
+    // check only; the server does the real ssh.ParsePublicKey at save.
+    const hk = (sf.host_key ?? '').trim();
+    if (!hk) return 'SFTP host key is required when the destination is enabled — get it with: ssh-keyscan <host>';
+    const fields = hk.split(/\s+/);
+    const b64 = fields.length >= 2 ? fields[1] : fields[0];
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length < 16) {
+      return 'SFTP host key must be a public key (ssh-ed25519 AAAA… or bare base64) — get it with: ssh-keyscan <host>';
+    }
+  }
+  // SFTP path traversal parity with the server.
+  if ((sf?.path ?? '').split('/').some((seg) => seg === '..')) {
+    return 'SFTP path must not contain .. segments';
   }
   return null;
 }
@@ -353,6 +372,7 @@ export default function SettingsPage() {
           port: clampInt(o.sftp?.port ?? 0, 0, 65535),
           user: o.sftp?.user,
           path: o.sftp?.path,
+          host_key: o.sftp?.host_key,
         };
         if (offsiteSFTPPassword) sftpSave.password = offsiteSFTPPassword;
         if (offsiteSFTPKey.trim()) sftpSave.private_key = offsiteSFTPKey.trim();
@@ -936,6 +956,26 @@ export default function SettingsPage() {
         </label>
         {offField('SFTP user', 'SSH account that owns the backup directory.', settings.backup_offsite?.sftp?.user, (v) => setOffSFTP({ user: v }), 'backup')}
         {offField('SFTP path (optional)', 'Remote directory; empty = the SSH home dir. Created if missing.', settings.backup_offsite?.sftp?.path, (v) => setOffSFTP({ path: v }), '/backups/encode')}
+        {/* D1: host-key pinning. Public material (not a write-only secret),
+            so the stored value round-trips into the field. Required when
+            the destination is enabled — the bundle carries the shares key. */}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SFTP host key</span>
+          <textarea
+            aria-label="SFTP host key"
+            rows={3}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.sftp?.host_key ?? ''}
+            placeholder="ssh-ed25519 AAAA…"
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ host_key: e.target.value })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Required — pinned on every connection. Paste the server&apos;s public host key
+            (known-hosts style or bare base64); get it with: ssh-keyscan &lt;host&gt;.
+            A mismatch aborts the backup.
+          </span>
+        </label>
         {secretField(
           'SFTP password',
           'Write-only — blank keeps the stored password. A password or a private key is required.',

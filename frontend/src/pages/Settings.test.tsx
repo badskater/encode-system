@@ -761,6 +761,7 @@ describe('Settings offsite backups card', () => {
     fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
     fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
     fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef' } });
     fireEvent.click(await offsiteSaveButton());
     expect(await screen.findByText(/SFTP needs a password or private key/i)).toBeInTheDocument();
     expect(saveSpy).not.toHaveBeenCalled();
@@ -782,6 +783,7 @@ describe('Settings offsite backups card', () => {
     fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
     fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
     fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef' } });
     fireEvent.change(screen.getByLabelText('SFTP port'), { target: { value: '65535' } });
     fireEvent.change(screen.getByLabelText('Offsite keep N'), { target: { value: '365' } });
     fireEvent.click(await offsiteSaveButton());
@@ -801,5 +803,76 @@ describe('Settings offsite backups card', () => {
     fireEvent.click(await offsiteSaveButton());
     await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
     expect(saveSpy.mock.calls[0][0].backup_offsite!.include_shares_key).toBe(false);
+  });
+
+  // ---------- Host-key pinning (D1) + traversal parity (G3) ----------
+
+  // A syntactically valid ed25519 host key blob (client checks shape only;
+  // the server does the real parse). Assembled at runtime, redaction-safe.
+  const hostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef';
+
+  async function enableSftpBase() {
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+  }
+
+  it('blocks save when SFTP is enabled without a host key', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/host key is required.*ssh-keyscan/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a garbage host key with an ssh-keyscan hint', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'not-a-host-key' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/host key must be a public key/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the pinned host key in the save payload', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: hostKey } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].backup_offsite!.sftp?.host_key).toBe(hostKey);
+  });
+
+  it('prefills the stored host key on load (public material round-trips)', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      backup_offsite: {
+        keep_n: 7,
+        include_shares_key: true,
+        sftp: { enabled: true, host: 'backup.example.com', user: 'backup', host_key: hostKey },
+        has_sftp_password: true,
+      },
+    }));
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText('SFTP host key')) as HTMLTextAreaElement;
+    await waitFor(() => expect(field.value).toBe(hostKey));
+  });
+
+  it('rejects traversal segments in the S3 prefix and SFTP path (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText('S3 prefix (optional)'), { target: { value: 'encode/../etc' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/S3 prefix must not contain/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('S3 prefix (optional)'), { target: { value: 'encode/' } });
+    fireEvent.change(screen.getByLabelText('SFTP path (optional)'), { target: { value: '/backups/../etc' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/SFTP path must not contain/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
   });
 });

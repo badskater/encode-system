@@ -13,6 +13,7 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/offsite"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -48,6 +49,7 @@ type offsiteReq struct {
 	HasS3SecretKey    bool           `json:"has_s3_secret_key"`    // output-only echo, ignored
 	HasSFTPPassword   bool           `json:"has_sftp_password"`    // output-only echo, ignored
 	HasSFTPPrivateKey bool           `json:"has_sftp_private_key"` // output-only echo, ignored
+	HasS3AccessKey    bool           `json:"has_s3_access_key"`    // output-only echo, ignored
 }
 
 // offsiteS3Req is the S3 sub-block: model fields + the write-only secret.
@@ -70,15 +72,22 @@ type settingsOut struct {
 	*model.Settings
 	HasNtfyToken    bool `json:"has_ntfy_token"`
 	HasSMTPPassword bool `json:"has_smtp_password"`
+	// hasS3AccessKey overrides the presence flag derived from the (possibly
+	// masked) settings: non-admin GETs empty the access_key value but must
+	// still report that one is configured (Q2).
+	hasS3AccessKey *bool
 }
 
 // offsiteOut is the API-facing backup_offsite block: the model fields plus
-// has_* flags for the three write-only destination secrets.
+// has_* flags for the three write-only destination secrets. has_s3_access_key
+// reports access_key presence for NON-admin readers, whose access_key value
+// is masked (Q2) — admins see the value itself.
 type offsiteOut struct {
 	model.BackupOffsite
 	HasS3SecretKey    bool `json:"has_s3_secret_key"`
 	HasSFTPPassword   bool `json:"has_sftp_password"`
 	HasSFTPPrivateKey bool `json:"has_sftp_private_key"`
+	HasS3AccessKey    bool `json:"has_s3_access_key"`
 }
 
 // MarshalJSON implements the mask: embed Settings' fields (secrets already
@@ -87,6 +96,10 @@ type offsiteOut struct {
 func (o settingsOut) MarshalJSON() ([]byte, error) {
 	type alias model.Settings
 	off := o.Settings.BackupOffsite
+	hasAccessKey := off.S3.AccessKey != ""
+	if o.hasS3AccessKey != nil {
+		hasAccessKey = *o.hasS3AccessKey
+	}
 	return json.Marshal(struct {
 		alias
 		HasNtfyToken    bool       `json:"has_ntfy_token"`
@@ -97,6 +110,7 @@ func (o settingsOut) MarshalJSON() ([]byte, error) {
 		HasS3SecretKey:    off.S3.SecretKey != "",
 		HasSFTPPassword:   off.SFTP.Password != "",
 		HasSFTPPrivateKey: off.SFTP.PrivateKey != "",
+		HasS3AccessKey:    hasAccessKey,
 	}})
 }
 
@@ -149,25 +163,37 @@ func (s *Server) currentSettings(ctx context.Context) *model.Settings {
 // masked to has_* flags. For NON-admin readers (viewer sessions, read-scope
 // API tokens) the channel URLs' query VALUES are masked too — ntfy topic and
 // generic webhook URLs can carry credentials (?auth=<token>), and this route
-// is reachable by any authenticated user. Admins see the full URLs.
+// is reachable by any authenticated user. The offsite S3 access_key is
+// masked as well (has_s3_access_key reports presence). Admins see everything.
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	st := s.currentSettings(r.Context())
+	out := maskSettings(st)
 	if !requestIsAdmin(r) {
-		st = maskSettingsURLsForNonAdmin(st)
+		// Presence must be computed BEFORE the mask empties the value.
+		hasAccessKey := st.BackupOffsite.S3.AccessKey != ""
+		st = maskSettingsForNonAdmin(st)
+		out = maskSettings(st)
+		out.hasS3AccessKey = &hasAccessKey
 	}
-	writeJSON(w, http.StatusOK, maskSettings(st))
+	writeJSON(w, http.StatusOK, out)
 }
 
-// maskSettingsURLsForNonAdmin returns a COPY of st with credential-bearing
-// query values masked in the two channel URLs (scheme/host/path stay visible
-// so the endpoint remains identifiable — the least-breaking mask; the only
-// non-admin consumer is the Settings page's read-only fields). The stored
-// settings are never mutated. Dedicated secret fields are already write-only
-// on the model (json:"-") for every role.
-func maskSettingsURLsForNonAdmin(st *model.Settings) *model.Settings {
+// maskSettingsForNonAdmin returns a COPY of st with credential material
+// masked for non-admin readers:
+//   - query values in the two channel URLs (scheme/host/path stay visible
+//     so the endpoint remains identifiable — the least-breaking mask),
+//   - the offsite S3 access_key (emptied; has_s3_access_key reports presence
+//     — P4 review Q2: it is half of a credential pair and was fully visible).
+//
+// The only non-admin consumer is the Settings page's read-only fields, so
+// masking breaks no workflow. The stored settings are never mutated.
+// Dedicated secret fields are already write-only on the model (json:"-")
+// for every role.
+func maskSettingsForNonAdmin(st *model.Settings) *model.Settings {
 	cp := *st
 	cp.NtfyTopicURL = notify.RedactURL(cp.NtfyTopicURL)
 	cp.GenericWebhookURL = notify.RedactURL(cp.GenericWebhookURL)
+	cp.BackupOffsite.S3.AccessKey = ""
 	return &cp
 }
 
@@ -512,6 +538,20 @@ func validateBackupOffsite(o *model.BackupOffsite) error {
 		if sf.User == "" {
 			return errSettings("backup_offsite.sftp.user is required when the SFTP destination is enabled")
 		}
+		// D1: the bundle carries the shares key — an unpinned SFTP
+		// connection is a MITM key-theft vector. Require the host key.
+		if sf.HostKey == "" {
+			return errSettings("backup_offsite.sftp.host_key is required when the SFTP destination is enabled — pin the server's host key (get it with: ssh-keyscan <host>)")
+		}
+	}
+	// A supplied host key must parse NOW (catch paste errors at save time,
+	// not mid-backup) and is stored normalized to "<type> <base64>".
+	if sf.HostKey != "" {
+		key, err := offsite.ParseHostKey(sf.HostKey)
+		if err != nil {
+			return errSettings("backup_offsite.sftp.host_key: " + err.Error())
+		}
+		sf.HostKey = offsite.NormalizeHostKey(key)
 	}
 	if sf.Path != "" {
 		for _, seg := range strings.Split(sf.Path, "/") {

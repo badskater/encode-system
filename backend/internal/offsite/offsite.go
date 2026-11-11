@@ -11,8 +11,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // KeySuffix is appended to the snapshot name for the shares-key companion
@@ -65,10 +67,14 @@ func Run(ctx context.Context, log *slog.Logger, dests []Destination, snapshotPat
 	}
 	name := filepath.Base(snapshotPath)
 
-	// Read the key once for all destinations. A missing key file is normal
+	// Read the key once for all destinations. A MISSING key file is normal
 	// on a fresh install that has not stored any secret yet (the cipher
-	// creates it lazily) — snapshot-only copies are still valid there.
+	// creates it lazily) — snapshot-only copies are still valid there. Any
+	// OTHER read error (permissions, corruption, I/O) fails the whole run:
+	// silently uploading snapshot-only with a success audit would hide a
+	// bundle that cannot decrypt on restore (P4 review Q10).
 	var keyData []byte
+	var keyReadErr error
 	if includeKey && keyPath != "" {
 		b, err := os.ReadFile(keyPath)
 		switch {
@@ -77,8 +83,18 @@ func Run(ctx context.Context, log *slog.Logger, dests []Destination, snapshotPat
 		case os.IsNotExist(err):
 			log.Info("offsite: shares key not present yet, uploading snapshot only", "key_path", keyPath)
 		default:
-			log.Warn("offsite: shares key unreadable, uploading snapshot only", "key_path", keyPath, "err", err)
+			keyReadErr = err
+			log.Error("offsite: shares key unreadable, failing run", "key_path", keyPath, "err", err)
 		}
+	}
+	if keyReadErr != nil {
+		for _, d := range dests {
+			results = append(results, Result{
+				Destination: d.Name(),
+				Err:         "shares key unreadable: " + keyReadErr.Error(),
+			})
+		}
+		return results, false
 	}
 	// S3's Put is file-based, so stage the key bytes in a 0600 temp file
 	// once per run (removed on return — plaintext key never lingers).
@@ -124,7 +140,7 @@ func Run(ctx context.Context, log *slog.Logger, dests []Destination, snapshotPat
 		if err != nil {
 			r.PruneErr = err.Error()
 		} else {
-			for _, del := range pruneList(names, keepN) {
+			for _, del := range pruneList(names, keepN, name) {
 				if err := d.Delete(ctx, del); err != nil {
 					if r.PruneErr == "" {
 						r.PruneErr = err.Error()
@@ -162,12 +178,19 @@ func stageKey(log *slog.Logger, keyData []byte) string {
 
 // pruneList returns the object names to delete so at most keepN snapshot
 // generations remain (newest kept). A generation is the snapshot object plus
-// its optional key companion — both go together. Foreign objects under the
-// same root are never touched. Snapshot names embed a fixed-width UTC
-// timestamp (encode-20060102-150405-…), so lexicographic order IS
+// its optional key companion — both go together, companion FIRST so a
+// mid-pair delete failure leaves snapshot-only (restorable with an
+// out-of-band key), never a key-only orphan (P4 review G2). Foreign objects
+// under the same root are never touched. Snapshot names embed a fixed-width
+// UTC timestamp (encode-20060102-150405-…), so lexicographic order IS
 // chronological order; the collision counter suffix (-1, -2) sorts after
 // the plain name within the same second, which is harmless.
-func pruneList(names []string, keepN int) []string {
+//
+// current is the snapshot name this run just uploaded: it is NEVER a delete
+// candidate, even when a newer foreign generation (clock skew / another HA
+// replica) pushes it past the keepN window (P4 review Q6). Pass "" when
+// there is no current generation (pure listing analysis).
+func pruneList(names []string, keepN int, current string) []string {
 	present := make(map[string]bool, len(names))
 	bases := make(map[string]bool)
 	for _, n := range names {
@@ -187,19 +210,35 @@ func pruneList(names []string, keepN int) []string {
 	sort.Sort(sort.Reverse(sort.StringSlice(sorted)))
 	var del []string
 	for _, b := range sorted[keepN:] {
-		del = append(del, b)
+		if b == current {
+			continue // the just-uploaded generation always survives
+		}
 		if present[b+KeySuffix] {
 			del = append(del, b+KeySuffix)
 		}
+		del = append(del, b)
 	}
 	return del
 }
 
-// isSnapshotName recognizes the controller's snapshot naming on both
-// backends: encode-<UTC timestamp>-<kind>[-counter].db (SQLite) / .dump (PG).
+// snapshotNameRe matches the EXACT controller snapshot naming on both
+// backends: encode-<YYYYMMDD>-<HHMMSS>-<sched|manual>[-counter].db/.dump.
+// Anchored, so nested paths ("encode-…/x.db") and foreign encode-* files
+// never match (P4 review Q11: over-matching counted them as generations and
+// wedged retention — Delete rejects such names, yielding a permanent
+// PruneErr and an eviction DoS on the valid generations).
+var snapshotNameRe = regexp.MustCompile(`^encode-(\d{8}-\d{6})-(sched|manual)(-\d+)?\.(db|dump)$`)
+
+// isSnapshotName recognizes the controller's snapshot naming. The timestamp
+// must also be a REAL date/time (time.Parse rejects month 13, hour 25, …) —
+// a hostile listing cannot inflate the generation count with lookalikes.
 func isSnapshotName(name string) bool {
-	return strings.HasPrefix(name, "encode-") &&
-		(strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".dump"))
+	m := snapshotNameRe.FindStringSubmatch(name)
+	if m == nil {
+		return false
+	}
+	_, err := time.Parse("20060102-150405", m[1])
+	return err == nil
 }
 
 // validName rejects traversal in remote object names (defense in depth —

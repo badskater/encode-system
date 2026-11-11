@@ -106,6 +106,20 @@ func (s *Store) shareCipher() (cipher.AEAD, error) {
 	return aead, nil
 }
 
+// InvalidateShareCipher drops the cached AES-GCM cipher so the NEXT use
+// re-reads the key file from disk. The in-place PG restore calls it after a
+// successful commit (P4 review Q9): an operator who places the restored
+// bundle's shares-key file beside the DB before restoring would otherwise
+// keep decrypting with the OLD cached key until a controller restart —
+// restored secrets silently undecryptable. Safe under cipherMu: in-flight
+// operations keep the cipher they already obtained; only future uses
+// re-read. The key file itself is never touched here.
+func (s *Store) InvalidateShareCipher() {
+	s.cipherMu.Lock()
+	defer s.cipherMu.Unlock()
+	s.aead = nil
+}
+
 // loadOrCreateShareKey reads the key file, creating it on first use. The
 // create is O_CREATE|O_EXCL so concurrent processes cannot both claim it;
 // the loser of the race re-reads the winner's key instead of overwriting it

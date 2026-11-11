@@ -327,6 +327,11 @@ type BackupOffsiteSFTP struct {
 	// PrivateKey is WRITE-ONLY over the API, AES-GCM encrypted at rest.
 	PrivateKey string `json:"-"`
 	Path       string `json:"path"` // remote dir; empty = the SSH home dir (".")
+	// HostKey pins the server's SSH host key (REQUIRED when enabled).
+	// Public material — round-trips over the API. Stored normalized to
+	// "<type> <base64>" (known-hosts style); parsed at save time and
+	// enforced with ssh.FixedHostKey on every dial.
+	HostKey string `json:"host_key"`
 }
 
 // Session is an issued management session (token stored hashed at rest).

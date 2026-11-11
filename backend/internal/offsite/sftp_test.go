@@ -19,18 +19,36 @@ import (
 // free of a real SSH server. It records paths/flags and serves listings.
 type fakeSFTP struct {
 	files      map[string][]byte
+	modes      map[string]os.FileMode
 	mkdirs     []string
 	opens      []string
 	openFlags  []int
 	removed    []string
+	chmods     []fakeChmod
+	renames    []fakeRename
 	mkdirErr   error
 	openErr    error
 	readDirErr error
 	removeErr  error
+	chmodErr   error
+	renameErr  error
+	writeErr   error // injected mid-copy Write failure
+	closeErr   error // injected flush-on-Close failure
 	closed     int
 }
 
-func newFakeSFTP() *fakeSFTP { return &fakeSFTP{files: map[string][]byte{}} }
+type fakeChmod struct {
+	path string
+	mode os.FileMode
+}
+
+type fakeRename struct {
+	old, new string
+}
+
+func newFakeSFTP() *fakeSFTP {
+	return &fakeSFTP{files: map[string][]byte{}, modes: map[string]os.FileMode{}}
+}
 
 func (f *fakeSFTP) MkdirAll(p string) error {
 	if f.mkdirErr != nil {
@@ -70,7 +88,31 @@ func (f *fakeSFTP) Remove(p string) error {
 		return f.removeErr
 	}
 	delete(f.files, p)
+	delete(f.modes, p)
 	f.removed = append(f.removed, p)
+	return nil
+}
+
+func (f *fakeSFTP) Chmod(p string, mode os.FileMode) error {
+	if f.chmodErr != nil {
+		return f.chmodErr
+	}
+	f.chmods = append(f.chmods, fakeChmod{path: p, mode: mode})
+	f.modes[p] = mode
+	return nil
+}
+
+func (f *fakeSFTP) Rename(old, new string) error {
+	if f.renameErr != nil {
+		return f.renameErr
+	}
+	f.renames = append(f.renames, fakeRename{old: old, new: new})
+	f.files[new] = f.files[old]
+	delete(f.files, old)
+	if m, ok := f.modes[old]; ok {
+		f.modes[new] = m
+		delete(f.modes, old)
+	}
 	return nil
 }
 
@@ -82,8 +124,16 @@ type fakeSFTPWriter struct {
 	buf    bytes.Buffer
 }
 
-func (w *fakeSFTPWriter) Write(b []byte) (int, error) { return w.buf.Write(b) }
+func (w *fakeSFTPWriter) Write(b []byte) (int, error) {
+	if w.parent.writeErr != nil {
+		return 0, w.parent.writeErr
+	}
+	return w.buf.Write(b)
+}
 func (w *fakeSFTPWriter) Close() error {
+	if w.parent.closeErr != nil {
+		return w.parent.closeErr
+	}
 	w.parent.files[w.path] = w.buf.Bytes()
 	return nil
 }
@@ -100,8 +150,9 @@ func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeFileInfo) IsDir() bool        { return f.dir }
 func (f fakeFileInfo) Sys() any           { return nil }
 
-// TestSFTPDestinationUpload: Put creates the root, opens root/name with
-// create+truncate flags, and writes the exact local bytes.
+// TestSFTPDestinationUpload: Put creates the root, uploads to a TEMP name,
+// chmods it 0600 and renames it onto the final name (Q1/Q7) — the exact
+// local bytes land, no partial object remains.
 func TestSFTPDestinationUpload(t *testing.T) {
 	f := newFakeSFTP()
 	d := &SFTPDestination{Client: f, Root: "/backups/encode"}
@@ -116,14 +167,23 @@ func TestSFTPDestinationUpload(t *testing.T) {
 	if len(f.mkdirs) != 1 || f.mkdirs[0] != "/backups/encode" {
 		t.Fatalf("MkdirAll must create the root: %v", f.mkdirs)
 	}
-	if len(f.opens) != 1 || f.opens[0] != "/backups/encode/snap.db" {
-		t.Fatalf("upload path wrong: %v", f.opens)
+	if len(f.opens) != 1 || !strings.HasPrefix(f.opens[0], "/backups/encode/snap.db.partial-") {
+		t.Fatalf("upload must target a temp name: %v", f.opens)
 	}
 	if f.openFlags[0]&(os.O_CREATE|os.O_TRUNC) != os.O_CREATE|os.O_TRUNC {
 		t.Fatalf("open flags must create+truncate: %d", f.openFlags[0])
 	}
+	if len(f.chmods) != 1 || f.chmods[0].path != f.opens[0] || f.chmods[0].mode != 0o600 {
+		t.Fatalf("temp file must be chmodded 0600 before rename: %v", f.chmods)
+	}
+	if len(f.renames) != 1 || f.renames[0].old != f.opens[0] || f.renames[0].new != "/backups/encode/snap.db" {
+		t.Fatalf("temp must rename onto the final name: %v", f.renames)
+	}
 	if string(f.files["/backups/encode/snap.db"]) != "sftp-bytes" {
 		t.Fatalf("content wrong: %q", f.files["/backups/encode/snap.db"])
+	}
+	if len(f.files) != 1 {
+		t.Fatalf("no partial object may remain: %v", f.files)
 	}
 }
 
@@ -185,7 +245,7 @@ func TestSFTPDestinationTraversalGuard(t *testing.T) {
 // build error Result — the other destination still builds.
 func TestBuildSFTPAuthFailure(t *testing.T) {
 	authErr := errors.New("ssh: handshake failed: unable to authenticate")
-	dial := func(cfg model.BackupOffsiteSFTP) (sftpAPI, error) { return nil, authErr }
+	dial := func(ctx context.Context, cfg model.BackupOffsiteSFTP) (sftpAPI, error) { return nil, authErr }
 	st := &model.Settings{}
 	st.BackupOffsite.S3 = model.BackupOffsiteS3{
 		Enabled: true, Endpoint: "minio.example.com:9000", Bucket: "b",
@@ -194,7 +254,7 @@ func TestBuildSFTPAuthFailure(t *testing.T) {
 	st.BackupOffsite.SFTP = model.BackupOffsiteSFTP{
 		Enabled: true, Host: "sftp.example.com", User: "backup", Password: "pw" + "TEST",
 	}
-	dests, errs := BuildDestinations(st, dial)
+	dests, errs := BuildDestinations(context.Background(), st, dial)
 	if len(dests) != 1 || dests[0].Name() != "s3" {
 		t.Fatalf("s3 must still build when sftp auth fails: %v", dests)
 	}
@@ -207,7 +267,7 @@ func TestBuildSFTPAuthFailure(t *testing.T) {
 // configured credentials; an empty Path defaults to "." (SSH home dir).
 func TestBuildSFTPPassesConfigAndDefaultRoot(t *testing.T) {
 	var got model.BackupOffsiteSFTP
-	dial := func(cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
+	dial := func(ctx context.Context, cfg model.BackupOffsiteSFTP) (sftpAPI, error) {
 		got = cfg
 		return newFakeSFTP(), nil
 	}
@@ -215,7 +275,7 @@ func TestBuildSFTPPassesConfigAndDefaultRoot(t *testing.T) {
 		Enabled: true, Host: "sftp.example.com", Port: 2222, User: "backup",
 		Password: "pw" + "TEST",
 	}
-	d, err := BuildSFTP(cfg, dial)
+	d, err := BuildSFTP(context.Background(), cfg, dial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +293,7 @@ func TestBuildSFTPPassesConfigAndDefaultRoot(t *testing.T) {
 // TestDialSFTPNoCredentials: the production dialer refuses a config with
 // neither password nor key — before any network I/O.
 func TestDialSFTPNoCredentials(t *testing.T) {
-	_, err := dialSFTP(model.BackupOffsiteSFTP{Host: "sftp.example.com", User: "u"})
+	_, err := dialSFTP(context.Background(), model.BackupOffsiteSFTP{Host: "sftp.example.com", User: "u"})
 	if err == nil || !strings.Contains(err.Error(), "no credentials") {
 		t.Fatalf("want no-credentials error, got %v", err)
 	}
@@ -242,7 +302,7 @@ func TestDialSFTPNoCredentials(t *testing.T) {
 // TestDialSFTPParseKeyFailure: a malformed private key fails at parse time
 // (no network). A real key parses and proceeds to the dial stage.
 func TestDialSFTPParseKeyFailure(t *testing.T) {
-	_, err := dialSFTP(model.BackupOffsiteSFTP{
+	_, err := dialSFTP(context.Background(), model.BackupOffsiteSFTP{
 		Host: "sftp.example.com", User: "u", PrivateKey: "not-a-pem-key",
 	})
 	if err == nil || !strings.Contains(err.Error(), "private key") {
@@ -260,8 +320,9 @@ func TestDialSFTPConnectionRefused(t *testing.T) {
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close() // port is now guaranteed closed
-	_, err = dialSFTP(model.BackupOffsiteSFTP{
+	_, err = dialSFTP(context.Background(), model.BackupOffsiteSFTP{
 		Host: "127.0.0.1", Port: port, User: "u", Password: "pw" + "TEST",
+		HostKey: pinnedKey(genPub(t)),
 	})
 	if err == nil {
 		t.Fatal("dial to a closed port must fail")

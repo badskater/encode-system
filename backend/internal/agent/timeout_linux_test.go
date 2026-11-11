@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -172,6 +174,180 @@ func TestFastJobUnaffectedByTimeouts(t *testing.T) {
 	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, jobCtx, limits)
 	if exitCode != 0 || stepErr != "" {
 		t.Fatalf("fast job disturbed by limits: exit=%d err=%q", exitCode, stepErr)
+	}
+}
+
+// TestStepDeadlineDisarmedOnTransition is the regression for the stale
+// step deadline: step 'encode' has a 1s limit and finishes at ~0.3s; the
+// NEXT step 'mux' has NO limit and runs past encode's old deadline. The
+// transition must disarm encode's deadline — mux is unlimited and the job
+// must succeed (before the fix, mux was killed at ~1.1s with "step encode
+// timeout after 1s").
+func TestStepDeadlineDisarmedOnTransition(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP encode 0.0'\n"+
+			"sleep 0.3\n"+
+			"echo 'ENCODE_STEP mux 0.0'\n"+
+			"sleep 1.2\n"+ // finishes ~1.5s — past encode's 1s deadline
+			"echo 'ENCODE_JOB_DONE'\n")
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := jobLimits{steps: map[string]time.Duration{"encode": time.Second}}
+
+	start := time.Now()
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, context.Background(), limits)
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("job did not finish promptly")
+	}
+	if exitCode != 0 || stepErr != "" {
+		t.Fatalf("unlimited step after a timed step failed: exit=%d err=%q (stale step deadline not disarmed?)", exitCode, stepErr)
+	}
+}
+
+// TestJobDeadlineKillsUnlimitedStep proves the job deadline still kills a
+// step that has NO per-step limit: with the step deadline disarmed on
+// transition, the job deadline remains the outer bound for unlimited steps.
+func TestJobDeadlineKillsUnlimitedStep(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP mux 0.0'\nsleep 30\n")
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	limits := jobLimits{job: time.Second} // no step limits: mux is unlimited
+
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, jobCtx, limits)
+	if exitCode == 0 {
+		t.Fatal("killed job must report nonzero exit")
+	}
+	if stepErr != "job timeout after 1s" {
+		t.Fatalf("stepErr = %q, want the JOB timeout reason for an unlimited step", stepErr)
+	}
+}
+
+// TestStepTimeoutStillArmsAfterTransition proves the disarm-on-transition
+// fix does not break arming: a later step WITH its own limit is still
+// killed with ITS OWN name and budget when it overruns.
+func TestStepTimeoutStillArmsAfterTransition(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP encode 0.0'\n"+
+			"sleep 0.2\n"+
+			"echo 'ENCODE_STEP mux 0.0'\n"+
+			"sleep 30\n")
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := jobLimits{steps: map[string]time.Duration{"encode": time.Second, "mux": time.Second}}
+
+	start := time.Now()
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, context.Background(), limits)
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("step timeout did not kill promptly")
+	}
+	if exitCode == 0 {
+		t.Fatal("killed step must report nonzero exit")
+	}
+	if stepErr != "step mux timeout after 1s" {
+		t.Fatalf("stepErr = %q, want the SECOND step's own timeout reason", stepErr)
+	}
+}
+
+// TestJobDeadlineCoversS3Uploads is the regression for uploads escaping the
+// job deadline: the script finishes fast, then the S3 PUT hangs past the
+// job limit. The upload must run under the job context, so the job fails
+// with an s3 upload error at the deadline — and the failure report still
+// reaches the controller (completeJob uses its own context, not jobCtx).
+// Before the fix, uploads ran under context.Background(): the PUT completed
+// after the deadline and the job wrongly reported done.
+func TestJobDeadlineCoversS3Uploads(t *testing.T) {
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "release.mkv"), []byte("mkv"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Minimal S3 endpoint: accept the PUT but hold the response well past
+	// the 1s job deadline. When the client's job ctx expires it aborts the
+	// request, which cancels r.Context() and releases the handler.
+	var putSeen atomic.Int32
+	s3srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putSeen.Add(1)
+			io.Copy(io.Discard, r.Body)
+			select {
+			case <-time.After(3 * time.Second):
+			case <-r.Context().Done():
+			}
+			w.Header().Set("ETag", `"0123456789abcdef0123456789abcdef"`)
+			w.WriteHeader(200)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer s3srv.Close()
+
+	var gotStatus, gotError string
+	reports := make(chan struct{}, 1)
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/complete") {
+			var rep struct {
+				Status string `json:"status"`
+				Error  string `json:"error"`
+			}
+			json.NewDecoder(r.Body).Decode(&rep)
+			gotStatus, gotError = rep.Status, rep.Error
+			reports <- struct{}{}
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	}))
+	defer controller.Close()
+
+	a, err := New(Config{ControllerURL: controller.URL, NodeName: "n", Token: nodeTok(), DataDir: dir}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &model.JobPayload{
+		ID:     78,
+		Script: "#!/usr/bin/env bash\necho 'ENCODE_STEP mux 100.0'\necho 'ENCODE_JOB_DONE'\nexit 0\n",
+		Vars:   map[string]string{},
+		Flow:   "s3-deadline-test",
+		S3: &model.S3Transfer{
+			Endpoint:  strings.TrimPrefix(s3srv.URL, "http://"),
+			AccessKey: "ak", SecretKey: "sk", Region: "us-east-1",
+			Uploads: []model.S3Upload{{Bucket: "releases", Prefix: "out", LocalDir: outDir}},
+		},
+	}
+
+	start := time.Now()
+	a.executeJobWithLimits(job, jobLimits{job: time.Second})
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("executeJob did not return promptly at the job deadline")
+	}
+	select {
+	case <-reports:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no completion report after the upload deadline — failure report must survive job ctx expiry")
+	}
+	if putSeen.Load() == 0 {
+		t.Fatal("upload never attempted — test did not exercise the upload path")
+	}
+	if gotStatus != "failed" {
+		t.Fatalf("completion status = %q, want failed (upload ran past the job deadline)", gotStatus)
+	}
+	if !strings.HasPrefix(gotError, "s3 upload:") {
+		t.Fatalf("completion error = %q, want the s3 upload failure reason", gotError)
 	}
 }
 

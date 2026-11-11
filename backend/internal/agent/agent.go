@@ -587,12 +587,16 @@ func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 	// S3-backed releases: push outputs after a SUCCESSFUL run only — a
 	// failed encode must not publish partial artifacts. Upload failure
 	// downgrades the job to failed (the encode itself worked, but the
-	// release never landed).
+	// release never landed). Uploads run under the SAME job context as
+	// downloads: the job deadline covers the whole job incl. S3 staging.
+	// If jobCtx is already expired the upload fails fast and the failure
+	// still reaches the controller — completeJob reports on its own
+	// background context, never on jobCtx.
 	if status == "done" && job.S3 != nil && len(job.S3.Uploads) > 0 {
 		store, err := newObjectStore(job.S3)
 		if err == nil {
 			log.Info("uploading s3 outputs", "uploads", len(job.S3.Uploads))
-			err = runS3Uploads(context.Background(), store, job.S3)
+			err = runS3Uploads(jobCtx, store, job.S3)
 		}
 		if err != nil {
 			status, exitCode, errMsg = "failed", -1, "s3 upload: "+err.Error()
@@ -697,9 +701,10 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 		watch.setJobDeadline(deadline, limits.job)
 	}
 	observer.onStepStart = func(name string) {
-		if d, ok := limits.steps[name]; ok {
-			watch.startStep(name, d, time.Now())
-		}
+		// EVERY step transition disarms the previous step's deadline;
+		// startStep re-arms only when this step has a limit (a missing
+		// entry yields 0 = unlimited, job deadline still applies).
+		watch.startStep(name, limits.steps[name], time.Now())
 	}
 
 	// 0600: run.log can echo the discord_notify webhook line — keep it

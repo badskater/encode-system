@@ -35,6 +35,42 @@ func TestLimitsFromPayload(t *testing.T) {
 	}
 }
 
+// TestStartStepTransitionDisarmsPreviousDeadline pins the watcher contract
+// behind the stale-deadline regression: every first-marker transition
+// clears the previous step's deadline; a limit of 0 (unlimited step) leaves
+// NO step deadline, and a later limited step arms a fresh one.
+func TestStartStepTransitionDisarmsPreviousDeadline(t *testing.T) {
+	w := &timeoutWatcher{}
+	base := time.Now()
+	w.startStep("encode", time.Second, base)
+	// Next step has no limit: encode's deadline must be disarmed.
+	w.startStep("mux", 0, base.Add(300*time.Millisecond))
+	if reason, ok := w.expire(base.Add(5 * time.Second)); ok {
+		t.Fatalf("unlimited step killed by a stale deadline: %q", reason)
+	}
+	// A later step WITH a limit arms a fresh deadline under its own name.
+	w.startStep("verify", time.Second, base.Add(5*time.Second))
+	if reason, ok := w.expire(base.Add(6 * time.Second)); !ok || reason != "step verify timeout after 1s" {
+		t.Fatalf("fresh step deadline not armed: ok=%v reason=%q", ok, reason)
+	}
+}
+
+// TestLimitsFromPayloadDuplicateStepLastEntryWins pins the duplicate-step
+// lookup contract: enforcement keys on the step NAME (markers carry no
+// index), so when a flow lists the same step twice with different limits,
+// the LAST payload entry wins (encode 10 then 90 → 90m).
+func TestLimitsFromPayloadDuplicateStepLastEntryWins(t *testing.T) {
+	l := limitsFromPayload(&model.JobPayload{
+		StepTimeouts: []model.StepTimeout{
+			{Index: 0, Step: "encode", TimeoutMinutes: 10},
+			{Index: 3, Step: "encode", TimeoutMinutes: 90},
+		},
+	})
+	if l.steps["encode"] != 90*time.Minute {
+		t.Fatalf("duplicate encode limit = %s, want the LAST entry (90m)", l.steps["encode"])
+	}
+}
+
 func TestTimeoutMessage(t *testing.T) {
 	cases := []struct {
 		kind string

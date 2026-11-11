@@ -26,6 +26,9 @@ type jobLimits struct {
 // limitsFromPayload converts the payload's minute fields into durations.
 // Non-positive values mean "no limit" and are dropped; unknown/empty step
 // names are ignored defensively (the controller validates at the API).
+// Duplicate step names: the LAST entry wins (map assignment in payload
+// order) — enforcement keys on the step name because ENCODE_STEP markers
+// carry no index.
 func limitsFromPayload(p *model.JobPayload) jobLimits {
 	l := jobLimits{steps: map[string]time.Duration{}}
 	if p == nil {
@@ -62,13 +65,20 @@ func (w *timeoutWatcher) setJobDeadline(deadline time.Time, limit time.Duration)
 	w.jobDeadline, w.jobLimit = deadline, limit
 }
 
-// startStep arms the deadline for a step that just emitted its first
-// ENCODE_STEP marker. The effective deadline is min(now+step limit, job
+// startStep handles a step's first ENCODE_STEP marker. EVERY transition
+// disarms the previous step's deadline first: an unlimited step (limit <= 0)
+// must run with NO step deadline, never inheriting the previous step's
+// budget (a stale deadline would false-kill healthy later steps). Only a
+// positive limit arms a new deadline, clamped to min(now+step limit, job
 // deadline) — a step can never outlive the job. The CONFIGURED limit is
 // kept for the error message so operators see the value they set.
 func (w *timeoutWatcher) startStep(name string, limit time.Duration, now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if limit <= 0 {
+		w.stepName, w.stepLimit, w.stepDeadline = "", 0, time.Time{}
+		return
+	}
 	deadline := now.Add(limit)
 	if !w.jobDeadline.IsZero() && deadline.After(w.jobDeadline) {
 		deadline = w.jobDeadline

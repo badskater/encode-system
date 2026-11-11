@@ -233,6 +233,79 @@ func TestFlowExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+// TestImportFlowValidatesTimeouts is the F2 regression: flow import must
+// apply the SAME timeout validation as create/PUT. An out-of-range
+// job_timeout_minutes (e.g. 922337204) overflows time.Duration in the
+// agent's limitsFromPayload and wraps to a ~19s kill-everything deadline,
+// so the import boundary must reject it with 400 — while a valid import
+// with in-range timeouts still succeeds and persists the values.
+func TestImportFlowValidatesTimeouts(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	base := func(name string) map[string]any {
+		return map[string]any{
+			"flow": map[string]any{
+				"name":  name,
+				"steps": []map[string]any{{"type": "dgindex"}},
+			},
+		}
+	}
+
+	// Out-of-range job timeout (the overflow probe value) → 400.
+	exp := base("bad-job-timeout")
+	exp["flow"].(map[string]any)["job_timeout_minutes"] = 922337204
+	resp, body := doJSON(t, "POST", ts.URL+"/api/flows/import", adminTok, exp)
+	if resp.StatusCode != 400 {
+		t.Fatalf("import with overflowing job_timeout_minutes: status %d, want 400 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "job_timeout_minutes") {
+		t.Fatalf("400 body should name the offending field: %s", body)
+	}
+
+	// Out-of-range step timeout → 400 (same shape as create).
+	exp = base("bad-step-timeout")
+	exp["flow"].(map[string]any)["steps"] = []map[string]any{
+		{"type": "dgindex", "timeout_minutes": 10081},
+	}
+	resp, body = doJSON(t, "POST", ts.URL+"/api/flows/import", adminTok, exp)
+	if resp.StatusCode != 400 {
+		t.Fatalf("import with out-of-range step timeout: status %d, want 400 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "timeout_minutes") {
+		t.Fatalf("400 body should name the offending field: %s", body)
+	}
+
+	// Negative job timeout → 400.
+	exp = base("negative-timeout")
+	exp["flow"].(map[string]any)["job_timeout_minutes"] = -5
+	resp, _ = doJSON(t, "POST", ts.URL+"/api/flows/import", adminTok, exp)
+	if resp.StatusCode != 400 {
+		t.Fatalf("import with negative job_timeout_minutes: status %d, want 400", resp.StatusCode)
+	}
+
+	// Rejected imports must not leave a flow behind.
+	if fl, err := e.server.Store.FlowByName(ctxBg(), "bad-job-timeout"); err == nil && fl != nil {
+		t.Fatalf("rejected import persisted a flow: %+v", fl)
+	}
+
+	// Valid import with in-range timeouts → 201, values persisted.
+	exp = base("good-timeouts")
+	exp["flow"].(map[string]any)["job_timeout_minutes"] = 240
+	exp["flow"].(map[string]any)["steps"] = []map[string]any{
+		{"type": "dgindex", "timeout_minutes": 45},
+	}
+	resp, body = doJSON(t, "POST", ts.URL+"/api/flows/import", adminTok, exp)
+	if resp.StatusCode != 201 {
+		t.Fatalf("valid import: status %d, want 201 (%s)", resp.StatusCode, body)
+	}
+	var imported model.Flow
+	json.Unmarshal(body, &imported)
+	if imported.JobTimeoutMinutes != 240 || len(imported.Steps) != 1 || imported.Steps[0].TimeoutMinutes != 45 {
+		t.Fatalf("imported timeouts not persisted: %+v", imported)
+	}
+}
+
 // ---------- Pairing ----------
 
 func TestPairingCodeFlow(t *testing.T) {

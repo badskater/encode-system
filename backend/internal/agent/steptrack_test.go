@@ -407,3 +407,89 @@ func TestStepTrackerObservesFromScanLine(t *testing.T) {
 		}
 	}
 }
+
+// observeLines feeds complete lines through a fresh lineObserver and returns
+// the ordered list of onStepStart firings plus the observer (for timing
+// assertions).
+func observeLines(t *testing.T, lines []string) ([]string, *lineObserver) {
+	t.Helper()
+	o := newLineObserver(nil, newStepTracker())
+	var starts []string
+	o.onStepStart = func(name string) { starts = append(starts, name) }
+	for _, l := range lines {
+		if _, err := o.Write([]byte(l + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return starts, o
+}
+
+// TestLineObserverStepInstanceNameChange is the F3 regression for
+// encode→mux→encode: returning to a previously-seen step name after a
+// different step is a NEW instance and must re-fire onStepStart so the
+// timeout re-arms. The timing aggregation stays first-seen-per-name.
+func TestLineObserverStepInstanceNameChange(t *testing.T) {
+	starts, o := observeLines(t, []string{
+		"ENCODE_STEP encode 0",
+		"ENCODE_STEP encode 50",
+		"ENCODE_STEP encode 100",
+		"ENCODE_STEP mux 0",
+		"ENCODE_STEP mux 100",
+		"ENCODE_STEP encode 0", // second encode instance
+		"ENCODE_STEP encode 100",
+	})
+	want := []string{"encode", "mux", "encode"}
+	if len(starts) != len(want) {
+		t.Fatalf("onStepStart firings = %v, want %v (second encode instance must re-arm)", starts, want)
+	}
+	for i := range want {
+		if starts[i] != want[i] {
+			t.Fatalf("onStepStart firings = %v, want %v", starts, want)
+		}
+	}
+	// Aggregation unchanged: one timing row per distinct name, first-seen order.
+	timings := o.timings.finish(time.Now())
+	if len(timings) != 2 || timings[0].Step != "encode" || timings[1].Step != "mux" {
+		t.Fatalf("timing aggregation changed: %+v", timings)
+	}
+}
+
+// TestLineObserverAdjacentSameStepRepeat is the F3 regression for
+// encode→encode: adjacent instances of the SAME name are detected by the
+// progress reset (100→0) and each fires onStepStart.
+func TestLineObserverAdjacentSameStepRepeat(t *testing.T) {
+	starts, _ := observeLines(t, []string{
+		"ENCODE_STEP encode 0",
+		"ENCODE_STEP encode 100",
+		"ENCODE_STEP encode 0", // adjacent repeat: progress reset
+		"ENCODE_STEP encode 100",
+	})
+	if len(starts) != 2 || starts[0] != "encode" || starts[1] != "encode" {
+		t.Fatalf("onStepStart firings = %v, want [encode encode] (adjacent repeat must re-arm)", starts)
+	}
+}
+
+// TestLineObserverProgressWithinInstanceDoesNotReArm guards the other side
+// of F3: progress lines inside ONE instance (0→50→100, including a small
+// non-monotonic dip) must NOT re-fire onStepStart — the original deadline
+// stands.
+func TestLineObserverProgressWithinInstanceDoesNotReArm(t *testing.T) {
+	starts, _ := observeLines(t, []string{
+		"ENCODE_STEP encode 0",
+		"ENCODE_STEP encode 50",
+		"ENCODE_STEP encode 100",
+	})
+	if len(starts) != 1 || starts[0] != "encode" {
+		t.Fatalf("onStepStart firings = %v, want [encode] (progress must not re-arm)", starts)
+	}
+	// A small dip (encoder rounding/pass noise) is not a new instance.
+	starts, _ = observeLines(t, []string{
+		"ENCODE_STEP encode 0",
+		"ENCODE_STEP encode 60",
+		"ENCODE_STEP encode 55",
+		"ENCODE_STEP encode 100",
+	})
+	if len(starts) != 1 || starts[0] != "encode" {
+		t.Fatalf("onStepStart firings = %v, want [encode] (small dip must not re-arm)", starts)
+	}
+}

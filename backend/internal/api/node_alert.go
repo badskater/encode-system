@@ -114,6 +114,22 @@ func (s *Server) nodeAlertTickWithState(ctx context.Context, state *nodeAlertSta
 
 	transitions := diffNodeStates(state.prev, cur)
 
+	// F5: drop pending cancels for nodes that went offline or disappeared
+	// (deleted) — the agent is unreachable or gone, so the queued IDs would
+	// otherwise accumulate unbounded. Runs regardless of whether alerts
+	// are enabled. A node that reconnects starts clean; a still-wedged run
+	// is re-detected by the watchdog/orphan recovery after reconnection.
+	for _, tr := range transitions {
+		if tr.to == "offline" {
+			s.clearPendingCancels(tr.nodeID)
+		}
+	}
+	for id := range state.prev {
+		if _, ok := cur[id]; !ok {
+			s.clearPendingCancels(id) // node deleted
+		}
+	}
+
 	// Update the baseline for the next tick regardless of whether alerts
 	// are enabled — this prevents a missed transition when alerts are off
 	// and then turned on mid-transition (the baseline would otherwise show

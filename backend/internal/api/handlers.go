@@ -255,6 +255,16 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		return
 	}
 
+	// F5: deliver queued stall-cancels BEFORE any other instruction — the
+	// node is typically busy with the very job that needs killing, so this
+	// must not wait for an idle heartbeat (and must reach disabled nodes
+	// too: cleanup is not new work). Drained once; the next heartbeat
+	// re-evaluates reboot/update/assignment as usual.
+	if ids := s.drainPendingCancels(node.ID); len(ids) > 0 {
+		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "cancel", CancelJobIDs: ids})
+		return
+	}
+
 	// A disabled node gets no work, no reboot, no update — just an ack.
 	if !node.Enabled {
 		writeJSON(w, http.StatusOK, model.HeartbeatReply{Instruction: "none"})

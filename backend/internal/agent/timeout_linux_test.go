@@ -260,6 +260,105 @@ func TestStepTimeoutStillArmsAfterTransition(t *testing.T) {
 	}
 }
 
+// TestStepTimeoutReArmsForRepeatedStepInstance is the F3 regression for
+// encode→mux→encode: the SECOND encode instance must be killed at its OWN
+// limit. Before the fix, onStepStart fired only on the first marker per
+// name, so the second encode ran with no deadline at all (and the mux
+// transition had disarmed the first encode's).
+func TestStepTimeoutReArmsForRepeatedStepInstance(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP encode 0'\n"+
+			"sleep 0.2\n"+
+			"echo 'ENCODE_STEP encode 100'\n"+
+			"echo 'ENCODE_STEP mux 0'\n"+
+			"sleep 0.2\n"+
+			"echo 'ENCODE_STEP mux 100'\n"+
+			"echo 'ENCODE_STEP encode 0'\n"+ // second encode instance…
+			"sleep 30\n") // …wedges past its own 1s limit
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := jobLimits{steps: map[string]time.Duration{"encode": time.Second}}
+
+	start := time.Now()
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, context.Background(), limits)
+	elapsed := time.Since(start)
+	if elapsed > 10*time.Second {
+		t.Fatalf("second encode instance was never killed (ran %s) — its deadline did not re-arm", elapsed)
+	}
+	if exitCode == 0 {
+		t.Fatal("wedged second encode instance must report nonzero exit")
+	}
+	if stepErr != "step encode timeout after 1s" {
+		t.Fatalf("stepErr = %q, want the second instance's own timeout reason", stepErr)
+	}
+	// The kill must land AFTER the second instance starts (~0.4s), not at
+	// the first instance's old deadline (~1s from job start is fine, but it
+	// must not be the mux transition killing early).
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("killed too early (%s) — wrong instance's deadline fired", elapsed)
+	}
+}
+
+// TestAdjacentStepRepeatNotKilledByStaleBudget is the F3 regression for
+// adjacent encode→encode: the first instance (1s limit) finishes at ~0.3s;
+// the second instance re-arms with a FRESH budget and runs past the first
+// instance's old deadline without being killed by it.
+func TestAdjacentStepRepeatNotKilledByStaleBudget(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP encode 0'\n"+
+			"sleep 0.3\n"+
+			"echo 'ENCODE_STEP encode 100'\n"+
+			"echo 'ENCODE_STEP encode 0'\n"+ // adjacent repeat → re-arm
+			"sleep 0.8\n"+ // finishes ~1.1s: past the stale 1s deadline, inside the fresh one
+			"echo 'ENCODE_STEP encode 100'\n"+
+			"echo 'ENCODE_JOB_DONE'\n")
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := jobLimits{steps: map[string]time.Duration{"encode": time.Second}}
+
+	start := time.Now()
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, context.Background(), limits)
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("job did not finish promptly")
+	}
+	if exitCode != 0 || stepErr != "" {
+		t.Fatalf("second instance killed by the first's stale budget: exit=%d err=%q", exitCode, stepErr)
+	}
+}
+
+// TestProgressWithinInstanceDoesNotReArm guards F3's other side with a real
+// process: a step reporting 0→50 mid-run keeps its ORIGINAL deadline — the
+// 50% marker must not extend it (the script is killed at ~1s even though it
+// would finish at ~1.2s).
+func TestProgressWithinInstanceDoesNotReArm(t *testing.T) {
+	script, runLog := writeTimeoutScript(t,
+		"echo 'ENCODE_STEP encode 0'\n"+
+			"sleep 0.6\n"+
+			"echo 'ENCODE_STEP encode 50'\n"+
+			"sleep 0.6\n"+
+			"echo 'ENCODE_STEP encode 100'\n")
+
+	a, err := New(Config{ControllerURL: "http://127.0.0.1:0", NodeName: "n", Token: nodeTok(), DataDir: t.TempDir()}, "v", testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := jobLimits{steps: map[string]time.Duration{"encode": time.Second}}
+
+	exitCode, _, stepErr, _ := a.runBash(script, runLog, nil, nil, context.Background(), limits)
+	if exitCode == 0 {
+		t.Fatal("mid-instance progress re-armed the deadline — the step escaped its timeout")
+	}
+	if stepErr != "step encode timeout after 1s" {
+		t.Fatalf("stepErr = %q, want the original step timeout reason", stepErr)
+	}
+}
+
 // TestJobDeadlineCoversS3Uploads is the regression for uploads escaping the
 // job deadline: the script finishes fast, then the S3 PUT hangs past the
 // job limit. The upload must run under the job context, so the job fails

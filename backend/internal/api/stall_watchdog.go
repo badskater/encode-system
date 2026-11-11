@@ -74,10 +74,28 @@ func (s *Server) stallWatchdogTick(ctx context.Context) {
 // failure. The audit event and structured log fire regardless of the retry
 // outcome (the stall happened either way); the notification is skipped on
 // auto-retry, matching every other silent-retry path.
+//
+// The transition itself is GUARDED (FailStalledJob): the snapshot j came
+// from an earlier StalledRunningJobs read, and the agent may have completed
+// the job in between. Only when the guarded UPDATE actually moved a still-
+// live, still-stale row to failed do we release the node, audit, and apply
+// the retry policy — a lost race is a silent no-op, never an overwrite of a
+// finished encode and never a second retry burn on a duplicate snapshot.
 func (s *Server) failStalledJob(ctx context.Context, j *model.Job, minutes int) {
 	errMsg := fmt.Sprintf("stalled: no progress for %d minutes", minutes)
-	if err := s.Store.FinishJob(ctx, j.ID, model.JobFailed, -1, errMsg, nil, ""); err != nil {
+	// Re-derive the cutoff at transition time (same formula as the tick):
+	// a job that made progress since the snapshot has a newer stamp and
+	// fails the guard, exactly like a job that left the live states.
+	cutoff := time.Now().UTC().Add(-time.Duration(minutes) * time.Minute)
+	transitioned, err := s.Store.FailStalledJob(ctx, j.ID, cutoff, errMsg)
+	if err != nil {
 		s.Log.Warn("stall watchdog: finish job failed", "err", err, "job", j.ID)
+		return
+	}
+	if !transitioned {
+		// The job completed, was cancelled/failed elsewhere, or refreshed
+		// its progress since the snapshot — nothing to do.
+		s.Log.Debug("stall watchdog: job no longer stalled-live, skipped", "job", j.ID)
 		return
 	}
 	// Free the node's slot (mirrors handleJobComplete): the job left the
@@ -85,6 +103,17 @@ func (s *Server) failStalledJob(ctx context.Context, j *model.Job, minutes int) 
 	if j.NodeID > 0 {
 		if err := s.Store.ReleaseNode(ctx, j.NodeID); err != nil {
 			s.Log.Warn("stall watchdog: release node failed", "err", err, "job", j.ID, "node", j.NodeID)
+		}
+		// F5: an ONLINE node still runs the wedged process — failing the
+		// row does not stop it, and an auto-retry re-dispatched to the same
+		// node would be deduped by the agent registry against the stuck
+		// run. Queue the cancel for the node's next heartbeat (same
+		// freshness rule as handleListNodes/node-alert). Offline nodes are
+		// skipped: their agent is unreachable, and orphan recovery owns
+		// the reconnect path.
+		if node, err := s.Store.GetNode(ctx, j.NodeID); err == nil && node != nil &&
+			node.LastSeen != nil && time.Since(*node.LastSeen) < s.Cfg.StaleAfter {
+			s.queuePendingCancel(j.NodeID, j.ID)
 		}
 	}
 	s.Log.Warn("job stalled — failed by watchdog", "job", j.ID, "node", j.NodeID,

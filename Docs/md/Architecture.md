@@ -161,10 +161,12 @@ remains the default). The HA facts:
 ### Agent (`backend/cmd/agent` → `encode-agent.exe` on Windows, `encode-agent` on Linux)
 
 - Runs as a Windows scheduled task (`EncodeAgentDist`, restart-safe) or service/foreground for debugging; on Linux as a systemd service (`encode-agent.service`, `Restart=always`) or bare foreground loop (`cmd/agent/service_other.go`). Config file + flags: controller URL, node token, data dir. The agent reports its platform (`runtime.GOOS`: `"windows"` or `"linux"`) in every heartbeat so the controller selects the correct script dialect at dispatch time.
-- Loop: heartbeat (status JSON: current job(s), step, tasks_since_boot, agent version, platform, metrics) → controller response carries instructions: `job` (rendered script + vars), `reboot`, `update`.
+- Loop: heartbeat (status JSON: current job(s), step, tasks_since_boot, agent version, platform, metrics) → controller response carries instructions: `job`/`jobs` (rendered script + vars), `reboot`, `update`, `cancel` (stop server-finalized jobs). Unknown instructions are ignored gracefully (rolling-upgrade contract).
 - Executes jobs by writing the generated `.ps1` (Windows) or `job.sh` (Linux, mode 0700, no BOM), invoking `powershell.exe -NoProfile -ExecutionPolicy Bypass -File` (Windows) or `bash <script>` (Linux), streaming stdout/stderr to the controller, tracking exit code. The shared `runJobCommand` core parses the same `ENCODE_STEP` markers in both dialects — no per-dialect parser. `EncodeLib.ps1` is only required on Windows (bash scripts are self-contained). Reports per-step timings and `ENCODE_METRIC key=value` quality/output stats (vmaf, bitrate, durations, sizes) in the completion payload.
 - S3-backed jobs: downloads `scripts/<episode_dir>` into the job staging dir before the run (mirroring the subdir layout the rendered script joins) and uploads outputs after success only.
 - Reboot: on `reboot` instruction with no running job, schedules `shutdown /r /t 30` (Windows) and reports; counter resets naturally on next boot.
+- Job/step timeouts: flows carry `job_timeout_minutes` and per-step `timeout_minutes` (validated 0–10080 on create, PUT, **and import**); the payload's limits run the whole job (S3 staging included) under a deadline. A watchdog goroutine kills the whole process tree on expiry (Linux process-group SIGKILL / Windows `taskkill /T /F`), retrying transient kill failures (3 attempts, 200ms apart); if every attempt fails the timeout reason wins even when the script later exits 0, while a natural exit before the kill lands stays a success. Step deadlines arm per step INSTANCE — every `ENCODE_STEP` name change and every adjacent same-name repeat detected by a progress reset (≥50-point drop, canonically 100→0) re-arms; progress within one instance never extends the deadline.
+- Cancel: on `cancel` instruction (queued by the stall watchdog for online nodes), the agent kills each listed job's process tree, deregisters it (freeing the slot so a retry re-dispatch is not deduped against the stuck run), and sends no completion report — the controller already finalized the job; late reports are status-guarded.
 - Auto-update: on `update` instruction, downloads new agent binary + `EncodeLib.ps1` to staging, verifies checksum, swaps the script immediately and the binary via a swap sidecar. Windows uses `swap-update.bat` (task relaunch via the swap sidecar); Linux uses `swap-update.sh` (setsid-detached, retries the `mv`, then either exits to let systemd's `Restart=always` relaunch — detected via `INVOCATION_ID` + `systemctl is-active encode-agent` — or relaunches the new binary directly via `setsid` for bare deployments). The controller keeps one `.prev` agent slot; `POST /api/updates/agent/rollback` re-promotes it and nodes self-downgrade through the same version-diff sync.
 
 ### Step templates — every flow section owns its PowerShell
@@ -388,10 +390,11 @@ Response:
 
 ```json
 {
-  "instruction": "job|reboot|update|none",
+  "instruction": "job|jobs|reboot|update|cancel|none",
   "job": { "id": "j_019", "script": "<rendered ps1>", "vars": { }, "flow": "default-1080" },
   "reboot": { "delay_seconds": 30 },
-  "update": { "agent_version": "0.4.0", "agent_sha256": "...", "lib_version": 3, "lib_sha256": "..." }
+  "update": { "agent_version": "0.4.0", "agent_sha256": "...", "lib_version": 3, "lib_sha256": "..." },
+  "cancel_job_ids": [42]
 }
 ```
 
@@ -566,6 +569,20 @@ controller re-caps `log_full` at 1 MiB defensively.
   loop body runs under `store.RunLoopSupervisor` with `LockKeyNodeAlert`
   (`pg_try_advisory_lock` key 1006) so exactly one replica alerts per
   transition; on SQLite the supervisor is a transparent always-locked wrapper.
+- **Stall watchdog** — `StartStallWatchdogLoop` (30s tick, `LockKeyStallWatchdog`
+  key 1007 on PG) fails RUNNING jobs whose `last_progress_at` (stamped on
+  claim, refreshed only by heartbeats reporting a CHANGED step/progress) is
+  older than `settings.stall_timeout_minutes` (0 = off). The threshold must
+  exceed the longest interval without step/progress change in any healthy
+  job — not the heartbeat cadence. The fail transition is a guarded UPDATE
+  (`FailStalledJob`: only if still running/assigned AND still stale), so a
+  job that completes inside the detection window is never overwritten and
+  duplicate snapshots never burn two retries. The failure flows through the
+  normal retry/audit/notify path; when the node is still online the job ID
+  is queued for a `cancel` heartbeat instruction (drained once into the
+  reply; cleared when the node goes offline, is deleted, or re-registers).
+  `encode_jobs_stalled_total` is DB-derived (failed rows with a `stalled:`
+  error prefix) and undercounts stall events that auto-retry to success.
 - **Backup restore** — `POST /api/backup/{name}/restore` (admin-only) swaps a
   snapshot back into the live database. Guards: the name must be
   traversal-safe (no path separators, no `..`), must exist in the backups dir,

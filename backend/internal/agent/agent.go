@@ -335,9 +335,46 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 			a.wg.Add(1)
 			go func(m model.UpdateManifest) { defer a.wg.Done(); a.handleUpdate(m) }(*reply.Update)
 		}
+	case "cancel":
+		// F5: the controller finalized these jobs server-side (stall
+		// watchdog) — kill their process trees and free the slots.
+		a.handleCancel(reply.CancelJobIDs)
 	case "none", "":
 	}
+	// No default: an unknown instruction from a NEWER controller is
+	// ignored gracefully (the rolling-upgrade contract — old agents
+	// survive new instructions, and this agent survives future ones).
 	return nil
+}
+
+// handleCancel stops jobs the controller has already finalized server-side
+// (F5): kill the process tree, mark the instance cancelled so executeJob
+// skips its completion report, and deregister it to free the slot — without
+// the deregistration, an auto-retry re-dispatched to this node would be
+// deduped by the registry against the stuck run and burn retries. Unknown
+// IDs (already finished) are a no-op. No completion report is sent: the
+// controller's state is authoritative, and any late report from the
+// winding-down executeJob goroutine is status-guarded on the server.
+func (a *Agent) handleCancel(ids []int64) {
+	r := a.registry()
+	for _, id := range ids {
+		aj := r.get(id)
+		if aj == nil {
+			continue // already finished or never registered here
+		}
+		// Mark BEFORE the kill so executeJob sees it as soon as Wait returns.
+		aj.cancelled.Store(true)
+		if cmd := r.cmdFor(id); cmd != nil {
+			if !killTreeWithRetry(cmd, a.Log.With("job", id), nil) {
+				// The controller already failed the job; free the slot even
+				// if the kill never landed (the process may run to its own
+				// completion, but it no longer occupies dispatch capacity).
+				a.Log.Error("cancel kill failed after retries; deregistering anyway", "job", id)
+			}
+		}
+		r.remove(id)
+		a.Log.Warn("job cancelled by controller", "job", id)
+	}
 }
 
 // spawnJobs registers payloads (dedupe + hard cap inside the registry) and
@@ -442,7 +479,14 @@ func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 	r := a.registry()
 	r.accept([]*model.JobPayload{job})
 	aj := r.get(job.ID)
-	defer a.finishJob(job.ID)
+	// Instance-guarded cleanup: if a cancel removed this instance and the
+	// controller re-dispatched the same ID, this goroutine must not delete
+	// the NEW instance (F5).
+	defer r.removeIf(job.ID, aj)
+	// cancelled is set by the cancel instruction (F5); the controller has
+	// already finalized the job, so every exit path below skips the
+	// completion report when it is set.
+	cancelled := func() bool { return aj != nil && aj.cancelled.Load() }
 
 	log := a.Log.With("job", job.ID)
 	log.Info("executing job", "flow", job.Flow, "episode", job.Vars["episode_dir"])
@@ -535,6 +579,13 @@ func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 		}
 	}
 
+	// F5: a cancel may have landed during S3 staging — the controller
+	// already finalized the job, so do not start the script at all.
+	if cancelled() {
+		log.Info("job cancelled by controller before script start; skipping execution")
+		return
+	}
+
 	runLog := filepath.Join(jobDir, "run.log")
 	// Expose this job's run.log to the heartbeat goroutine (FPS parsing
 	// picks the newest active job's log). Per-job slot in the registry;
@@ -545,10 +596,17 @@ func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 	var stepErr string
 	var timings *stepTimingTracker
 	if linux {
-		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits)
+		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits, aj)
 	} else {
 		ps := a.findPowerShell()
-		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits)
+		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits, aj)
+	}
+	// F5: a cancel killed the process and finalized the job server-side —
+	// do not send a completion report (a late report would be status-
+	// guarded anyway, but silence is the contract).
+	if cancelled() {
+		log.Info("job cancelled by controller; skipping completion report")
+		return
 	}
 
 	status := "done"
@@ -592,7 +650,7 @@ func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 	// If jobCtx is already expired the upload fails fast and the failure
 	// still reaches the controller — completeJob reports on its own
 	// background context, never on jobCtx.
-	if status == "done" && job.S3 != nil && len(job.S3.Uploads) > 0 {
+	if status == "done" && !cancelled() && job.S3 != nil && len(job.S3.Uploads) > 0 {
 		store, err := newObjectStore(job.S3)
 		if err == nil {
 			log.Info("uploading s3 outputs", "uploads", len(job.S3.Uploads))
@@ -640,10 +698,10 @@ func (a *Agent) findPowerShell() string {
 // arrival time, time.Now()), not a post-hoc single-timestamp pass after
 // cmd.Wait. The full output is still accumulated for tail extraction and the
 // ENCODE_STEP_FAILED scan, which run unchanged.
-func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits, aj ...*activeJob) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
-	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings, jobCtx, limits)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings, jobCtx, limits, firstActiveJob(aj))
 }
 
 // runBash executes the Linux job script via bash, teeing output to run.log.
@@ -652,14 +710,25 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 // per-dialect parser logic is needed. bash's `set -euo pipefail` (emitted by
 // the bash dialect preamble) makes a nonzero step exit propagate to a nonzero
 // script exit, which the exit-code path below reports as failed.
-func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits, aj ...*activeJob) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	// /usr/bin/env bash resolves the interpreter via PATH; falls back to
 	// a direct bash lookup. The script carries its own shebang too, so
 	// `bash <script>` is belt-and-suspenders on hosts where /usr/bin/env
 	// is missing.
 	cmd := exec.Command("bash", scriptPath)
-	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings, jobCtx, limits)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings, jobCtx, limits, firstActiveJob(aj))
+}
+
+// firstActiveJob unwraps the optional activeJob argument of the run
+// wrappers. It is variadic so the existing test seams (runBash/runPowerShell
+// without a job context) keep their signatures; production passes the job's
+// activeJob so runJobCommand can register the started process for cancel.
+func firstActiveJob(aj []*activeJob) *activeJob {
+	if len(aj) > 0 {
+		return aj[0]
+	}
+	return nil
 }
 
 // runJobCommand is the shared execution core for both PowerShell and bash
@@ -678,7 +747,7 @@ func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metric
 // a deadline expires; the resulting nonzero exit is reported with the
 // timeout reason as the step error, flowing through the normal failure
 // path (completeJob → controller retry/audit/notify).
-func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
+func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker, jobCtx context.Context, limits jobLimits, aj *activeJob) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
 	if prog == nil {
 		// Defensive: direct callers without a tracker get a throwaway
@@ -693,9 +762,11 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 	observer.metrics = metrics // ENCODE_METRIC accumulator (vmaf, sizes…)
 	metrics.reset()
 
-	// Timeout watcher: the job deadline comes from the context; each step's
-	// deadline is armed when its FIRST ENCODE_STEP marker arrives (the
-	// observer hook below), clamped to the remaining job time.
+	// Timeout watcher: the job deadline comes from the context; each step
+	// INSTANCE's deadline is (re-)armed when its first ENCODE_STEP marker
+	// arrives — every name change and every adjacent same-name repeat
+	// detected via progress reset (the observer hook below), clamped to the
+	// remaining job time.
 	watch := &timeoutWatcher{}
 	if deadline, ok := jobCtx.Deadline(); ok {
 		watch.setJobDeadline(deadline, limits.job)
@@ -728,13 +799,24 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 	if err := cmd.Start(); err != nil {
 		return -1, "", "start " + interpreter + ": " + err.Error(), timings
 	}
+	// F5: expose the running process to the cancel instruction (the
+	// registry guards the field; nil aj = direct test callers).
+	if aj != nil && aj.payload != nil {
+		a.registry().setCmd(aj.payload.ID, cmd)
+	}
 
 	// Watchdog: polls the deadlines and kills the process tree on expiry.
 	// 100ms granularity is invisible against minute-scale limits and keeps
 	// second-scale test limits snappy. The goroutine exits once it fires or
-	// when watchDone closes after cmd.Wait returns.
+	// when watchDone closes after cmd.Wait returns; watchExited lets the
+	// main goroutine wait for the kill outcome to be final before reading it.
+	// guard carries the reaped-process state (F6): the kill is skipped once
+	// the child exited, so a natural exit is never charged as a kill failure.
+	guard := &procGuard{}
 	watchDone := make(chan struct{})
+	watchExited := make(chan struct{})
 	go func() {
+		defer close(watchExited)
 		tick := time.NewTicker(100 * time.Millisecond)
 		defer tick.Stop()
 		for {
@@ -745,19 +827,32 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 				// Job deadline expired (the only cancel source while the
 				// job runs is the WithTimeout in executeJob).
 				if _, ok := watch.expire(time.Now()); ok {
-					_ = killProcessTree(cmd)
+					if !killTreeWithRetry(cmd, a.Log, guard) {
+						watch.markKillFailed()
+					}
 				}
 				return
 			case <-tick.C:
 				if _, ok := watch.expire(time.Now()); ok {
-					_ = killProcessTree(cmd)
+					if !killTreeWithRetry(cmd, a.Log, guard) {
+						watch.markKillFailed()
+					}
 					return
 				}
 			}
 		}
 	}()
 
-	if err := cmd.Wait(); err != nil {
+	// Reap the child in its own goroutine so the exit state is recorded
+	// under guard as soon as cmd.Wait returns — the watcher's kill check
+	// and this record are the two sides of the F6 synchronization.
+	waitErrCh := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		guard.record(cmd)
+		waitErrCh <- err
+	}()
+	if err := <-waitErrCh; err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
@@ -765,6 +860,7 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 		}
 	}
 	close(watchDone)
+	<-watchExited // kill outcome (if any) is final now
 	// Process any final trailing partial line that never got a newline.
 	observer.flush()
 
@@ -784,13 +880,22 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 		}
 	}
 	// A fired timeout is the authoritative failure reason — it overrides
-	// any marker scan. Only apply it when the run actually failed: a script
-	// that exited 0 in the instant before the kill landed completed
-	// successfully and must not be reported as timed out.
+	// any marker scan. When the run failed (exit != 0), the reason applies
+	// directly. When the run exited 0 there are two distinct cases (F4):
+	//   - the script exited naturally before the kill landed (the kill was
+	//     skipped because the process was already reaped, or it landed on a
+	//     process that was just exiting) → genuine success, keep exit 0;
+	//   - the deadline fired and EVERY kill attempt failed, so the script
+	//     survived and ran to completion → timeout failure. The timeout
+	//     reason MUST win here; exit 0 is an artifact of the failed kill,
+	//     not evidence of a healthy run.
 	if exitCode != 0 {
 		if reason := watch.takeReason(); reason != "" {
 			stepErr = reason
 		}
+	} else if watch.killFailedReported() {
+		exitCode = -1
+		stepErr = watch.takeReason()
 	}
 	return exitCode, tail, stepErr, timings
 }

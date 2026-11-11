@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
@@ -111,6 +112,17 @@ type Server struct {
 	// (never nil) so nodeAlertTick can use it without a nil check. The
 	// baseline is seeded silently on the first tick after a restart.
 	nodeAlert *nodeAlertState
+	// pendingCancels queues per-node job IDs for the "cancel" heartbeat
+	// instruction (F5): the stall watchdog fails a job server-side, but an
+	// online node keeps the wedged process — the cancel tells the agent to
+	// kill the tree and free the slot. Guarded by cancelMu; drained into
+	// the node's next heartbeat reply, cleared on offline/deletion/re-pair
+	// so unreachable nodes never accumulate state. In-memory only: a
+	// controller restart loses queued cancels (acceptable — the job is
+	// already failed in the DB, and orphan recovery re-evaluates on the
+	// node's next heartbeat).
+	cancelMu       sync.Mutex
+	pendingCancels map[int64][]int64
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -147,11 +159,12 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
-		digest:      &digestState{buf: notify.NewDigestBuffer()},
-		logHub:      newLogHub(),
-		diskGuard:   &diskGuardState{last: map[int64]time.Time{}},
-		scanTrigger: make(chan struct{}, 1),
-		nodeAlert:   &nodeAlertState{prev: map[int64]bool{}},
+		digest:         &digestState{buf: notify.NewDigestBuffer()},
+		logHub:         newLogHub(),
+		diskGuard:      &diskGuardState{last: map[int64]time.Time{}},
+		scanTrigger:    make(chan struct{}, 1),
+		nodeAlert:      &nodeAlertState{prev: map[int64]bool{}},
+		pendingCancels: map[int64][]int64{},
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")

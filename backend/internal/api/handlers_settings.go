@@ -127,8 +127,11 @@ func validateSettings(st *model.Settings) error {
 	if st.DiskAlertGB < 0 || st.DiskAlertGB > 100000 {
 		return errSettings("disk_alert_gb must be 0 (disabled) or 1-100000")
 	}
-	// Stall watchdog: 0 disables it; otherwise 1 minute - 1 week. A
-	// threshold below the heartbeat cadence would fail healthy jobs.
+	// Stall watchdog: 0 disables it; otherwise 1 minute - 1 week. The
+	// threshold must exceed the longest interval WITHOUT step/progress
+	// change in any healthy job (e.g. a long encode that only marks start
+	// and finish) — not the heartbeat cadence: heartbeats reporting an
+	// unchanged step/progress deliberately do NOT refresh the stall stamp.
 	if st.StallTimeoutMinutes < 0 || st.StallTimeoutMinutes > 10080 {
 		return errSettings("stall_timeout_minutes must be 0 (disabled) or 1-10080")
 	}

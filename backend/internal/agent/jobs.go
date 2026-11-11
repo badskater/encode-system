@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"os/exec"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 )
@@ -21,6 +23,14 @@ type activeJob struct {
 	prog    *progressTracker
 	metrics *metricTracker // ENCODE_METRIC accumulator (vmaf, sizes, rates)
 	runLog  string         // this job's run.log path (FPS parsing picks the newest)
+	// cmd is the running job-script process, registered by runJobCommand
+	// after Start and read by the cancel instruction (F5). Guarded by the
+	// registry mutex (setCmd/cmdFor), like runLog.
+	cmd *exec.Cmd
+	// cancelled is set by the cancel instruction BEFORE the kill so the
+	// executeJob goroutine skips its completion report — the controller
+	// already finalized the job server-side.
+	cancelled atomic.Bool
 }
 
 // jobRegistry is the concurrency-safe multi-job bookkeeping that replaces
@@ -66,6 +76,19 @@ func (r *jobRegistry) remove(id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.jobs, id)
+}
+
+// removeIf drops a job ONLY when the registry still holds the given
+// instance. The executeJob goroutine uses this for its deferred cleanup:
+// after a cancel removed the old instance and the controller re-dispatched
+// the same job ID, the OLD goroutine's cleanup must not delete the NEW
+// instance (which would stop its heartbeat reports and orphan the retry).
+func (r *jobRegistry) removeIf(id int64, aj *activeJob) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.jobs[id]; ok && cur == aj {
+		delete(r.jobs, id)
+	}
 }
 
 // count returns the number of in-flight jobs.
@@ -118,6 +141,27 @@ func (r *jobRegistry) setRunLog(id int64, path string) {
 	if aj, ok := r.jobs[id]; ok {
 		aj.runLog = path
 	}
+}
+
+// setCmd records a job's running process under the registry lock so the
+// cancel instruction can kill it (F5). Unknown ids are a no-op.
+func (r *jobRegistry) setCmd(id int64, cmd *exec.Cmd) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if aj, ok := r.jobs[id]; ok {
+		aj.cmd = cmd
+	}
+}
+
+// cmdFor returns a job's running process (nil when absent or not yet
+// started), under the registry lock.
+func (r *jobRegistry) cmdFor(id int64) *exec.Cmd {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if aj, ok := r.jobs[id]; ok {
+		return aj.cmd
+	}
+	return nil
 }
 
 // newestRunLog returns the run.log path of the highest-id active job —

@@ -323,6 +323,16 @@ func (s *Server) handleImportFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "import needs a named flow with steps")
 		return
 	}
+	// Same timeout validation as create/PUT — an import is just another
+	// flow-creation boundary. Without it an out-of-range job_timeout_minutes
+	// (e.g. 922337204) sails through and overflows time.Duration in the
+	// agent's limitsFromPayload, wrapping to a ~19s deadline that kills
+	// every job. Validate BEFORE installing templates so a rejected import
+	// leaves no residue.
+	if err := validateFlowTimeouts(&exp.Flow); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx := r.Context()
 
 	// Install embedded custom templates first so validation can see them.

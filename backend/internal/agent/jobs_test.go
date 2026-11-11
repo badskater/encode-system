@@ -103,3 +103,30 @@ func TestJobRegistryHardCap(t *testing.T) {
 		t.Fatalf("active = %d, want hard cap %d", a.activeCount(), maxLocalJobs)
 	}
 }
+
+// TestRegistryRemoveIfIgnoresReplacedInstance is the F5 cleanup-race guard:
+// after a cancel removed the old instance and the controller re-dispatched
+// the same job ID, the OLD executeJob goroutine's deferred cleanup must not
+// delete the NEW instance.
+func TestRegistryRemoveIfIgnoresReplacedInstance(t *testing.T) {
+	r := newJobRegistry()
+	p := &model.JobPayload{ID: 1}
+	r.accept([]*model.JobPayload{p})
+	old := r.get(1)
+
+	r.remove(1)                      // cancel removes the stuck instance
+	r.accept([]*model.JobPayload{p}) // retry re-dispatches the same ID
+	fresh := r.get(1)
+	if fresh == nil || fresh == old {
+		t.Fatal("re-dispatch after cancel must create a fresh instance")
+	}
+
+	r.removeIf(1, old) // old goroutine winds down — must be a no-op
+	if r.get(1) != fresh {
+		t.Fatal("old instance's cleanup deleted the re-dispatched job")
+	}
+	r.removeIf(1, fresh) // own-instance cleanup still works
+	if r.get(1) != nil {
+		t.Fatal("removeIf did not remove the matching instance")
+	}
+}

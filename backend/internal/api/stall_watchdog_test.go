@@ -202,6 +202,76 @@ func TestStallWatchdogNeverTouchesPending(t *testing.T) {
 	}
 }
 
+// TestStallWatchdogDoesNotOverwriteConcurrentlyCompletedJob is the F1
+// regression: the watchdog snapshot says running+stale, but the agent
+// completes the job inside the failure window. The guarded transition must
+// leave the done row (and its outputs) untouched — no failed overwrite, no
+// auto-retry of a finished encode, no notification.
+func TestStallWatchdogDoesNotOverwriteConcurrentlyCompletedJob(t *testing.T) {
+	e, rec, job := stallEnv(t, 2) // retry policy ON: an overwrite would re-queue
+	enableStallWatchdog(t, e, 30)
+	ctx := ctxBg()
+	// Snapshot taken while the job is still running and stale…
+	snapshot, err := e.server.Store.StalledRunningJobs(ctx, time.Now().UTC().Add(-30*time.Minute))
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot = %+v err=%v, want the one stalled job", snapshot, err)
+	}
+	// …then the agent completes the job before the watchdog acts on it.
+	if err := e.server.Store.FinishJobWithReport(ctx, job.ID, model.JobDone, 0, "",
+		[]string{"StallShow/Ep 01/out.mkv"}, "tail", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	e.server.failStalledJob(ctx, snapshot[0], 30)
+
+	got, err := e.server.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.JobDone {
+		t.Fatalf("concurrently completed job overwritten: status = %s, want done", got.Status)
+	}
+	if len(got.Outputs) != 1 || got.Outputs[0] != "StallShow/Ep 01/out.mkv" {
+		t.Fatalf("completed job's outputs wiped: %+v", got.Outputs)
+	}
+	if got.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0 (a finished encode must not re-queue)", got.RetryCount)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("notifier fired %d times for a completed job", rec.count())
+	}
+}
+
+// TestStallWatchdogStaleSnapshotFailsJobOnce is the F1 double-transition
+// regression: two failStalledJob calls on ONE stale snapshot (duplicate
+// tick / orphan-recovery race) must burn exactly one retry, not two.
+func TestStallWatchdogStaleSnapshotFailsJobOnce(t *testing.T) {
+	e, rec, job := stallEnv(t, 2)
+	enableStallWatchdog(t, e, 30)
+	ctx := ctxBg()
+	snapshot, err := e.server.Store.StalledRunningJobs(ctx, time.Now().UTC().Add(-30*time.Minute))
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot = %+v err=%v, want the one stalled job", snapshot, err)
+	}
+
+	e.server.failStalledJob(ctx, snapshot[0], 30)
+	e.server.failStalledJob(ctx, snapshot[0], 30)
+
+	got, err := e.server.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.JobPending {
+		t.Fatalf("status = %s, want pending (one auto-retry)", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1 (double fail burned two retries)", got.RetryCount)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("notifier fired %d times, want 0 (silent auto-retry)", rec.count())
+	}
+}
+
 // TestStallWatchdogRetryBudgetExhausted: a stalled job that already burned
 // its retry budget stays failed and notifies (carrying the retry count).
 func TestStallWatchdogRetryBudgetExhausted(t *testing.T) {

@@ -537,6 +537,173 @@ func storeContractConcurrency(t *testing.T, openFn func(t *testing.T) *Store) {
 	}
 }
 
+// storeContractFailStalled verifies the guarded stall-fail transition
+// (FailStalledJob) on both backends: a stale running job transitions exactly
+// once, a concurrently-completed job is never overwritten (outputs intact),
+// and fresh progress is never failed.
+func storeContractFailStalled(t *testing.T, openFn func(t *testing.T) *Store) {
+	ctx := context.Background()
+	s := openFn(t)
+	flow, err := s.CreateFlow(ctx, &model.Flow{Name: "fs-flow", Steps: []model.Step{{Type: model.StepEncode}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := s.CreateNode(ctx, "fs-node", "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture runs several jobs on one node; lift the default 1-slot cap.
+	if err := s.SetNodeMaxConcurrent(ctx, node.ID, 8); err != nil {
+		t.Fatal(err)
+	}
+	// runningJob creates an assigned+running job with a known progress value.
+	runningJob := func(episode string) *model.Job {
+		t.Helper()
+		j, err := s.CreateJob(ctx, &model.Job{
+			Series: "FailStalledShow", Episode: episode, EpisodeDir: "FailStalledShow/Ep " + episode,
+			ScriptType: "vpy", FlowID: flow.ID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AssignJob(ctx, j.ID, node.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateJobStatus(ctx, j.ID, model.JobRunning, "encode", 42, "tail"); err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	cutoff := time.Now().UTC().Add(-1 * time.Hour)
+	const stallMsg = "stalled: no progress for 60 minutes"
+
+	// 1. A stale running job transitions: failed, exit -1, stall error,
+	// finished_at stamped, progress kept, steering stamp set for retry.
+	j1 := runningJob("01")
+	if err := s.SeedJobLastProgress(ctx, j1.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := s.FailStalledJob(ctx, j1.ID, cutoff, stallMsg)
+	if err != nil || !ok {
+		t.Fatalf("FailStalledJob(stale running) = %v err=%v, want true", ok, err)
+	}
+	got, err := s.GetJob(ctx, j1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.JobFailed || got.ExitCode != -1 || got.Error != stallMsg {
+		t.Fatalf("stale job transition wrong: %+v", got)
+	}
+	if got.FinishedAt == nil {
+		t.Fatal("finished_at not stamped")
+	}
+	if got.Progress != 42 {
+		t.Fatalf("progress = %v, want 42 (failure must not render as completion)", got.Progress)
+	}
+	if got.LastFailedNodeID != node.ID {
+		t.Fatalf("last_failed_node_id = %d, want %d (retry steering)", got.LastFailedNodeID, node.ID)
+	}
+
+	// 2. A second call on the same job is a no-op (double transition guard).
+	ok, err = s.FailStalledJob(ctx, j1.ID, cutoff, "stalled: again")
+	if err != nil || ok {
+		t.Fatalf("second FailStalledJob = %v err=%v, want false (already failed)", ok, err)
+	}
+	got, _ = s.GetJob(ctx, j1.ID)
+	if got.Error != stallMsg || got.RetryCount != 0 {
+		t.Fatalf("second call mutated the row: %+v", got)
+	}
+
+	// 3. A concurrently-completed job is NEVER overwritten, even with an
+	// ancient stamp: status, exit code and outputs survive untouched.
+	j2 := runningJob("02")
+	if err := s.FinishJobWithReport(ctx, j2.ID, model.JobDone, 0, "",
+		[]string{"out.mkv"}, "tail", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SeedJobLastProgress(ctx, j2.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = s.FailStalledJob(ctx, j2.ID, cutoff, stallMsg)
+	if err != nil || ok {
+		t.Fatalf("FailStalledJob(completed) = %v err=%v, want false", ok, err)
+	}
+	got, _ = s.GetJob(ctx, j2.ID)
+	if got.Status != model.JobDone || got.ExitCode != 0 {
+		t.Fatalf("completed job overwritten: %+v", got)
+	}
+	if len(got.Outputs) != 1 || got.Outputs[0] != "out.mkv" {
+		t.Fatalf("completed job's outputs wiped: %+v", got.Outputs)
+	}
+
+	// 4. Fresh progress is never failed (stamp newer than the cutoff).
+	j3 := runningJob("03") // claim stamped last_progress_at=now
+	ok, err = s.FailStalledJob(ctx, j3.ID, cutoff, stallMsg)
+	if err != nil || ok {
+		t.Fatalf("FailStalledJob(fresh) = %v err=%v, want false", ok, err)
+	}
+	got, _ = s.GetJob(ctx, j3.ID)
+	if got.Status != model.JobRunning {
+		t.Fatalf("fresh-progress job failed: %+v", got)
+	}
+
+	// 5. The fail path does not wipe outputs/log_tail of the stalled row
+	// itself (it mirrors FinishJob's column set minus the output write).
+	j4 := runningJob("04")
+	if _, err := s.qExec(ctx, `UPDATE jobs SET outputs_json=? WHERE id=?`, `["partial.mkv"]`, j4.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SeedJobLastProgress(ctx, j4.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = s.FailStalledJob(ctx, j4.ID, cutoff, stallMsg)
+	if err != nil || !ok {
+		t.Fatalf("FailStalledJob(stale w/ outputs) = %v err=%v, want true", ok, err)
+	}
+	got, _ = s.GetJob(ctx, j4.ID)
+	if len(got.Outputs) != 1 || got.Outputs[0] != "partial.mkv" {
+		t.Fatalf("stalled job's outputs wiped: %+v", got.Outputs)
+	}
+	if got.LogTail != "tail" {
+		t.Fatalf("stalled job's log_tail wiped: %q", got.LogTail)
+	}
+}
+
+// TestFailStalledJobContract runs the guarded stall-fail contract on SQLite.
+func TestFailStalledJobContract(t *testing.T) {
+	storeContractFailStalled(t, func(t *testing.T) *Store {
+		t.Helper()
+		s, err := Open(filepath.Join(t.TempDir(), "failstalled.db"))
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		return s
+	})
+}
+
+// TestFailStalledJobContractPG runs the same contract on Postgres when
+// ENCODE_TEST_PG_DSN is set (env-gated like the other PG contract suites).
+func TestFailStalledJobContractPG(t *testing.T) {
+	dsn := os.Getenv("ENCODE_TEST_PG_DSN")
+	if dsn == "" {
+		t.Skip("ENCODE_TEST_PG_DSN not set; skipping PG FailStalledJob contract test")
+	}
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		for _, tbl := range []string{"jobs", "flows", "nodes"} {
+			s.db.ExecContext(ctx, fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", tbl))
+		}
+		s.Close()
+	})
+	storeContractFailStalled(t, func(t *testing.T) *Store { return s })
+}
+
 // TestRebindPostgres verifies the ? → $N placeholder rebind with hostile
 // inputs: ? inside single-quoted string literals must NOT be rebound.
 func TestRebindPostgres(t *testing.T) {

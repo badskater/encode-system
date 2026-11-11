@@ -395,7 +395,7 @@ export default function SettingsPage() {
               value={settings.stall_timeout_minutes ?? 0}
               disabled={!isAdmin}
             onChange={(e) => set('stall_timeout_minutes', Number(e.target.value))}
-              title="Running jobs reporting no step/progress change for this long are failed as stalled (flow retry policy applies). 0 disables."
+              title="Running jobs reporting no step/progress change for this long are failed as stalled (flow retry policy applies). Set above the longest gap between progress updates of any step — heartbeats with unchanged progress do not count. 0 disables."
             />
           </label>
           <label style={{ flex: 1 }}>

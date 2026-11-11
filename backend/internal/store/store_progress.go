@@ -65,11 +65,54 @@ func (s *Store) StalledRunningJobs(ctx context.Context, cutoff time.Time) ([]*mo
 	return out, rows.Err()
 }
 
+// FailStalledJob atomically fails a job ONLY IF it is still live
+// (running/assigned) AND still stale (last progress at or before cutoff).
+// It returns true when this call performed the transition, false when the
+// guard matched zero rows — the job already completed, was cancelled, was
+// failed by someone else, or made progress since the watchdog's snapshot.
+//
+// This is the watchdog's guard against the snapshot race: StalledRunningJobs
+// is a point-in-time read, and the agent may complete the job before the
+// watchdog acts on it. An unguarded finish would overwrite done→failed,
+// wipe the outputs, and auto-retry a finished encode. The conditional
+// UPDATE makes the transition atomic on BOTH backends (SQLite's single
+// writer and PG's row lock serialize it), so concurrent watchdog passes /
+// orphan recovery can never double-fail one job.
+//
+// Column set mirrors FinishJob's failure path (status/exit_code=-1/error/
+// finished_at + the last_failed_node_id steering stamp for retry) but
+// deliberately does NOT write outputs_json, log_tail or progress: a stalled
+// job keeps whatever partial state it had, and a row that raced to done is
+// never touched at all.
+func (s *Store) FailStalledJob(ctx context.Context, id int64, cutoff time.Time, errMsg string) (bool, error) {
+	res, err := s.qExec(ctx,
+		`UPDATE jobs SET status='failed', exit_code=-1, error=?, finished_at=datetime('now'),
+		  last_failed_node_id=(SELECT node_id FROM jobs WHERE id=?)
+		 WHERE id=? AND status IN ('running','assigned') AND COALESCE(last_progress_at, started_at) <= ?`,
+		errMsg, id, id, fmtTime(cutoff))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // CountStalledJobs counts failed jobs whose recorded error carries the
 // watchdog's stall prefix — the DB-derived basis for the
 // encode_jobs_stalled_total Prometheus counter (same derivation pattern as
 // encode_jobs_failed_total: a count over the jobs table, not an in-memory
 // tally, so every replica serves the same number).
+//
+// Known derivation limits (deliberate, no behavior change):
+//   - Undercount on auto-retry: a stalled job that is re-queued and later
+//     succeeds (or fails with a different error) no longer carries a
+//     'stalled:' error on its row, so the counter reflects jobs CURRENTLY
+//     failed-stalled, not the total number of stall events.
+//   - The LIKE prefix is not exclusive to the watchdog: an agent-reported
+//     error that happens to start with 'stalled:' also matches.
 func (s *Store) CountStalledJobs(ctx context.Context) (int, error) {
 	var n int
 	err := s.qRow(ctx, `SELECT COUNT(*) FROM jobs WHERE status='failed' AND error LIKE 'stalled:%'`).Scan(&n)

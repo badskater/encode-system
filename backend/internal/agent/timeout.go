@@ -2,6 +2,9 @@ package agent
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -56,6 +59,10 @@ type timeoutWatcher struct {
 	stepDeadline time.Time     // zero = no active step limit
 	stepLimit    time.Duration // configured step limit (for the message)
 	reason       string
+	// killFailed records that a deadline fired but EVERY kill attempt
+	// failed — the process survived because the kill failed, so the
+	// timeout reason must win even if it later exits 0 (F4).
+	killFailed bool
 }
 
 // setJobDeadline arms the job-level deadline (from the job context).
@@ -114,6 +121,73 @@ func (w *timeoutWatcher) takeReason() string {
 	return w.reason
 }
 
+// markKillFailed records that a deadline fired and every kill attempt failed.
+func (w *timeoutWatcher) markKillFailed() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.killFailed = true
+}
+
+// killFailedReported reports whether a fired deadline's kill never landed.
+func (w *timeoutWatcher) killFailedReported() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.killFailed
+}
+
+// procGuard synchronizes the process-exit state between the goroutine that
+// reaps the child (cmd.Wait) and the timeout watcher that may kill it (F6).
+// cmd.ProcessState is written by cmd.Wait without an exported lock, so the
+// watcher must never read it directly — it reads this guarded copy instead,
+// closing the kill-after-reap window: once the child is reaped there is
+// nothing left to kill, and attempting it would burn retries on a dead
+// process (or worse, a recycled PID on Windows).
+type procGuard struct {
+	mu    sync.Mutex
+	state *os.ProcessState
+}
+
+// exited reports whether the child has been reaped.
+func (p *procGuard) exited() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state != nil
+}
+
+// record captures cmd.ProcessState after cmd.Wait returns (same goroutine
+// as the Wait call, so the read itself is race-free).
+func (p *procGuard) record(cmd *exec.Cmd) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state = cmd.ProcessState
+}
+
+// killTreeWithRetry kills the job's process tree, retrying transient
+// failures (killMaxAttempts attempts, killRetryDelay apart) with a warning
+// per failed attempt. Returns true when the kill landed OR the process had
+// already exited (nothing to kill — a natural exit, not a kill failure);
+// false only when every attempt against a live process failed. guard may be
+// nil for callers without a reaper (the cancel path).
+func killTreeWithRetry(cmd *exec.Cmd, log *slog.Logger, guard *procGuard) bool {
+	for attempt := 1; attempt <= killMaxAttempts; attempt++ {
+		if guard != nil && guard.exited() {
+			// F6: the child exited and was reaped — skip the kill so a
+			// natural exit is never charged as a kill failure.
+			return true
+		}
+		err := killTreeFn(cmd)
+		if err == nil {
+			return true
+		}
+		log.Warn("timeout kill attempt failed", "attempt", attempt, "max", killMaxAttempts, "err", err)
+		if attempt < killMaxAttempts {
+			time.Sleep(killRetryDelay)
+		}
+	}
+	log.Error("timeout kill failed after all retries; process may survive", "attempts", killMaxAttempts)
+	return false
+}
+
 // timeoutMessage renders the failure reason: "job timeout after N minutes"
 // / "step encode timeout after N minutes" for whole-minute limits (the wire
 // unit), falling back to the duration string for sub-minute test limits.
@@ -128,6 +202,20 @@ func timeoutMessage(kind string, d time.Duration) string {
 	}
 	return fmt.Sprintf("%s timeout after %s", kind, d)
 }
+
+// killTreeFn is the process-tree kill seam: production uses the platform
+// killProcessTree; tests inject failures to exercise the retry/precedence
+// logic without a real taskkill/kill syscall.
+var killTreeFn = killProcessTree
+
+// Kill retry policy (F4): a transient kill failure (realistic on Windows
+// taskkill) must not let the script run to completion and report false
+// success — retry a few times, and if every attempt fails the timeout
+// reason wins even when the process later exits 0.
+var (
+	killMaxAttempts = 3
+	killRetryDelay  = 200 * time.Millisecond
+)
 
 // windowsKillArgs builds the taskkill argument list that kills a process
 // AND its children (/T = tree, /F = force). Kept platform-neutral so the

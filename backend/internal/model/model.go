@@ -679,7 +679,7 @@ type UpdateManifest struct {
 
 // HeartbeatReply is the controller's instruction channel to the agent.
 type HeartbeatReply struct {
-	Instruction string `json:"instruction"` // none | job | jobs | reboot | update
+	Instruction string `json:"instruction"` // none | job | jobs | reboot | update | cancel
 	// Job carries a single assignment. Kept for old agents: when the
 	// controller assigns to an old agent (no Jobs reported) only Job is
 	// set. New agents prefer the Jobs array.
@@ -690,6 +690,11 @@ type HeartbeatReply struct {
 	Jobs        []*JobPayload   `json:"jobs,omitempty"`
 	RebootDelay int             `json:"reboot_delay_seconds,omitempty"`
 	Update      *UpdateManifest `json:"update,omitempty"`
+	// CancelJobIDs lists jobs the controller has already finalized
+	// server-side (stall watchdog) whose processes the agent must kill and
+	// deregister. Additive wire field: old agents ignore the unknown
+	// instruction gracefully; old controllers never send it.
+	CancelJobIDs []int64 `json:"cancel_job_ids,omitempty"`
 }
 
 // ---------- Fleet stats (Phase E) ----------

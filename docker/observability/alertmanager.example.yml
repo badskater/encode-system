@@ -1,0 +1,61 @@
+# Alertmanager config — routes firing alerts from Prometheus to Discord.
+# EXAMPLE for an EXISTING Alertmanager deployment (opt-in; see README.md).
+# This repo does not run Alertmanager itself — copy this file into your
+# observability stack's config and adapt the paths to that stack.
+#
+# Secret handling: the Discord webhook URL is NOT hardcoded here. It is read
+# at notification time from webhook_url_file (supported since Alertmanager
+# v0.27.0, PR #3555 — validated against v0.28.1). Create the secret on the
+# host running Alertmanager and bind-mount it into the container, e.g.
+#   ./secrets/discord_webhook -> /etc/alertmanager/secrets/discord_webhook
+# Create the file with the bare webhook URL (shape shown with placeholders;
+# never commit the real file):
+#   echo 'https://discord.com/api/webhooks/EXAMPLE/EXAMPLE' > secrets/discord_webhook
+#   chmod 600 secrets/discord_webhook
+# A placeholder lives at docker/observability/discord_webhook.example.
+#
+# Validate after edits:  amtool check-config docker/observability/alertmanager.example.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  # Default destination for every alert. When the Discord secret file is
+  # absent, sends fail (logged) but Alertmanager keeps running — alerts still
+  # land in its UI/API and can be inspected/silenced.
+  receiver: discord
+  group_by: ["alertname", "job", "severity"]
+  group_wait: 30s        # batch alerts arriving close together before sending
+  group_interval: 5m     # minimum gap between notifications for an active group
+  repeat_interval: 4h    # re-notify about still-firing alerts every 4h
+  routes:
+    # Suppress Prometheus self-health noise (Watchdog etc.) before Discord.
+    # These route to the no-op 'null' receiver instead of spamming the channel.
+    - receiver: "null"
+      matchers:
+        - alertname=~"Watchdog|InfoInhibitor"
+      continue: false
+
+receivers:
+  # No-op receiver: no integration, so it silently drops every alert routed to
+  # it. A safe fallback target that guarantees Alertmanager always has a valid
+  # route even when Discord is unconfigured or a notification integration is
+  # misconfigured. (Alertmanager refuses to start if no receiver matches the
+  # default route — defining 'null' covers that.)
+  # Quote "null": a bare null is a YAML null literal (empty name), and
+  # Alertmanager refuses to start with "missing name in receiver".
+  - name: "null"
+  - name: discord
+    discord_configs:
+      - webhook_url_file: /etc/alertmanager/secrets/discord_webhook
+        send_resolved: true
+
+inhibit_rules:
+  # A critical alert suppresses the matching warning for the SAME alertname,
+  # so e.g. a critical outage mutes its own lower-severity echo. (The current
+  # encode rule set has no critical+warning pair sharing an alertname, but this
+  # is the correct general rule and will govern future additions.)
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["alertname"]

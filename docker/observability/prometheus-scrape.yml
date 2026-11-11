@@ -1,0 +1,20 @@
+# Optional scrape job for an EXISTING Prometheus stack (e.g. the network-wide
+# onprem-observability system). Merge this job into that stack's scrape_configs;
+# it is NOT applied automatically. Target assumes the controller's metrics port
+# is host-published; switch to encode-controller:8080 if the stacks share a network.
+# job_name MUST stay "encode": alert-rules.yml matches up{job="encode"}.
+  # Encode-system controller — serves Prometheus text exposition at
+  # GET /metrics on its HTTP port (default 8080). The endpoint is
+  # unauthenticated by design (management network only); it exposes only
+  # aggregate operational numbers (queue depth, node liveness, terminal
+  # counters). scrape_interval inherits the global 15s.
+  #
+  # The controller runs on the Docker host at 172.24.92.232 with its metrics
+  # port host-published (:8080), so Prometheus scrapes it over the LAN. If
+  # the encode-system and observability stacks ever share a Docker network,
+  # switch the target to the container name instead: ["encode-controller:8080"]
+  # — same port, no host publish required.
+  - job_name: encode
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["172.24.92.232:8080"]

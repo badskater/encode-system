@@ -1,0 +1,33 @@
+// OPTIONAL network-wide enrichment for an existing Grafana Alloy config.
+// Insert this loki.process block between loki.source.docker and loki.write,
+// and change the docker source's forward_to to [loki.process.docker_json.receiver]
+// (e.g. loki.source.docker "containers" in the reference onprem stack).
+// Parses JSON container log lines and promotes 'level' to a Loki label;
+// non-JSON lines pass through unchanged. Syslog pipeline stays untouched.
+// Syntax validated with `alloy validate` (v1.21.3) against a minimal
+// loki.write "local" wrapper.
+// ---- Structured-JSON enrichment for container logs -------------------------
+// Sits between loki.source.docker and loki.write. Parses JSON log lines and
+// promotes the 'level' field to a Loki label (low cardinality: info/warn/
+// error/debug). Non-JSON lines and JSON without 'level' yield no extracted
+// value, so stage.labels simply omits the label and the line flows through
+// unchanged — plain-text container logs are never broken. 'msg' is extracted
+// too (available to downstream stages) but is NOT promoted to a label, keeping
+// stream cardinality flat. The syslog pipeline is untouched and still routes
+// directly to loki.write via its own relabel receiver.
+loki.process "docker_json" {
+	forward_to = [loki.write.local.receiver]
+
+	stage.json {
+		expressions = {
+			level = "level",
+			msg   = "msg",
+		}
+	}
+
+	stage.labels {
+		values = {
+			level = "",
+		}
+	}
+}

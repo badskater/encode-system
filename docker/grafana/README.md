@@ -31,7 +31,7 @@ Add a scrape job to your `prometheus.yml`. The controller serves
 
 ```yaml
 scrape_configs:
-  - job_name: encode-system
+  - job_name: encode
     metrics_path: /metrics
     scrape_interval: 30s
     static_configs:
@@ -43,8 +43,20 @@ scrape_configs:
 ```
 
 After editing, reload Prometheus (`POST /-/reload` on the Prometheus port, or
-restart the container) and verify the `encode-system` job is **UP** in
+restart the container) and verify the `encode` job is **UP** in
 Prometheus → Status → Targets.
+
+The canonical snippet lives at `../observability/prometheus-scrape.yml`
+(host-published target example + shared-network alternative). Keep
+`job_name: encode` — the alert rules match `up{job="encode"}`.
+
+## Alerting and full wiring
+
+For alert rules, Alertmanager → Discord routing, and optional Alloy log
+enrichment — all opt-in assets for an **existing** Prometheus/Grafana stack
+— see [`../observability/README.md`](../observability/README.md). Nothing
+there is applied automatically; merging it into your monitoring stack is a
+deliberate, separate operation.
 
 ## Metrics covered
 

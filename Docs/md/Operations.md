@@ -338,6 +338,23 @@ and `gauge` panels — all built **only** from the 10 metrics the controller
 actually emits (verified against `backend/internal/api/prometheus.go`; no
 synthetic series).
 
+### Opt-in Prometheus wiring and alerting
+
+`docker/observability/` ships opt-in assets for wiring the controller into an
+**existing** Prometheus/Grafana/Loki/Alloy stack (e.g. the network-wide
+observability system): a scrape-job snippet (`prometheus-scrape.yml`,
+`job_name: encode`), 5 alert rules (`alert-rules.yml`: controller down, queue
+stalled, node offline, failure spike, host disk low), an Alertmanager →
+Discord example (`alertmanager.example.yml`, webhook read from a `chmod 600`
+secret file — never committed), and an optional Alloy JSON-log enrichment
+snippet. Nothing is applied automatically — merging into the monitoring
+stack is a deliberate, separate operation. See
+`docker/observability/README.md` for the wiring guide and post-wiring
+verification checklist. Metric names are cross-checked against
+`backend/internal/api/prometheus.go` by `docker/observability/check_rules.py`
+and `docker/grafana/check_metrics.py`; rules/config also validate with
+`promtool check rules` / `amtool check-config`.
+
 ### Security note
 
 The `/metrics` endpoint is **unauthenticated** by design: the route

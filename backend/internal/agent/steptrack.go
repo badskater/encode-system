@@ -179,6 +179,10 @@ type lineObserver struct {
 	metrics   *metricTracker   // ENCODE_METRIC accumulator; nil in unit tests
 	buf       bytes.Buffer     // accumulates ALL output verbatim
 	remainder string           // trailing partial line from the last Write
+	// onStepStart, when set, fires once per step name at its FIRST
+	// ENCODE_STEP marker — the timeout enforcement arms the step's
+	// deadline here. nil in unit tests that only care about parsing.
+	onStepStart func(name string)
 }
 
 // newLineObserver creates a live-scanning writer. log may be nil (unit tests
@@ -238,7 +242,13 @@ func (o *lineObserver) processLine(line string) {
 	if o.log != nil {
 		o.log.Info("job progress", "step", m[1], "pct", m[2])
 	}
+	// First-seen check BEFORE observe (which records the name): the
+	// timeout hook must fire exactly once per step, at its start.
+	first := !o.timings.seen[m[1]]
 	o.timings.observe(line, time.Now())
+	if first && o.onStepStart != nil {
+		o.onStepStart(m[1])
+	}
 }
 
 // String returns the full accumulated output, reassembled exactly — no lost

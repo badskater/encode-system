@@ -410,3 +410,52 @@ describe('Settings publish platform picker', () => {
     expect(screen.getByRole('button', { name: /rollback to 0\.7\.0/i })).toBeInTheDocument();
   });
 });
+
+describe('Settings stall timeout', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the stall timeout field bound to settings (0 = off by default)', async () => {
+    render(<SettingsPage />);
+    const input = (await screen.findByLabelText(/stall timeout/i)) as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.value).toBe('0');
+  });
+
+  it('reflects a loaded stall_timeout_minutes value', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({ stall_timeout_minutes: 45 }));
+    render(<SettingsPage />);
+    const input = (await screen.findByLabelText(/stall timeout/i)) as HTMLInputElement;
+    expect(input.value).toBe('45');
+  });
+
+  it('sends stall_timeout_minutes in the PUT body after editing and saving', async () => {
+    const saveSpy = vi
+      .spyOn(api, 'saveSettings')
+      .mockResolvedValue(baseSettings({ stall_timeout_minutes: 60 }));
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/stall timeout/i);
+    fireEvent.change(input, { target: { value: '60' } });
+    // The field lives in the Behavior & naming card — its Save button is first.
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.stall_timeout_minutes).toBe(60);
+  });
+
+  it('clamps an out-of-range stall timeout to the 0-10080 bound on save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/stall timeout/i);
+    fireEvent.change(input, { target: { value: '99999' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.stall_timeout_minutes).toBe(10080);
+  });
+});

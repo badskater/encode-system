@@ -11,8 +11,9 @@ import (
 // The default name is "<original> (copy)"; the request body may override it
 // with {"name":"..."}. The copy is never the default flow (is_default=false)
 // so duplicating the flagged default does not create a second default. The
-// retry policy (MaxRetries, RetryBackoffMinutes) is copied alongside the
-// steps so a duplicated flow preserves its failure-handling behavior.
+// retry policy (MaxRetries, RetryBackoffMinutes) and job timeout are copied
+// alongside the steps so a duplicated flow preserves its failure-handling
+// behavior. Per-step timeouts ride inside Steps verbatim.
 //
 // Audit: flow.duplicate.
 func (s *Server) handleDuplicateFlow(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +46,7 @@ func (s *Server) handleDuplicateFlow(w http.ResponseWriter, r *http.Request) {
 		Steps:               src.Steps,
 		MaxRetries:          src.MaxRetries,
 		RetryBackoffMinutes: src.RetryBackoffMinutes,
+		JobTimeoutMinutes:   src.JobTimeoutMinutes,
 	}
 	created, err := s.Store.CreateFlow(r.Context(), dup)
 	if err != nil {

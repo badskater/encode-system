@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -23,18 +24,31 @@ func (s *Server) audit(r *http.Request, action, object string, detail any) {
 	} else if tok := apiTokenFromCtx(r); tok != nil {
 		actor = "api-token:" + tok.Name
 	}
+	s.writeAudit(r.Context(), actor, action, object, detail)
+}
+
+// auditSystem records an audit event raised by a background loop (no HTTP
+// request/session): the actor is "controller", matching the node name the
+// controller-detected failure paths already use in notifications. Same
+// fire-and-forget contract as audit.
+func (s *Server) auditSystem(ctx context.Context, action, object string, detail any) {
+	s.writeAudit(ctx, "controller", action, object, detail)
+}
+
+// writeAudit is the shared audit write path for request-scoped and
+// system-scoped events. Detail is marshaled leniently and capped at 512
+// bytes — audit rows are forensic breadcrumbs, not data dumps.
+func (s *Server) writeAudit(ctx context.Context, actor, action, object string, detail any) {
 	detailStr := ""
 	if detail != nil {
 		if b, err := json.Marshal(detail); err == nil {
-			// Cap the detail snippet: audit rows are forensic breadcrumbs,
-			// not data dumps — 512 bytes keeps a table scan cheap.
 			detailStr = string(b)
 			if len(detailStr) > 512 {
 				detailStr = detailStr[:512] + "…"
 			}
 		}
 	}
-	if err := s.Store.AppendAudit(r.Context(), actor, action, object, detailStr); err != nil {
+	if err := s.Store.AppendAudit(ctx, actor, action, object, detailStr); err != nil {
 		s.Log.Warn("audit write failed", "err", err, "action", action)
 	}
 }

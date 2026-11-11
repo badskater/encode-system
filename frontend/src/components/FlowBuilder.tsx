@@ -1,11 +1,13 @@
 import { useMemo, useState } from 'react';
 import type { Flow, Step, StepTemplate } from '../types';
 
-// RetryPolicy is the { max_retries, retry_backoff_minutes } pair the builder
-// hands to onSave alongside name + steps. max_retries=0 means retry is OFF.
+// RetryPolicy is the { max_retries, retry_backoff_minutes, job_timeout_minutes }
+// set the builder hands to onSave alongside name + steps. max_retries=0 means
+// retry is OFF; job_timeout_minutes=0 means the job timeout is OFF.
 export interface RetryPolicy {
   max_retries: number;
   retry_backoff_minutes: number;
+  job_timeout_minutes: number;
 }
 
 interface Props {
@@ -42,6 +44,7 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
   const [steps, setSteps] = useState<Step[]>(initial?.steps ?? []);
   const [maxRetries, setMaxRetries] = useState(initial?.max_retries ?? 0);
   const [retryBackoff, setRetryBackoff] = useState(initial?.retry_backoff_minutes ?? 15);
+  const [jobTimeout, setJobTimeout] = useState(initial?.job_timeout_minutes ?? 0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -60,16 +63,31 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
     if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 10) return false;
     if (maxRetries > 0 && (!Number.isInteger(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
       return false;
+    // Job timeout: 0 = off, otherwise a whole number of minutes up to one
+    // week (mirrors the backend bound).
+    if (!Number.isInteger(jobTimeout) || jobTimeout < 0 || jobTimeout > 10080) return false;
+    // Per-step timeouts: same bound; 0/absent = inherit (no step limit).
+    for (const s of steps) {
+      const t = s.timeout_minutes ?? 0;
+      if (!Number.isInteger(t) || t < 0 || t > 10080) return false;
+    }
     return true;
-  }, [maxRetries, retryBackoff]);
+  }, [maxRetries, retryBackoff, jobTimeout, steps]);
 
   const retryError = useMemo(() => {
     if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 10)
       return 'Max retries must be a whole number 0–10';
     if (maxRetries > 0 && (!Number.isInteger(retryBackoff) || retryBackoff < 1 || retryBackoff > 1440))
       return 'Retry backoff must be a whole number 1–1440 minutes';
+    if (!Number.isInteger(jobTimeout) || jobTimeout < 0 || jobTimeout > 10080)
+      return 'Job timeout must be a whole number 0–10080 minutes (0 = off)';
+    for (let i = 0; i < steps.length; i++) {
+      const t = steps[i].timeout_minutes ?? 0;
+      if (!Number.isInteger(t) || t < 0 || t > 10080)
+        return `Step ${i + 1} timeout must be a whole number 0–10080 minutes (0 = inherit)`;
+    }
     return null;
-  }, [maxRetries, retryBackoff]);
+  }, [maxRetries, retryBackoff, jobTimeout, steps]);
 
   function addStep(type: string) {
     const meta = metaFor(templates, type);
@@ -99,6 +117,12 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
     setSteps(next);
   }
 
+  // setStepTimeout updates a step's optional wall-clock limit (minutes).
+  // 0 = inherit (no per-step limit) — the save payload omits it then.
+  function setStepTimeout(i: number, value: number) {
+    setSteps(steps.map((s, idx) => (idx === i ? { ...s, timeout_minutes: value } : s)));
+  }
+
   async function save() {
     // Client-side validation of the retry policy before hitting the API.
     if (!retryValid) {
@@ -110,15 +134,19 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
     try {
       // Strip empty params so the backend applies step defaults; keep
       // explicit values (including booleans) so the flow stays self-documenting.
+      // Per-step timeouts ride along only when set (>0); 0 = inherit and is
+      // omitted so the wire shape stays minimal for flows without limits.
       const cleaned = steps.map((s) => ({
         type: s.type,
         params: Object.fromEntries(
           Object.entries(s.params ?? {}).filter(([, v]) => v.trim() !== ''),
         ),
+        ...((s.timeout_minutes ?? 0) > 0 ? { timeout_minutes: s.timeout_minutes } : {}),
       }));
       await onSave(name.trim(), cleaned, {
         max_retries: maxRetries,
         retry_backoff_minutes: maxRetries > 0 ? retryBackoff : 0,
+        job_timeout_minutes: jobTimeout,
       });
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -168,6 +196,18 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
             style={{ width: 80, marginLeft: 6 }}
           />
         </label>
+        <label>
+          Job timeout (minutes)
+          <input
+            type="number"
+            min={0}
+            max={10080}
+            value={jobTimeout}
+            onChange={(e) => setJobTimeout(Number(e.target.value))}
+            style={{ width: 80, marginLeft: 6 }}
+            title="Whole-job wall-clock limit enforced by the agent. 0 = off."
+          />
+        </label>
       </div>
 
       <div className="flow-canvas">
@@ -212,6 +252,22 @@ export default function FlowBuilder({ initial, templates, onSave, onCancel }: Pr
                       )}
                     </div>
                   )}
+                  {/* Optional per-step wall-clock limit (minutes). Reuses the
+                      step-params label/input styling; 0 = inherit (only the
+                      flow's job timeout applies). */}
+                  <div className="step-params">
+                    <label>
+                      Timeout (minutes)
+                      <input
+                        type="number"
+                        min={0}
+                        max={10080}
+                        value={s.timeout_minutes ?? 0}
+                        onChange={(e) => setStepTimeout(i, Number(e.target.value))}
+                        title="Per-step wall-clock limit enforced by the agent. 0 = inherit (job timeout only)."
+                      />
+                    </label>
+                  </div>
                 </div>
                 <div className="step-actions">
                   <button title="Move up" onClick={() => moveStep(i, -1)} disabled={i === 0}>

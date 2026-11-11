@@ -165,6 +165,8 @@ export default function SettingsPage() {
         job_retention_days: clampInt(settings.job_retention_days ?? 0, 0, 3650),
         // 0 = disabled; a cleared (NaN) field maps to lo=0, the safe default.
         disk_alert_gb: clampInt(settings.disk_alert_gb ?? 0, 0, 100000),
+        // Stall watchdog: 0 = off; same NaN→0 safe default, ceiling 1 week.
+        stall_timeout_minutes: clampInt(settings.stall_timeout_minutes ?? 0, 0, 10080),
       };
       const saved = await api.saveSettings(toSave);
       setSettings(saved);
@@ -379,6 +381,21 @@ export default function SettingsPage() {
               disabled={!isAdmin}
             onChange={(e) => set('disk_alert_gb', Number(e.target.value))}
               title="Nodes below this free space alert Discord (1/hour) and take no new jobs until they recover. 0 disables."
+            />
+          </label>
+          <label style={{ flex: 1 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>
+              Stall timeout (minutes, 0 = off)
+            </span>
+            <input
+              type="number"
+              min={0}
+              max={10080}
+              style={{ width: '100%' }}
+              value={settings.stall_timeout_minutes ?? 0}
+              disabled={!isAdmin}
+            onChange={(e) => set('stall_timeout_minutes', Number(e.target.value))}
+              title="Running jobs reporting no step/progress change for this long are failed as stalled (flow retry policy applies). 0 disables."
             />
           </label>
           <label style={{ flex: 1 }}>

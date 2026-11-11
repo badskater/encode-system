@@ -50,6 +50,11 @@ const (
 type Step struct {
 	Type   StepType          `json:"type"`
 	Params map[string]string `json:"params,omitempty"`
+	// TimeoutMinutes bounds this step's wall-clock runtime on the agent.
+	// 0/absent = no per-step limit (the job timeout, if any, still applies).
+	// Stored inside the flow's steps_json like Params — additive, so old
+	// flows and old agents are unaffected. Validated 0-10080 at the API.
+	TimeoutMinutes int `json:"timeout_minutes,omitempty"`
 }
 
 // TemplateKey returns the step's template reference (defaults to its type).
@@ -71,9 +76,15 @@ type Flow struct {
 	// assignable again. Applied only when MaxRetries > 0; a zero value when
 	// retries are enabled defaults to a sensible minimum at the decision
 	// site so a retry is never instant. Stored in options_json.
-	RetryBackoffMinutes int       `json:"retry_backoff_minutes"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	RetryBackoffMinutes int `json:"retry_backoff_minutes"`
+	// JobTimeoutMinutes bounds the whole job's wall-clock runtime on the
+	// agent: the agent kills the job's process tree and reports a failure
+	// when it expires. 0 = timeout OFF (the default for flows created
+	// before the resilience batch). Stored in options_json alongside the
+	// retry policy. Validated 0-10080 (one week) at the API.
+	JobTimeoutMinutes int       `json:"job_timeout_minutes"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // User is a management-plane account (login-based, replaces the static
@@ -224,6 +235,14 @@ type Settings struct {
 	// hourly retention loop. 0 = keep forever (the default, and the zero
 	// value old settings rows unmarshal to). Validated 0 or 1-3650.
 	JobRetentionDays int `json:"job_retention_days"`
+
+	// StallTimeoutMinutes is the controller-side stall watchdog threshold:
+	// a RUNNING job whose last_progress_at (stamped on claim and refreshed
+	// by heartbeats that report changed step/progress) is older than this
+	// is failed as stalled, through the normal failure path so the flow's
+	// retry policy applies. 0 = watchdog OFF (the default, and the zero
+	// value old settings rows unmarshal to). Validated 0-10080.
+	StallTimeoutMinutes int `json:"stall_timeout_minutes"`
 
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
@@ -532,6 +551,24 @@ type JobPayload struct {
 	// running the script and uploads each Upload dir AFTER a successful
 	// run. Nil for mount-backed jobs (the common case).
 	S3 *S3Transfer `json:"s3,omitempty"`
+	// JobTimeoutMinutes bounds the whole job's runtime on the agent
+	// (0/absent = no limit). Additive wire field: old agents ignore it.
+	JobTimeoutMinutes int `json:"job_timeout_minutes,omitempty"`
+	// StepTimeouts carries the per-step limits for steps that set one
+	// (0-minute steps are omitted). The agent applies each limit when the
+	// step's first ENCODE_STEP marker arrives, clamped to the remaining
+	// job time. Additive wire field: old agents ignore it.
+	StepTimeouts []StepTimeout `json:"step_timeouts,omitempty"`
+}
+
+// StepTimeout is one per-step runtime limit on the job payload. Step is the
+// step type — the same name the rendered script emits in its ENCODE_STEP
+// markers — and Index is the step's position in the flow (diagnostic; the
+// agent keys enforcement on Step because markers carry no index).
+type StepTimeout struct {
+	Index          int    `json:"index"`
+	Step           string `json:"step"`
+	TimeoutMinutes int    `json:"timeout_minutes"`
 }
 
 // S3Transfer is the per-job object-store work order. Credentials are

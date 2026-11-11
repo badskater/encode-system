@@ -34,6 +34,11 @@ const (
 	// diffs node liveness against an in-memory baseline and sends Discord
 	// alerts on transitions (online→offline, offline→online).
 	LockKeyNodeAlert int64 = 1006
+	// LockKeyStallWatchdog guards the job stall watchdog loop. Each tick
+	// fails running jobs whose last_progress_at is older than the
+	// settings stall threshold (two replicas failing the same job would
+	// double-count retries and double-notify).
+	LockKeyStallWatchdog int64 = 1007
 )
 
 // advisoryLockKeepalive is how often the held-lock keepalive probes the

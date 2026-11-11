@@ -364,7 +364,7 @@ export const api = {
   flows: () => request<Flow[]>('GET', '/api/flows'),
   createFlow: (flow: Omit<Flow, 'id' | 'created_at' | 'updated_at'>) =>
     request<Flow>('POST', '/api/flows', flow),
-  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps' | 'max_retries' | 'retry_backoff_minutes'>>) =>
+  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps' | 'max_retries' | 'retry_backoff_minutes' | 'job_timeout_minutes'>>) =>
     request<Flow>('PUT', `/api/flows/${id}`, flow),
   deleteFlow: (id: number) => request<void>('DELETE', `/api/flows/${id}`),
   setDefaultFlow: (id: number) => request<Flow>('POST', `/api/flows/${id}/default`),

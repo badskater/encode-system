@@ -272,6 +272,16 @@ func main() {
 	// ctx as the scanner/digest loops so SIGTERM stops all of them cleanly.
 	srv.StartRetentionLoop(ctx)
 
+	// Stall watchdog: 30s pass that fails RUNNING jobs whose last progress
+	// (claim stamp / changed-step-or-progress heartbeats) is older than
+	// settings.StallTimeoutMinutes (0 = off, the default). Catches wedged
+	// encodes that keep heartbeating the same percentage — the gap between
+	// agent-side job timeouts and orphan recovery. Failures route through
+	// the normal failure path so flow retry policy applies. HA: wrapped in
+	// RunLoopSupervisor (LockKeyStallWatchdog) so only one replica fails
+	// stalled jobs. Bound to the same ctx so SIGTERM stops it cleanly.
+	srv.StartStallWatchdogLoop(ctx)
+
 	// DB backup scheduler: periodic snapshots under <dataDir>/backups (SQLite
 	// VACUUM INTO or PG logical dump), keeps the newest 24 scheduled ones;
 	// manual snapshots are never auto-pruned. Enabled/interval live-adjustable

@@ -14,6 +14,9 @@ export type StepType =
 export interface Step {
   type: string;
   params?: Record<string, string>;
+  // Per-step wall-clock limit enforced by the agent (minutes). 0/absent =
+  // no per-step limit (the flow's job timeout, if any, still applies).
+  timeout_minutes?: number;
 }
 
 export interface Flow {
@@ -28,6 +31,10 @@ export interface Flow {
   // max_retries > 0.
   max_retries?: number;
   retry_backoff_minutes?: number;
+  // Whole-job wall-clock limit enforced by the agent (minutes). The agent
+  // kills the job's process tree and reports a failure when it expires.
+  // 0/absent = no timeout. Valid range on save: 0-10080.
+  job_timeout_minutes?: number;
 }
 
 export interface Series {
@@ -127,6 +134,11 @@ export interface Settings {
   // when a node transitions between online/offline/busy states. Off by
   // default — only meaningful when discord_webhook is also set.
   notify_node_status?: boolean;
+  // Stall watchdog threshold (minutes): running jobs whose last reported
+  // step/progress is older than this are failed as stalled (through the
+  // normal failure path, so flow retry policy applies). 0/absent = off.
+  // Valid range on save: 0-10080.
+  stall_timeout_minutes?: number;
   updated_at?: string;
 }
 

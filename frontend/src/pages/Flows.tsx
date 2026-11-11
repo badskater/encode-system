@@ -24,6 +24,7 @@ export default function FlowsPage() {
         steps,
         max_retries: policy.max_retries,
         retry_backoff_minutes: policy.retry_backoff_minutes,
+        job_timeout_minutes: policy.job_timeout_minutes,
       });
     } else {
       await api.createFlow({
@@ -32,6 +33,7 @@ export default function FlowsPage() {
         is_default: false,
         max_retries: policy.max_retries,
         retry_backoff_minutes: policy.retry_backoff_minutes,
+        job_timeout_minutes: policy.job_timeout_minutes,
       });
     }
     setEditing(null);
@@ -180,6 +182,9 @@ export default function FlowsPage() {
                 {f.max_retries && f.max_retries > 0
                   ? `retry ${f.max_retries}× @${f.retry_backoff_minutes ?? 15}m`
                   : 'no retry'}
+                {f.job_timeout_minutes && f.job_timeout_minutes > 0
+                  ? ` · timeout ${f.job_timeout_minutes}m`
+                  : ''}
               </td>
               <td>
                 {f.is_default ? (

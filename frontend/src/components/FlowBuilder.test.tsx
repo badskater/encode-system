@@ -179,7 +179,7 @@ describe('FlowBuilder', () => {
 
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     const [, , policy] = onSave.mock.calls[0];
-    expect(policy).toEqual({ max_retries: 3, retry_backoff_minutes: 15 });
+    expect(policy).toEqual({ max_retries: 3, retry_backoff_minutes: 15, job_timeout_minutes: 0 });
   });
 
   it('blocks save when max retries exceeds 10', async () => {
@@ -227,6 +227,131 @@ describe('FlowBuilder', () => {
 
     fireEvent.click(screen.getByText('Create flow'));
     await waitFor(() => expect(screen.getByText(/retries must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe('FlowBuilder timeouts', () => {
+  it('renders the job timeout field defaulting to 0 (off)', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const input = screen.getByLabelText(/job timeout/i) as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.value).toBe('0');
+  });
+
+  it('prefills the job timeout from the initial flow', () => {
+    const flow: Flow = {
+      id: 1, name: 'existing', steps: [{ type: 'encode' }],
+      is_default: false, created_at: '', updated_at: '',
+      job_timeout_minutes: 90,
+    };
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    expect((screen.getByLabelText(/job timeout/i) as HTMLInputElement).value).toBe('90');
+  });
+
+  it('passes job_timeout_minutes in the onSave policy', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'timeout-flow' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '120' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, , policy] = onSave.mock.calls[0];
+    expect(policy).toEqual({ max_retries: 0, retry_backoff_minutes: 0, job_timeout_minutes: 120 });
+  });
+
+  it('blocks save when the job timeout exceeds 10080', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '10081' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/job timeout must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when the job timeout is fractional', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'frac-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '2.5' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/job timeout must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('renders a per-step timeout input for every step', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.click(screen.getByText('MKV mux'));
+    // Exact label match: the flow-level field is "Job timeout (minutes)".
+    expect(screen.getAllByLabelText('Timeout (minutes)')).toHaveLength(2);
+  });
+
+  it('prefills step timeouts from the initial flow', () => {
+    const flow: Flow = {
+      id: 1, name: 'existing',
+      steps: [{ type: 'encode', timeout_minutes: 30 }, { type: 'mux' }],
+      is_default: false, created_at: '', updated_at: '',
+    };
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const inputs = screen.getAllByLabelText('Timeout (minutes)') as HTMLInputElement[];
+    expect(inputs[0].value).toBe('30');
+    expect(inputs[1].value).toBe('0');
+  });
+
+  it('includes timeout_minutes in the save payload when set', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'step-timeout-flow' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText('Timeout (minutes)'), { target: { value: '45' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'dgindex', params: {}, timeout_minutes: 45 }]);
+  });
+
+  it('omits timeout_minutes from the payload when 0 (inherit)', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'no-step-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'dgindex', params: {} }]);
+  });
+
+  it('blocks save when a step timeout exceeds 10080', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad-step-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText('Timeout (minutes)'), { target: { value: '10081' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/step 1 timeout must be a whole number/i)).toBeInTheDocument());
     expect(onSave).not.toHaveBeenCalled();
   });
 });

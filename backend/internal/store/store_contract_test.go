@@ -297,6 +297,104 @@ func storeContract(t *testing.T, openFn func(t *testing.T) *Store) {
 	if gotRetry.LastFailedNodeID != 0 {
 		t.Fatalf("done finish should clear steering: last_failed_node_id = %d", gotRetry.LastFailedNodeID)
 	}
+
+	// --- Flow options: job timeout + per-step timeout round-trip ---
+	toFlow, err := s.CreateFlow(ctx, &model.Flow{
+		Name:              "contract-timeout-flow",
+		Steps:             []model.Step{{Type: model.StepEncode, TimeoutMinutes: 45}, {Type: model.StepMux}},
+		MaxRetries:        1,
+		JobTimeoutMinutes: 240,
+	})
+	if err != nil {
+		t.Fatalf("create timeout flow: %v", err)
+	}
+	gotTO, err := s.GetFlow(ctx, toFlow.ID)
+	if err != nil {
+		t.Fatalf("get timeout flow: %v", err)
+	}
+	if gotTO.JobTimeoutMinutes != 240 || gotTO.MaxRetries != 1 {
+		t.Fatalf("flow options round-trip: %+v", gotTO)
+	}
+	if len(gotTO.Steps) != 2 || gotTO.Steps[0].TimeoutMinutes != 45 || gotTO.Steps[1].TimeoutMinutes != 0 {
+		t.Fatalf("step timeout round-trip: %+v", gotTO.Steps)
+	}
+	// PUT-style update replaces the options (timeout OFF must persist).
+	gotTO.JobTimeoutMinutes = 0
+	gotTO.Steps[0].TimeoutMinutes = 0
+	if err := s.UpdateFlow(ctx, gotTO); err != nil {
+		t.Fatalf("update timeout flow: %v", err)
+	}
+	gotTO, _ = s.GetFlow(ctx, toFlow.ID)
+	if gotTO.JobTimeoutMinutes != 0 || gotTO.Steps[0].TimeoutMinutes != 0 {
+		t.Fatalf("timeout OFF did not persist: %+v", gotTO)
+	}
+
+	// --- Stall watchdog: last_progress_at claim stamp + touch + query ---
+	wdNode, err := s.CreateNode(ctx, "contract-wd-node", "wdh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wdJob, err := s.CreateJob(ctx, &model.Job{
+		Series: "WatchShow", Episode: "01", EpisodeDir: "WatchShow/Ep 01",
+		ScriptType: "vpy", FlowID: flow.ID,
+	})
+	if err != nil {
+		t.Fatalf("create watchdog job: %v", err)
+	}
+	// Pending jobs carry no stamp and are never returned by the query.
+	if ts, err := s.JobLastProgressAt(ctx, wdJob.ID); err != nil || ts != nil {
+		t.Fatalf("pending job stamp = %v err=%v, want nil", ts, err)
+	}
+	if err := s.AssignJob(ctx, wdJob.ID, wdNode.ID); err != nil {
+		t.Fatalf("assign watchdog job: %v", err)
+	}
+	claimed, err := s.JobLastProgressAt(ctx, wdJob.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim must stamp last_progress_at: %v err=%v", claimed, err)
+	}
+	if err := s.UpdateJobStatus(ctx, wdJob.ID, model.JobRunning, "encode", 10, ""); err != nil {
+		t.Fatalf("run watchdog job: %v", err)
+	}
+	// Backdate the stamp (second-granularity timestamps make a sleep-based
+	// assertion flaky; the contract suite controls time explicitly).
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.SeedJobLastProgress(ctx, wdJob.ID, old); err != nil {
+		t.Fatalf("backdate progress: %v", err)
+	}
+	stalled, err := s.StalledRunningJobs(ctx, time.Now().UTC().Add(-1*time.Hour))
+	if err != nil {
+		t.Fatalf("stalled query: %v", err)
+	}
+	if len(stalled) != 1 || stalled[0].ID != wdJob.ID {
+		t.Fatalf("stalled jobs = %+v, want exactly the backdated running job", stalled)
+	}
+	// TouchJobProgress refreshes the stamp → the job leaves the stalled set.
+	if err := s.TouchJobProgress(ctx, wdJob.ID); err != nil {
+		t.Fatalf("touch progress: %v", err)
+	}
+	refreshed, err := s.JobLastProgressAt(ctx, wdJob.ID)
+	if err != nil || refreshed == nil || !refreshed.After(old) {
+		t.Fatalf("touch did not refresh stamp: %v (was %v) err=%v", refreshed, old, err)
+	}
+	stalled, err = s.StalledRunningJobs(ctx, time.Now().UTC().Add(-1*time.Hour))
+	if err != nil || len(stalled) != 0 {
+		t.Fatalf("fresh-progress job must not stall: %+v err=%v", stalled, err)
+	}
+	// A terminal job is never returned even when its stamp is ancient.
+	if err := s.FinishJob(ctx, wdJob.ID, model.JobFailed, 1, "stalled: no progress for 60 minutes", nil, ""); err != nil {
+		t.Fatalf("finish watchdog job: %v", err)
+	}
+	if err := s.SeedJobLastProgress(ctx, wdJob.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err = s.StalledRunningJobs(ctx, time.Now().UTC())
+	if err != nil || len(stalled) != 0 {
+		t.Fatalf("terminal job must not stall: %+v err=%v", stalled, err)
+	}
+	// The stall counter derives from failed rows with the stall prefix.
+	if n, err := s.CountStalledJobs(ctx); err != nil || n != 1 {
+		t.Fatalf("CountStalledJobs = %d err=%v, want 1", n, err)
+	}
 }
 
 // TestContractSQLite runs the contract suite against a tmpfile SQLite store.

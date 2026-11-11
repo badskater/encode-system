@@ -426,8 +426,17 @@ func (a *Agent) getAuth(ctx context.Context, path string, w io.Writer) error {
 var stepLine = regexp.MustCompile(`ENCODE_STEP (\w+) (\d+(?:\.\d+)?)`)
 
 // executeJob runs one job: write the rendered script, invoke PowerShell,
-// parse progress lines, and report completion.
+// parse progress lines, and report completion. The execution limits come
+// from the payload's timeout fields (minute granularity on the wire).
 func (a *Agent) executeJob(job *model.JobPayload) {
+	a.executeJobWithLimits(job, limitsFromPayload(job))
+}
+
+// executeJobWithLimits is executeJob with the resolved execution limits
+// passed explicitly — the injection seam that lets tests exercise the
+// timeout kill path with second-scale deadlines instead of waiting whole
+// minutes. Production always enters through executeJob.
+func (a *Agent) executeJobWithLimits(job *model.JobPayload, limits jobLimits) {
 	// Register if not already (direct test calls bypass acceptJobs); the
 	// registry dedupes by id so a double-register is impossible.
 	r := a.registry()
@@ -437,6 +446,17 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 
 	log := a.Log.With("job", job.ID)
 	log.Info("executing job", "flow", job.Flow, "episode", job.Vars["episode_dir"])
+
+	// Job/step timeout enforcement (resilience batch): the whole job —
+	// S3 staging included — runs under the job context, so a hung
+	// download cannot hold a slot forever either. Zero limits keep
+	// context.Background (no deadline, pre-batch behavior).
+	jobCtx := context.Background()
+	if limits.job > 0 {
+		var cancel context.CancelFunc
+		jobCtx, cancel = context.WithTimeout(context.Background(), limits.job)
+		defer cancel()
+	}
 
 	jobDir := filepath.Join(a.Cfg.DataDir, "jobs", fmt.Sprintf("%d", job.ID))
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
@@ -509,7 +529,7 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 			return
 		}
 		log.Info("downloading s3 sources", "downloads", len(job.S3.Downloads))
-		if err := runS3Downloads(context.Background(), store, job.S3); err != nil {
+		if err := runS3Downloads(jobCtx, store, job.S3); err != nil {
 			a.completeJob(job.ID, "failed", -1, "s3 download: "+err.Error(), nil, "", "", nil, nil)
 			return
 		}
@@ -525,10 +545,10 @@ func (a *Agent) executeJob(job *model.JobPayload) {
 	var stepErr string
 	var timings *stepTimingTracker
 	if linux {
-		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics)
+		exitCode, tail, stepErr, timings = a.runBash(scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits)
 	} else {
 		ps := a.findPowerShell()
-		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics)
+		exitCode, tail, stepErr, timings = a.runPowerShell(ps, scriptPath, runLog, aj.prog, aj.metrics, jobCtx, limits)
 	}
 
 	status := "done"
@@ -616,10 +636,10 @@ func (a *Agent) findPowerShell() string {
 // arrival time, time.Now()), not a post-hoc single-timestamp pass after
 // cmd.Wait. The full output is still accumulated for tail extraction and the
 // ENCODE_STEP_FAILED scan, which run unchanged.
-func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	cmd := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-LibPath", a.Cfg.LibPath)
-	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "powershell", timings, jobCtx, limits)
 }
 
 // runBash executes the Linux job script via bash, teeing output to run.log.
@@ -628,14 +648,14 @@ func (a *Agent) runPowerShell(ps, scriptPath, runLog string, prog *progressTrack
 // per-dialect parser logic is needed. bash's `set -euo pipefail` (emitted by
 // the bash dialect preamble) makes a nonzero step exit propagate to a nonzero
 // script exit, which the exit-code path below reports as failed.
-func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
+func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metrics *metricTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, timings *stepTimingTracker) {
 	timings = newStepTracker()
 	// /usr/bin/env bash resolves the interpreter via PATH; falls back to
 	// a direct bash lookup. The script carries its own shebang too, so
 	// `bash <script>` is belt-and-suspenders on hosts where /usr/bin/env
 	// is missing.
 	cmd := exec.Command("bash", scriptPath)
-	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings)
+	return a.runJobCommand(cmd, runLog, prog, metrics, "bash", timings, jobCtx, limits)
 }
 
 // runJobCommand is the shared execution core for both PowerShell and bash
@@ -646,7 +666,15 @@ func (a *Agent) runBash(scriptPath, runLog string, prog *progressTracker, metric
 // timings. The interpreter label is used only in the cmd.Start error message
 // so a failure to launch names the right tool. This is dialect-agnostic: the
 // marker text is identical across dialects, so the parser never branches.
-func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
+//
+// Timeout enforcement (resilience batch): jobCtx carries the job deadline
+// (context.WithTimeout in executeJob when the flow sets one) and limits
+// carries the per-step deadlines. A watchdog goroutine kills the WHOLE
+// process tree (Linux process-group SIGKILL / Windows taskkill /T /F) when
+// a deadline expires; the resulting nonzero exit is reported with the
+// timeout reason as the step error, flowing through the normal failure
+// path (completeJob → controller retry/audit/notify).
+func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracker, metrics *metricTracker, interpreter string, timings *stepTimingTracker, jobCtx context.Context, limits jobLimits) (exitCode int, tail string, stepErr string, _ *stepTimingTracker) {
 	observer := newLineObserver(a.Log, timings) // live scan: stamps each marker at arrival
 	if prog == nil {
 		// Defensive: direct callers without a tracker get a throwaway
@@ -660,6 +688,20 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 	}
 	observer.metrics = metrics // ENCODE_METRIC accumulator (vmaf, sizes…)
 	metrics.reset()
+
+	// Timeout watcher: the job deadline comes from the context; each step's
+	// deadline is armed when its FIRST ENCODE_STEP marker arrives (the
+	// observer hook below), clamped to the remaining job time.
+	watch := &timeoutWatcher{}
+	if deadline, ok := jobCtx.Deadline(); ok {
+		watch.setJobDeadline(deadline, limits.job)
+	}
+	observer.onStepStart = func(name string) {
+		if d, ok := limits.steps[name]; ok {
+			watch.startStep(name, d, time.Now())
+		}
+	}
+
 	// 0600: run.log can echo the discord_notify webhook line — keep it
 	// owner-only like the job script (security audit 2026-10).
 	f, err := os.OpenFile(runLog, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -673,9 +715,43 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 	cmd.Stdout = mw
 	cmd.Stderr = mw
 
+	// Own process group (Linux) so the timeout kill reaches encoder
+	// children, not just the script. No-op on Windows (taskkill /T walks
+	// the tree by PID instead).
+	setProcessGroup(cmd)
+
 	if err := cmd.Start(); err != nil {
 		return -1, "", "start " + interpreter + ": " + err.Error(), timings
 	}
+
+	// Watchdog: polls the deadlines and kills the process tree on expiry.
+	// 100ms granularity is invisible against minute-scale limits and keeps
+	// second-scale test limits snappy. The goroutine exits once it fires or
+	// when watchDone closes after cmd.Wait returns.
+	watchDone := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-jobCtx.Done():
+				// Job deadline expired (the only cancel source while the
+				// job runs is the WithTimeout in executeJob).
+				if _, ok := watch.expire(time.Now()); ok {
+					_ = killProcessTree(cmd)
+				}
+				return
+			case <-tick.C:
+				if _, ok := watch.expire(time.Now()); ok {
+					_ = killProcessTree(cmd)
+					return
+				}
+			}
+		}
+	}()
+
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
@@ -683,6 +759,7 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 			exitCode = -1
 		}
 	}
+	close(watchDone)
 	// Process any final trailing partial line that never got a newline.
 	observer.flush()
 
@@ -699,6 +776,15 @@ func (a *Agent) runJobCommand(cmd *exec.Cmd, runLog string, prog *progressTracke
 	for _, l := range lines {
 		if strings.HasPrefix(l, "ENCODE_STEP_FAILED") {
 			stepErr = strings.TrimSpace(l)
+		}
+	}
+	// A fired timeout is the authoritative failure reason — it overrides
+	// any marker scan. Only apply it when the run actually failed: a script
+	// that exited 0 in the instant before the kill landed completed
+	// successfully and must not be reported as timed out.
+	if exitCode != 0 {
+		if reason := watch.takeReason(); reason != "" {
+			stepErr = reason
 		}
 	}
 	return exitCode, tail, stepErr, timings

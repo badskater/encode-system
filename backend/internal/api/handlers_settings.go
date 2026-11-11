@@ -84,6 +84,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		"notify_node_status":    req.NotifyNodeStatus,
 		"job_retention_days":    req.JobRetentionDays,
 		"disk_alert_gb":         req.DiskAlertGB,
+		"stall_timeout_minutes": req.StallTimeoutMinutes,
 		"webhook_set":           req.DiscordWebhook != "",
 	})
 	writeJSON(w, http.StatusOK, s.currentSettings(r.Context()))
@@ -125,6 +126,11 @@ func validateSettings(st *model.Settings) error {
 	// sane range for a threshold on an encode farm.
 	if st.DiskAlertGB < 0 || st.DiskAlertGB > 100000 {
 		return errSettings("disk_alert_gb must be 0 (disabled) or 1-100000")
+	}
+	// Stall watchdog: 0 disables it; otherwise 1 minute - 1 week. A
+	// threshold below the heartbeat cadence would fail healthy jobs.
+	if st.StallTimeoutMinutes < 0 || st.StallTimeoutMinutes > 10080 {
+		return errSettings("stall_timeout_minutes must be 0 (disabled) or 1-10080")
 	}
 	if st.Group == "" {
 		return errSettings("group is required")

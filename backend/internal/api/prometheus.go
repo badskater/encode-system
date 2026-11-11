@@ -37,6 +37,17 @@ func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	writeCounter(&b, "encode_jobs_done_total", "Jobs finished successfully since DB start.", float64(counts[string(model.JobDone)]))
 	writeCounter(&b, "encode_jobs_failed_total", "Jobs failed since DB start.", float64(counts[string(model.JobFailed)]))
 	writeCounter(&b, "encode_jobs_cancelled_total", "Jobs cancelled since DB start.", float64(counts[string(model.JobCancelled)]))
+	// Stall watchdog counter: failed jobs carrying the watchdog's stall
+	// error prefix. DB-derived like the other job counters, so every HA
+	// replica serves the same number (an in-memory tally would reset on
+	// restart and diverge across replicas).
+	stalled, err := s.Store.CountStalledJobs(ctx)
+	if err != nil {
+		s.Log.Error("prometheus: stalled job count", "err", err)
+		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
+		return
+	}
+	writeCounter(&b, "encode_jobs_stalled_total", "Jobs failed by the stall watchdog (no progress within the configured threshold).", float64(stalled))
 
 	// ---- node liveness (gauge with node label) ----
 	nodes, err := s.Store.ListNodes(ctx)

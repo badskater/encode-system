@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -130,6 +131,16 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, node *m
 		if err := s.Store.UpdateJobStatus(ctx, job.ID, model.JobStatus(rep.JobStatus), rep.Step, rep.StepProgress, rep.LogTail); err != nil {
 			s.Log.Warn("update job status", "err", err, "job", job.ID)
 		} else {
+			// Stall-watchdog progress stamp: refresh last_progress_at ONLY
+			// when the reported step or progress differs from the stored
+			// row (job is the pre-update snapshot). An unchanged heartbeat
+			// must not refresh the stamp — a wedged encode reporting the
+			// same percentage forever is exactly what the watchdog fails.
+			if rep.Step != job.Step || rep.StepProgress != job.Progress {
+				if err := s.Store.TouchJobProgress(ctx, job.ID); err != nil {
+					s.Log.Warn("touch job progress", "err", err, "job", job.ID)
+				}
+			}
 			// DB write landed: fan the live snapshot out to SSE
 			// log-stream subscribers. Publish AFTER the store write
 			// so stream events never run ahead of persisted state.
@@ -470,6 +481,20 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job, platform string)
 	if episode == "" {
 		episode = flow.EpisodeNumber(job.EpisodeDir)
 	}
+	// Timeout wire fields (resilience batch): the flow's job limit plus one
+	// entry per step that sets a limit. Additive — old agents ignore unknown
+	// keys, and the heartbeat/claim shapes are untouched. Step names match
+	// the ENCODE_STEP markers the rendered script emits (the step type).
+	var stepTimeouts []model.StepTimeout
+	for i, st := range fl.Steps {
+		if st.TimeoutMinutes > 0 {
+			stepTimeouts = append(stepTimeouts, model.StepTimeout{
+				Index:          i,
+				Step:           string(st.Type),
+				TimeoutMinutes: st.TimeoutMinutes,
+			})
+		}
+	}
 	return &model.JobPayload{
 		ID:     job.ID,
 		Script: script,
@@ -480,8 +505,10 @@ func (s *Server) renderJob(ctx context.Context, job *model.Job, platform string)
 			// output file instead of the episode directory itself.
 			"expected_output": flow.OutputName(job.Series, episode, vars.Tag),
 		},
-		Flow: fl.Name,
-		S3:   s3spec,
+		Flow:              fl.Name,
+		S3:                s3spec,
+		JobTimeoutMinutes: fl.JobTimeoutMinutes,
+		StepTimeouts:      stepTimeouts,
 	}, nil
 }
 
@@ -1305,6 +1332,26 @@ func (s *Server) handleListFlows(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, flows)
 }
 
+// maxTimeoutMinutes bounds job/step/stall timeout settings: one week. A
+// shared ceiling keeps the three knobs consistent (and a fat-fingered
+// huge value can never overflow a time.Duration multiply downstream).
+const maxTimeoutMinutes = 10080
+
+// validateFlowTimeouts checks the flow's job timeout and every step's
+// timeout against the shared 0-10080 bound. 0 = off/inherit and is always
+// valid; negative or absurd values are rejected at the API boundary.
+func validateFlowTimeouts(f *model.Flow) error {
+	if f.JobTimeoutMinutes < 0 || f.JobTimeoutMinutes > maxTimeoutMinutes {
+		return fmt.Errorf("job_timeout_minutes must be 0 (off) or 1-%d", maxTimeoutMinutes)
+	}
+	for i, st := range f.Steps {
+		if st.TimeoutMinutes < 0 || st.TimeoutMinutes > maxTimeoutMinutes {
+			return fmt.Errorf("step %d (%s): timeout_minutes must be 0 (inherit) or 1-%d", i, st.Type, maxTimeoutMinutes)
+		}
+	}
+	return nil
+}
+
 // handleCreateFlow creates a flow from the UI builder.
 func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 	var req model.Flow
@@ -1314,6 +1361,10 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" || len(req.Steps) == 0 {
 		writeErr(w, http.StatusBadRequest, "name and at least one step required")
+		return
+	}
+	if err := validateFlowTimeouts(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Server-controlled fields never come from the client.
@@ -1368,6 +1419,12 @@ func (s *Server) handleUpdateFlow(w http.ResponseWriter, r *http.Request) {
 	// retry policy OFF would leave the stale old values in options_json.
 	existing.MaxRetries = req.MaxRetries
 	existing.RetryBackoffMinutes = req.RetryBackoffMinutes
+	// Same replace semantics for the job timeout (0 = OFF must persist).
+	existing.JobTimeoutMinutes = req.JobTimeoutMinutes
+	if err := validateFlowTimeouts(existing); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := flow.ValidateForRender(existing, s.storeResolver()); err != nil {
 		writeErr(w, http.StatusBadRequest, "flow invalid: "+err.Error())
 		return

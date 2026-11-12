@@ -41,6 +41,11 @@
 # Env overrides: ENCODE_HOME (default /opt/encode-system), ENCODE_REPO
 # (default badskater/encode-system), GITHUB_TOKEN (for private repos:
 # a PAT with repo read access; also used for `docker login ghcr.io`).
+#
+# Native HTTPS: set ENCODE_TLS_CERT + ENCODE_TLS_KEY in .env (PEM paths inside
+# the container, mounts in docker-compose.runtime.yml) to serve TLS. This
+# script then health-probes over https automatically. Recipe + agent CA trust
+# (ENCODE_AGENT_CA_CERT): Docs/md/Deployment.md §Native HTTPS.
 set -euo pipefail
 
 REPO="${ENCODE_REPO:-badskater/encode-system}"
@@ -206,6 +211,20 @@ existing=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project
 if [ -n "$existing" ] && [ "$existing" != "$COMPOSE_PROJECT_NAME" ]; then
     die "container '$CONTAINER_NAME' exists but belongs to compose project '$existing' (not '$COMPOSE_PROJECT_NAME'). Refusing to touch it — set ENCODE_COMPOSE_PROJECT=$existing to manage that deployment, or remove the container first."
 fi
+# Native TLS detection: when .env sets BOTH ENCODE_TLS_CERT and ENCODE_TLS_KEY
+# the controller serves HTTPS (it fail-fasts on a partial config). Probe
+# accordingly. -k / --no-check-certificate relax ONLY this installer's local
+# health probe — the typical LAN deploy uses a self-signed CA; agents verify
+# it properly via ENCODE_AGENT_CA_CERT. `|| true` on the greps: a legacy .env
+# without the keys must fall through to the http default, not abort (set -e).
+TLS_CERT="$(grep -E '^ENCODE_TLS_CERT=' .env 2>/dev/null | cut -d= -f2 || true)"
+TLS_KEY="$(grep -E '^ENCODE_TLS_KEY=' .env 2>/dev/null | cut -d= -f2 || true)"
+SCHEME="http"
+if [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ]; then
+    SCHEME="https"
+    log "native TLS enabled (ENCODE_TLS_CERT/KEY set) — health probes use https"
+fi
+
 # Private GHCR image: log in when a token is available.
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${GITHUB_USER:-$USER}" --password-stdin >/dev/null 2>&1 \
@@ -339,8 +358,14 @@ if [ "$USE_HA" = "1" ]; then
     for c in encode-controller-1 encode-controller-2; do
         ok=0
         for _ in $(seq 1 30); do
-            if docker exec "$c" wget -qO- http://localhost:8080/api/health >/dev/null 2>&1; then
-                ok=1; break
+            if [ "$SCHEME" = "https" ]; then
+                if docker exec "$c" wget -qO- --no-check-certificate https://localhost:8080/api/health >/dev/null 2>&1; then
+                    ok=1; break
+                fi
+            else
+                if docker exec "$c" wget -qO- http://localhost:8080/api/health >/dev/null 2>&1; then
+                    ok=1; break
+                fi
             fi
             sleep 2
         done
@@ -365,10 +390,12 @@ compose -f docker-compose.runtime.yml up -d
 # `|| true`: same legacy-.env guard as the container-name read above — a
 # missing ENCODE_PORT key must fall through to the 8080 default, not abort.
 PORT=$(grep -E '^ENCODE_PORT=' .env 2>/dev/null | cut -d= -f2 || true); PORT="${PORT:-8080}"
-for i in $(seq 1 30); do
-    if curl -fsS "http://localhost:$PORT/api/health" >/dev/null 2>&1; then
-        log "controller healthy on port $PORT"
-        log "UI: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):$PORT"
+health_args=(-fsS)
+if [ "$SCHEME" = "https" ]; then health_args+=(-k); fi
+for _ in $(seq 1 30); do
+    if curl "${health_args[@]}" "$SCHEME://localhost:$PORT/api/health" >/dev/null 2>&1; then
+        log "controller healthy on port $PORT ($SCHEME)"
+        log "UI: $SCHEME://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):$PORT"
         exit 0
     fi
     sleep 2

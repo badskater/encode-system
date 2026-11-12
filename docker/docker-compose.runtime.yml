@@ -72,6 +72,13 @@ services:
       # beside the DB automatically). Set to a path on a mounted volume so
       # the key survives container recreation. See Docs/md/Deployment.md.
       ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-}
+      # Native HTTPS (optional): set BOTH vars in .env to PEM file paths
+      # INSIDE the container (uncomment the tls mounts below) to serve the
+      # API, UI, /metrics and health over TLS (1.2 minimum). Exactly one
+      # set = the controller refuses to start; neither = plain HTTP (the
+      # default, unchanged). See Docs/md/Deployment.md §Native HTTPS.
+      ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
+      ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
     volumes:
       # Controller state (SQLite DB + update payloads + shares key file).
       # On Postgres the DB lives in the postgres container's volume, but the
@@ -82,8 +89,19 @@ services:
       # scripts/release roles to S3 shares in the UI (no mounts needed).
       - encode-scripts:/data/scripts
       - encode-release:/data/release
+      # TLS cert/key mounts (optional): uncomment together with
+      # ENCODE_TLS_CERT/KEY above; the container paths must match the env
+      # values. Read-only — the controller never writes them.
+      # - ./tls/controller.crt:/tls/controller.crt:ro
+      # - ./tls/controller.key:/tls/controller.key:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      # Default probes plain HTTP (unchanged). With native TLS enabled set
+      # in .env:
+      #   ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health
+      #   ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate   (self-signed CA;
+      #   omit for publicly trusted certs). This relaxes ONLY the local
+      #   probe — agents still verify via ENCODE_AGENT_CA_CERT.
+      test: ["CMD-SHELL", "wget -qO- ${ENCODE_HEALTHCHECK_FLAGS:-} ${ENCODE_HEALTHCHECK_URL:-http://localhost:8080/api/health}"]
       interval: 30s
       timeout: 5s
       retries: 3

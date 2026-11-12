@@ -96,6 +96,14 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 	if cfg.Token == "" && cfg.PairingCode == "" {
 		return nil, fmt.Errorf("token or pairing_code is required")
 	}
+	// Custom controller CA trust (native controller TLS): ENCODE_AGENT_CA_CERT
+	// points at a PEM file appended to the system pool for EVERY controller-
+	// facing request (heartbeat + update downloads share this one client).
+	// Resolved before any side effect so a broken trust config fails fast.
+	client, err := newControllerClient(os.Getenv("ENCODE_AGENT_CA_CERT"))
+	if err != nil {
+		return nil, err
+	}
 	if cfg.BinDir == "" {
 		cfg.BinDir = `C:\bin`
 	}
@@ -114,10 +122,11 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 	ag := &Agent{
 		Cfg: cfg,
 		Log: log,
-		// No hard client Timeout: large payload downloads are governed by
-		// per-request contexts (heartbeat uses 30s, updates 30m). A fixed
-		// client-wide cap would contradict the download windows.
-		Client:  &http.Client{},
+		// One client for all controller traffic (postJSON + getAuth).
+		// With ENCODE_AGENT_CA_CERT set it carries the custom root pool;
+		// otherwise it is the plain default client. Timeout policy lives
+		// in newControllerClient's comment (per-request contexts).
+		Client:  client,
 		Version: version,
 		prog:    newProgressTracker(progressRingLines),
 		reg:     newJobRegistry(),

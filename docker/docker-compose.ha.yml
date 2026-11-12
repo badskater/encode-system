@@ -76,6 +76,13 @@ services:
       # below is for trials only.
       ENCODE_DATABASE_URL: ${ENCODE_DATABASE_URL:?HA requires Postgres — set ENCODE_DATABASE_URL in .env (see install.sh --postgres)}
       ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-/data/encode.db.shares-key}
+      # Native HTTPS (optional, per replica): set BOTH in .env to PEM paths
+      # inside the container (uncomment the tls mounts below). One set =
+      # fail-fast; neither = plain HTTP. With Traefik terminating TLS at the
+      # edge this is usually left unset (Traefik→replica stays HTTP on the
+      # internal network). See Docs/md/Deployment.md §Native HTTPS.
+      ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
+      ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
     volumes:
       # Shared state volume (update payloads + shares key file + backups).
       # Same named volume names as docker-compose.runtime.yml so publish,
@@ -85,6 +92,9 @@ services:
       - encode-state:/data
       - encode-scripts:/data/scripts
       - encode-release:/data/release
+      # TLS cert/key mounts (optional): uncomment with ENCODE_TLS_CERT/KEY.
+      # - ./tls/controller.crt:/tls/controller.crt:ro
+      # - ./tls/controller.key:/tls/controller.key:ro
     networks:
       - encode-ha-net
       - traefik
@@ -107,7 +117,10 @@ services:
       # server.port points at the controller's in-container 8080.
       traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      # Plain HTTP by default; with native TLS set ENCODE_HEALTHCHECK_URL=
+      # https://localhost:8080/api/health (+ ENCODE_HEALTHCHECK_FLAGS=
+      # --no-check-certificate for a self-signed CA) in .env.
+      test: ["CMD-SHELL", "wget -qO- ${ENCODE_HEALTHCHECK_FLAGS:-} ${ENCODE_HEALTHCHECK_URL:-http://localhost:8080/api/health}"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -135,10 +148,16 @@ services:
       ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
       ENCODE_DATABASE_URL: ${ENCODE_DATABASE_URL:?HA requires Postgres — set ENCODE_DATABASE_URL in .env (see install.sh --postgres)}
       ENCODE_SHARES_KEY_FILE: ${ENCODE_SHARES_KEY_FILE:-/data/encode.db.shares-key}
+      # Native HTTPS (optional) — same contract as controller-1 above.
+      ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
+      ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
     volumes:
       - encode-state:/data
       - encode-scripts:/data/scripts
       - encode-release:/data/release
+      # TLS cert/key mounts (optional): uncomment with ENCODE_TLS_CERT/KEY.
+      # - ./tls/controller.crt:/tls/controller.crt:ro
+      # - ./tls/controller.key:/tls/controller.key:ro
     networks:
       - encode-ha-net
       - traefik
@@ -155,7 +174,10 @@ services:
       traefik.http.routers.encode-controller.middlewares: ${ENCODE_AUTH_MIDDLEWARE:-}
       traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      # Plain HTTP by default; with native TLS set ENCODE_HEALTHCHECK_URL=
+      # https://localhost:8080/api/health (+ ENCODE_HEALTHCHECK_FLAGS=
+      # --no-check-certificate for a self-signed CA) in .env.
+      test: ["CMD-SHELL", "wget -qO- ${ENCODE_HEALTHCHECK_FLAGS:-} ${ENCODE_HEALTHCHECK_URL:-http://localhost:8080/api/health}"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -68,6 +68,18 @@ func main() {
 	}
 	slog.SetDefault(log)
 
+	// Native HTTPS (optional): ENCODE_TLS_CERT + ENCODE_TLS_KEY (PEM file
+	// paths) move the WHOLE server — API, /metrics, health, UI — to TLS
+	// (1.2 minimum). Exactly one set fails fast HERE, before any state is
+	// touched; neither keeps the plain-HTTP default byte-identical. Cert
+	// load errors (missing/unreadable/mismatched files) also fail fast with
+	// the offending paths. See Docs/md/Deployment.md §Native HTTPS.
+	tlsCfg, err := resolveTLSConfig(os.Getenv("ENCODE_TLS_CERT"), os.Getenv("ENCODE_TLS_KEY"))
+	if err != nil {
+		log.Error("tls config", "err", err)
+		os.Exit(1)
+	}
+
 	// Management-plane admin account. Username defaults to "admin". The
 	// password comes from ENCODE_ADMIN_PASSWORD, but ONLY on the boot that
 	// creates the account — existing accounts keep their stored bcrypt hash
@@ -354,9 +366,20 @@ func main() {
 	}()
 
 	log.Info("controller starting", "listen", *listen, "data", *dataDir,
-		"scripts_root", cfg.ScriptsRoot, "scan_interval_s", cfg.ScanIntervalSeconds)
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("http server", "err", err)
+		"scripts_root", cfg.ScriptsRoot, "scan_interval_s", cfg.ScanIntervalSeconds,
+		"tls", tlsCfg != nil)
+	// One server, one port: with TLS configured the SAME mux (API, metrics,
+	// health, SPA) is served over HTTPS. Empty cert/key file names are valid
+	// here because the keypair is already loaded into TLSConfig.
+	var serveErr error
+	if tlsCfg != nil {
+		httpSrv.TLSConfig = tlsCfg
+		serveErr = httpSrv.ListenAndServeTLS("", "")
+	} else {
+		serveErr = httpSrv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Error("http server", "err", serveErr)
 		os.Exit(1)
 	}
 	log.Info("controller stopped")

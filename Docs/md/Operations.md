@@ -2,7 +2,7 @@
 
 ## Health checks
 
-- Controller: `GET /api/health` → `{"status":"ok"}`. Include in any container orchestrator liveness config.
+- Controller: `GET /api/health` → `{"status":"ok"}`. Include in any container orchestrator liveness config. With native TLS enabled the same endpoint is served over HTTPS (`curl --cacert ca.crt https://<controller>:8080/api/health`); the compose healthcheck switches via `ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS` — see the Native TLS runbook below.
 - Node considered stale when no heartbeat for 3× the heartbeat interval (default 15s → stale at 45s). UI shows `offline`.
 
 ## Logs
@@ -772,6 +772,74 @@ Production HA should point `ENCODE_DATABASE_URL` at a managed/external PG
 (RDS, Cloud SQL, a Patroni cluster). If the PG dies, both replicas
 fail-fast-exit on boot (same path as a corrupt SQLite file); bring PG back
 and the replicas reconnect + re-acquire their advisory locks on restart.
+
+## Native TLS runbook
+
+Native controller HTTPS (`ENCODE_TLS_CERT` + `ENCODE_TLS_KEY`) and agent CA
+trust (`ENCODE_AGENT_CA_CERT`). Setup recipe, compose wiring and the farm
+cutover order live in `Docs/md/Deployment.md` §Native HTTPS — this section
+covers verification, rotation and failure diagnosis. With TLS enabled,
+`ENCODE_AGENT_ALLOW_HTTP_UPDATES` is unnecessary (the opt-in only gates
+plain-HTTP downloads); remove it after cutover.
+
+### Verify
+
+```bash
+# Health + metrics over TLS with the farm CA (from any machine holding ca.crt):
+curl --cacert ca.crt https://<controller>:8080/api/health
+curl --cacert ca.crt https://<controller>:8080/metrics | head
+
+# Handshake + served chain + expiry (no CA file needed for inspection):
+openssl s_client -connect <controller>:8080 -servername <controller> </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# On the controller host, straight from the file:
+openssl x509 -in /opt/encode-system/tls/controller.crt -noout -enddate -ext subjectAltName
+```
+
+Agent side: the node shows `online` in UI → Nodes within one heartbeat;
+`agent.log` (Windows) / `journalctl -u encode-agent` (Linux) has no
+`x509`/`certificate` errors. A successful agent self-update after cutover
+proves the download path trusts the cert too.
+
+### Certificate rotation
+
+- **Server cert only (CA unchanged)** — the common case: sign a new
+  `controller.crt` with the existing `ca.key` (recipe step 3 in
+  Deployment.md), replace the mounted file, then
+  `docker compose -f docker-compose.runtime.yml restart controller`
+  (or `up -d` if the mount changed). **Agents need nothing** — they trust
+  the CA, not the leaf. Check the new cert's SANs still cover every
+  name/IP agents dial.
+- **CA rotation**: distribute the NEW `ca.crt` to every node FIRST (append
+  it to the existing PEM file — the agent pool accepts multiple certs —
+  and restart agents), then switch the controller to a cert signed by the
+  new CA. Doing it controller-first breaks every node until they get the
+  new CA.
+- Track expiry: server certs are signed for 825 days in the recipe; set a
+  calendar reminder or scrape `openssl x509 -enddate` in monitoring. An
+  expired cert fails every agent handshake (`x509: certificate has expired
+  or is not yet valid`).
+
+### Failure diagnosis
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Controller exits at boot: `ENCODE_TLS_KEY is set but ENCODE_TLS_CERT is missing` (or vice versa) | Partial TLS config — fail-fast by design | Set BOTH vars in `.env` or remove both (plain HTTP). |
+| Controller exits: `load TLS keypair …` | Missing/unreadable/mismatched cert or key files | Check the compose mounts exist and container paths match the env values; cert and key must be a matching PEM pair. |
+| Container `unhealthy` after enabling TLS | Healthcheck still probes plain HTTP | Set `ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health` (+ `ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate` for self-signed) in `.env`, recreate. |
+| Agent log: `x509: certificate signed by unknown authority` | `ENCODE_AGENT_CA_CERT` unset, wrong file, or not the CA that signed the controller cert | Point it at the correct `ca.crt` (PEM); restart the agent. Machine env on Windows needs an agent restart to take effect. |
+| Agent log: `x509: certificate is valid for X, not Y` | SAN mismatch — cert lacks the IP/hostname in `controller_url` | Re-sign with the right `subjectAltName` (IP SAN for IP URLs); replace controller cert, restart controller. |
+| Agent refuses to start: `ENCODE_AGENT_CA_CERT: cannot read …` / `contains no valid PEM certificates` | Broken path or non-PEM file — fail-fast by design | Fix the path/file; on Linux check the `ca-cert.conf` drop-in, on Windows the machine env var. |
+| Agent log: `refusing download … over plain HTTP` | `controller_url` still `http://` after cutover | Switch `agent.json` to `https://` (or, temporarily, set `ENCODE_AGENT_ALLOW_HTTP_UPDATES=1`). |
+| Node offline right after controller TLS cutover | Node not switched yet (expected mid-cutover) | Apply the node steps (CA env + https URL + restart); old agents retry every heartbeat and recover on their own once switched. |
+
+### Cutover / rollback order (summary)
+
+Controller first (drain or idle window → TLS env + mounts + healthcheck →
+recreate → verify with `curl --cacert`), then node-by-node (CA file + env +
+`https://` URL + restart). Rollback = remove both `ENCODE_TLS_*` vars,
+recreate, point nodes back to `http://` (the CA env is inert on plain HTTP).
+Full step-by-step: `Docs/md/Deployment.md` §Switching an existing farm.
 
 ## Known failure modes
 

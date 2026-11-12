@@ -110,6 +110,7 @@ First-boot env:
 | `ENCODE_SCAN_INTERVAL` | Seconds between share scans (default `30`). |
 | `ENCODE_TASKS_BEFORE_REBOOT` | Default `10`. |
 | `ENCODE_LISTEN` | Listen address (default `:8080`). |
+| `ENCODE_TLS_CERT` / `ENCODE_TLS_KEY` | Native HTTPS: PEM cert + key file paths. Both set → TLS 1.2+; one set → fail-fast; neither → plain HTTP (default). See [Native HTTPS](#native-https-controller-tls). |
 | `ENCODE_BACKUP_ENABLED` / `ENCODE_BACKUP_EVERY_SECONDS` | Seed the scheduled DB-backup defaults (live-editable afterwards via `PUT /api/backup/settings`). |
 | `ENCODE_GROUP` / `ENCODE_TAG` / `ENCODE_DEFAULT_FLOW` | Seed release naming + the default flow name (live Settings afterwards). |
 | `ENCODE_DISCORD_WEBHOOK` | Seeds the live Settings webhook (saved blank turns notifications off). |
@@ -364,7 +365,9 @@ idempotent.
 | Setting | Where | Default | Effect |
 | --- | --- | --- | --- |
 | `ENCODE_BIND_ADDR` | controller `.env` | `0.0.0.0` | bind API to one interface; set `127.0.0.1` behind a reverse proxy |
-| `ENCODE_AGENT_ALLOW_HTTP_UPDATES` | agent node env | unset (refuse) | allow lib/bin/agent downloads over plain HTTP (trusted LAN only) |
+| `ENCODE_TLS_CERT` / `ENCODE_TLS_KEY` | controller `.env` | unset (plain HTTP) | native HTTPS on the controller (both or neither; partial config fail-fasts) |
+| `ENCODE_AGENT_CA_CERT` | agent node env | unset (system roots) | PEM CA file appended to the agent's trust pool for all controller requests (native controller TLS) |
+| `ENCODE_AGENT_ALLOW_HTTP_UPDATES` | agent node env | unset (refuse) | allow lib/bin/agent downloads over plain HTTP (trusted LAN only; unnecessary with an https:// controller) |
 | `ENCODE_BIN_FETCH_PRIVATE` | controller env | unset (refuse) | allow `publishBinFromURL` to fetch from LAN/localhost hosts (SSRF guard opt-in) |
 | `-ServiceUser` / `-ServicePassword` | `install-agent.ps1` | LocalSystem | run the agent service as a least-privilege account |
 
@@ -393,6 +396,161 @@ on older cores as well. The release bundle ships the
 the GHCR image at `/app/provision` and `/app/systemd`
 (`ENCODE_PROVISION_DIR=/app/provision` sets the engine's `PlaybookDir`,
 default in `backend/cmd/controller/main.go`).
+
+## Native HTTPS (controller TLS)
+
+The controller can terminate TLS itself — no reverse proxy required. The
+**whole server** (API, UI, `/metrics`, health) moves to HTTPS on the same
+port, and agents verify the certificate against a CA you distribute.
+
+| Var | Where | Meaning |
+| --- | --- | --- |
+| `ENCODE_TLS_CERT` | controller env / `.env` | PEM certificate file path (inside the container when compose-mounted). |
+| `ENCODE_TLS_KEY` | controller env / `.env` | Matching PEM private key file path. |
+| `ENCODE_AGENT_CA_CERT` | agent node env | PEM CA certificate file. The agent **appends** it to the system trust pool and uses it for EVERY controller request: pairing, heartbeats, completion reports, and lib/bin/agent update downloads. |
+
+Behavior rules (all fail-fast, tested):
+
+- **Both** controller vars set → HTTPS with TLS 1.2 minimum.
+- **Exactly one** set → the controller refuses to start, naming the missing
+  var. It never silently falls back to HTTP.
+- **Neither** set → plain HTTP, byte-identical to previous releases. This is
+  the default; existing deploys need no change.
+- Unreadable/invalid/mismatched cert or key files → startup error with the
+  offending paths.
+- `ENCODE_AGENT_CA_CERT` missing/unreadable/not-PEM → the agent refuses to
+  start. Public CAs keep working (append, never replace). There is no
+  `InsecureSkipVerify` anywhere — a wrong or untrusted cert fails the
+  handshake.
+- With an `https://` controller URL, **`ENCODE_AGENT_ALLOW_HTTP_UPDATES` is
+  no longer needed** — that opt-in only gates plain-HTTP downloads. Remove
+  it (and the `http-updates.conf` systemd drop-in) after the cutover.
+
+### Compose wiring
+
+All three composes (`docker-compose.runtime.yml`, `docker-compose.yml`,
+`docker-compose.ha.yml`) pass `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY` through from
+`.env` (empty default = plain HTTP) and carry commented read-only cert/key
+mounts. To enable:
+
+1. Place the cert + key under the compose dir (e.g. `tls/controller.crt`,
+   `tls/controller.key`; recipe below).
+2. Uncomment the two `./tls/...` volume lines in the compose file.
+3. In `.env` set `ENCODE_TLS_CERT=/tls/controller.crt`,
+   `ENCODE_TLS_KEY=/tls/controller.key`, plus the healthcheck probe override:
+   `ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health` and (self-signed
+   CA only) `ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate`. The flag
+   relaxes ONLY the container's local probe — agents still verify via
+   `ENCODE_AGENT_CA_CERT`.
+4. `docker compose -f docker-compose.runtime.yml up -d` (recreates the
+   container). `install.sh` detects the TLS vars and health-probes over
+   https automatically.
+
+HA note: with Traefik terminating TLS at the edge, native TLS is usually
+left unset (Traefik→replica stays HTTP on the internal network). Set it only
+when the replicas themselves must serve HTTPS.
+
+### Self-signed CA recipe (LAN farms)
+
+Run on the controller host (or any trusted machine), then copy the files as
+noted. Adjust the two variables to YOUR farm — the SANs must cover every
+name/IP agents will dial (an `https://<ip>:8080` URL needs the **IP SAN**;
+no DNS lookup happens):
+
+```bash
+CTRL_IP=172.24.92.232          # the address agents use in controller_url
+CTRL_DNS=encode.lan            # optional hostname agents may use instead
+mkdir -p /opt/encode-system/tls && cd /opt/encode-system/tls
+
+# 1. Farm CA. Keep ca.key 0600 and backed up offline — it signs everything
+#    the agents will trust. 10-year lifetime is typical for a private CA.
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -key ca.key -sha256 -days 3650 \
+  -subj "/CN=encode-farm CA" -out ca.crt
+
+# 2. Server key + CSR.
+openssl genrsa -out controller.key 2048
+openssl req -new -key controller.key -subj "/CN=encode-controller" \
+  -out controller.csr
+
+# 3. Sign with SANs for every controller name/IP + serverAuth usage.
+cat > san.cnf <<EOF
+subjectAltName = DNS:${CTRL_DNS}, IP:${CTRL_IP}
+extendedKeyUsage = serverAuth
+EOF
+openssl x509 -req -in controller.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -days 825 -sha256 -extfile san.cnf -out controller.crt
+
+chmod 600 ca.key controller.key
+# Sanity: the SANs must list the IP/hostname agents will use.
+openssl x509 -in controller.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+Controller placement (compose deploy): `controller.crt`/`controller.key` go
+to `/opt/encode-system/tls/` (mounted per the wiring above); set the `.env`
+vars; recreate. Bare-binary deploy: point `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY`
+at the files directly and restart the process.
+
+Agent placement — copy **`ca.crt` only** (never `ca.key`) to each node:
+
+```powershell
+# Windows node (elevated PowerShell). Example path for the farm's
+# scheduled-task installs (C:\encode-agent-dist); service installs can use
+# C:\encode-agent\encode-ca.crt the same way.
+# 1. Copy ca.crt to the node, e.g. C:\encode-agent-dist\encode-ca.crt
+# 2. Machine-level env (picked up by services AND scheduled tasks on start):
+[Environment]::SetEnvironmentVariable("ENCODE_AGENT_CA_CERT", "C:\encode-agent-dist\encode-ca.crt", "Machine")
+# 3. Point agent.json at https:
+#    "controller_url": "https://172.24.92.232:8080"
+# 4. Restart the agent:
+Restart-Service encode-agent                       # service installs
+Stop-ScheduledTask EncodeAgentDist; Start-ScheduledTask EncodeAgentDist  # task installs
+```
+
+```bash
+# Linux node: install-agent.sh passes the env through as a systemd drop-in.
+sudo cp ca.crt /etc/encode-agent/encode-ca.crt
+sudo ENCODE_AGENT_CA_CERT=/etc/encode-agent/encode-ca.crt \
+  ./install-agent.sh -c https://<controller>:8080 -p <pairing-code>
+# Existing install instead: write /etc/systemd/system/encode-agent.service.d/ca-cert.conf
+#   [Service]
+#   Environment="ENCODE_AGENT_CA_CERT=/etc/encode-agent/encode-ca.crt"
+# edit controller_url in agent.json to https://, then:
+sudo systemctl daemon-reload && sudo systemctl restart encode-agent
+```
+
+### Switching an existing farm (restart order)
+
+The cutover is **controller first, then nodes**. Old agents keep retrying
+heartbeats every tick against the TLS-only controller (warnings in the log,
+no crash) until they are switched; jobs are held by the drain.
+
+1. Generate the CA + server cert (recipe above); place the files on the
+   controller host. Verify the SANs cover the address agents use.
+2. **Drain the farm** (UI → Settings → Drain mode) or wait for an idle
+   window: a job running during the cutover would lose its completion
+   report (the old-URL agent cannot reach the TLS-only controller), leaving
+   the job to stall-watchdog/orphan recovery. Running jobs finish first.
+3. **Controller**: set the `.env` TLS vars + healthcheck override, uncomment
+   the mounts, `docker compose -f docker-compose.runtime.yml up -d`.
+   Verify: `curl --cacert /opt/encode-system/tls/ca.crt https://<CTRL_IP>:8080/api/health`
+   → `{"status":"ok",...}`. The container must report healthy.
+4. **Each node**: copy `ca.crt`, set `ENCODE_AGENT_CA_CERT` (machine env /
+   systemd drop-in), change `controller_url` to `https://…`, restart the
+   agent (service or scheduled task). Nodes reconnect on the next heartbeat
+   (~5s); confirm `online`/`idle` in UI → Nodes. Repeat node-by-node.
+5. Release the drain. Remove `ENCODE_AGENT_ALLOW_HTTP_UPDATES` (and the
+   `http-updates.conf` drop-in on Linux nodes) — TLS makes it unnecessary.
+   Publish an agent update once to confirm the download path works over TLS.
+
+**Rollback**: remove BOTH `ENCODE_TLS_*` vars from `.env`, recreate the
+controller (plain HTTP returns), and point nodes' `controller_url` back to
+`http://`. The CA env can stay on nodes — it is inert for plain HTTP.
+
+**Publicly trusted certs**: skip the CA recipe — use a cert from your normal
+issuer (or Let's Encrypt via the Traefik HA path). Agents need no
+`ENCODE_AGENT_CA_CERT` then (system roots already trust it), and the
+healthcheck needs no `--no-check-certificate`.
 
 ## Post-deploy validation
 

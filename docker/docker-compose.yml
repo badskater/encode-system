@@ -46,6 +46,16 @@ services:
       # default, unchanged). See Docs/md/Deployment.md §Native HTTPS.
       ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
       ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
+      # Optional OIDC login (P10): set ALL FOUR core vars in .env to enable
+      # SSO next to local login; all unset = disabled (the default, zero
+      # behavior change). A partial set fails fast at startup. See
+      # Docs/md/Deployment.md §Optional OIDC login.
+      ENCODE_OIDC_ISSUER: ${ENCODE_OIDC_ISSUER:-}
+      ENCODE_OIDC_CLIENT_ID: ${ENCODE_OIDC_CLIENT_ID:-}
+      ENCODE_OIDC_CLIENT_SECRET: ${ENCODE_OIDC_CLIENT_SECRET:-}
+      ENCODE_OIDC_REDIRECT_URL: ${ENCODE_OIDC_REDIRECT_URL:-}
+      ENCODE_OIDC_ADMIN_GROUP: ${ENCODE_OIDC_ADMIN_GROUP:-}
+      ENCODE_OIDC_GROUPS_CLAIM: ${ENCODE_OIDC_GROUPS_CLAIM:-}
     volumes:
       # Controller state (SQLite DB + update payloads) — the WHOLE /data dir
       # is persistent. The NFS share mounts below are sub-mounts layered on

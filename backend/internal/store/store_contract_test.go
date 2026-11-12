@@ -458,6 +458,47 @@ func storeContract(t *testing.T, openFn func(t *testing.T) *Store) {
 	if !reSr.Enabled {
 		t.Fatalf("re-upserted series must be enabled: %+v", reSr)
 	}
+
+	// --- Users: provision, role sync, sessions (OIDC P10) ---
+	// CreateUser/UserByUsername/CreateSession were previously only exercised
+	// through the API package (SQLite); the contract suite now pins them on
+	// BOTH backends together with UpdateUserRole (the OIDC role-sync path).
+	u, err := s.CreateUser(ctx, "contract-user", "", model.RoleViewer)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if u.Username != "contract-user" || u.Role != model.RoleViewer {
+		t.Fatalf("user round-trip: %+v", u)
+	}
+	gotU, err := s.UserByUsername(ctx, "contract-user")
+	if err != nil || gotU == nil || gotU.ID != u.ID {
+		t.Fatalf("user by username: %+v err=%v", gotU, err)
+	}
+	if err := s.UpdateUserRole(ctx, u.ID, model.RoleAdmin); err != nil {
+		t.Fatalf("update user role: %v", err)
+	}
+	gotU, err = s.UserByUsername(ctx, "contract-user")
+	if err != nil || gotU.Role != model.RoleAdmin {
+		t.Fatalf("role sync not persisted: %+v err=%v", gotU, err)
+	}
+	// Sessions join the user row: a session minted AFTER the role change
+	// must carry the new role (middleware reads it per request).
+	if err := s.CreateSession(ctx, "contract-session-hash", u.ID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sess, err := s.SessionByTokenHash(ctx, "contract-session-hash")
+	if err != nil || sess == nil {
+		t.Fatalf("session by hash: %+v err=%v", sess, err)
+	}
+	if sess.Username != "contract-user" || sess.Role != model.RoleAdmin {
+		t.Fatalf("session role propagation: %+v", sess)
+	}
+	if err := s.DeleteSession(ctx, "contract-session-hash"); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	if sess, err := s.SessionByTokenHash(ctx, "contract-session-hash"); err != nil || sess != nil {
+		t.Fatalf("revoked session still resolvable: %+v err=%v", sess, err)
+	}
 }
 
 // TestContractSQLite runs the contract suite against a tmpfile SQLite store.

@@ -578,6 +578,118 @@ issuer (or Let's Encrypt via the Traefik HA path). Agents need no
 `ENCODE_AGENT_CA_CERT` then (system roots already trust it), and the
 healthcheck needs no `--no-check-certificate`.
 
+## Optional OIDC login
+
+The controller can offer **Sign in with SSO** (OpenID Connect) next to the
+local username/password form. It is **OFF by default and entirely optional**
+— a LAN farm with local accounts needs none of this, and with the vars unset
+the controller registers no OIDC routes and behaves exactly as before.
+Local login keeps working unchanged when OIDC is enabled; both coexist.
+
+### Environment variables
+
+| Var | Required | Meaning |
+| --- | --- | --- |
+| `ENCODE_OIDC_ISSUER` | yes* | Provider identifier URL. Must EXACTLY match the `iss` in the provider's discovery document (`<issuer>/.well-known/openid-configuration`). |
+| `ENCODE_OIDC_CLIENT_ID` | yes* | Client ID registered on the provider. |
+| `ENCODE_OIDC_CLIENT_SECRET` | yes* | Client secret. Never logged; treat like any credential (`.env` perms, secrets manager). |
+| `ENCODE_OIDC_REDIRECT_URL` | yes* | The controller's callback URL, e.g. `https://encode.example.com/api/auth/oidc/callback`. Must EXACTLY match a redirect URI registered on the provider. |
+| `ENCODE_OIDC_ADMIN_GROUP` | no | Group name that grants the **admin** role. Unset = no group mapping (see below). |
+| `ENCODE_OIDC_GROUPS_CLAIM` | no | ID-token claim carrying the group list (default `groups`). |
+
+\* All four core vars together enable OIDC. **All unset = disabled** (the
+default). **A partial set fails fast at startup** with an error naming the
+missing vars — the controller never silently falls back to local-only when
+you intended SSO (same contract as `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY`).
+
+Docker deploys: all six vars are passed through by every compose file
+(`docker-compose.yml`, `docker-compose.runtime.yml`, `docker-compose.ha.yml`);
+set them in `.env` (commented template in `docker/.env.example`).
+
+### Provider setup (generic)
+
+Works with any standards-compliant OIDC provider — pocket-id, Authelia,
+Keycloak, Authentik, etc.:
+
+1. Create a **confidential client** (authorization-code flow) for the
+   controller. Note the client ID and secret.
+2. Register the redirect URI **exactly** as
+   `https://<controller-host>/api/auth/oidc/callback` (scheme, host, port and
+   path must match `ENCODE_OIDC_REDIRECT_URL` character-for-character).
+3. Ensure the provider issues the `openid profile email` scopes and includes
+   `preferred_username` (or `email`) in the ID token.
+4. For role mapping, make the provider emit the user's groups in the ID
+   token (Keycloak: a "group membership" mapper on the client; Authelia:
+   `groups` claim via access-control configuration; pocket-id: user groups).
+   Set `ENCODE_OIDC_ADMIN_GROUP` to the group that should be admin.
+5. Set the four core vars (+ optional two) and restart the controller. The
+   login page shows **Sign in with SSO** only when enabled — the UI learns
+   the flag from the unauthenticated `/api/health` bootstrap (`oidc_enabled`).
+
+Example `.env` (Keycloak-style realm):
+
+```bash
+ENCODE_OIDC_ISSUER=https://keycloak.example.com/realms/farm
+ENCODE_OIDC_CLIENT_ID=encode-system
+ENCODE_OIDC_CLIENT_SECRET=<from the client's Credentials tab>
+ENCODE_OIDC_REDIRECT_URL=https://encode.example.com/api/auth/oidc/callback
+ENCODE_OIDC_ADMIN_GROUP=encode-admins
+```
+
+### Accounts and role mapping
+
+- **First SSO login auto-provisions** a local account. Username derivation:
+  `preferred_username` → email local part → `sub`, lowercased and sanitized
+  to `[a-z0-9._-]` (separator runs collapse to `-`, 64-char cap). The
+  derivation is deterministic, so repeat logins reuse the same account —
+  no duplicates.
+- **New accounts get the viewer role**, or **admin** when
+  `ENCODE_OIDC_ADMIN_GROUP` is set and the groups claim contains it (exact
+  match, not substring).
+- **Existing accounts**: with `ENCODE_OIDC_ADMIN_GROUP` set, the role is
+  **synced on every login in both directions** (in the group → admin, out →
+  viewer). With no admin group configured, existing accounts **keep their
+  stored role** — nothing is mapped, and an existing admin is never silently
+  demoted. Plan IdP usernames so they do not collide with local accounts
+  unless you intend them to be the same account (matching is exact on the
+  derived, lowercased username).
+- SSO-provisioned accounts have **no local password** (local login for them
+  is always 401). An admin can set one via user management to make the
+  account hybrid; deleting the account removes SSO access too (it will be
+  re-provisioned on the next SSO login).
+- Sessions are ordinary controller sessions: same 24h sliding expiry, same
+  logout/revocation, same role enforcement as local login. Every SSO login
+  writes an `auth.oidc_login` audit event (actor = username, detail carries
+  the role and whether the account was just provisioned).
+
+### Security notes
+
+- The flow is authorization-code with **state** (single-use, 10-minute TTL,
+  CSRF), **nonce** (bound into the ID token and checked) and **PKCE** (S256).
+  The ID token is verified via `go-oidc`: signature against the provider's
+  JWKS, issuer, audience and expiry. Any failure rejects the login.
+- The session token reaches the SPA in the URL **fragment** (`/#oidc=…`),
+  which browsers never send to servers or logs; the SPA consumes and strips
+  it immediately. **HTTPS is strongly recommended** for the controller (see
+  §Native HTTPS or the Traefik HA path) — over plain HTTP the fragment is
+  still exposed to anything observing the browser side.
+- The redirect URL must match the provider's registered URI exactly; a
+  mismatch is rejected by the provider before any token is issued.
+- Discovery is lazy: the controller boots even if the IdP is down; the first
+  SSO attempt then returns 503 and retries discovery on the next attempt.
+- **HA (two replicas)**: pending login flows live in the memory of the
+  replica that started them. The callback must reach the SAME replica —
+  enable sticky sessions on the load balancer, or run SSO on a single
+  replica. Without stickiness, callbacks that land on the other replica fail
+  with "unknown or expired login state" and the user simply retries.
+
+### Disabling / rollback
+
+Unset the four core vars (or blank them in `.env`) and restart: the routes
+and the SSO button disappear, local login is untouched. Already-provisioned
+accounts and their sessions remain (sessions expire on the normal TTL);
+delete the accounts via user management if you want them gone.
+
 ## Post-deploy validation
 
 See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:

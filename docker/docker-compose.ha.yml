@@ -83,6 +83,17 @@ services:
       # internal network). See Docs/md/Deployment.md §Native HTTPS.
       ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
       ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
+      # Optional OIDC login (P10): set ALL FOUR core vars in .env to enable
+      # SSO next to local login; all unset = disabled (the default). Partial
+      # set = fail-fast. HA NOTE: pending login flows are per-replica memory
+      # — the callback must reach the replica that started the login (sticky
+      # sessions). See Docs/md/Operations.md §OIDC login.
+      ENCODE_OIDC_ISSUER: ${ENCODE_OIDC_ISSUER:-}
+      ENCODE_OIDC_CLIENT_ID: ${ENCODE_OIDC_CLIENT_ID:-}
+      ENCODE_OIDC_CLIENT_SECRET: ${ENCODE_OIDC_CLIENT_SECRET:-}
+      ENCODE_OIDC_REDIRECT_URL: ${ENCODE_OIDC_REDIRECT_URL:-}
+      ENCODE_OIDC_ADMIN_GROUP: ${ENCODE_OIDC_ADMIN_GROUP:-}
+      ENCODE_OIDC_GROUPS_CLAIM: ${ENCODE_OIDC_GROUPS_CLAIM:-}
     volumes:
       # Shared state volume (update payloads + shares key file + backups).
       # Same named volume names as docker-compose.runtime.yml so publish,
@@ -156,6 +167,17 @@ services:
       # Native HTTPS (optional) — same contract as controller-1 above.
       ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
       ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
+      # Optional OIDC login (P10): set ALL FOUR core vars in .env to enable
+      # SSO next to local login; all unset = disabled (the default). Partial
+      # set = fail-fast. HA NOTE: pending login flows are per-replica memory
+      # — the callback must reach the replica that started the login (sticky
+      # sessions). See Docs/md/Operations.md §OIDC login.
+      ENCODE_OIDC_ISSUER: ${ENCODE_OIDC_ISSUER:-}
+      ENCODE_OIDC_CLIENT_ID: ${ENCODE_OIDC_CLIENT_ID:-}
+      ENCODE_OIDC_CLIENT_SECRET: ${ENCODE_OIDC_CLIENT_SECRET:-}
+      ENCODE_OIDC_REDIRECT_URL: ${ENCODE_OIDC_REDIRECT_URL:-}
+      ENCODE_OIDC_ADMIN_GROUP: ${ENCODE_OIDC_ADMIN_GROUP:-}
+      ENCODE_OIDC_GROUPS_CLAIM: ${ENCODE_OIDC_GROUPS_CLAIM:-}
     volumes:
       - encode-state:/data
       - encode-scripts:/data/scripts

@@ -26,6 +26,20 @@ export function hasToken(): boolean {
   return (localStorage.getItem(TOKEN_KEY) ?? '') !== '';
 }
 
+// consumeOidcFragment extracts the one-time session token delivered by the
+// OIDC callback redirect (/#oidc=<token>) and strips the fragment from the
+// URL so the token never lingers in browser history. The strict 64-hex shape
+// matches the server's session tokens; anything else is ignored. Returns ''
+// when no OIDC fragment is present. The App calls this once at startup and
+// stores the token via setToken — validation then goes through the normal
+// /api/auth/me path, exactly like a stored local-login session.
+export function consumeOidcFragment(): string {
+  const m = window.location.hash.match(/^#oidc=([0-9a-f]{64})$/);
+  if (!m) return '';
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  return m[1];
+}
+
 function sessionValue(): string {
   return localStorage.getItem(TOKEN_KEY) ?? '';
 }
@@ -131,7 +145,11 @@ async function rollbackUpload(path: string, platform?: 'windows' | 'linux'): Pro
 }
 
 export const api = {
-  health: () => request<{ status: string }>('GET', '/api/health'),
+  // health is the unauthenticated bootstrap call: besides status it carries
+  // oidc_enabled (P10) so the login page can show the SSO button only when
+  // the controller has OIDC configured. Additive optional field — older
+  // controllers simply omit it (treated as disabled).
+  health: () => request<{ status: string; oidc_enabled?: boolean }>('GET', '/api/health'),
   settings: () => request<Settings>('GET', '/api/settings'),
 
   // Authentication. login is unauthenticated; it issues the session token.

@@ -11,7 +11,7 @@ import StatsPage from './pages/Stats';
 import AuditPage from './pages/Audit';
 import TokenGate from './components/TokenGate';
 import ChangePasswordDialog from './components/ChangePasswordDialog';
-import { api, hasToken, setCurrentUser, clearToken, onSessionExpired } from './api/client';
+import { api, hasToken, setToken, setCurrentUser, clearToken, onSessionExpired, consumeOidcFragment } from './api/client';
 import { RoleContext, type Role } from './hooks/useRole';
 
 type Page = 'dashboard' | 'jobs' | 'nodes' | 'flows' | 'series' | 'steps' | 'stats' | 'audit' | 'settings' | 'provision';
@@ -49,7 +49,18 @@ const NAV_GROUPS: { label: string; items: { id: Page; label: string }[] }[] = [
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
-  const [authed, setAuthed] = useState<boolean | null>(() => (hasToken() ? null : false));
+  const [authed, setAuthed] = useState<boolean | null>(() => {
+    // OIDC callback landing: the controller redirected here with the fresh
+    // session token in the URL fragment. Consume it (strips the fragment),
+    // store it, and let the normal /api/auth/me validation below run — the
+    // same path a stored local-login session takes.
+    const oidcTok = consumeOidcFragment();
+    if (oidcTok) {
+      setToken(oidcTok);
+      return null;
+    }
+    return hasToken() ? null : false;
+  });
   const [who, setWho] = useState('');
   const [role, setRole] = useState<Role>('admin');
   const [showChangePassword, setShowChangePassword] = useState(false);

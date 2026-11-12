@@ -21,6 +21,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/api"
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/oidc"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/s3"
 	"github.com/badskater/encode-system/backend/internal/scanner"
@@ -77,6 +78,24 @@ func main() {
 	tlsCfg, err := resolveTLSConfig(os.Getenv("ENCODE_TLS_CERT"), os.Getenv("ENCODE_TLS_KEY"), log)
 	if err != nil {
 		log.Error("tls config", "err", err)
+		os.Exit(1)
+	}
+
+	// Optional OIDC login (P10): ENCODE_OIDC_ISSUER + ENCODE_OIDC_CLIENT_ID
+	// + ENCODE_OIDC_CLIENT_SECRET + ENCODE_OIDC_REDIRECT_URL enable SSO next
+	// to local login. All unset = disabled (the default, zero behavior
+	// change); a partial set fails fast HERE, before any state is touched
+	// (same pattern as TLS above). The client secret is never logged.
+	oidcCfg, err := oidc.Resolve(
+		os.Getenv("ENCODE_OIDC_ISSUER"),
+		os.Getenv("ENCODE_OIDC_CLIENT_ID"),
+		os.Getenv("ENCODE_OIDC_CLIENT_SECRET"),
+		os.Getenv("ENCODE_OIDC_REDIRECT_URL"),
+		os.Getenv("ENCODE_OIDC_ADMIN_GROUP"),
+		os.Getenv("ENCODE_OIDC_GROUPS_CLAIM"),
+	)
+	if err != nil {
+		log.Error("oidc config", "err", err)
 		os.Exit(1)
 	}
 
@@ -159,6 +178,7 @@ func main() {
 		GitHubRepo:          env("ENCODE_GITHUB_REPO", "badskater/encode-system"),
 		GitHubAPI:           env("ENCODE_GITHUB_API", "https://api.github.com"),
 		Version:             Version,
+		OIDC:                oidcCfg,
 	}
 
 	srv, err := api.New(st, up, log, cfg)

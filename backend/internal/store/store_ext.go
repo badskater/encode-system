@@ -1119,6 +1119,15 @@ func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHa
 	return err
 }
 
+// UpdateUserRole replaces a user's role (admin|viewer). Used by OIDC login
+// to sync the role from the provider's group claim on each login. Existing
+// sessions pick up the new role on their next request (SessionByTokenHash
+// joins the user row); no session is revoked by a role change.
+func (s *Store) UpdateUserRole(ctx context.Context, userID int64, role string) error {
+	_, err := s.qExec(ctx, "UPDATE users SET role = ? WHERE id = ?", role, userID)
+	return err
+}
+
 // CountActiveJobs returns the number of jobs that are pending, assigned, or
 // running — i.e. not in a terminal state. Used by the backup-restore guard
 // to refuse a restore while work is in flight.

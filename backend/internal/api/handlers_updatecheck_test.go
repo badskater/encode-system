@@ -314,12 +314,12 @@ func TestHealthCarriesVersion(t *testing.T) {
 	if r.StatusCode != 200 {
 		t.Fatalf("health: %d %s", r.StatusCode, b)
 	}
-	var h map[string]string
+	var h map[string]any
 	json.Unmarshal(b, &h)
 	if h["status"] != "ok" {
-		t.Errorf("status: want ok, got %q", h["status"])
+		t.Errorf("status: want ok, got %v", h["status"])
 	}
 	if h["version"] != "3.7.2" {
-		t.Errorf("version: want 3.7.2, got %q", h["version"])
+		t.Errorf("version: want 3.7.2, got %v", h["version"])
 	}
 }

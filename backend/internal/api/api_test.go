@@ -36,6 +36,21 @@ type testEnv struct {
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
+	cfg := Config{
+		AdminUsername: "admin", AdminPassword: adminPassword,
+		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
+		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
+		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
+		DiscordWebhook: "https://discord.com/api/webhooks/env/default",
+	}
+	return newTestEnvWithConfig(t, dir, cfg)
+}
+
+// newTestEnvWithConfig is newTestEnv with a caller-supplied Config — the
+// OIDC tests use it to enable a mock provider (Config.OIDC). dir is the
+// temp state directory (DB + updates live there).
+func newTestEnvWithConfig(t *testing.T, dir string, cfg Config) *testEnv {
+	t.Helper()
 	st, err := store.Open(dir + "/test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -47,13 +62,6 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	cfg := Config{
-		AdminUsername: "admin", AdminPassword: adminPassword,
-		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
-		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
-		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
-		DiscordWebhook: "https://discord.com/api/webhooks/env/default",
-	}
 	s, err := New(st, up, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
 	if err != nil {
 		t.Fatal(err)

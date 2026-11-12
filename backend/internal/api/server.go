@@ -18,6 +18,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/offsite"
+	"github.com/badskater/encode-system/backend/internal/oidc"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -62,6 +63,11 @@ type Config struct {
 	// Version is the controller build version (set via ldflags -X main.Version
 	// in CI). Empty in dev builds; the update check reports it as "unknown".
 	Version string
+	// OIDC carries the validated optional OIDC login configuration
+	// (ENCODE_OIDC_* env vars, resolved in main). nil = disabled (the
+	// default): no OIDC routes are registered and /api/health reports
+	// oidc_enabled=false. Local login is unaffected either way.
+	OIDC *oidc.Config
 }
 
 // Server bundles dependencies for all handlers.
@@ -135,6 +141,10 @@ type Server struct {
 	// node's next heartbeat).
 	cancelMu       sync.Mutex
 	pendingCancels map[int64][]int64
+	// OIDC drives the optional SSO login flow (P10). Built in New when
+	// Config.OIDC is non-nil; nil = disabled, and Routes() then registers
+	// NO oidc endpoints (404) — zero behavior change for local-only installs.
+	OIDC *oidc.Provider
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -180,6 +190,12 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
+	}
+	if cfg.OIDC != nil {
+		// No network I/O here: discovery is lazy (first login attempt), so
+		// the controller boots even while the IdP is unreachable.
+		s.OIDC = oidc.NewProvider(cfg.OIDC, log)
+		log.Info("OIDC login enabled", "issuer", cfg.OIDC.Issuer, "admin_group", cfg.OIDC.AdminGroup, "groups_claim", cfg.OIDC.GroupsClaim)
 	}
 	if err := s.seedStepTemplates(); err != nil {
 		return nil, err
@@ -461,6 +477,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/auth/me", s.withAnyUser(s.handleMe))
 	mux.HandleFunc("POST /api/auth/password", s.withAdmin(s.handleChangePassword))
 
+	// Optional OIDC login (P10): registered ONLY when enabled via env.
+	// Disabled installs have no such routes (404) — local auth is the only
+	// way in, byte-identical to before.
+	if s.OIDC != nil {
+		mux.HandleFunc("GET /api/auth/oidc/login", s.handleOIDCLogin)
+		mux.HandleFunc("GET /api/auth/oidc/callback", s.handleOIDCCallback)
+	}
+
 	// UI endpoints — session auth. GET routes use withAnyUser so viewers
 	// can read; all mutations (POST/PUT/PATCH/DELETE) stay withAdmin.
 	// Management surfaces (/api/users, /api/tokens, /api/audit, /api/backup*)
@@ -699,8 +723,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	// this replica (Phase 3 HA) so an operator can tell two controllers apart
 	// behind a load balancer — both serve health, each reports its own id.
 	// The "version" field exposes the controller build version (ldflags) so
-	// operators can tell at a glance what's running.
-	out := map[string]string{"status": "ok", "instance": s.Cfg.InstanceID}
+	// operators can tell at a glance what's running. "oidc_enabled" (P10)
+	// lets the login page decide whether to show the SSO button BEFORE any
+	// session exists — health is the SPA's unauthenticated bootstrap call.
+	out := map[string]any{"status": "ok", "instance": s.Cfg.InstanceID, "oidc_enabled": s.OIDC != nil}
 	if s.Cfg.Version != "" {
 		out["version"] = s.Cfg.Version
 	}

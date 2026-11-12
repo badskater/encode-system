@@ -255,3 +255,38 @@ describe('api client', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/api/updates/check');
   });
 });
+
+describe('consumeOidcFragment', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    window.location.hash = '';
+  });
+
+  it('extracts the OIDC session token and strips the fragment', async () => {
+    const { consumeOidcFragment } = await import('./client');
+    const tok = 'a1b2c3d4e5f6'.repeat(5) + 'abcd'; // 64 hex chars
+    window.location.hash = '#oidc=' + tok;
+    expect(consumeOidcFragment()).toBe(tok);
+    expect(window.location.hash).toBe('');
+  });
+
+  it('returns empty string when no fragment is present', async () => {
+    const { consumeOidcFragment } = await import('./client');
+    expect(consumeOidcFragment()).toBe('');
+  });
+
+  it('ignores malformed fragments', async () => {
+    const { consumeOidcFragment } = await import('./client');
+    for (const bad of ['#oidc=too-short', '#oidc=' + 'g'.repeat(64), '#other=' + 'a'.repeat(64), '#oidc=' + 'a'.repeat(63)]) {
+      window.location.hash = bad;
+      expect(consumeOidcFragment()).toBe('');
+    }
+  });
+
+  it('leaves a stored local-login session untouched', async () => {
+    const { consumeOidcFragment } = await import('./client');
+    setToken('local-session');
+    expect(consumeOidcFragment()).toBe('');
+    expect(hasToken()).toBe(true);
+  });
+});

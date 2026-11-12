@@ -854,6 +854,58 @@ unhealthy), recreate, point nodes back to `http://` (the CA env is inert on
 plain HTTP). Full step-by-step: `Docs/md/Deployment.md` §Switching an existing
 farm.
 
+## OIDC login (optional SSO)
+
+Off by default; enabled only when all four core `ENCODE_OIDC_*` vars are set
+(see `Docs/md/Deployment.md` §Optional OIDC login for setup, role mapping and
+security notes). Local login is unaffected either way.
+
+### Verify / operate
+
+```bash
+# Is SSO enabled on this controller? (unauthenticated bootstrap flag)
+curl -s http://<controller>:8080/api/health | jq .oidc_enabled
+# true  → login page shows "Sign in with SSO"; routes below exist.
+# false → no OIDC routes (404), local-only install (the default).
+
+# Start a flow by hand (browser does this via the SSO button):
+curl -sI http://<controller>:8080/api/auth/oidc/login
+# 302 → Location: <issuer>/authorize?...state=...&nonce=...&code_challenge=...
+# 503 → provider discovery failed (see diagnosis below).
+
+# SSO logins are audited like other auth events:
+# GET /api/audit → action "auth.oidc_login", actor = username,
+# detail {"role":..., "provisioned":true|false}.
+```
+
+- **Enable**: set the four core vars (+ optional `ENCODE_OIDC_ADMIN_GROUP`,
+  `ENCODE_OIDC_GROUPS_CLAIM`) in `.env`, recreate the controller. Startup
+  logs `OIDC login enabled` with the issuer (never the secret).
+- **Disable**: unset/blank the four core vars, recreate. Routes and button
+  disappear; provisioned accounts and live sessions remain until they expire
+  or are deleted (user management).
+- **Role changes**: with `ENCODE_OIDC_ADMIN_GROUP` set, roles sync on each
+  login (both directions). A demoted user's EXISTING sessions pick up the
+  new role on their next request (sessions join the user row); revoke them
+  explicitly via user delete/password reset if immediate cutoff is needed.
+- **HA**: pending flows are per-replica memory — the IdP callback must reach
+  the replica that started the login (sticky sessions on the LB). Without
+  stickiness users see intermittent "unknown or expired login state" and
+  must retry; this is the documented limitation, not a bug.
+
+### Diagnosis
+
+| Symptom | Cause / fix |
+| --- | --- |
+| Controller refuses to start, `oidc config … missing` | Partial env: some but not all four core vars set. Set all four or none (fail-fast by design). |
+| SSO button missing | `oidc_enabled` false — vars not set in the controller's actual environment (check `.env` → compose passthrough), or an old UI bundle. |
+| `GET /api/auth/oidc/login` → 503 | Discovery failed: issuer URL wrong/unreachable from the controller, or the IdP is down. Check `curl <issuer>/.well-known/openid-configuration` FROM the controller host/container. Retried on every attempt — no restart needed once the IdP recovers. |
+| Callback → 401 `unknown or expired login state` | Login took >10 min, the callback was replayed, the controller restarted mid-flow, or (HA) the callback hit the other replica. Start the login again; on HA enable sticky sessions. |
+| Callback → 401 `nonce mismatch` / verification error | Provider misconfiguration (wrong client, token for another audience, clock skew beyond expiry). Check the provider's client ID/secret and the controller clock. |
+| Provider rejects the redirect | `ENCODE_OIDC_REDIRECT_URL` does not exactly match a registered redirect URI (scheme/host/port/path). |
+| User gets viewer instead of admin | Groups claim not emitted by the provider, wrong claim name (`ENCODE_OIDC_GROUPS_CLAIM`), group name mismatch (exact match), or `ENCODE_OIDC_ADMIN_GROUP` unset (no mapping → existing roles kept, new users viewer). Inspect the ID token's claims at the provider side. |
+| SSO user cannot log in locally | By design: provisioned accounts have no local password. Set one via user management if hybrid access is wanted. |
+
 ## Known failure modes
 
 - **Share mount dropped on a Windows node** (NFS/SMB): jobs fail at source read; remount via the Ansible play (`ansible-playbook site.yml --tags nfs-client`) or the provisioning "mount shares" option. On Linux: `mount -a` or `systemctl restart mnt-*.automount` (the CIFS/NFS mounts use `x-systemd.automount` so they auto-remount on first access; check the 0600 credential files at `/etc/encode-agent/cifs-*.cred` if a mount refuses).

@@ -279,7 +279,13 @@ const bashSourceChapterExtract = `chapter_extract () {
     if [[ "$total" == "0" ]]; then
         echo "[chapter_extract] no chapters in $src - skipping"
         if [[ -e "$dest" ]]; then
-            rm -f -- "$dest"
+            # Fail-closed: the StepCall wrapper disables errexit inside this
+            # function — an unchecked rm reported success AND logged a false
+            # 'removed' while the stale artifact (e.g. a directory) survived.
+            rm -f -- "$dest" || {
+                echo "chapter_extract: failed to remove stale chapters.xml: $dest"
+                echo 'ENCODE_STEP_FAILED chapter_extract'; exit 1
+            }
             echo '[chapter_extract] removed stale chapters.xml'
         fi
     else

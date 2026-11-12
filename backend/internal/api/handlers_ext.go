@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/store"
 )
 
@@ -82,6 +83,17 @@ func (s *Server) handleListSeries(w http.ResponseWriter, r *http.Request) {
 			EpisodesActive: p.Active,
 			EpisodesTotal:  total,
 		})
+	}
+	// W9: the per-series Discord override carries the same path-token
+	// credential as the global webhook — apply the same non-admin mask
+	// (RedactURL masks the token, keeps the webhook identifiable). Copy
+	// each row; the store's rows must never be mutated. Admins see all.
+	if !requestIsAdmin(r) {
+		for i := range out {
+			cp := *out[i].Series
+			cp.WebhookURL = notify.RedactURL(cp.WebhookURL)
+			out[i].Series = &cp
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }

@@ -63,10 +63,13 @@ func (s *Server) OffsiteAfterSnapshot(ctx context.Context, info *BackupInfo) {
 			}
 		}
 		detail := map[string]any{
-			"name":               info.Name,
-			"destination":        r.Destination,
-			"uploaded":           r.Uploaded,
-			"pruned":             r.Pruned,
+			"name":        info.Name,
+			"destination": r.Destination,
+			"uploaded":    r.Uploaded,
+			// Summarize at the SOURCE: a large retention prune (hundreds of
+			// names) would blow the 1024-byte audit detail cap and truncate
+			// the key fields. Full list stays in the structured log below.
+			"pruned":             summarizeAuditList(r.Pruned, auditListKeep),
 			"shares_key_bundled": keyBundled,
 		}
 		if r.Err != "" {

@@ -409,12 +409,15 @@ port goes in `smtp_port`); `smtp_user` requires a password (stored or new).
 
 Channel URLs can embed credentials in the query string (`?auth=<token>`).
 For NON-admin readers (viewer sessions, read-scope API tokens) `GET
-/api/settings` masks those query VALUES in `ntfy_topic_url` and
-`generic_webhook_url` (scheme/host/path stay visible), and empties
+/api/settings` masks those query VALUES in `ntfy_topic_url`,
+`generic_webhook_url` and `ingest.url` (scheme/host/path stay visible),
+masks the `discord_webhook` PATH token (the last `/api/webhooks/` segment
+becomes `REDACTED` — the token IS the credential), and empties
 `backup_offsite.s3.access_key` (`has_s3_access_key` reports presence);
-admins see the full values. Channel error logs never carry raw query
-credentials either — URLs are redacted before logging, including URLs
-EMBEDDED in larger transport-error strings.
+admins see the full values. The same Discord mask applies to the
+per-series override `webhook_url` in `GET /api/series`. Channel error logs
+never carry raw query credentials either — URLs are redacted before
+logging, including URLs EMBEDDED in larger transport-error strings.
 
 **Key-loss failure mode (fail-closed save).** If the shares key file is lost
 or replaced, stored secrets become undecryptable. `GET /api/settings` still
@@ -1060,6 +1063,10 @@ the current farm host is `172.24.92.232:8080`).
 - **Job Status Totals** — terminal counters `encode_jobs_done_total` /
   `failed_total` / `cancelled_total` as stat tiles; the **Throughput
   Counters** time series shows the completion/failure rate slope.
+- **Stalled Jobs (Watchdog)** — `encode_jobs_stalled_total` as a stat tile
+  (green at 0, red at ≥1): any non-zero value means the stall watchdog is
+  firing (jobs wedged on nodes, failed + retried). Alerted by
+  `EncodeJobStalled`.
 - **Per-Node Slot Utilization** — `encode_node_active_jobs` vs
   `encode_node_max_concurrent_jobs` overlaid so saturation is visible.
 - **Node Fleet Status** — a table joining online / enabled / active / max
@@ -1072,18 +1079,18 @@ The dashboard JSON lives at `docker/grafana/encode-system-dashboard.json`
 `${DS_PROMETHEUS}` datasource). It uses only `stat`, `timeseries`, `table`,
 and `gauge` panels — all built **only** from metrics the controller
 actually emits (verified against `backend/internal/api/prometheus.go`; no
-synthetic series). It panels 10 of the 11 emitted series;
-`encode_jobs_stalled_total` (P1 stall watchdog) is scrape-ready but not
-yet panelled — add a stat/timeseries panel for it if you want stall
-visibility in Grafana.
+synthetic series). It panels all 11 emitted series, including
+`encode_jobs_stalled_total` (P1 stall watchdog) as the **Stalled Jobs
+(Watchdog)** stat tile.
 
 ### Opt-in Prometheus wiring and alerting
 
 `docker/observability/` ships opt-in assets for wiring the controller into an
 **existing** Prometheus/Grafana/Loki/Alloy stack (e.g. the network-wide
 observability system): a scrape-job snippet (`prometheus-scrape.yml`,
-`job_name: encode`), 5 alert rules (`alert-rules.yml`: controller down, queue
-stalled, node offline, failure spike, host disk low), an Alertmanager →
+`job_name: encode`), 6 alert rules (`alert-rules.yml`: controller down, queue
+stalled, node offline, failure spike, job stalled — the stall watchdog
+firing — and host disk low), an Alertmanager →
 Discord example (`alertmanager.example.yml`, webhook read from a `chmod 600`
 secret file — never committed), and an optional Alloy JSON-log enrichment
 snippet. Nothing is applied automatically — merging into the monitoring

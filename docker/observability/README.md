@@ -18,7 +18,7 @@ only hard prerequisite.
 | File | Purpose |
 | --- | --- |
 | `prometheus-scrape.yml` | Scrape-job snippet to merge into your `prometheus.yml` (`job_name: encode`). |
-| `alert-rules.yml` | 5 Prometheus alert rules (controller down, queue stalled, node offline, failure spike, host disk low). |
+| `alert-rules.yml` | 6 Prometheus alert rules (controller down, queue stalled, node offline, failure spike, job stalled, host disk low). |
 | `alertmanager.example.yml` | Example Alertmanager config routing alerts to Discord via a secret file. |
 | `discord_webhook.example` | Placeholder for the Discord webhook secret file (never commit the real one). |
 | `alloy-json-enrichment.alloy` | Optional `loki.process` snippet: promote JSON log `level` to a Loki label. |

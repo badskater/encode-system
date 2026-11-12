@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 )
@@ -56,6 +57,42 @@ func (s *Server) writeAudit(ctx context.Context, actor, action, object string, d
 	if err := s.Store.AppendAudit(ctx, actor, action, object, detailStr); err != nil {
 		s.Log.Warn("audit write failed", "err", err, "action", action)
 	}
+}
+
+// auditListKeep is the maximum number of list entries an audit detail carries
+// before summarizing (see summarizeAuditList).
+const auditListKeep = 20
+
+// auditNameCap is the maximum rune length of a torrent name embedded in an
+// ingest audit detail (see capAuditName).
+const auditNameCap = 200
+
+// summarizeAuditList caps a string list embedded in an audit detail: lists
+// longer than keep become the first keep entries plus a "...and N more"
+// summary entry. writeAudit's 1024-byte cap would otherwise truncate the
+// marshaled JSON mid-list, dropping the key fields that follow it (a
+// backup.offsite prune of 364 names marshaled to ~10KB). The full list stays
+// in the structured logs; the audit row keeps a bounded, parseable summary.
+func summarizeAuditList(names []string, keep int) []string {
+	if len(names) <= keep {
+		return names
+	}
+	out := make([]string, 0, keep+1)
+	out = append(out, names[:keep]...)
+	out = append(out, fmt.Sprintf("...and %d more", len(names)-keep))
+	return out
+}
+
+// capAuditName caps a torrent name for an audit detail at max runes (plus an
+// ellipsis when cut). A 1024-rune name marshaled to ~1.1KB and pushed series
+// and staged_path past the 1024-byte detail cap. The FULL name stays in the
+// ingest ledger and the structured log line — the audit row is a breadcrumb.
+func capAuditName(name string, max int) string {
+	r := []rune(name)
+	if len(r) <= max {
+		return name
+	}
+	return string(r[:max]) + "…"
 }
 
 // handleListAudit serves GET /api/audit?limit=N (default 200, max 1000).

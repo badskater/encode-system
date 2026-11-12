@@ -69,7 +69,10 @@ func (s *Server) onIngestStaged(ev ingest.StagedEvent) {
 	ctx := context.Background()
 	if len(ev.Files) == 0 {
 		s.auditSystem(ctx, "ingest.duplicate", "ingest:"+ev.Provider+":"+ev.Hash, map[string]any{
-			"name":        ev.Name,
+			// Name capped at the SOURCE: a 1024-rune torrent name would push
+			// series/staged_path past the 1024-byte audit detail cap. The
+			// full name stays in the ledger and structured logs.
+			"name":        capAuditName(ev.Name, auditNameCap),
 			"series":      ev.Series,
 			"episode":     ev.Episode,
 			"staged_path": ev.StagedPath,
@@ -78,7 +81,7 @@ func (s *Server) onIngestStaged(ev ingest.StagedEvent) {
 		return
 	}
 	s.auditSystem(ctx, "ingest.staged", "ingest:"+ev.Provider+":"+ev.Hash, map[string]any{
-		"name":        ev.Name,
+		"name":        capAuditName(ev.Name, auditNameCap),
 		"series":      ev.Series,
 		"episode":     ev.Episode,
 		"staged_path": ev.StagedPath,

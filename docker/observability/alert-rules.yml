@@ -91,6 +91,23 @@ groups:
           summary: "Encode failure spike ({{ $value }} failures in 1h)"
           description: "encode_jobs_failed_total rose by {{ $value }} over the last hour (threshold >5). Investigate recent failures — a sustained spike signals a systemic problem (bad input batch, broken node, encoder crash loop). Threshold is tunable; see the rule comment."
 
+      # --- Stall watchdog firing ---------------------------------------------
+      # encode_jobs_stalled_total counts jobs the stall watchdog failed (no
+      # progress within settings.stall_timeout_minutes). ANY increase means
+      # the watchdog is firing: jobs are wedging on nodes (hung agent,
+      # stalled toolchain, hung network share) and being failed + retried.
+      # Same DB-derived caveat as EncodeFailureSpike: the counter is a
+      # cumulative DB count ("since DB start"), so job pruning lowers it and
+      # increase() treats a decrease as a counter reset.
+      - alert: EncodeJobStalled
+        expr: increase(encode_jobs_stalled_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Encode stall watchdog fired ({{ $value }} stalled in 1h)"
+          description: "encode_jobs_stalled_total rose by {{ $value }} over the last hour — the stall watchdog is failing jobs that make no progress within the configured stall timeout. Check the affected nodes' agents and toolchains (hung encodes, wedged network shares); affected jobs were auto-retried per their flow's retry policy."
+
       # --- Host disk (node-exporter, job=node) ------------------------------
       # The encode Docker host's filesystems, scraped via node-exporter.
       # fstype!~"tmpfs|overlay" excludes pseudo/ephemeral mounts so only real

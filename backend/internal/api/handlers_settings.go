@@ -188,8 +188,9 @@ func (s *Server) currentSettings(ctx context.Context) *model.Settings {
 // masked to has_* flags. For NON-admin readers (viewer sessions, read-scope
 // API tokens) the channel URLs' query VALUES are masked too — ntfy topic and
 // generic webhook URLs can carry credentials (?auth=<token>), and this route
-// is reachable by any authenticated user. The offsite S3 access_key is
-// masked as well (has_s3_access_key reports presence). Admins see everything.
+// is reachable by any authenticated user. The Discord webhook's PATH token
+// and the offsite S3 access_key are masked as well (has_s3_access_key reports
+// presence). Admins see everything.
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	st := s.currentSettings(r.Context())
 	out := maskSettings(st)
@@ -207,6 +208,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 // masked for non-admin readers:
 //   - query values in the two channel URLs (scheme/host/path stay visible
 //     so the endpoint remains identifiable — the least-breaking mask),
+//   - the Discord webhook's path token (RedactURL masks the last
+//     /api/webhooks/ segment — the token IS the credential),
 //   - the offsite S3 access_key (emptied; has_s3_access_key reports presence
 //     — P4 review Q2: it is half of a credential pair and was fully visible).
 //
@@ -218,6 +221,10 @@ func maskSettingsForNonAdmin(st *model.Settings) *model.Settings {
 	cp := *st
 	cp.NtfyTopicURL = notify.RedactURL(cp.NtfyTopicURL)
 	cp.GenericWebhookURL = notify.RedactURL(cp.GenericWebhookURL)
+	// Discord's secret is a PATH token, not a query value — RedactURL's
+	// discord.com/discordapp.com branch masks it (W9: this was the one
+	// channel URL the non-admin mask missed).
+	cp.DiscordWebhook = notify.RedactURL(cp.DiscordWebhook)
 	cp.BackupOffsite.S3.AccessKey = ""
 	// The ingestion client URL can carry query credentials the same way
 	// the channel URLs can; mask its query values for non-admin readers.

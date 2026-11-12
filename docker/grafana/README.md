@@ -75,11 +75,12 @@ All panels are built **only** from metrics the controller actually emits
 | `encode_node_enabled` | gauge | `node` | Node Fleet Status |
 | `encode_node_active_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
 | `encode_node_max_concurrent_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
+| `encode_jobs_stalled_total` | counter | — | Stalled Jobs (Watchdog) |
 
-The controller emits an 11th series, `encode_jobs_stalled_total` (P1 stall
-watchdog; DB-derived count of failed-stalled jobs) — scrape-ready but not
-yet panelled here. Add a stat/timeseries panel for it if you want stall
-visibility in Grafana.
+`encode_jobs_stalled_total` (P1 stall watchdog; DB-derived count of
+failed-stalled jobs) is panelled as the **Stalled Jobs (Watchdog)** stat
+tile (green at 0, red at ≥1) and alerted by `EncodeJobStalled`
+(`increase(...[1h]) > 0` for 5m) in `docker/observability/alert-rules.yml`.
 
 ## Notes
 

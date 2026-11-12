@@ -137,7 +137,13 @@ const bashSourceRename = `source_rename () {
         echo 'ENCODE_STEP_FAILED source_rename'; exit 1
     fi
     local rawext="${raw##*.}"
-    mv -- "$raw" "$EpisodeDir/$source_name.$rawext"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function,
+    # so an unchecked mv (read-only dir, EIO on a network share) would report
+    # 100 + JOB_DONE with the source never renamed.
+    mv -- "$raw" "$EpisodeDir/$source_name.$rawext" || {
+        echo "failed to rename $raw -> $source_name.$rawext"
+        echo 'ENCODE_STEP_FAILED source_rename'; exit 1
+    }
     echo "renamed $(basename "$raw") -> $source_name.$rawext"
     echo 'ENCODE_STEP source_rename 100'
 }`
@@ -212,12 +218,20 @@ const bashSourceHdrProbe = `hdr_probe () {
         echo "no source media file in $EpisodeDir"; echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
     }
     local out="$EpisodeDir/hdr.json"
-    if [[ -e "$out" ]] && [[ "$out" -nt "$src" ]]; then
+    # -f, NOT -e: a DIRECTORY named hdr.json must never satisfy the fresh
+    # skip (encode_4k would silently drop HDR signaling on a jq read failure).
+    if [[ -f "$out" ]] && [[ "$out" -nt "$src" ]]; then
         echo 'hdr.json already present and newer than source, reusing'
         echo 'ENCODE_STEP hdr_probe 100'
         return 0
     fi
-    rm -f -- "$out"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked rm/write left NO hdr.json while reporting 100 + JOB_DONE,
+    # and encode_4k then silently dropped HDR signaling.
+    rm -f -- "$out" || {
+        echo "failed to remove stale hdr.json: $out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    }
     local mi
     mi=$(command -v mediainfo 2>/dev/null || true)
     [[ -z "$mi" ]] && mi="$BinDir/mediainfo"
@@ -254,7 +268,18 @@ const bashSourceHdrProbe = `hdr_probe () {
     jq -nc --arg hdr "$hdr" --argjson dovi "$dovi" --arg transfer "$transfer" \
         --arg primaries "$primaries" --arg maxcll "$maxcll" --arg maxfall "$maxfall" \
         --arg master_display "$master_display" --argjson width "$width" --argjson height "$height" \
-        '{hdr:$hdr,dovi:$dovi,transfer:$transfer,primaries:$primaries,max_cll:$maxcll,max_fall:$maxfall,master_display:$master_display,width:$width,height:$height}' > "$out"
+        '{hdr:$hdr,dovi:$dovi,transfer:$transfer,primaries:$primaries,max_cll:$maxcll,max_fall:$maxfall,master_display:$master_display,width:$width,height:$height}' > "$out" || {
+        echo "failed to write hdr.json: $out"
+        rm -f -- "$out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    }
+    # Post-publish check: a partial/empty artifact must never survive for the
+    # freshness skip to reuse on retry.
+    if ! [[ -s "$out" ]]; then
+        echo "hdr_probe finished but hdr.json was not written: $out"
+        rm -f -- "$out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    fi
     echo "[hdr] $width x $height, transfer '$transfer', primaries '$primaries' -> $hdr (DoVi: $dovi)"
     if [[ "$dovi" == "true" ]]; then
         echo '[hdr] Dolby Vision detected — encode_4k will extract the RPU with dovi_tool and encode profile 8.1'
@@ -471,7 +496,13 @@ const bashSourceAudioLang = `audio_lang () {
         echo 'ENCODE_STEP audio_lang 100'
         return 0
     fi
-    rm -f -- "$opus" "$audio_json"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked rm/audio.json write reported 100 + JOB_DONE with no manifest
+    # and mux silently fell back to jpn.
+    rm -f -- "$opus" "$audio_json" || {
+        echo "failed to remove stale audio.opus/audio.json in $EpisodeDir"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    }
     echo 'ENCODE_STEP audio_lang 10'
     local mi
     mi=$(command -v mediainfo 2>/dev/null || true)
@@ -537,7 +568,16 @@ const bashSourceAudioLang = `audio_lang () {
     rm -f -- "$wav"
     echo 'removed intermediate WAV'
     jq -nc --arg language "$chosen_lang" --argjson track "$track" --arg codec 'opus' --arg bitrate "$bitrate" \
-        '{language:$language,track:$track,codec:$codec,bitrate:$bitrate}' > "$audio_json"
+        '{language:$language,track:$track,codec:$codec,bitrate:$bitrate}' > "$audio_json" || {
+        echo "failed to write audio.json: $audio_json"
+        rm -f -- "$audio_json"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    }
+    if ! [[ -s "$audio_json" ]]; then
+        echo "audio_lang finished but audio.json was not written: $audio_json"
+        rm -f -- "$audio_json"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    fi
     echo "[audio_lang] wrote audio.json (language '$chosen_lang')"
     echo 'ENCODE_STEP audio_lang 100'
 }`
@@ -919,8 +959,13 @@ const bashSourceVerifyOutput = `verify_output () {
 // 8-hex tag) and the OutputName propagation are preserved.
 const bashSourceCrc32Rename = `crc32_rename () {
     echo 'ENCODE_STEP crc32_rename 0'
-    local uppercase=true
-    [[ "$uppercase" == "false" ]] && uppercase=false
+    # Read the flow param (StepCall injects $uppercase); default true only
+    # when unset/blank. PS parity: only 'false' turns the tag lowercase (PS
+    # -eq is case-insensitive, so lowercase the value first). The old
+    # 'local uppercase=true' SHADOWED the injected param — uppercase=false
+    # was silently ignored.
+    local uppercase="${uppercase:-true}"
+    uppercase="${uppercase,,}"
     local mkv="$EpisodeDir/$OutputName"
     if ! [[ -e "$mkv" ]]; then
         echo "finished MKV not found: $mkv (run after the mux step)"; echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
@@ -932,15 +977,36 @@ const bashSourceCrc32Rename = `crc32_rename () {
         base="${base% *}"
         echo 'existing checksum tag found, replacing'
     fi
-    # POSIX cksum computes CRC32 (reflected polynomial, same as fansub CRC32).
-    # Output format: "<crc> <size> <filename>" — we take the first field.
+    # POSIX cksum computes a CRC32 (non-reflected 0x04C11DB7 + file length).
+    # NOTE: this is NOT the IEEE CRC-32 the PS template's C# computes — the
+    # two dialects produce different tags for the same file (known follow-up;
+    # changing the algorithm needs a tooling decision). Output format:
+    # "<crc> <size> <filename>" — we take the first field.
+    # Fail-closed: an unchecked cksum failure published an EMPTY CRC tag
+    # ("Show - 01 [].mkv") with 100 + JOB_DONE.
     local hex
-    hex=$(cksum -- "$mkv" | awk '{printf "%08X", $1}')
+    hex=$(cksum -- "$mkv" | awk '{printf "%08X", $1}') || {
+        echo "cksum failed for $mkv"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    }
+    if ! [[ "$hex" =~ ^[0-9A-F]{8}$ ]]; then
+        echo "cksum produced no usable CRC32 for $mkv"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    fi
     if [[ "$uppercase" == "false" ]]; then
         hex=$(echo "$hex" | tr 'A-F' 'a-f')
     fi
     local new_name="$base [$hex].$ext"
-    mv -- "$mkv" "$EpisodeDir/$new_name"
+    mv -- "$mkv" "$EpisodeDir/$new_name" || {
+        echo "failed to rename $mkv -> $new_name"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    }
+    # Post-publish check: 'mv file dir/' SUCCEEDS by moving the file INSIDE
+    # the directory — only a regular file at the target is a published rename.
+    if ! [[ -f "$EpisodeDir/$new_name" ]]; then
+        echo "crc32 rename did not produce a regular file: $EpisodeDir/$new_name"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    fi
     # Propagate to the shared job context so release_copy/keyframes pick up the
     # checksummed name. (In bash, this exports the new OutputName for later
     # steps in the same script.)
@@ -958,14 +1024,24 @@ const bashSourceReleaseCopy = `release_copy () {
         echo "finished MKV not found: $src"; echo 'ENCODE_STEP_FAILED release_copy'; exit 1
     fi
     local dest_dir="$ReleaseDir/$ReleaseFolder"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked mkdir/cp let a failed copy publish a SAME-SIZE stale
+    # destination as OVERWROTE with 100 + JOB_DONE (the size guard alone
+    # cannot catch that shape).
     if ! [[ -e "$dest_dir" ]]; then
-        mkdir -p -- "$dest_dir"
+        mkdir -p -- "$dest_dir" || {
+            echo "failed to create release folder: $dest_dir"
+            echo 'ENCODE_STEP_FAILED release_copy'; exit 1
+        }
         echo "created release folder: $dest_dir"
     fi
     local dest="$dest_dir/$OutputName"
     local existed=false
     [[ -e "$dest" ]] && existed=true
-    cp -f -- "$src" "$dest"
+    cp -f -- "$src" "$dest" || {
+        echo "failed to copy release: $src -> $dest"
+        echo 'ENCODE_STEP_FAILED release_copy'; exit 1
+    }
     if [[ "$existed" == "true" ]]; then
         echo "OVERWROTE existing release: $dest"
     else

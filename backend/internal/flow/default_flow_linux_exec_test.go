@@ -1,3 +1,5 @@
+//go:build linux
+
 package flow
 
 import (
@@ -29,10 +31,12 @@ func TestDefaultFlowLinuxExecNoCommandNotFound(t *testing.T) {
 	binDir, path := stubBinDir(t)
 	v, root := execTestEnv(t, binDir)
 
-	// Build a Linux-shaped default flow (no dgindex/keyframes — refused on
-	// Linux). The steps here are exactly the ones a production Linux encode
-	// job dispatches: source_rename → audio → encode → mux → verify_output
-	// → release_copy → crc32_rename → discord_notify.
+	// Build a Linux-shaped default flow (no dgindex — refused on Linux;
+	// keyframes IS ported since P7 and runs after release_copy, mirroring
+	// the production DefaultFlow order). The steps here are the ones a
+	// production Linux encode job dispatches: source_rename → audio →
+	// encode → mux → verify_output → release_copy → keyframes →
+	// crc32_rename → discord_notify.
 	f := &model.Flow{
 		Name: "default-1080-linux",
 		Steps: []model.Step{
@@ -42,6 +46,7 @@ func TestDefaultFlowLinuxExecNoCommandNotFound(t *testing.T) {
 			{Type: model.StepMux},
 			{Type: model.StepType("verify_output")},
 			{Type: model.StepReleaseCopy},
+			{Type: model.StepKeyframes},
 			{Type: model.StepType("crc32_rename")},
 			{Type: model.StepType("discord_notify")},
 		},

@@ -43,6 +43,54 @@ function Resolve-Tool {
     return $path
 }
 
+# Test-LegacyNativeArgumentPassing reports whether this PowerShell
+# serializes native-command arguments with the LEGACY algorithm (wrap in
+# quotes WITHOUT escaping embedded quotes/backslashes). Windows
+# PowerShell 5.1 always does; pwsh 7+ defaults to Standard (correct)
+# passing. Deliberately a separate function so tests can override it to
+# force the legacy path under pwsh 7 ($PSNativeCommandArgumentPassing =
+# 'Legacy') and exercise the 5.1 escaping on Linux CI.
+function Test-LegacyNativeArgumentPassing {
+    return ($PSVersionTable.PSVersion.Major -lt 7)
+}
+
+# ConvertTo-LegacyNativeArgument pre-escapes ONE argument with the MSVCRT
+# (CommandLineToArgvW) rules so the legacy 5.1 serializer passes it
+# through VERBATIM and the target's CRT parser reconstructs it exactly:
+#   - 2n+1 backslashes before a double quote encode n backslashes + quote
+#   - trailing backslashes are doubled so the closing wrap quote is not
+#     escaped
+#   - the result is always wrapped in double quotes
+# The legacy NeedQuotes check does not count escaped quotes and sees the
+# whitespace INSIDE the outer quote pair, so it never re-wraps the result
+# (validated against live pwsh Legacy passing + a CommandLineToArgvW
+# simulator over hostile shapes: quotes, backslashes, spaces, newlines,
+# empty strings, flag-injection payloads). Without this, an untrusted
+# mkvmerge track_name like 'x" --attach-file C:\secret y" z' breaks out
+# of its argument and injects mkvmerge flags on PS 5.1 nodes.
+function ConvertTo-LegacyNativeArgument {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Argument
+    )
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Argument.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$sb.Append('\' * (2 * $backslashes + 1))
+            [void]$sb.Append('"')
+        } else {
+            if ($backslashes -gt 0) { [void]$sb.Append('\' * $backslashes) }
+            [void]$sb.Append($ch)
+        }
+        $backslashes = 0
+    }
+    [void]$sb.Append('\' * (2 * $backslashes))
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 # Invoke-Tool runs an external process, streams its output with a prefix, and
 # throws when the exit code is non-zero. Stdout/stderr are merged so x265's
 # progress (written to stderr) appears in order in the job log.
@@ -53,6 +101,13 @@ function Invoke-Tool {
         [string] $Label = (Split-Path $ExePath -Leaf)
     )
     Write-Output "[$Label] starting: $ExePath $($Arguments -join ' ')"
+    if (Test-LegacyNativeArgumentPassing) {
+        # PS 5.1 / Legacy passing: pre-escape every argument (MSVCRT rules)
+        # so untrusted metadata cannot break out and inject tool flags.
+        # pwsh 7+ Standard passing already escapes correctly — leave the
+        # arguments untouched there.
+        $Arguments = @($Arguments | ForEach-Object { ConvertTo-LegacyNativeArgument -Argument $_ })
+    }
     # Windows PowerShell 5.1 wraps native stderr as ErrorRecords; under
     # ErrorActionPreference=Stop that aborts on harmless progress output
     # (x265 writes progress to stderr). Relax EAP for the native call and
@@ -95,6 +150,122 @@ function Find-SourceFile {
     throw "no source media file found in $EpisodeDir"
 }
 
+# Test-SameFile reports whether two EXISTING paths refer to the same file
+# on disk: the same resolved path, symlinks pointing at one target, or
+# hardlinks (distinct names, one file identity). Plain path-string equality
+# misses both link kinds — that let quality_gate's self-compare guard be
+# bypassed (a src.mkv symlink/hardlink to the output faked a perfect score).
+function Test-SameFile {
+    param(
+        [Parameter(Mandatory)] [string] $PathA,
+        [Parameter(Mandatory)] [string] $PathB
+    )
+    $a = Resolve-LinkFullPath $PathA
+    $b = Resolve-LinkFullPath $PathB
+    if ($a -eq $b) { return $true }
+    # Different resolved names can still be hardlinks to ONE file: compare
+    # the filesystem's file identity, not the names.
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        $ida = Get-FileIdentity $PathA
+        $idb = Get-FileIdentity $PathB
+        return ($null -ne $ida -and $null -ne $idb -and $ida -eq $idb)
+    }
+    # Non-Windows pwsh (Linux nodes / CI): coreutils stat exposes device +
+    # inode. Without stat, fall back to resolved-path comparison only
+    # (hardlinks stay undetectable — documented limitation, symlinks are
+    # still caught above).
+    # Get-Command can return MULTIPLE matches (e.g. /usr/bin/stat and
+    # /bin/stat when /bin is a symlink) — take the first, or .Source
+    # stringifies the whole array into an unrunnable command name.
+    $stat = Get-Command stat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $stat) { return $false }
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $ida = & $stat.Source -c '%d:%i' -- $PathA 2>$null
+        $codeA = $LASTEXITCODE
+        $idb = & $stat.Source -c '%d:%i' -- $PathB 2>$null
+        $codeB = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prevEAP }
+    if ($codeA -ne 0 -or $codeB -ne 0) { return $false }
+    $ida = ([string]::Join('', @($ida | ForEach-Object { [string]$_ }))).Trim()
+    $idb = ([string]::Join('', @($idb | ForEach-Object { [string]$_ }))).Trim()
+    return ($ida -ne '' -and $ida -eq $idb)
+}
+
+# Resolve-LinkFullPath follows a symlink chain to the final target path.
+# .NET 6+ (pwsh 7.2+) does it in one call; Windows PowerShell 5.1 falls
+# back to Get-Item's reparse-point Target, walked with a bounded loop.
+function Resolve-LinkFullPath {
+    param([Parameter(Mandatory)] [string] $Path)
+    try {
+        $t = [System.IO.File]::ResolveLinkTarget($Path, $true)
+        if ($null -ne $t) { return $t.FullName }
+    } catch { }
+    $item = Get-Item -LiteralPath $Path -Force
+    for ($i = 0; $i -lt 16; $i++) {
+        $tp = $item.PSObject.Properties['Target']
+        if ($null -eq $tp -or $null -eq $tp.Value -or @($tp.Value).Count -eq 0) { break }
+        $target = [string]@($tp.Value)[0]
+        if ($target -eq '') { break }
+        if (-not [System.IO.Path]::IsPathRooted($target)) {
+            $target = Join-Path $item.DirectoryName $target
+        }
+        $item = Get-Item -LiteralPath $target -Force
+    }
+    return $item.FullName
+}
+
+# Get-FileIdentity returns the Windows file identity (volume serial number
+# + 128-bit file index) via GetFileInformationByHandle — the identity NTFS
+# hardlinks share. Returns $null when the file cannot be opened/queried.
+function Get-FileIdentity {
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not ('EncodeLib.FileIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace EncodeLib {
+    public static class FileIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFileW(string path, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(IntPtr h, out BY_HANDLE_FILE_INFORMATION info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr h);
+        public static string Get(string path) {
+            // FILE_READ_ATTRIBUTES=0x80; share READ|WRITE|DELETE=7;
+            // OPEN_EXISTING=3; FILE_FLAG_BACKUP_SEMANTICS=0x02000000.
+            IntPtr h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+            if (h == new IntPtr(-1)) { return null; }
+            try {
+                BY_HANDLE_FILE_INFORMATION info;
+                if (!GetFileInformationByHandle(h, out info)) { return null; }
+                ulong index = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
+                return info.VolumeSerialNumber.ToString("X8") + ":" + index.ToString("X16");
+            } finally { CloseHandle(h); }
+        }
+    }
+}
+'@
+    }
+    return [EncodeLib.FileIdentity]::Get($Path)
+}
+
 # Assert-SafeName rejects values that could escape the intended directory or
 # break Windows filenames. Controller data is admin-authored, but this
 # boundary is where it meets the filesystem — defense in depth.
@@ -106,6 +277,28 @@ function Assert-SafeName {
     if ($Value -match '[\\/:*?"<>|]' -or $Value.Contains('..') -or $Value.Trim() -eq '') {
         throw "unsafe $What value: '$Value' (path separators, '..' or reserved characters are not allowed)"
     }
+}
+
+# ConvertTo-FlagYesNo normalizes a track-flag value to 'yes'/'no' with the
+# SAME truthiness as the bash port: true / 1 / "true" / "yes"
+# (case-insensitive, strings trimmed) → 'yes'; everything else
+# (false / 0 / "no" / missing / null) → 'no'. mkvmerge -J reports booleans,
+# but hand-edited manifests and older identify output carry numbers and
+# strings — both dialects must agree on every shape.
+function ConvertTo-FlagYesNo {
+    param($Value)
+    if ($null -eq $Value) { return 'no' }
+    if ($Value -is [bool]) {
+        if ($Value) { return 'yes' }
+        return 'no'
+    }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        if ($Value -eq 1) { return 'yes' }
+        return 'no'
+    }
+    $s = ([string]$Value).Trim().ToLowerInvariant()
+    if ($s -eq 'true' -or $s -eq 'yes' -or $s -eq '1') { return 'yes' }
+    return 'no'
 }
 
 # Write-EncodeMetric emits one ENCODE_METRIC key=value line for the agent to

@@ -57,28 +57,33 @@ package flow
 // params from the exported locals StepCall sets (lowercased, hyphens→
 // underscores: e.g. $track, $bitrate, $x265_args, $source_name).
 var builtinBashSources = map[string]string{
-	"source_rename":  bashSourceRename,
-	"media_probe":    bashSourceMediaProbe,
-	"hdr_probe":      bashSourceHdrProbe,
-	"audio":          bashSourceAudio,
-	"audio_branch":   bashSourceAudioBranch,
-	"audio_lang":     bashSourceAudioLang,
-	"flac_audio":     bashSourceFlacAudio,
-	"encode":         bashSourceEncode,
-	"encode_4k":      bashSourceEncode4k,
-	"mux":            bashSourceMux,
-	"verify_output":  bashSourceVerifyOutput,
-	"crc32_rename":   bashSourceCrc32Rename,
-	"release_copy":   bashSourceReleaseCopy,
-	"discord_notify": bashSourceDiscordNotify,
+	"source_rename":    bashSourceRename,
+	"media_probe":      bashSourceMediaProbe,
+	"hdr_probe":        bashSourceHdrProbe,
+	"audio":            bashSourceAudio,
+	"audio_branch":     bashSourceAudioBranch,
+	"audio_lang":       bashSourceAudioLang,
+	"flac_audio":       bashSourceFlacAudio,
+	"encode":           bashSourceEncode,
+	"encode_4k":        bashSourceEncode4k,
+	"mux":              bashSourceMux,
+	"verify_output":    bashSourceVerifyOutput,
+	"quality_gate":     bashSourceQualityGate,
+	"subtitle_extract": bashSourceSubtitleExtract,
+	"font_extract":     bashSourceFontExtract,
+	"chapter_extract":  bashSourceChapterExtract,
+	"mux_extras":       bashSourceMuxExtras,
+	"crc32_rename":     bashSourceCrc32Rename,
+	"release_copy":     bashSourceReleaseCopy,
+	"keyframes":        bashSourceKeyframes,
+	"discord_notify":   bashSourceDiscordNotify,
 }
 
 // builtinBashRefused lists built-in templates that genuinely have no Linux
 // equivalent. Each value is the human-readable reason included in the render
 // error so an operator reading the job log understands the platform mismatch.
 var builtinBashRefused = map[string]string{
-	"dgindex":   "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
-	"keyframes": "scene-change keyframe detection: the PS template uses SCXvid.exe (Windows .NET); a faithful Linux equivalent requires scxvid-standalone or a VapourSynth SCXvid plugin, neither of which is wired into this change. The previous bash body was a fake (every-240th-frame, NOT scene-change detection) — shipping a fake is worse than refusing. Add a real Linux SCXvid path before re-enabling.",
+	"dgindex": "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
 }
 
 // findSourceFileBash mirrors the EncodeLib Find-SourceFile helper: locate the
@@ -132,7 +137,13 @@ const bashSourceRename = `source_rename () {
         echo 'ENCODE_STEP_FAILED source_rename'; exit 1
     fi
     local rawext="${raw##*.}"
-    mv -- "$raw" "$EpisodeDir/$source_name.$rawext"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function,
+    # so an unchecked mv (read-only dir, EIO on a network share) would report
+    # 100 + JOB_DONE with the source never renamed.
+    mv -- "$raw" "$EpisodeDir/$source_name.$rawext" || {
+        echo "failed to rename $raw -> $source_name.$rawext"
+        echo 'ENCODE_STEP_FAILED source_rename'; exit 1
+    }
     echo "renamed $(basename "$raw") -> $source_name.$rawext"
     echo 'ENCODE_STEP source_rename 100'
 }`
@@ -207,12 +218,20 @@ const bashSourceHdrProbe = `hdr_probe () {
         echo "no source media file in $EpisodeDir"; echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
     }
     local out="$EpisodeDir/hdr.json"
-    if [[ -e "$out" ]] && [[ "$out" -nt "$src" ]]; then
+    # -f, NOT -e: a DIRECTORY named hdr.json must never satisfy the fresh
+    # skip (encode_4k would silently drop HDR signaling on a jq read failure).
+    if [[ -f "$out" ]] && [[ "$out" -nt "$src" ]]; then
         echo 'hdr.json already present and newer than source, reusing'
         echo 'ENCODE_STEP hdr_probe 100'
         return 0
     fi
-    rm -f -- "$out"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked rm/write left NO hdr.json while reporting 100 + JOB_DONE,
+    # and encode_4k then silently dropped HDR signaling.
+    rm -f -- "$out" || {
+        echo "failed to remove stale hdr.json: $out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    }
     local mi
     mi=$(command -v mediainfo 2>/dev/null || true)
     [[ -z "$mi" ]] && mi="$BinDir/mediainfo"
@@ -249,7 +268,18 @@ const bashSourceHdrProbe = `hdr_probe () {
     jq -nc --arg hdr "$hdr" --argjson dovi "$dovi" --arg transfer "$transfer" \
         --arg primaries "$primaries" --arg maxcll "$maxcll" --arg maxfall "$maxfall" \
         --arg master_display "$master_display" --argjson width "$width" --argjson height "$height" \
-        '{hdr:$hdr,dovi:$dovi,transfer:$transfer,primaries:$primaries,max_cll:$maxcll,max_fall:$maxfall,master_display:$master_display,width:$width,height:$height}' > "$out"
+        '{hdr:$hdr,dovi:$dovi,transfer:$transfer,primaries:$primaries,max_cll:$maxcll,max_fall:$maxfall,master_display:$master_display,width:$width,height:$height}' > "$out" || {
+        echo "failed to write hdr.json: $out"
+        rm -f -- "$out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    }
+    # Post-publish check: a partial/empty artifact must never survive for the
+    # freshness skip to reuse on retry.
+    if ! [[ -s "$out" ]]; then
+        echo "hdr_probe finished but hdr.json was not written: $out"
+        rm -f -- "$out"
+        echo 'ENCODE_STEP_FAILED hdr_probe'; exit 1
+    fi
     echo "[hdr] $width x $height, transfer '$transfer', primaries '$primaries' -> $hdr (DoVi: $dovi)"
     if [[ "$dovi" == "true" ]]; then
         echo '[hdr] Dolby Vision detected — encode_4k will extract the RPU with dovi_tool and encode profile 8.1'
@@ -466,7 +496,13 @@ const bashSourceAudioLang = `audio_lang () {
         echo 'ENCODE_STEP audio_lang 100'
         return 0
     fi
-    rm -f -- "$opus" "$audio_json"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked rm/audio.json write reported 100 + JOB_DONE with no manifest
+    # and mux silently fell back to jpn.
+    rm -f -- "$opus" "$audio_json" || {
+        echo "failed to remove stale audio.opus/audio.json in $EpisodeDir"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    }
     echo 'ENCODE_STEP audio_lang 10'
     local mi
     mi=$(command -v mediainfo 2>/dev/null || true)
@@ -532,7 +568,16 @@ const bashSourceAudioLang = `audio_lang () {
     rm -f -- "$wav"
     echo 'removed intermediate WAV'
     jq -nc --arg language "$chosen_lang" --argjson track "$track" --arg codec 'opus' --arg bitrate "$bitrate" \
-        '{language:$language,track:$track,codec:$codec,bitrate:$bitrate}' > "$audio_json"
+        '{language:$language,track:$track,codec:$codec,bitrate:$bitrate}' > "$audio_json" || {
+        echo "failed to write audio.json: $audio_json"
+        rm -f -- "$audio_json"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    }
+    if ! [[ -s "$audio_json" ]]; then
+        echo "audio_lang finished but audio.json was not written: $audio_json"
+        rm -f -- "$audio_json"
+        echo 'ENCODE_STEP_FAILED audio_lang'; exit 1
+    fi
     echo "[audio_lang] wrote audio.json (language '$chosen_lang')"
     echo 'ENCODE_STEP audio_lang 100'
 }`
@@ -914,8 +959,13 @@ const bashSourceVerifyOutput = `verify_output () {
 // 8-hex tag) and the OutputName propagation are preserved.
 const bashSourceCrc32Rename = `crc32_rename () {
     echo 'ENCODE_STEP crc32_rename 0'
-    local uppercase=true
-    [[ "$uppercase" == "false" ]] && uppercase=false
+    # Read the flow param (StepCall injects $uppercase); default true only
+    # when unset/blank. PS parity: only 'false' turns the tag lowercase (PS
+    # -eq is case-insensitive, so lowercase the value first). The old
+    # 'local uppercase=true' SHADOWED the injected param — uppercase=false
+    # was silently ignored.
+    local uppercase="${uppercase:-true}"
+    uppercase="${uppercase,,}"
     local mkv="$EpisodeDir/$OutputName"
     if ! [[ -e "$mkv" ]]; then
         echo "finished MKV not found: $mkv (run after the mux step)"; echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
@@ -927,15 +977,36 @@ const bashSourceCrc32Rename = `crc32_rename () {
         base="${base% *}"
         echo 'existing checksum tag found, replacing'
     fi
-    # POSIX cksum computes CRC32 (reflected polynomial, same as fansub CRC32).
-    # Output format: "<crc> <size> <filename>" — we take the first field.
+    # POSIX cksum computes a CRC32 (non-reflected 0x04C11DB7 + file length).
+    # NOTE: this is NOT the IEEE CRC-32 the PS template's C# computes — the
+    # two dialects produce different tags for the same file (known follow-up;
+    # changing the algorithm needs a tooling decision). Output format:
+    # "<crc> <size> <filename>" — we take the first field.
+    # Fail-closed: an unchecked cksum failure published an EMPTY CRC tag
+    # ("Show - 01 [].mkv") with 100 + JOB_DONE.
     local hex
-    hex=$(cksum -- "$mkv" | awk '{printf "%08X", $1}')
+    hex=$(cksum -- "$mkv" | awk '{printf "%08X", $1}') || {
+        echo "cksum failed for $mkv"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    }
+    if ! [[ "$hex" =~ ^[0-9A-F]{8}$ ]]; then
+        echo "cksum produced no usable CRC32 for $mkv"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    fi
     if [[ "$uppercase" == "false" ]]; then
         hex=$(echo "$hex" | tr 'A-F' 'a-f')
     fi
     local new_name="$base [$hex].$ext"
-    mv -- "$mkv" "$EpisodeDir/$new_name"
+    mv -- "$mkv" "$EpisodeDir/$new_name" || {
+        echo "failed to rename $mkv -> $new_name"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    }
+    # Post-publish check: 'mv file dir/' SUCCEEDS by moving the file INSIDE
+    # the directory — only a regular file at the target is a published rename.
+    if ! [[ -f "$EpisodeDir/$new_name" ]]; then
+        echo "crc32 rename did not produce a regular file: $EpisodeDir/$new_name"
+        echo 'ENCODE_STEP_FAILED crc32_rename'; exit 1
+    fi
     # Propagate to the shared job context so release_copy/keyframes pick up the
     # checksummed name. (In bash, this exports the new OutputName for later
     # steps in the same script.)
@@ -953,14 +1024,24 @@ const bashSourceReleaseCopy = `release_copy () {
         echo "finished MKV not found: $src"; echo 'ENCODE_STEP_FAILED release_copy'; exit 1
     fi
     local dest_dir="$ReleaseDir/$ReleaseFolder"
+    # Fail-closed: the StepCall wrapper disables errexit inside this function.
+    # An unchecked mkdir/cp let a failed copy publish a SAME-SIZE stale
+    # destination as OVERWROTE with 100 + JOB_DONE (the size guard alone
+    # cannot catch that shape).
     if ! [[ -e "$dest_dir" ]]; then
-        mkdir -p -- "$dest_dir"
+        mkdir -p -- "$dest_dir" || {
+            echo "failed to create release folder: $dest_dir"
+            echo 'ENCODE_STEP_FAILED release_copy'; exit 1
+        }
         echo "created release folder: $dest_dir"
     fi
     local dest="$dest_dir/$OutputName"
     local existed=false
     [[ -e "$dest" ]] && existed=true
-    cp -f -- "$src" "$dest"
+    cp -f -- "$src" "$dest" || {
+        echo "failed to copy release: $src -> $dest"
+        echo 'ENCODE_STEP_FAILED release_copy'; exit 1
+    }
     if [[ "$existed" == "true" ]]; then
         echo "OVERWROTE existing release: $dest"
     else
@@ -975,12 +1056,196 @@ const bashSourceReleaseCopy = `release_copy () {
     echo 'ENCODE_STEP release_copy 100'
 }`
 
-// bashSourceKeyframes was REMOVED (GAP 2): the inline Python emitted every
-// 240th frame, NOT scene-change detection — a fake. The PS template uses
-// SCXvid.exe (Windows .NET) for real scene-change detection. Rather than
-// ship a fake, `keyframes` is now refused in builtinBashRefused with a clear
-// error. A faithful Linux SCXvid path (scxvid-standalone / VapourSynth
-// plugin) can re-enable it in a future change.
+// bashSourceKeyframes: real scene-change detection on Linux via the
+// vapoursynth-scxvid plugin (pip install vapoursynth-scxvid), replacing the
+// old fake every-240th-frame body that was refused in GAP 2.
+//
+// PARITY CONTRACT (verified against the Windows template + upstream sources):
+//   - Windows feeds SCXvid.exe the RELEASE MKV downscaled to 640x360 yuv420p
+//     (ffmpeg scale=640:360 -pix_fmt yuv420p). The .vpy mirrors that input:
+//     same release MKV, resize.Bicubic to 640x360, format YUV420P8 (scxvid
+//     requires constant-format YUV420P8; Bicubic matches ffmpeg's default
+//     scaler family).
+//   - SCXvid.exe (the soyokaze/SCXvid-standalone port of the Avisynth
+//     plugin) writes an XviD FIRST-PASS STATS LOG as its output file — that
+//     log IS the "<Series> - <Episode> Keyframes.txt" artifact (Aegisub
+//     opens it directly). vapoursynth-scxvid uses the same xvidcore
+//     xvid_plugin_2pass1 with identical encoder settings, so its `log`
+//     output is the same artifact format — no conversion/parser needed.
+//   - use_slices=True mirrors SCXvid-standalone, which sets
+//     num_slices = num_threads (threaded WITH slices); the encoder flag
+//     sets (vop/motion/quant/max_key_interval) are identical upstream.
+//   - The log is written to a unique temp file NEXT TO the final artifact
+//     and renamed on success: a failed run never leaves a partial
+//     Keyframes.txt that the freshness skip would treat as valid on retry
+//     (an improvement over the Windows direct-write, same success output).
+//   - Source loading: L-SMASH Works (lsmas.LWLibavSource) with an FFMS2
+//     fallback — the same CPU source-filter family the Linux encode path
+//     documents for .vpy scripts. Paths reach the .vpy through env vars
+//     (ENCODE_KF_SOURCE/ENCODE_KF_LOG), so the heredoc stays fully quoted
+//     and no path ever needs Python-literal escaping.
+//   - vspipe runs the WHOLE clip to a null sink (scxvid seeking is slow —
+//     it processes from frame 0; the log is only complete after the last
+//     frame). Markers, skip/stale logic and error texts mirror the PS body.
+const bashSourceKeyframes = `keyframes () {
+    echo 'ENCODE_STEP keyframes 0'
+    local vspipe
+    vspipe=$(command -v vspipe 2>/dev/null || true)
+    [[ -z "$vspipe" ]] && vspipe="$BinDir/vspipe"
+    if ! [[ -x "$vspipe" ]]; then
+        echo "VapourSynth (vspipe) not found - install VapourSynth and the scxvid plugin: pip install vapoursynth-scxvid"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    local dest_dir="$ReleaseDir/$ReleaseFolder"
+    local mkv="$dest_dir/$OutputName"
+    local kf="$dest_dir/$Series - $Episode Keyframes.txt"
+    # Flattened display copies for error echoes: CR/LF inside a path must
+    # never split an echo into a line-start ENCODE_STEP marker (forgery).
+    local mkv_disp="${mkv//$'\n'/ }" kf_disp="${kf//$'\n'/ }"
+    mkv_disp="${mkv_disp//$'\r'/ }"
+    kf_disp="${kf_disp//$'\r'/ }"
+    if ! [[ -e "$mkv" ]]; then
+        echo "release MKV not found: $mkv_disp"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    # -f, NOT -e: a DIRECTORY named Keyframes.txt is not an artifact and
+    # must never satisfy the fresh-skip — it falls through to the guarded
+    # stale-rm below and fails closed.
+    if [[ -f "$kf" ]] && [[ "$kf" -nt "$mkv" ]]; then
+        echo 'keyframes file exists and is newer than the MKV, skipping'
+        echo 'ENCODE_STEP keyframes 100'
+        return 0
+    fi
+    if [[ -e "$kf" ]]; then
+        echo 'keyframes file is stale (older than MKV), regenerating'
+        rm -f -- "$kf" || {
+            echo "failed to remove stale keyframes file: $kf_disp"
+            echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+        }
+    fi
+    echo '[keyframes] vspipe -> scxvid (xvid first-pass log)'
+    # Unique work dir (episode side) for the generated script; unique log
+    # temp NEXT TO the artifact so the final rename is atomic on the
+    # release filesystem. NOTE: the StepCall wrapper '{ fn; } || {...}'
+    # DISABLES errexit/ERR inside this function — every critical command
+    # below carries an explicit failure guard (a swallowed rm/mv failure
+    # used to publish 100 + JOB_DONE with no artifact).
+    local tmpd log
+    tmpd=$(mktemp -d "$EpisodeDir/.keyframes.XXXXXX") || {
+        echo 'keyframes: failed to create temp work dir'
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
+    log=$(mktemp "$dest_dir/.scxvid.XXXXXX") || {
+        echo 'keyframes: failed to create temp log file'
+        rm -rf -- "$tmpd"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
+    export ENCODE_KF_SOURCE="$mkv"
+    export ENCODE_KF_LOG="$log"
+    cat > "$tmpd/script.vpy" <<'VPY'
+import os
+import vapoursynth as vs
+import scxvid
+
+core = vs.core
+source = os.environ["ENCODE_KF_SOURCE"]
+log = os.environ["ENCODE_KF_LOG"]
+
+# Release MKV in, same as the Windows path. L-SMASH Works first, FFMS2
+# fallback (the CPU source-filter family the Linux encode path uses).
+try:
+    clip = core.lsmas.LWLibavSource(source=source)
+except (AttributeError, vs.Error):
+    clip = core.ffms2.Source(source=source)
+
+# Windows contract: scale=640:360, yuv420p (8-bit 4:2:0). scxvid requires
+# constant-format YUV420P8; convert 10-bit sources here.
+clip = core.resize.Bicubic(clip, width=640, height=360, format=vs.YUV420P8)
+
+# use_slices=True mirrors SCXvid-standalone (num_slices = num_threads).
+# The log is the xvid first-pass stats file = the Keyframes.txt artifact.
+clip = scxvid.Scxvid(clip, log=log, use_slices=True)
+clip.set_output()
+VPY
+    if ! [[ -s "$tmpd/script.vpy" ]]; then
+        echo 'keyframes: failed to write the generated .vpy script'
+        rm -rf -- "$tmpd"; rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    # Whole clip to a null sink: scxvid must see every frame in order for
+    # the log to be complete. -p makes vspipe stream 'Frame: N/M (fps)'
+    # progress to stderr (CR-terminated, ~2Hz — upstream vspipe.cpp). The
+    # pipeline reads it LIVE: chunks are split on CR/LF, echoed with the
+    # [vspipe] prefix, and Frame lines become throttled ENCODE_STEP markers
+    # so the controller's stall watchdog (refreshes last_progress_at only
+    # on progress CHANGE) sees a long run advancing. vspipe's exit code is
+    # captured through a temp rc file — the pipeline's own status is the
+    # reader's, not vspipe's.
+    local last_pct=0 last_emit
+    last_emit=$(date +%s)
+    { "$vspipe" -p -c y4m "$tmpd/script.vpy" - > /dev/null; echo "$?" > "$tmpd/vspipe.rc"; } 2>&1 | while IFS= read -r -d $'\r' chunk || [[ -n "$chunk" ]]; do
+        # A chunk is CR-delimited but may embed LF-terminated error lines;
+        # iterate every complete line in it.
+        local line
+        while IFS= read -r line; do
+            [[ "$line" =~ [^[:space:]] ]] || continue
+            echo "[vspipe] $line"
+            if [[ "$line" =~ ^Frame:\ ([0-9]+)/([0-9]+) ]]; then
+                local n="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}"
+                if (( m > 0 )); then
+                    local pct=$(( n * 100 / m ))
+                    if (( pct > 99 )); then pct=99; fi
+                    local now
+                    now=$(date +%s)
+                    # Throttle: >=2% change or >=5s since the last marker;
+                    # never repeat or regress. 100 stays reserved for the
+                    # publish marker below.
+                    if (( pct > last_pct )) && { (( pct >= last_pct + 2 )) || (( now - last_emit >= 5 )); }; then
+                        echo "ENCODE_STEP keyframes $pct"
+                        last_pct=$pct
+                        last_emit=$now
+                    fi
+                fi
+            fi
+        done <<< "$chunk"
+    done
+    unset ENCODE_KF_SOURCE ENCODE_KF_LOG
+    local rc
+    rc=$(cat "$tmpd/vspipe.rc" 2>/dev/null || echo 1)
+    if ! [[ "$rc" =~ ^[0-9]+$ ]]; then rc=1; fi
+    rm -rf -- "$tmpd"
+    if (( rc != 0 )); then
+        rm -f -- "$log"
+        echo "vspipe exited with code $rc - scene-change detection failed (VapourSynth + scxvid plugin required: pip install vapoursynth-scxvid)"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    if ! [[ -s "$log" ]]; then
+        echo "scxvid finished but the keyframes log was not created"
+        rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    # Log content validity: xvidcore writes the two header comment lines at
+    # plugin CREATE (plugin_2pass1.c rc_2pass1_create), BEFORE any frame is
+    # processed — a header-only log means ZERO frames, not a static clip
+    # (which still yields one b/p stats line per frame). Require at least
+    # one real frame-stats line before publishing.
+    if ! grep -Eq '^[ipbs]([[:space:]]+[0-9]+){6}[[:space:]]*$' "$log"; then
+        echo "scxvid finished but the keyframes log has no frame lines (zero frames processed)"
+        rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    mv -f -- "$log" "$kf" || {
+        rm -f -- "$log"
+        echo "failed to move keyframes log into place: $kf_disp"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
+    # Post-publish check: 'mv file dir/' SUCCEEDS by moving the file INSIDE
+    # the directory — only a regular file at $kf is a published artifact.
+    if ! [[ -f "$kf" ]]; then
+        echo "keyframes publish did not produce a regular file: $kf_disp"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    echo 'ENCODE_STEP keyframes 100'
+}`
 
 // bashSourceDiscordNotify: PS uses System.Net.WebClient to POST JSON to a
 // Discord webhook. bash uses curl -fsS with the same JSON payload shape

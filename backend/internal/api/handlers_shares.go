@@ -1,7 +1,9 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -144,6 +146,13 @@ func (s *Server) handleDeleteShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.DeleteShare(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Concurrent delete: another request removed the row between
+			// our GetShare and this DELETE. The share is gone — 404, not
+			// 500.
+			writeErr(w, http.StatusNotFound, "share not found")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "delete share")
 		return
 	}

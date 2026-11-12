@@ -1,0 +1,128 @@
+# Encode-system alerting rules.
+#
+# Every metric name below (encode_jobs_*, encode_node_*) is emitted by the
+# encode-system controller at GET /metrics — see
+# backend/internal/api/prometheus.go for the authoritative source. The
+# `up{job="encode"}` series is produced by Prometheus itself for the scrape
+# job defined in prometheus-scrape.yml (job_name: encode). The
+# node_filesystem_* metrics come from node-exporter (job "node"), not the
+# controller. No synthetic or invented metric names.
+#
+# Validate after edits:
+#   promtool check rules docker/observability/alert-rules.yml
+#   python3 docker/observability/check_rules.py
+groups:
+  - name: encode-system
+    rules:
+      # --- Controller reachability -------------------------------------------
+      - alert: EncodeControllerDown
+        expr: up{job="encode"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Encode controller down ({{ $labels.instance }})"
+          description: "Prometheus has failed to scrape the encode-system controller /metrics endpoint at {{ $labels.instance }} for 5m. The controller process/container is unreachable or crashed — check it and network reachability to :8080."
+
+      # --- Queue stall -------------------------------------------------------
+      # Fires when the queue has pending work but nothing can make progress:
+      #   1. encode_jobs_pending > 0   — work is waiting
+      #   2. encode_jobs_running == 0  — nothing encoding
+      #   3. encode_jobs_assigned == 0 — nothing dispatched/in-flight
+      #   4. no node is online         — nobody to accept dispatch
+      # A single PromQL expression captures all four cleanly: every
+      # encode_jobs_* gauge is labelless, so the `and` chain vector-matches on
+      # the empty label set. sum() collapses the per-node `encode_node_online`
+      # gauge (label: node) to one scalar. The `or vector(0)` handles the edge
+      # case where NO node is registered at all: sum() over zero series yields
+      # an empty vector, which would short-circuit the `and` chain and let a
+      # nodeless stalled queue slip through. With the fallback, "zero
+      # registered nodes" is treated identically to "all nodes offline".
+      - alert: EncodeQueueStalled
+        expr: |
+          (encode_jobs_pending > 0)
+            and (encode_jobs_running == 0)
+            and (encode_jobs_assigned == 0)
+            and ((sum(encode_node_online) or vector(0)) == 0)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Encode queue stalled — {{ $value }} pending, no progress"
+          description: "Jobs are pending ({{ $value }}) but none are running or assigned and no encode nodes are online, for 15m. The fleet cannot drain the queue — check whether nodes are powered off, agents are hung, or dispatch is wedged."
+
+      # --- Per-node liveness -------------------------------------------------
+      # prometheus.go emits encode_node_online with a `node` label, so this
+      # fires once per registered node that has gone stale/offline (no
+      # aggregation needed). A node removed from the controller's DB has no
+      # series and will not alert here — EncodeControllerDown covers a total
+      # controller outage instead.
+      - alert: EncodeNodeOffline
+        expr: encode_node_online == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Encode node offline ({{ $labels.node }})"
+          description: "Node {{ $labels.node }} has not heartbeated within the controller's stale window for 10m (encode_node_online=0). Check the node's agent process and network — it may be hung, powered off, or unreachable."
+
+      # --- Failure rate ------------------------------------------------------
+      # increase() over a 1h window on the failed-jobs counter. The >5
+      # threshold is a sane default for a small encode farm — TUNE IT:
+      #   - raise (e.g. >20) for high-throughput fleets where occasional
+      #     failures are expected
+      #   - lower (e.g. >1) for a strict SLO where any cluster of failures
+      #     is actionable
+      # `for: 5m` dampens momentary counter jumps from a single batch of bad
+      # inputs; remove it if you want immediate notification on threshold
+      # crossing.
+      # Caveat: encode_jobs_failed_total is a cumulative DB count ("since DB
+      # start"), not a process-lifetime counter. Job pruning/deletion (the
+      # retention loop) lowers it, and increase() treats any decrease as a
+      # counter reset — a large prune can therefore manufacture a false
+      # spike. If you prune aggressively, raise the threshold or lengthen
+      # the window.
+      - alert: EncodeFailureSpike
+        expr: increase(encode_jobs_failed_total[1h]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Encode failure spike ({{ $value }} failures in 1h)"
+          description: "encode_jobs_failed_total rose by {{ $value }} over the last hour (threshold >5). Investigate recent failures — a sustained spike signals a systemic problem (bad input batch, broken node, encoder crash loop). Threshold is tunable; see the rule comment."
+
+      # --- Stall watchdog firing ---------------------------------------------
+      # encode_jobs_stalled_total counts jobs the stall watchdog failed (no
+      # progress within settings.stall_timeout_minutes). ANY increase means
+      # the watchdog is firing: jobs are wedging on nodes (hung agent,
+      # stalled toolchain, hung network share) and being failed + retried.
+      # Same DB-derived caveat as EncodeFailureSpike: the counter is a
+      # cumulative DB count ("since DB start"), so job pruning lowers it and
+      # increase() treats a decrease as a counter reset.
+      - alert: EncodeJobStalled
+        expr: increase(encode_jobs_stalled_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Encode stall watchdog fired ({{ $value }} stalled in 1h)"
+          description: "encode_jobs_stalled_total rose by {{ $value }} over the last hour — the stall watchdog is failing jobs that make no progress within the configured stall timeout. Check the affected nodes' agents and toolchains (hung encodes, wedged network shares); affected jobs were auto-retried per their flow's retry policy."
+
+      # --- Host disk (node-exporter, job=node) ------------------------------
+      # The encode Docker host's filesystems, scraped via node-exporter.
+      # fstype!~"tmpfs|overlay" excludes pseudo/ephemeral mounts so only real
+      # backing filesystems (ext4/xfs/etc.) are evaluated. Both node_filesystem_*
+      # metrics share identical labelsets, so the division is a clean per-mount
+      # ratio. <10% free for 10m trips the alert — the encode host stores job
+      # workdirs/output on disk, so a full volume stalls encoding and can
+      # corrupt in-progress jobs.
+      - alert: EncodeHostDiskLow
+        expr: |
+          (node_filesystem_avail_bytes{job="node",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{job="node",fstype!~"tmpfs|overlay"}) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk on encode host ({{ $labels.mountpoint }})"
+          description: "Filesystem {{ $labels.mountpoint }} ({{ $labels.device }}, {{ $labels.fstype }}) on {{ $labels.instance }} has <10% space available for 10m. Free space before the encode host's job workdirs/output fill up."

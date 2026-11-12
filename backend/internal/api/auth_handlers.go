@@ -48,10 +48,15 @@ func (t *loginThrottle) fail() {
 	}
 }
 
+// reset clears the failure counter AND any active lockout: a successful
+// authentication is proof of legitimate use. For local login this only runs
+// after allow() passed (lockout already expired); for OIDC a completed
+// callback lifts an active login-start lockout.
 func (t *loginThrottle) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.failures = 0
+	t.lockedUntil = time.Time{}
 }
 
 // ---------- Login / session handlers ----------

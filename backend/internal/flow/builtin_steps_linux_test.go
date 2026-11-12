@@ -141,30 +141,35 @@ func markersFromFunctionBody(script string) []string {
 // are refused by the bash dialect with a clear error rather than ported
 // incorrectly.
 var refusedTemplates = map[string]string{
-	"dgindex":   "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters instead (no dgi index needed)",
-	"keyframes": "scene-change keyframe detection uses SCXvid.exe (Windows .NET); the bash body was a fake (every-240th-frame, not scene detection) — refused until a real Linux SCXvid path is wired",
+	"dgindex": "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters instead (no dgi index needed)",
 }
 
 // builtinLinuxToolMap records the Linux tool each ported template MUST
 // reference in its bash body. A template missing its expected tool indicates
 // a broken port (e.g. audio still calling eac3to). Verified per-template.
-// Refused templates (dgindex, keyframes) are excluded — they error before
-// producing a body.
+// Refused templates (dgindex) are excluded — they error before producing
+// a body.
 var builtinLinuxToolMap = map[string]string{
-	"source_rename":  "mv",        // bash mv replaces Rename-Item
-	"media_probe":    "mediainfo", // MediaInfo CLI (lowercase binary name on Linux)
-	"hdr_probe":      "mediainfo", // MediaInfo CLI
-	"audio":          "opusenc",   // opusenc is the encoder (ffmpeg decode-only)
-	"audio_branch":   "opusenc",   // opusenc + mediainfo + ffmpeg decode
-	"audio_lang":     "opusenc",   // opusenc + mediainfo + ffmpeg decode
-	"flac_audio":     "flac",      // flac encoder (ffmpeg decode-only)
-	"encode":         "x265",      // x265 encoder (vspipe pipes in)
-	"encode_4k":      "x265",      // x265 encoder (vspipe pipes in)
-	"mux":            "mkvmerge",  // mkvmerge (same binary on Linux)
-	"verify_output":  "mkvmerge",  // mkvmerge -J (same binary)
-	"crc32_rename":   "cksum",     // POSIX cksum (CRC32) or python fallback
-	"release_copy":   "cp",        // bash cp replaces Copy-Item
-	"discord_notify": "curl",      // curl replaces WebClient
+	"source_rename":    "mv",         // bash mv replaces Rename-Item
+	"media_probe":      "mediainfo",  // MediaInfo CLI (lowercase binary name on Linux)
+	"hdr_probe":        "mediainfo",  // MediaInfo CLI
+	"audio":            "opusenc",    // opusenc is the encoder (ffmpeg decode-only)
+	"audio_branch":     "opusenc",    // opusenc + mediainfo + ffmpeg decode
+	"audio_lang":       "opusenc",    // opusenc + mediainfo + ffmpeg decode
+	"flac_audio":       "flac",       // flac encoder (ffmpeg decode-only)
+	"encode":           "x265",       // x265 encoder (vspipe pipes in)
+	"encode_4k":        "x265",       // x265 encoder (vspipe pipes in)
+	"mux":              "mkvmerge",   // mkvmerge (same binary on Linux)
+	"verify_output":    "mkvmerge",   // mkvmerge -J (same binary)
+	"quality_gate":     "ffmpeg",     // ffmpeg libvmaf/ssim comparison (same binary)
+	"subtitle_extract": "mkvextract", // mkvmerge -J identify + mkvextract tracks
+	"font_extract":     "mkvextract", // mkvmerge -J identify + mkvextract attachments
+	"chapter_extract":  "mkvextract", // mkvmerge -J identify + mkvextract chapters
+	"mux_extras":       "mkvmerge",   // mkvmerge merges extras into the encoded MKV
+	"crc32_rename":     "cksum",      // POSIX cksum (CRC32) or python fallback
+	"release_copy":     "cp",         // bash cp replaces Copy-Item
+	"keyframes":        "vspipe",     // vspipe runs the scxvid .vpy (vapoursynth-scxvid)
+	"discord_notify":   "curl",       // curl replaces WebClient
 }
 
 // TestBuiltinBashAllTemplatesResolveOrRefuse: every built-in template must

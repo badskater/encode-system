@@ -179,7 +179,7 @@ describe('FlowBuilder', () => {
 
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     const [, , policy] = onSave.mock.calls[0];
-    expect(policy).toEqual({ max_retries: 3, retry_backoff_minutes: 15 });
+    expect(policy).toEqual({ max_retries: 3, retry_backoff_minutes: 15, job_timeout_minutes: 0 });
   });
 
   it('blocks save when max retries exceeds 10', async () => {
@@ -228,5 +228,375 @@ describe('FlowBuilder', () => {
     fireEvent.click(screen.getByText('Create flow'));
     await waitFor(() => expect(screen.getByText(/retries must be a whole number/i)).toBeInTheDocument());
     expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe('FlowBuilder timeouts', () => {
+  it('renders the job timeout field defaulting to 0 (off)', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const input = screen.getByLabelText(/job timeout/i) as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.value).toBe('0');
+  });
+
+  it('prefills the job timeout from the initial flow', () => {
+    const flow: Flow = {
+      id: 1, name: 'existing', steps: [{ type: 'encode' }],
+      is_default: false, created_at: '', updated_at: '',
+      job_timeout_minutes: 90,
+    };
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    expect((screen.getByLabelText(/job timeout/i) as HTMLInputElement).value).toBe('90');
+  });
+
+  it('passes job_timeout_minutes in the onSave policy', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'timeout-flow' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '120' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, , policy] = onSave.mock.calls[0];
+    expect(policy).toEqual({ max_retries: 0, retry_backoff_minutes: 0, job_timeout_minutes: 120 });
+  });
+
+  it('blocks save when the job timeout exceeds 10080', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '10081' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/job timeout must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when the job timeout is fractional', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'frac-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText(/job timeout/i), { target: { value: '2.5' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/job timeout must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('renders a per-step timeout input for every step', () => {
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.click(screen.getByText('MKV mux'));
+    // Exact label match: the flow-level field is "Job timeout (minutes)".
+    expect(screen.getAllByLabelText('Timeout (minutes)')).toHaveLength(2);
+  });
+
+  it('prefills step timeouts from the initial flow', () => {
+    const flow: Flow = {
+      id: 1, name: 'existing',
+      steps: [{ type: 'encode', timeout_minutes: 30 }, { type: 'mux' }],
+      is_default: false, created_at: '', updated_at: '',
+    };
+    render(<FlowBuilder initial={flow} templates={templatesFixture()} onSave={vi.fn()} onCancel={() => {}} />);
+    const inputs = screen.getAllByLabelText('Timeout (minutes)') as HTMLInputElement[];
+    expect(inputs[0].value).toBe('30');
+    expect(inputs[1].value).toBe('0');
+  });
+
+  it('includes timeout_minutes in the save payload when set', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'step-timeout-flow' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText('Timeout (minutes)'), { target: { value: '45' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'dgindex', params: {}, timeout_minutes: 45 }]);
+  });
+
+  it('omits timeout_minutes from the payload when 0 (inherit)', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'no-step-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'dgindex', params: {} }]);
+  });
+
+  it('blocks save when a step timeout exceeds 10080', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<FlowBuilder initial={null} templates={templatesFixture()} onSave={onSave} onCancel={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'bad-step-timeout' },
+    });
+    fireEvent.click(screen.getByText('DGIndexNV index'));
+    fireEvent.change(screen.getByLabelText('Timeout (minutes)'), { target: { value: '10081' } });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(screen.getByText(/step 1 timeout must be a whole number/i)).toBeInTheDocument());
+    expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+// quality_gate (P5): the builtin surfaces through the same generic
+// ParamDef-driven rendering as every other builtin — no bespoke UI. The
+// fixture mirrors the REAL template params from
+// backend/internal/flow/builtin_steps_quality.go (metric/threshold/sampling).
+describe('FlowBuilder quality_gate params', () => {
+  function qualityGateTemplate(): StepTemplate {
+    return {
+      id: 0,
+      key: 'quality_gate',
+      label: 'Quality gate (VMAF/SSIM)',
+      description: 'Perceptual quality check against the source.',
+      params: [
+        { key: 'metric', label: 'Metric (vmaf or ssim)', default: 'vmaf' },
+        {
+          key: 'threshold',
+          label: 'Minimum score (blank: 90 VMAF / 0.95 SSIM)',
+          type: 'number',
+          placeholder: '90',
+        },
+        { key: 'sampling', label: 'Compare every Nth frame (1 = all)', type: 'number', default: '12' },
+      ],
+      powershell: '',
+      builtin: true,
+      created_at: '',
+      updated_at: '',
+    };
+  }
+
+  it('shows quality_gate in the palette and renders its three params with defaults', () => {
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={vi.fn()}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+
+    // metric + sampling prefilled from the declared defaults; threshold is
+    // metric-dependent so it stays blank (script-side default) with the
+    // VMAF placeholder visible.
+    expect((screen.getByLabelText('Metric (vmaf or ssim)') as HTMLInputElement).value).toBe('vmaf');
+    expect((screen.getByLabelText('Compare every Nth frame (1 = all)') as HTMLInputElement).value).toBe('12');
+    const threshold = screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)') as HTMLInputElement;
+    expect(threshold.value).toBe('');
+    expect(threshold.type).toBe('number');
+    expect(threshold.placeholder).toBe('90');
+  });
+
+  it('round-trips edited quality_gate params through onSave', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'gated-flow' },
+    });
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+    fireEvent.change(screen.getByLabelText('Metric (vmaf or ssim)'), { target: { value: 'ssim' } });
+    fireEvent.change(screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)'), {
+      target: { value: '0.9' },
+    });
+    fireEvent.change(screen.getByLabelText('Compare every Nth frame (1 = all)'), {
+      target: { value: '24' },
+    });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [name, steps] = onSave.mock.calls[0];
+    expect(name).toBe('gated-flow');
+    expect(steps).toEqual([
+      { type: 'quality_gate', params: { metric: 'ssim', threshold: '0.9', sampling: '24' } },
+    ]);
+  });
+
+  it('strips a blank threshold so the script applies the metric default', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder
+        initial={null}
+        templates={[qualityGateTemplate()]}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'default-threshold' },
+    });
+    fireEvent.click(screen.getByText('Quality gate (VMAF/SSIM)'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    // threshold blank -> stripped; metric/sampling keep their visible defaults.
+    expect(steps).toEqual([
+      { type: 'quality_gate', params: { metric: 'vmaf', sampling: '12' } },
+    ]);
+  });
+
+  it('renders stored quality_gate params when editing an existing flow', () => {
+    const flow: Flow = {
+      id: 1,
+      name: 'existing',
+      steps: [
+        { type: 'mux' },
+        { type: 'quality_gate', params: { metric: 'ssim', threshold: '0.97', sampling: '6' } },
+      ],
+      is_default: false,
+      created_at: '',
+      updated_at: '',
+    };
+    render(
+      <FlowBuilder
+        initial={flow}
+        templates={[qualityGateTemplate()]}
+        onSave={vi.fn()}
+        onCancel={() => {}}
+      />,
+    );
+    expect((screen.getByLabelText('Metric (vmaf or ssim)') as HTMLInputElement).value).toBe('ssim');
+    expect((screen.getByLabelText('Minimum score (blank: 90 VMAF / 0.95 SSIM)') as HTMLInputElement).value).toBe('0.97');
+    expect((screen.getByLabelText('Compare every Nth frame (1 = all)') as HTMLInputElement).value).toBe('6');
+  });
+});
+
+// P6 extras builtins: like quality_gate, these surface through the generic
+// ParamDef-driven rendering — no bespoke UI. The fixtures mirror the REAL
+// template params from backend/internal/flow/builtin_steps_subs.go: the
+// three extraction steps declare NO params; mux_extras declares the single
+// optional `output` param.
+describe('FlowBuilder extras builtins (P6)', () => {
+  function extrasTemplates(): StepTemplate[] {
+    const mk = (key: string, label: string, params: StepTemplate['params'] = []): StepTemplate => ({
+      id: 0,
+      key,
+      label,
+      description: `${label} step`,
+      params,
+      powershell: '',
+      builtin: true,
+      created_at: '',
+      updated_at: '',
+    });
+    return [
+      mk('subtitle_extract', 'Subtitle extract'),
+      mk('font_extract', 'Font extract'),
+      mk('chapter_extract', 'Chapter extract'),
+      mk('mux_extras', 'Mux extras (subs/fonts/chapters)', [
+        {
+          key: 'output',
+          label: 'Encoded output filename (blank: auto-discover)',
+          placeholder: 'Series - 01 [1080p].mkv',
+        },
+      ]),
+    ];
+  }
+
+  it('shows all four extras builtins in the palette; extraction steps carry no params', () => {
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={vi.fn()} onCancel={() => {}} />,
+    );
+    fireEvent.click(screen.getByText('Subtitle extract'));
+    fireEvent.click(screen.getByText('Font extract'));
+    fireEvent.click(screen.getByText('Chapter extract'));
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+
+    // Only mux_extras renders a param input (the extraction steps have none).
+    expect(screen.getByLabelText('Encoded output filename (blank: auto-discover)')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Source name')).not.toBeInTheDocument();
+    const output = screen.getByLabelText('Encoded output filename (blank: auto-discover)') as HTMLInputElement;
+    expect(output.value).toBe('');
+    expect(output.placeholder).toBe('Series - 01 [1080p].mkv');
+  });
+
+  it('round-trips a default-subs flow with an explicit mux_extras output through onSave', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={onSave} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'my-subs-flow' },
+    });
+    fireEvent.click(screen.getByText('Subtitle extract'));
+    fireEvent.click(screen.getByText('Font extract'));
+    fireEvent.click(screen.getByText('Chapter extract'));
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+    fireEvent.change(screen.getByLabelText('Encoded output filename (blank: auto-discover)'), {
+      target: { value: 'Custom Encode.mkv' },
+    });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [name, steps] = onSave.mock.calls[0];
+    expect(name).toBe('my-subs-flow');
+    expect(steps).toEqual([
+      { type: 'subtitle_extract', params: {} },
+      { type: 'font_extract', params: {} },
+      { type: 'chapter_extract', params: {} },
+      { type: 'mux_extras', params: { output: 'Custom Encode.mkv' } },
+    ]);
+  });
+
+  it('strips a blank mux_extras output so the script auto-discovers the encoded MKV', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={onSave} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'auto-discover' },
+    });
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'mux_extras', params: {} }]);
+  });
+
+  it('renders a stored mux_extras output param when editing an existing flow', () => {
+    const flow: Flow = {
+      id: 1,
+      name: 'existing-subs',
+      steps: [
+        { type: 'subtitle_extract' },
+        { type: 'mux_extras', params: { output: 'Series - 01 [1080p].mkv' } },
+      ],
+      is_default: false,
+      created_at: '',
+      updated_at: '',
+    };
+    render(
+      <FlowBuilder initial={flow} templates={extrasTemplates()} onSave={vi.fn()} onCancel={() => {}} />,
+    );
+    expect(
+      (screen.getByLabelText('Encoded output filename (blank: auto-discover)') as HTMLInputElement).value,
+    ).toBe('Series - 01 [1080p].mkv');
   });
 });

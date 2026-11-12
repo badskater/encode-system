@@ -29,6 +29,15 @@ func validateSeriesName(name string) error {
 	if strings.ContainsAny(name, "\\/:*?\"<>|") {
 		return fmt.Errorf("name contains characters not allowed in folder names")
 	}
+	// CRLF / control chars are refused on the API path too (the scanner
+	// bypasses this validator, so notify-side header sanitization is the
+	// second layer): they enable email header injection and break ntfy
+	// Title headers downstream.
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("name must not contain control characters")
+		}
+	}
 	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
 		return fmt.Errorf("name must not start with '.' or end with a space or dot")
 	}

@@ -124,3 +124,40 @@ describe('Flows page duplicate action', () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe('Flows page job timeout', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows the job timeout alongside the retry policy', async () => {
+    vi.spyOn(api, 'flows').mockResolvedValue([
+      flowFixture({ id: 3, max_retries: 2, retry_backoff_minutes: 10, job_timeout_minutes: 90 }),
+    ]);
+    vi.spyOn(api, 'stepTemplates').mockResolvedValue([]);
+
+    render(<FlowsPage />);
+    await waitFor(() => expect(screen.getByText(/retry 2× @10m · timeout 90m/)).toBeInTheDocument());
+  });
+
+  it('sends job_timeout_minutes when saving an edited flow', async () => {
+    vi.spyOn(api, 'flows').mockResolvedValue([flowFixture({ job_timeout_minutes: 90 })]);
+    vi.spyOn(api, 'stepTemplates').mockResolvedValue([]);
+    const updateSpy = vi.spyOn(api, 'updateFlow').mockResolvedValue(flowFixture());
+
+    render(<FlowsPage />);
+    await waitFor(() => expect(screen.getByText('1080p-opus')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+
+    // Builder renders with the flow's current job timeout prefilled.
+    const timeoutInput = screen.getByLabelText(/job timeout/i) as HTMLInputElement;
+    expect(timeoutInput.value).toBe('90');
+    fireEvent.change(timeoutInput, { target: { value: '120' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+    const [id, body] = updateSpy.mock.calls[0];
+    expect(id).toBe(1);
+    expect(body.job_timeout_minutes).toBe(120);
+  });
+});

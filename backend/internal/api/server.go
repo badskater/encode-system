@@ -10,12 +10,16 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/flow"
+	"github.com/badskater/encode-system/backend/internal/ingest"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
+	"github.com/badskater/encode-system/backend/internal/offsite"
+	"github.com/badskater/encode-system/backend/internal/oidc"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/store"
 	"github.com/badskater/encode-system/backend/internal/update"
@@ -60,6 +64,11 @@ type Config struct {
 	// Version is the controller build version (set via ldflags -X main.Version
 	// in CI). Empty in dev builds; the update check reports it as "unknown".
 	Version string
+	// OIDC carries the validated optional OIDC login configuration
+	// (ENCODE_OIDC_* env vars, resolved in main). nil = disabled (the
+	// default): no OIDC routes are registered and /api/health reports
+	// oidc_enabled=false. Local login is unaffected either way.
+	OIDC *oidc.Config
 }
 
 // Server bundles dependencies for all handlers.
@@ -74,12 +83,33 @@ type Server struct {
 	// 503 when nil).
 	Backup   *BackupManager
 	throttle *loginThrottle
+	// oidcThrottle is the login-start lockout for /api/auth/oidc/login —
+	// the same mechanism as throttle but a SEPARATE counter, so OIDC bursts
+	// can never lock out local login (and vice versa).
+	oidcThrottle *loginThrottle
 	// Notifier, when non-nil, overrides the live Discord notifier resolved
 	// from settings on each job-outcome alert. Tests inject a recording
 	// notifier here to assert whether a notification fired (the auto-retry
 	// path must be silent). Production leaves this nil so notifyJobFinished
 	// resolves the webhook from currentSettings exactly as before.
 	Notifier notify.Notifier
+	// MailSender, when non-nil, overrides the net/smtp send seam used by the
+	// email notification channel. Tests inject a fake to assert envelope +
+	// content without a real relay. Production leaves this nil (real
+	// net/smtp.SendMail).
+	MailSender notify.SMTPSender
+	// OffsiteDestinations, when non-nil, overrides offsite destination
+	// construction (P4). Tests inject fakes to assert upload/retention
+	// behavior without real S3/SSH endpoints; production leaves this nil
+	// (offsite.BuildDestinations from live settings). Same seam pattern as
+	// Notifier/MailSender.
+	OffsiteDestinations func(st *model.Settings) ([]offsite.Destination, []offsite.Result)
+	// IngestClient, when non-nil, overrides download-client construction
+	// for the experimental ingestion loop (P11). Tests inject a fake to
+	// assert poll/stage/audit behavior without a real BitTorrent client;
+	// production leaves this nil (qBittorrent/ruTorrent from live
+	// settings). Same seam pattern as Notifier/MailSender.
+	IngestClient func(in model.IngestSettings) (ingest.Client, error)
 	// digest holds buffered job-outcome events when settings.NotifyDigest is
 	// ON. A ticker started by StartDigestLoop flushes it hourly, posting one
 	// summary instead of per-job alerts. Built in New (never nil — the buffer
@@ -111,6 +141,21 @@ type Server struct {
 	// (never nil) so nodeAlertTick can use it without a nil check. The
 	// baseline is seeded silently on the first tick after a restart.
 	nodeAlert *nodeAlertState
+	// pendingCancels queues per-node job IDs for the "cancel" heartbeat
+	// instruction (F5): the stall watchdog fails a job server-side, but an
+	// online node keeps the wedged process — the cancel tells the agent to
+	// kill the tree and free the slot. Guarded by cancelMu; drained into
+	// the node's next heartbeat reply, cleared on offline/deletion/re-pair
+	// so unreachable nodes never accumulate state. In-memory only: a
+	// controller restart loses queued cancels (acceptable — the job is
+	// already failed in the DB, and orphan recovery re-evaluates on the
+	// node's next heartbeat).
+	cancelMu       sync.Mutex
+	pendingCancels map[int64][]int64
+	// OIDC drives the optional SSO login flow (P10). Built in New when
+	// Config.OIDC is non-nil; nil = disabled, and Routes() then registers
+	// NO oidc endpoints (404) — zero behavior change for local-only installs.
+	OIDC *oidc.Provider
 }
 
 // digestState bundles the buffer + flush plumbing so Server carries one
@@ -147,14 +192,22 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
-		digest:      &digestState{buf: notify.NewDigestBuffer()},
-		logHub:      newLogHub(),
-		diskGuard:   &diskGuardState{last: map[int64]time.Time{}},
-		scanTrigger: make(chan struct{}, 1),
-		nodeAlert:   &nodeAlertState{prev: map[int64]bool{}},
+		oidcThrottle:   &loginThrottle{},
+		digest:         &digestState{buf: notify.NewDigestBuffer()},
+		logHub:         newLogHub(),
+		diskGuard:      &diskGuardState{last: map[int64]time.Time{}},
+		scanTrigger:    make(chan struct{}, 1),
+		nodeAlert:      &nodeAlertState{prev: map[int64]bool{}},
+		pendingCancels: map[int64][]int64{},
 	}
 	if cfg.DiscordWebhook != "" {
 		log.Info("discord notifications enabled (default; override via Settings page)")
+	}
+	if cfg.OIDC != nil {
+		// No network I/O here: discovery is lazy (first login attempt), so
+		// the controller boots even while the IdP is unreachable.
+		s.OIDC = oidc.NewProvider(cfg.OIDC, log)
+		log.Info("OIDC login enabled", "issuer", cfg.OIDC.Issuer, "admin_group", cfg.OIDC.AdminGroup, "groups_claim", cfg.OIDC.GroupsClaim)
 	}
 	if err := s.seedStepTemplates(); err != nil {
 		return nil, err
@@ -249,13 +302,19 @@ func (s *Server) runDigestLoop(ctx context.Context) {
 // flushDigestTick runs one digest flush. Live settings drive whether the
 // flush actually posts: digest OFF → the tick is silent (buffer retains
 // events from a previous ON period for the next ON tick); digest ON → drain
-// + post if non-empty.
+// + fan the summary out to every configured channel.
 func (s *Server) flushDigestTick(ctx context.Context) {
 	st := s.currentSettings(ctx)
 	if !st.NotifyDigest {
 		return // digest off; buffered events wait for the next ON tick
 	}
-	notify.FlushDigest(s.Log, st.DiscordWebhook, st.ControllerURL, s.digest.buf, time.Now().UTC())
+	notify.FlushDigestTo(s.Log, st, s.mailSender(), s.digest.buf, time.Now().UTC())
+}
+
+// mailSender returns the SMTP send seam: the injected fake when set (tests),
+// else nil so the notify package selects the production net/smtp sender.
+func (s *Server) mailSender() notify.SMTPSender {
+	return s.MailSender
 }
 
 // seedAdminUser ensures the management-plane admin account exists. On first
@@ -364,9 +423,18 @@ func (s *Server) seedStepTemplates() error {
 // existing flow (factory or user-edited) is never touched.
 func (s *Server) seedDefaultFlow() error {
 	ctx := ctxBg()
-	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow(), flow.Default4kCPUFlow()} {
+	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow(), flow.Default4kCPUFlow(), flow.DefaultSubsFlow()} {
 		if _, err := s.Store.FlowByName(ctx, seed.Name); err != nil {
 			if _, err := s.Store.CreateFlow(ctx, seed); err != nil {
+				// HA first-boot race: two replicas can both pass the name
+				// check before either inserts. A UNIQUE violation means the
+				// other replica already seeded this flow — re-check and
+				// continue silently instead of failing startup.
+				if isUniqueConstraintErr(err) {
+					if _, recheckErr := s.Store.FlowByName(ctx, seed.Name); recheckErr == nil {
+						continue
+					}
+				}
 				return fmt.Errorf("seed flow %q: %w", seed.Name, err)
 			}
 			s.Log.Info("seeded flow", "name", seed.Name, "steps", len(seed.Steps))
@@ -380,9 +448,13 @@ func (s *Server) seedDefaultFlow() error {
 		def := flow.DefaultFlow()
 		def.Name = s.Cfg.DefaultFlowName
 		if _, err := s.Store.CreateFlow(ctx, def); err != nil {
-			return fmt.Errorf("seed default flow %q: %w", def.Name, err)
+			// Same concurrent-seed tolerance as the factory loop above.
+			if !isUniqueConstraintErr(err) {
+				return fmt.Errorf("seed default flow %q: %w", def.Name, err)
+			}
+		} else {
+			s.Log.Info("seeded flow", "name", def.Name, "steps", len(def.Steps))
 		}
-		s.Log.Info("seeded flow", "name", def.Name, "steps", len(def.Steps))
 		if fl, err = s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err != nil {
 			return fmt.Errorf("resolve default flow: %w", err)
 		}
@@ -416,6 +488,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/logout", s.withAnyUser(s.handleLogout))
 	mux.HandleFunc("GET /api/auth/me", s.withAnyUser(s.handleMe))
 	mux.HandleFunc("POST /api/auth/password", s.withAdmin(s.handleChangePassword))
+
+	// Optional OIDC login (P10): registered ONLY when enabled via env.
+	// Disabled installs have no such routes (404) — local auth is the only
+	// way in, byte-identical to before.
+	if s.OIDC != nil {
+		mux.HandleFunc("GET /api/auth/oidc/login", s.handleOIDCLogin)
+		mux.HandleFunc("GET /api/auth/oidc/callback", s.handleOIDCCallback)
+	}
 
 	// UI endpoints — session auth. GET routes use withAnyUser so viewers
 	// can read; all mutations (POST/PUT/PATCH/DELETE) stay withAdmin.
@@ -478,6 +558,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/series", s.withAnyUser(s.handleListSeries))
 	mux.HandleFunc("POST /api/series", s.withAdmin(s.handleCreateSeries))
 	mux.HandleFunc("PATCH /api/series/{id}", s.withAdmin(s.handlePatchSeries))
+	mux.HandleFunc("DELETE /api/series/{id}", s.withAdmin(s.handleDeleteSeries))
 
 	mux.HandleFunc("GET /api/step-templates", s.withAnyUser(s.handleListStepTemplates))
 	mux.HandleFunc("POST /api/step-templates", s.withAdmin(s.handleCreateStepTemplate))
@@ -654,8 +735,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	// this replica (Phase 3 HA) so an operator can tell two controllers apart
 	// behind a load balancer — both serve health, each reports its own id.
 	// The "version" field exposes the controller build version (ldflags) so
-	// operators can tell at a glance what's running.
-	out := map[string]string{"status": "ok", "instance": s.Cfg.InstanceID}
+	// operators can tell at a glance what's running. "oidc_enabled" (P10)
+	// lets the login page decide whether to show the SSO button BEFORE any
+	// session exists — health is the SPA's unauthenticated bootstrap call.
+	out := map[string]any{"status": "ok", "instance": s.Cfg.InstanceID, "oidc_enabled": s.OIDC != nil}
 	if s.Cfg.Version != "" {
 		out["version"] = s.Cfg.Version
 	}

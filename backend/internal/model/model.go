@@ -50,6 +50,11 @@ const (
 type Step struct {
 	Type   StepType          `json:"type"`
 	Params map[string]string `json:"params,omitempty"`
+	// TimeoutMinutes bounds this step's wall-clock runtime on the agent.
+	// 0/absent = no per-step limit (the job timeout, if any, still applies).
+	// Stored inside the flow's steps_json like Params — additive, so old
+	// flows and old agents are unaffected. Validated 0-10080 at the API.
+	TimeoutMinutes int `json:"timeout_minutes,omitempty"`
 }
 
 // TemplateKey returns the step's template reference (defaults to its type).
@@ -71,9 +76,15 @@ type Flow struct {
 	// assignable again. Applied only when MaxRetries > 0; a zero value when
 	// retries are enabled defaults to a sensible minimum at the decision
 	// site so a retry is never instant. Stored in options_json.
-	RetryBackoffMinutes int       `json:"retry_backoff_minutes"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	RetryBackoffMinutes int `json:"retry_backoff_minutes"`
+	// JobTimeoutMinutes bounds the whole job's wall-clock runtime on the
+	// agent: the agent kills the job's process tree and reports a failure
+	// when it expires. 0 = timeout OFF (the default for flows created
+	// before the resilience batch). Stored in options_json alongside the
+	// retry policy. Validated 0-10080 (one week) at the API.
+	JobTimeoutMinutes int       `json:"job_timeout_minutes"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // User is a management-plane account (login-based, replaces the static
@@ -198,6 +209,26 @@ type Settings struct {
 	// job-outcome alerts and the discord_notify flow step (as the fallback
 	// when a flow omits its own webhook param). Empty = notifications off.
 	DiscordWebhook string `json:"discord_webhook"`
+	// GenericWebhookURL receives structured JSON event POSTs (job outcomes,
+	// operational alerts, digest summaries) — see notify.WebhookPayload for
+	// the wire shape. Empty = channel disabled (the default).
+	GenericWebhookURL string `json:"generic_webhook_url"`
+	// NtfyTopicURL is the full ntfy publish endpoint (scheme+host+topic).
+	// Empty = channel disabled. NtfyToken is the optional Bearer access
+	// token: WRITE-ONLY over the API (json:"-", masked as has_ntfy_token),
+	// AES-GCM encrypted at rest with the shares key.
+	NtfyTopicURL string `json:"ntfy_topic_url"`
+	NtfyToken    string `json:"-"`
+	// SMTP email channel. Enabled when host+from+to are all set; port 0
+	// defaults to 587. SMTPPassword is WRITE-ONLY over the API (json:"-",
+	// masked as has_smtp_password), AES-GCM encrypted at rest with the
+	// shares key. Empty host = channel disabled (the default).
+	SMTPHost     string `json:"smtp_host"`
+	SMTPPort     int    `json:"smtp_port"`
+	SMTPUser     string `json:"smtp_user"`
+	SMTPPassword string `json:"-"`
+	SMTPFrom     string `json:"smtp_from"`
+	SMTPTo       string `json:"smtp_to"` // comma-separated recipients
 	// DiskAlertGB is the free-disk threshold (GB) on the drive the agent
 	// measures. A heartbeat reporting less free space (1) fires a Discord
 	// alert with a per-node cooldown and (2) soft-drains the node: no new
@@ -225,8 +256,143 @@ type Settings struct {
 	// value old settings rows unmarshal to). Validated 0 or 1-3650.
 	JobRetentionDays int `json:"job_retention_days"`
 
+	// StallTimeoutMinutes is the controller-side stall watchdog threshold:
+	// a RUNNING job whose last_progress_at (stamped on claim and refreshed
+	// by heartbeats that report changed step/progress) is older than this
+	// is failed as stalled, through the normal failure path so the flow's
+	// retry policy applies. 0 = watchdog OFF (the default, and the zero
+	// value old settings rows unmarshal to). Validated 0-10080.
+	StallTimeoutMinutes int `json:"stall_timeout_minutes"`
+
+	// BackupOffsite configures offsite copies of DB snapshots (P4): after
+	// every successful snapshot (scheduled AND manual) the controller uploads
+	// the snapshot — plus, by default, the shares-key file needed to decrypt
+	// DB secrets on restore — to each enabled destination and prunes old
+	// generations to KeepN. Upload failures never fail the local backup.
+	BackupOffsite BackupOffsite `json:"backup_offsite"`
+
+	// Ingest configures EXPERIMENTAL download ingestion (P11): poll a
+	// BitTorrent client for completed downloads and stage their source
+	// files into the scripts share for hand-authored filter scripts.
+	// OFF by default; see IngestSettings.
+	Ingest IngestSettings `json:"ingest"`
+
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
+
+// BackupOffsite is the offsite-backup configuration block. Both destinations
+// are disabled by default; enabling one requires its connection fields (see
+// validateSettings). Secrets inside the sub-structs are WRITE-ONLY over the
+// API (json:"-", masked as has_* flags) and AES-GCM encrypted at rest with
+// the shares key — the same pattern as NtfyToken/SMTPPassword.
+type BackupOffsite struct {
+	S3   BackupOffsiteS3   `json:"s3"`
+	SFTP BackupOffsiteSFTP `json:"sftp"`
+	// KeepN is the per-destination offsite retention: after each successful
+	// upload, snapshot generations beyond the newest KeepN are deleted
+	// (snapshot + its key companion together). 0 = default (30); validated
+	// 0 or 1-365. Applies to ALL uploaded snapshots, manual ones included —
+	// unlike local retention, which never auto-prunes manual snapshots.
+	KeepN int `json:"keep_n"`
+	// IncludeSharesKey bundles the shares-key file alongside each snapshot
+	// so an offsite restore can decrypt DB secrets. Default TRUE (rows
+	// written before the field existed read back as true). SECURITY: the
+	// key decrypts every secret in the DB — the destination must be trusted
+	// and access-controlled. Operators can opt out (snapshot-only copies).
+	IncludeSharesKey bool `json:"include_shares_key"`
+}
+
+// BackupOffsiteS3 is the S3 offsite destination. Reuses internal/s3
+// (minio-go): any plain-S3 endpoint works (MinIO, Ceph RGW, AWS). Endpoint
+// is stored normalized to host[:port] (no scheme); UseTLS selects https.
+type BackupOffsiteS3 struct {
+	Enabled   bool   `json:"enabled"`
+	Endpoint  string `json:"endpoint"`
+	Bucket    string `json:"bucket"`
+	Prefix    string `json:"prefix"` // optional key prefix, stored with trailing "/"
+	AccessKey string `json:"access_key"`
+	// SecretKey is WRITE-ONLY over the API (json:"-", masked as
+	// has_secret_key inside backup_offsite), AES-GCM encrypted at rest.
+	SecretKey string `json:"-"`
+	UseTLS    bool   `json:"use_tls"`
+}
+
+// BackupOffsiteSFTP is the SFTP offsite destination (pkg/sftp over
+// x/crypto/ssh). Port 0 defaults to 22. Password and PrivateKey are
+// WRITE-ONLY (json:"-", masked as has_password / has_private_key), AES-GCM
+// encrypted at rest; at least one is required when enabled. PrivateKey must
+// be an unencrypted PEM key (passphrase-protected keys are rejected at save
+// time — there is no passphrase field).
+type BackupOffsiteSFTP struct {
+	Enabled bool   `json:"enabled"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	User    string `json:"user"`
+	// Password is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	Password string `json:"-"`
+	// PrivateKey is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	PrivateKey string `json:"-"`
+	Path       string `json:"path"` // remote dir; empty = the SSH home dir (".")
+	// HostKey pins the server's SSH host key (REQUIRED when enabled).
+	// Public material — round-trips over the API. Stored normalized to
+	// "<type> <base64>" (known-hosts style); parsed at save time and
+	// enforced with ssh.FixedHostKey on every dial.
+	HostKey string `json:"host_key"`
+}
+
+// IngestSettings configures EXPERIMENTAL download ingestion (P11): the
+// controller polls a BitTorrent client for completed downloads and stages
+// their source video files into the scripts share (<series>/<episode>/),
+// where the scanner picks them up once an operator authors the .avs/.vpy
+// filter script. Ingestion stages SOURCES only — it never creates jobs.
+//
+// OFF by default (Enabled=false is the zero value old settings rows
+// unmarshal to). Password is WRITE-ONLY over the API (json:"-", masked as
+// has_password inside ingest), AES-GCM encrypted at rest with the shares
+// key — the same pattern as NtfyToken/SMTPPassword.
+type IngestSettings struct {
+	Enabled bool `json:"enabled"`
+	// Provider selects the client: "qbittorrent" (WebAPI v2, first-class)
+	// or "rutorrent" (httprpc plugin, best-effort/experimental). Required
+	// when Enabled.
+	Provider string `json:"provider"`
+	// URL is the client's web base URL (e.g. http://192.168.1.10:8080 for
+	// qBittorrent, http://host/rutorrent for ruTorrent). Required when
+	// Enabled; stored with any trailing slash trimmed.
+	URL string `json:"url"`
+	// Username is optional: qBittorrent with auth bypassed for localhost
+	// needs none; ruTorrent behind web-server auth uses HTTP Basic. When
+	// set, a password is required (checked post-merge at save time).
+	Username string `json:"username"`
+	// Password is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	Password string `json:"-"`
+	// Category restricts polling to one client category (qBittorrent
+	// category / ruTorrent label). Empty = consider all completed
+	// downloads, or — when CategoryMap is non-empty — only the categories
+	// named in the map.
+	Category string `json:"category"`
+	// CategoryMap maps client category → series folder name. A mapped
+	// category overrides the series name parsed from the release name
+	// (the episode number is still parsed from the name — never guessed).
+	CategoryMap map[string]string `json:"category_map"`
+	// PollIntervalSeconds is the poll cadence. 0 = default (60s);
+	// validated 0 or 10-3600.
+	PollIntervalSeconds int `json:"poll_interval_seconds"`
+	// DownloadRoot is the CONTROLLER-visible directory that corresponds to
+	// the client's download root — the directory that directly contains the
+	// completed torrent folders. The controller resolves each torrent as
+	// DownloadRoot/<basename of the client save path> and verifies it
+	// exists before staging (missing = skip + log, never guess). MOUNT
+	// REQUIREMENT: the client's download directory must be mounted into
+	// the controller container at this path (see Docs/md/Deployment.md).
+	DownloadRoot string `json:"download_root"`
+}
+
+// Ingest provider constants.
+const (
+	IngestProviderQBit      = "qbittorrent"
+	IngestProviderRuTorrent = "rutorrent"
+)
 
 // Session is an issued management session (token stored hashed at rest).
 type Session struct {
@@ -532,6 +698,24 @@ type JobPayload struct {
 	// running the script and uploads each Upload dir AFTER a successful
 	// run. Nil for mount-backed jobs (the common case).
 	S3 *S3Transfer `json:"s3,omitempty"`
+	// JobTimeoutMinutes bounds the whole job's runtime on the agent
+	// (0/absent = no limit). Additive wire field: old agents ignore it.
+	JobTimeoutMinutes int `json:"job_timeout_minutes,omitempty"`
+	// StepTimeouts carries the per-step limits for steps that set one
+	// (0-minute steps are omitted). The agent applies each limit when the
+	// step's first ENCODE_STEP marker arrives, clamped to the remaining
+	// job time. Additive wire field: old agents ignore it.
+	StepTimeouts []StepTimeout `json:"step_timeouts,omitempty"`
+}
+
+// StepTimeout is one per-step runtime limit on the job payload. Step is the
+// step type — the same name the rendered script emits in its ENCODE_STEP
+// markers — and Index is the step's position in the flow (diagnostic; the
+// agent keys enforcement on Step because markers carry no index).
+type StepTimeout struct {
+	Index          int    `json:"index"`
+	Step           string `json:"step"`
+	TimeoutMinutes int    `json:"timeout_minutes"`
 }
 
 // S3Transfer is the per-job object-store work order. Credentials are
@@ -642,7 +826,7 @@ type UpdateManifest struct {
 
 // HeartbeatReply is the controller's instruction channel to the agent.
 type HeartbeatReply struct {
-	Instruction string `json:"instruction"` // none | job | jobs | reboot | update
+	Instruction string `json:"instruction"` // none | job | jobs | reboot | update | cancel
 	// Job carries a single assignment. Kept for old agents: when the
 	// controller assigns to an old agent (no Jobs reported) only Job is
 	// set. New agents prefer the Jobs array.
@@ -653,6 +837,11 @@ type HeartbeatReply struct {
 	Jobs        []*JobPayload   `json:"jobs,omitempty"`
 	RebootDelay int             `json:"reboot_delay_seconds,omitempty"`
 	Update      *UpdateManifest `json:"update,omitempty"`
+	// CancelJobIDs lists jobs the controller has already finalized
+	// server-side (stall watchdog) whose processes the agent must kill and
+	// deregister. Additive wire field: old agents ignore the unknown
+	// instruction gracefully; old controllers never send it.
+	CancelJobIDs []int64 `json:"cancel_job_ids,omitempty"`
 }
 
 // ---------- Fleet stats (Phase E) ----------

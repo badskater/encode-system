@@ -30,11 +30,27 @@ type testEnv struct {
 	server *Server
 	node   *model.Node
 	token  string
+	dir    string // temp state dir (DB + shares key live here)
 }
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
+	cfg := Config{
+		AdminUsername: "admin", AdminPassword: adminPassword,
+		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
+		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
+		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
+		DiscordWebhook: "https://discord.com/api/webhooks/env/default",
+	}
+	return newTestEnvWithConfig(t, dir, cfg)
+}
+
+// newTestEnvWithConfig is newTestEnv with a caller-supplied Config — the
+// OIDC tests use it to enable a mock provider (Config.OIDC). dir is the
+// temp state directory (DB + updates live there).
+func newTestEnvWithConfig(t *testing.T, dir string, cfg Config) *testEnv {
+	t.Helper()
 	st, err := store.Open(dir + "/test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -46,13 +62,6 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	cfg := Config{
-		AdminUsername: "admin", AdminPassword: adminPassword,
-		ScriptsRoot: dir + "/scripts", ReleaseRoot: dir + "/release",
-		NodeBinDir: `C:\bin`, NodeScriptsDir: `C:\Encodes\scripts`, NodeReleaseDir: `C:\Encodes\ReleaseFolders`,
-		Group: "OldFartsSubs", Tag: "1080p", TasksBeforeReboot: 10,
-		DiscordWebhook: "https://discord.com/api/webhooks/env/default",
-	}
 	s, err := New(st, up, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +94,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	ts := httptest.NewServer(s.Routes())
 	t.Cleanup(ts.Close)
 	// Store base URL on the server for request building via a wrapper.
-	return &testEnv{server: s, node: node, token: token}
+	return &testEnv{server: s, node: node, token: token, dir: dir}
 }
 
 // envRoutes serves the API through an httptest server per call set.
@@ -326,16 +335,16 @@ func TestUIFlowCRUDViaAPI(t *testing.T) {
 		t.Fatalf("want 400 for invalid flow, got %d", resp2.StatusCode)
 	}
 
-	// List includes the seeded flows (default-1080 + default-4k) + the new
-	// flow.
+	// List includes the seeded flows (default-1080, default-4k,
+	// default-4k-cpu, default-subs) + the new flow.
 	resp3, body3 := doJSON(t, "GET", ts.URL+"/api/flows", adminTok, nil)
 	if resp3.StatusCode != 200 {
 		t.Fatal(resp3.StatusCode)
 	}
 	var flows []model.Flow
 	json.Unmarshal(body3, &flows)
-	if len(flows) != 4 {
-		t.Fatalf("want 4 flows (3 seeded + 1 created), got %d", len(flows))
+	if len(flows) != 5 {
+		t.Fatalf("want 5 flows (4 seeded + 1 created), got %d", len(flows))
 	}
 }
 

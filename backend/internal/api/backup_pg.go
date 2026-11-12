@@ -56,11 +56,20 @@ func (b *BackupManager) dumpPG(ctx context.Context, dest string) error {
 	if b.PGDump == nil {
 		return fmt.Errorf("PGDump handle not set on BackupManager")
 	}
-	f, err := os.Create(dest)
+	f, err := createDumpFile(dest)
 	if err != nil {
 		return fmt.Errorf("create dump file: %w", err)
 	}
-	defer f.Close()
+	// A failed dump must not leave a partial .dump behind (it would be
+	// listed as a valid snapshot). The ErrExist path returns BEFORE this
+	// defer is armed, so a file owned by another writer is never removed.
+	ok := false
+	defer func() {
+		f.Close()
+		if !ok {
+			os.Remove(dest)
+		}
+	}()
 	enc := json.NewEncoder(f)
 	// Header control record so a restore tool can validate format/version.
 	if err := enc.Encode(map[string]any{
@@ -79,7 +88,18 @@ func (b *BackupManager) dumpPG(ctx context.Context, dest string) error {
 			return fmt.Errorf("dump table %s: %w", table, err)
 		}
 	}
+	ok = true
 	return nil
+}
+
+// createDumpFile creates the dump file EXCLUSIVELY (O_CREATE|O_EXCL, 0600).
+// Two HA replicas snapshotting in the same second must not truncate each
+// other's dump (P4 review Q8 — os.Create silently clobbered). The loser
+// gets os.ErrExist; TakeSnapshot advances the counter suffix and retries,
+// matching SQLite's VACUUM INTO behavior (which also refuses an existing
+// output file).
+func createDumpFile(dest string) (*os.File, error) {
+	return os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 }
 
 // dumpPGTable reads every row+column of one table and writes each as a
@@ -355,6 +375,11 @@ func (s *Server) restorePG(ctx context.Context, srcPath string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit restore: %w", err)
 	}
+	// Q9: the restored rows may be sealed with a DIFFERENT shares key (the
+	// operator places the bundle's key file before restoring). Drop the
+	// cached cipher so the next secret read re-reads the key from disk —
+	// no controller restart needed for the in-place path.
+	s.Store.InvalidateShareCipher()
 	return nil
 }
 

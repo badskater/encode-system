@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, SettingsSave, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -24,6 +24,20 @@ export function clearToken(): void {
 
 export function hasToken(): boolean {
   return (localStorage.getItem(TOKEN_KEY) ?? '') !== '';
+}
+
+// consumeOidcFragment extracts the one-time session token delivered by the
+// OIDC callback redirect (/#oidc=<token>) and strips the fragment from the
+// URL so the token never lingers in browser history. The strict 64-hex shape
+// matches the server's session tokens; anything else is ignored. Returns ''
+// when no OIDC fragment is present. The App calls this once at startup and
+// stores the token via setToken — validation then goes through the normal
+// /api/auth/me path, exactly like a stored local-login session.
+export function consumeOidcFragment(): string {
+  const m = window.location.hash.match(/^#oidc=([0-9a-f]{64})$/);
+  if (!m) return '';
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  return m[1];
 }
 
 function sessionValue(): string {
@@ -131,7 +145,11 @@ async function rollbackUpload(path: string, platform?: 'windows' | 'linux'): Pro
 }
 
 export const api = {
-  health: () => request<{ status: string }>('GET', '/api/health'),
+  // health is the unauthenticated bootstrap call: besides status it carries
+  // oidc_enabled (P10) so the login page can show the SSO button only when
+  // the controller has OIDC configured. Additive optional field — older
+  // controllers simply omit it (treated as disabled).
+  health: () => request<{ status: string; oidc_enabled?: boolean }>('GET', '/api/health'),
   settings: () => request<Settings>('GET', '/api/settings'),
 
   // Authentication. login is unauthenticated; it issues the session token.
@@ -169,7 +187,9 @@ export const api = {
 
   // ---------- Settings ----------
   // (settings GET lives near the top with health)
-  saveSettings: (s: Settings) => request<Settings>('PUT', '/api/settings', s),
+  // PUT takes SettingsSave: the blob plus optional write-only secrets
+  // (ntfy_token / smtp_password). Empty secret = keep the stored value.
+  saveSettings: (s: SettingsSave) => request<Settings>('PUT', '/api/settings', s),
 
   // ---------- Update publishing (agent / EncodeLib / bin package) ----------
   manifest: () => request<UpdateManifest>('GET', '/api/updates/manifest'),
@@ -364,7 +384,7 @@ export const api = {
   flows: () => request<Flow[]>('GET', '/api/flows'),
   createFlow: (flow: Omit<Flow, 'id' | 'created_at' | 'updated_at'>) =>
     request<Flow>('POST', '/api/flows', flow),
-  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps' | 'max_retries' | 'retry_backoff_minutes'>>) =>
+  updateFlow: (id: number, flow: Partial<Pick<Flow, 'name' | 'steps' | 'max_retries' | 'retry_backoff_minutes' | 'job_timeout_minutes'>>) =>
     request<Flow>('PUT', `/api/flows/${id}`, flow),
   deleteFlow: (id: number) => request<void>('DELETE', `/api/flows/${id}`),
   setDefaultFlow: (id: number) => request<Flow>('POST', `/api/flows/${id}/default`),
@@ -376,6 +396,10 @@ export const api = {
     request<CreateSeriesResponse>('POST', '/api/series', body),
   patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean; node_group?: string; webhook_url?: string }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
+  // deleteSeries removes the series REGISTRY ROW only (admin). Jobs,
+  // history and files on the shares survive; the scanner re-registers the
+  // series on the next scan if its folder still has ready episodes.
+  deleteSeries: (id: number) => request<void>('DELETE', `/api/series/${id}`),
 
   stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),
   createStepTemplate: (t: Omit<StepTemplate, 'id' | 'builtin' | 'created_at' | 'updated_at'>) =>

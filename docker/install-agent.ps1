@@ -36,6 +36,13 @@
 .PARAMETER Repo
   GitHub repo (default: badskater/encode-system). For private repos set
   $env:GITHUB_TOKEN to a PAT with repo read access before running.
+
+.PARAMETER CaCert
+  Optional PEM file path of the controller's CA certificate for native
+  controller TLS (https:// controller URL, self-signed CA recipe in
+  Docs/md/Deployment.md). Sets ENCODE_AGENT_CA_CERT machine-wide so the
+  agent service (and scheduled-task installs) trust the controller cert
+  on every request. The file must already exist on the node.
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +58,8 @@ param(
     # share-mount / service-control work); supplying an account with the
     # needed NTFS grants shrinks the blast radius of an agent compromise.
     [string]$ServiceUser = "",
-    [string]$ServicePassword = ""
+    [string]$ServicePassword = "",
+    [string]$CaCert = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -138,6 +146,17 @@ if ($Token)       { $cfg["token"] = $Token }
 $cfg | ConvertTo-Json | Set-Content -Path (Join-Path $InstallDir "agent.json") -Encoding UTF8
 Write-Host "[install] wrote agent.json (controller=$ControllerUrl node=$NodeName)"
 
+# --- custom CA trust (native controller TLS) ----------------------------------
+# Machine-level env so BOTH service installs and scheduled-task installs pick
+# it up on (re)start. The agent appends this CA to the system trust pool for
+# every controller request; a missing/unreadable file fail-fasts the agent,
+# so validate here with a clear installer error instead.
+if ($CaCert) {
+    if (-not (Test-Path -LiteralPath $CaCert)) { throw "CA cert file not found: $CaCert (copy ca.crt to the node first)" }
+    [Environment]::SetEnvironmentVariable("ENCODE_AGENT_CA_CERT", $CaCert, "Machine")
+    Write-Host "[install] ENCODE_AGENT_CA_CERT set (machine): $CaCert"
+}
+
 # --- service --------------------------------------------------------------------
 $binPath = "`"$exe`" -config `"$InstallDir\agent.json`""
 if ($svc) {
@@ -177,7 +196,14 @@ try {
     $nodes = Invoke-RestMethod "$ControllerUrl/api/health" -TimeoutSec 10
     Write-Host "[install] controller reachable: $($nodes | ConvertTo-Json -Compress)"
 } catch {
-    Write-Warning "[install] controller not reachable from this node ($ControllerUrl) — agent will retry."
+    if ($CaCert) {
+        # PowerShell's probe uses the Windows cert store, which does not know
+        # the farm CA — a failure here is expected with self-signed TLS and
+        # says nothing about the agent (it trusts $CaCert via the env var).
+        Write-Warning "[install] health probe failed (self-signed TLS is not in the Windows cert store; the agent itself trusts $CaCert). If the node stays offline, check $InstallDir\agent.log."
+    } else {
+        Write-Warning "[install] controller not reachable from this node ($ControllerUrl) — agent will retry."
+    }
 }
 Write-Host "[install] done. The node appears in the UI within one heartbeat (~5s)."
 Write-Host "[install] Next: provision C:\bin tools (UI Provision page or Ansible bin-tools)."

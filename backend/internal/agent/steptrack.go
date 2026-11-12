@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -162,6 +163,22 @@ func (t *stepTimingTracker) finish(finish time.Time) []model.StepTiming {
 	return out
 }
 
+// stepInstanceResetDrop is the progress drop (in percentage points) that
+// marks a NEW instance of the SAME step name. The marker protocol has no
+// step-end marker: each step instance emits "ENCODE_STEP <name> 0" at its
+// start, monotonic progress, then "<name> 100" at its end (see the builtin
+// step templates). A drop of ≥50 points from the instance's high-water
+// mark (canonically 100→0) is therefore a new instance, while smaller dips
+// are treated as intra-instance encoder noise and do NOT re-arm.
+//
+// Residual ambiguity (documented, accepted): an adjacent same-name repeat
+// whose FIRST instance never reported ≥50% before the second starts at 0
+// is not detected as a boundary — the second instance inherits the first's
+// deadline. All builtin steps emit a final 100 marker, so real flows hit
+// the reliable 100→0 case; only a custom template that skips both the
+// completion marker and high progress could land in the ambiguous zone.
+const stepInstanceResetDrop = 50.0
+
 // lineObserver is an io.Writer that tees child-process output live: it
 // accumulates ALL bytes into an internal buffer (runPowerShell still needs the
 // full output afterwards for tail extraction and the ENCODE_STEP_FAILED scan)
@@ -179,6 +196,17 @@ type lineObserver struct {
 	metrics   *metricTracker   // ENCODE_METRIC accumulator; nil in unit tests
 	buf       bytes.Buffer     // accumulates ALL output verbatim
 	remainder string           // trailing partial line from the last Write
+	// onStepStart, when set, fires once per step INSTANCE — on every step
+	// name change (including returning to a previously-seen name after a
+	// different step) and on an adjacent same-name repeat detected via a
+	// progress reset. The timeout enforcement (re-)arms the step's deadline
+	// here. nil in unit tests that only care about parsing.
+	onStepStart func(name string)
+	// curStep/curPct track the CURRENT step instance for boundary detection:
+	// the name and its progress high-water mark. Separate from the timing
+	// tracker, whose first-seen-per-name aggregation is deliberately unchanged.
+	curStep string
+	curPct  float64
 }
 
 // newLineObserver creates a live-scanning writer. log may be nil (unit tests
@@ -238,7 +266,24 @@ func (o *lineObserver) processLine(line string) {
 	if o.log != nil {
 		o.log.Info("job progress", "step", m[1], "pct", m[2])
 	}
+	// Step INSTANCE boundary detection (the timeout hook re-arms per
+	// instance, not per name): a different name is always a new instance —
+	// including a return to a previously-seen name after another step —
+	// and the SAME name with a large progress drop (canonically 100→0) is
+	// an adjacent repeat. Progress within one instance never re-arms.
+	name := m[1]
+	pct, _ := strconv.ParseFloat(m[2], 64) // regex guarantees a valid number
+	newInstance := name != o.curStep || o.curPct-pct >= stepInstanceResetDrop
+	// Timing aggregation is unchanged: first-seen-per-name (observe dedupes).
 	o.timings.observe(line, time.Now())
+	if newInstance {
+		o.curStep, o.curPct = name, pct
+		if o.onStepStart != nil {
+			o.onStepStart(name)
+		}
+	} else if pct > o.curPct {
+		o.curPct = pct // high-water mark: robust to small intra-instance dips
+	}
 }
 
 // String returns the full accumulated output, reassembled exactly — no lost

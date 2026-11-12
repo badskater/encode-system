@@ -40,6 +40,22 @@ services:
       ENCODE_TAG: ${ENCODE_TAG:-1080p}
       ENCODE_DEFAULT_FLOW: ${ENCODE_DEFAULT_FLOW:-default-1080}
       ENCODE_DISCORD_WEBHOOK: ${ENCODE_DISCORD_WEBHOOK:-}
+      # Native HTTPS (optional): set BOTH vars in .env to PEM file paths
+      # INSIDE the container (uncomment the tls mounts below). Exactly one
+      # set = the controller refuses to start; neither = plain HTTP (the
+      # default, unchanged). See Docs/md/Deployment.md §Native HTTPS.
+      ENCODE_TLS_CERT: ${ENCODE_TLS_CERT:-}
+      ENCODE_TLS_KEY: ${ENCODE_TLS_KEY:-}
+      # Optional OIDC login (P10): set ALL FOUR core vars in .env to enable
+      # SSO next to local login; all unset = disabled (the default, zero
+      # behavior change). A partial set fails fast at startup. See
+      # Docs/md/Deployment.md §Optional OIDC login.
+      ENCODE_OIDC_ISSUER: ${ENCODE_OIDC_ISSUER:-}
+      ENCODE_OIDC_CLIENT_ID: ${ENCODE_OIDC_CLIENT_ID:-}
+      ENCODE_OIDC_CLIENT_SECRET: ${ENCODE_OIDC_CLIENT_SECRET:-}
+      ENCODE_OIDC_REDIRECT_URL: ${ENCODE_OIDC_REDIRECT_URL:-}
+      ENCODE_OIDC_ADMIN_GROUP: ${ENCODE_OIDC_ADMIN_GROUP:-}
+      ENCODE_OIDC_GROUPS_CLAIM: ${ENCODE_OIDC_GROUPS_CLAIM:-}
     volumes:
       # Controller state (SQLite DB + update payloads) — the WHOLE /data dir
       # is persistent. The NFS share mounts below are sub-mounts layered on
@@ -49,8 +65,16 @@ services:
       # container reads/writes the same files the Windows agents see.
       - encode-scripts:/data/scripts
       - encode-release:/data/release
+      # TLS cert/key mounts (optional): uncomment together with
+      # ENCODE_TLS_CERT/KEY above; container paths must match the env values.
+      # - ./tls/controller.crt:/tls/controller.crt:ro
+      # - ./tls/controller.key:/tls/controller.key:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      # Default probes plain HTTP (unchanged). With native TLS enabled set
+      # ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health and (for a
+      # self-signed CA) ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate in
+      # .env — local probe only; agents verify via ENCODE_AGENT_CA_CERT.
+      test: ["CMD-SHELL", "wget -qO- ${ENCODE_HEALTHCHECK_FLAGS:-} ${ENCODE_HEALTHCHECK_URL:-http://localhost:8080/api/health}"]
       interval: 30s
       timeout: 5s
       retries: 3

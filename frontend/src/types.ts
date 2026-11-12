@@ -14,6 +14,9 @@ export type StepType =
 export interface Step {
   type: string;
   params?: Record<string, string>;
+  // Per-step wall-clock limit enforced by the agent (minutes). 0/absent =
+  // no per-step limit (the flow's job timeout, if any, still applies).
+  timeout_minutes?: number;
 }
 
 export interface Flow {
@@ -28,6 +31,10 @@ export interface Flow {
   // max_retries > 0.
   max_retries?: number;
   retry_backoff_minutes?: number;
+  // Whole-job wall-clock limit enforced by the agent (minutes). The agent
+  // kills the job's process tree and reports a failure when it expires.
+  // 0/absent = no timeout. Valid range on save: 0-10080.
+  job_timeout_minutes?: number;
 }
 
 export interface Series {
@@ -127,8 +134,52 @@ export interface Settings {
   // when a node transitions between online/offline/busy states. Off by
   // default — only meaningful when discord_webhook is also set.
   notify_node_status?: boolean;
+  // Stall watchdog threshold (minutes): running jobs whose last reported
+  // step/progress is older than this are failed as stalled (through the
+  // normal failure path, so flow retry policy applies). 0/absent = off.
+  // Valid range on save: 0-10080.
+  stall_timeout_minutes?: number;
+  // Notification channels (additive to Discord; each empty = disabled).
+  // Generic webhook: structured JSON event POSTs (job outcomes, operational
+  // alerts, digest summaries) — payload shape in Docs/md/Operations.md.
+  generic_webhook_url?: string;
+  // ntfy: full publish endpoint (scheme+host+topic). The access token is
+  // WRITE-ONLY: GET never returns it (has_ntfy_token flags its presence);
+  // send it via SettingsSave.ntfy_token — empty keeps the stored value.
+  ntfy_topic_url?: string;
+  has_ntfy_token?: boolean;
+  // SMTP email channel: enabled when host+from+to are all set; port 0
+  // defaults to 587. The password is WRITE-ONLY like the ntfy token.
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_user?: string;
+  has_smtp_password?: boolean;
+  smtp_from?: string;
+  smtp_to?: string; // comma-separated recipients
+  // Offsite backups (P4): S3 + SFTP destinations for DB snapshots. The
+  // block's secrets are write-only (has_* flags on GET); see BackupOffsite.
+  backup_offsite?: BackupOffsite;
+  // Experimental download ingestion (P11): stage completed torrents'
+  // source files into the scripts share. OFF by default; see Ingest.
+  ingest?: Ingest;
   updated_at?: string;
 }
+
+// SettingsSave is the PUT /api/settings payload: the settings blob plus the
+// write-only secrets (which never appear on GET). An empty/omitted secret
+// keeps the stored value (the shares pattern). The has_* output flags are
+// GET-only and must not be sent back. An OMITTED backup_offsite or ingest
+// block keeps the stored block wholesale; a present block replaces
+// non-secret fields.
+export type SettingsSave = Omit<
+  Settings,
+  'has_ntfy_token' | 'has_smtp_password' | 'backup_offsite' | 'ingest'
+> & {
+  ntfy_token?: string;
+  smtp_password?: string;
+  backup_offsite?: BackupOffsiteSave;
+  ingest?: IngestSave;
+};
 
 // ProvisionRun: one controller-driven Ansible provisioning attempt.
 export interface ProvisionRun {
@@ -161,6 +212,84 @@ export interface BackupStatus {
   last_run?: string;
   last_error?: string;
   next_run?: string;
+}
+
+// Offsite backup destinations (P4). GET shape: the destination secrets are
+// WRITE-ONLY — has_* flags report presence, values never echo back. Send
+// credentials via SettingsSave.backup_offsite (blank keeps the stored one).
+export interface OffsiteS3 {
+  enabled?: boolean;
+  endpoint?: string; // host[:port] or http(s) URL; stored normalized
+  bucket?: string;
+  prefix?: string;
+  access_key?: string;
+  use_tls?: boolean;
+}
+export interface OffsiteSFTP {
+  enabled?: boolean;
+  host?: string;
+  port?: number; // 0 = default 22
+  user?: string;
+  path?: string; // empty = the SSH home dir
+  // Public host key pinned on every connection (REQUIRED when enabled).
+  // Known-hosts style "ssh-ed25519 AAAA…" or bare base64; public material,
+  // so it round-trips over the API (unlike the write-only secrets).
+  host_key?: string;
+}
+export interface BackupOffsite {
+  s3?: OffsiteS3;
+  sftp?: OffsiteSFTP;
+  // Per-destination retention: newest N snapshot generations kept
+  // (snapshot + key companion together). 0 = default 30; range 1-365.
+  keep_n?: number;
+  // Bundle the shares key with each snapshot so offsite restore can
+  // decrypt DB secrets. Default true. SECURITY: the key decrypts every
+  // secret in the DB — only use trusted, access-controlled destinations.
+  include_shares_key?: boolean;
+  has_s3_secret_key?: boolean; // GET only
+  has_sftp_password?: boolean; // GET only
+  has_sftp_private_key?: boolean; // GET only
+}
+// Save shapes: write-only secrets in, has_* flags out (flags live at the
+// block level on BackupOffsite, mirroring the top-level has_ntfy_token).
+export interface OffsiteS3Save extends OffsiteS3 {
+  secret_key?: string;
+}
+export interface OffsiteSFTPSave extends OffsiteSFTP {
+  password?: string;
+  private_key?: string; // unencrypted PEM
+}
+export interface BackupOffsiteSave {
+  s3?: OffsiteS3Save;
+  sftp?: OffsiteSFTPSave;
+  keep_n?: number;
+  include_shares_key?: boolean;
+}
+
+// Experimental download ingestion (P11). OFF by default. The controller
+// polls a BitTorrent client for completed downloads and stages their
+// source video files into the scripts share (<series>/<episode>/); filter
+// scripts (.avs/.vpy) stay hand-authored and the scanner queues jobs once
+// both are present. The password is WRITE-ONLY: GET returns has_password,
+// never the value; send it via SettingsSave.ingest (blank keeps stored).
+export interface Ingest {
+  enabled?: boolean;
+  provider?: 'qbittorrent' | 'rutorrent' | '';
+  url?: string; // client web base URL
+  username?: string; // optional (auth-bypassed clients need none)
+  category?: string; // optional category/label filter
+  // Category → series folder name overrides (JSON object). The episode
+  // number is still parsed from the release name — never guessed.
+  category_map?: Record<string, string>;
+  poll_interval_seconds?: number; // 0 = default 60; range 10-3600
+  // Controller-visible mount of the client's download directory (the
+  // directory that directly contains the completed torrent folders).
+  download_root?: string;
+  has_password?: boolean; // GET only
+}
+// Save shape: the write-only password in, has_password out.
+export interface IngestSave extends Omit<Ingest, 'has_password'> {
+  password?: string;
 }
 
 // ShareKind is the transport backing a share mount.

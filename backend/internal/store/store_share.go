@@ -67,23 +67,32 @@ func (s *Store) shareKeyPath() string {
 	return sharesKeyPathForDSN(s.dbPath)
 }
 
+// SharesKeyPath exposes the shares-key file location (read-only accessor).
+// The offsite backup bundle (P4) needs it: the key must travel alongside the
+// snapshot for an offsite restore to decrypt DB secrets. Only the PATH is
+// exposed — key bytes never pass through the store API.
+func (s *Store) SharesKeyPath() string { return s.shareKeyPath() }
+
 // shareCipher returns (creating on first use) the AES-GCM cipher protecting
-// share passwords. Key is 32 random bytes, stored 0600.
+// share passwords and the write-only settings secrets. Key is 32 random
+// bytes, stored 0600.
+//
+// The whole lazy init is serialized by cipherMu: an unsynchronized
+// check-then-act let concurrent first use generate TWO different keys (last
+// write won, leaving ciphertext sealed with the loser permanently
+// undecryptable) and read the key file mid-write ("invalid key size 0").
+// Key creation is also atomic ACROSS processes (O_CREATE|O_EXCL — exactly
+// one creator wins; losers adopt the winner's key). An existing key file is
+// never overwritten.
 func (s *Store) shareCipher() (cipher.AEAD, error) {
+	s.cipherMu.Lock()
+	defer s.cipherMu.Unlock()
 	if s.aead != nil {
 		return s.aead, nil
 	}
-	key, err := os.ReadFile(s.shareKeyPath())
-	if errors.Is(err, os.ErrNotExist) {
-		key = make([]byte, 32)
-		if _, err := io.ReadFull(rand.Reader, key); err != nil {
-			return nil, fmt.Errorf("generate share key: %w", err)
-		}
-		if err := os.WriteFile(s.shareKeyPath(), key, 0o600); err != nil {
-			return nil, fmt.Errorf("persist share key: %w", err)
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("read share key: %w", err)
+	key, err := s.loadOrCreateShareKey()
+	if err != nil {
+		return nil, err
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -97,7 +106,83 @@ func (s *Store) shareCipher() (cipher.AEAD, error) {
 	return aead, nil
 }
 
+// InvalidateShareCipher drops the cached AES-GCM cipher so the NEXT use
+// re-reads the key file from disk. The in-place PG restore calls it after a
+// successful commit (P4 review Q9): an operator who places the restored
+// bundle's shares-key file beside the DB before restoring would otherwise
+// keep decrypting with the OLD cached key until a controller restart —
+// restored secrets silently undecryptable. Safe under cipherMu: in-flight
+// operations keep the cipher they already obtained; only future uses
+// re-read. The key file itself is never touched here.
+func (s *Store) InvalidateShareCipher() {
+	s.cipherMu.Lock()
+	defer s.cipherMu.Unlock()
+	s.aead = nil
+}
+
+// loadOrCreateShareKey reads the key file, creating it on first use. The
+// create is O_CREATE|O_EXCL so concurrent processes cannot both claim it;
+// the loser of the race re-reads the winner's key instead of overwriting it
+// (overwriting would brick every secret sealed with the original key).
+func (s *Store) loadOrCreateShareKey() ([]byte, error) {
+	path := s.shareKeyPath()
+	key, err := readShareKey(path)
+	if err == nil {
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read share key: %w", err)
+	}
+	key = make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, fmt.Errorf("generate share key: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		// Another process won the create race — adopt its key.
+		key, err := readShareKey(path)
+		if err != nil {
+			return nil, fmt.Errorf("read share key: %w", err)
+		}
+		return key, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("persist share key: %w", err)
+	}
+	if _, err := f.Write(key); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("persist share key: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("persist share key: %w", err)
+	}
+	return key, nil
+}
+
+// readShareKey reads the 32-byte key file. A short read is only possible
+// while a concurrent creator that claimed the file (O_EXCL) has not finished
+// its single 32-byte write, so retry briefly; a persistently wrong size is a
+// corrupt key and a hard error.
+func readShareKey(path string) ([]byte, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		key, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if len(key) == 32 {
+			return key, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("share key %s: invalid size %d (want 32 bytes)", path, len(key))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // encryptSharePassword returns a "v1:<hex>" ciphertext (empty stays empty).
+// Protects share passwords AND the write-only settings secrets (ntfy token,
+// SMTP password) — one AES-GCM key beside the DB for all at-rest credentials.
 func (s *Store) encryptSharePassword(plain string) (string, error) {
 	if plain == "" {
 		return "", nil
@@ -298,7 +383,13 @@ func (s *Store) DeleteShare(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	// Check the RowsAffected error like AssignJob/DeleteSeries do: a driver
+	// failure here must surface as itself, not be masked into a spurious ErrNoRows.
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return sql.ErrNoRows
 	}
 	return nil

@@ -12,10 +12,13 @@ import (
 // durations, frame counts).
 const maxMetrics = 64
 
-// metricLine matches "ENCODE_METRIC key=value" anywhere in a line (x265
-// prefixes its own tags before script output is echoed). Key is a simple
-// identifier; value is a float. Mirrors the stepLine regex's tolerance.
-var metricLine = regexp.MustCompile(`ENCODE_METRIC\s+([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(-?\d+(?:\.\d+)?)`)
+// metricLine matches "ENCODE_METRIC key=value" ONLY at line start.
+// Markers are line-based protocol messages: untrusted metadata echoed
+// mid-line (e.g. a hostile track_name inside an mkvmerge command line)
+// must not forge metrics. Real metric lines are emitted at line start by
+// Write-EncodeMetric / echo in both dialects. Key is a simple identifier;
+// value is a float. Mirrors the stepLine regex's anchoring.
+var metricLine = regexp.MustCompile(`^ENCODE_METRIC\s+([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(-?\d+(?:\.\d+)?)`)
 
 // metricTracker accumulates ENCODE_METRIC key=value pairs from live job
 // output. Same design as progressTracker: mutex-guarded, fed by the
@@ -31,8 +34,9 @@ func newMetricTracker() *metricTracker {
 	return &metricTracker{m: map[string]float64{}}
 }
 
-// observe records every ENCODE_METRIC pair on the line (a line may carry
-// one; multi-pair lines are tolerated). Non-matching lines are ignored.
+// observe records the ENCODE_METRIC pair when the line STARTS with the
+// marker (mid-line marker text is ordinary output, never protocol).
+// Non-matching lines are ignored.
 func (t *metricTracker) observe(line string) {
 	mm := metricLine.FindAllStringSubmatch(line, -1)
 	if mm == nil {

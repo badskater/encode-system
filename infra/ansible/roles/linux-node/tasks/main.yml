@@ -31,6 +31,62 @@
     state: present
   when: ansible_os_family | default("Debian") == "RedHat"
 
+# ------------------------------------------------- VapourSynth scxvid plugin
+# The keyframes builtin (scene-change detection, P7) runs on Linux through
+# the vapoursynth-scxvid VapourSynth plugin: the rendered .vpy imports
+# scxvid and vspipe writes the xvid first-pass log — the same artifact
+# format the Windows SCXvid step produces. The pip wheel bundles xvidcore
+# and installs the plugin under site-packages/vapoursynth/plugins/, where
+# VapourSynth (R55+) auto-loads it; no system xvid library is needed.
+# Requires the node's VapourSynth Python >= 3.12 (wheel Requires-Python).
+- name: Install pip for the VapourSynth scxvid plugin (apt)
+  ansible.builtin.apt:
+    name: python3-pip
+    state: present
+  when: ansible_os_family | default("Debian") == "Debian"
+
+- name: Install pip for the VapourSynth scxvid plugin (dnf)
+  ansible.builtin.dnf:
+    name: python3-pip
+    state: present
+  when: ansible_os_family | default("RedHat") == "RedHat"
+
+# Preflight: the vapoursynth-scxvid wheel declares Requires-Python >= 3.12.
+# Fail HERE with an actionable message instead of a cryptic pip resolver
+# error mid-provision. python3 is the interpreter pip3 installs into and
+# the one vspipe must share (a venv's site-packages is not auto-loaded).
+- name: Detect node Python version (scxvid wheel requires >= 3.12)
+  ansible.builtin.command: python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'
+  register: node_python_version
+  changed_when: false
+
+- name: Assert node Python meets the scxvid wheel requirement
+  ansible.builtin.assert:
+    that:
+      - node_python_version.stdout is version('3.12', '>=')
+    fail_msg: >-
+      Node Python {{ node_python_version.stdout }} is too old for the
+      vapoursynth-scxvid wheel (Requires-Python >= 3.12), which the
+      keyframes step needs. Install Python 3.12+ on the node (e.g.
+      Debian 13 / RHEL 9.6+, or a distro backport) and ensure vspipe uses
+      that same interpreter, then re-run provisioning.
+    success_msg: "Node Python {{ node_python_version.stdout }} meets the scxvid wheel requirement (>= 3.12)"
+
+# PEP 668 distros (Debian 12+) mark the system Python externally-managed.
+# The plugin MUST land in the same Python vspipe uses (a venv's
+# site-packages is not auto-loaded), so system-wide pip install is the
+# intended path on these dedicated encode nodes. PIP_BREAK_SYSTEM_PACKAGES
+# is set via environment: instead of the pip module's break_system_packages
+# parameter — that parameter requires ansible-core >= 2.17, while the env
+# var is honored by pip itself on ANY core version (same effect).
+- name: Install VapourSynth scxvid plugin (keyframes step)
+  ansible.builtin.pip:
+    name: vapoursynth-scxvid
+    state: present
+    executable: pip3
+  environment:
+    PIP_BREAK_SYSTEM_PACKAGES: "1"
+
 # --------------------------------------------------- agent user + directories
 - name: Create agent service user
   ansible.builtin.user:

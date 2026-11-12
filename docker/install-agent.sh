@@ -13,6 +13,9 @@
 #   sudo ./install-agent.sh -c http://192.168.1.10:8080 -t <permanent-token>
 #   sudo CONTROLLER_URL=http://192.168.1.10:8080 PAIRING_CODE=ABC123 ./install-agent.sh
 #   curl -fsSL <raw-url>/install-agent.sh | sudo bash -s -- -c http://... -p ABC123
+#   # Native controller TLS (self-signed CA recipe: Docs/md/Deployment.md):
+#   sudo ENCODE_AGENT_CA_CERT=/etc/encode-agent/encode-ca.crt \
+#        ./install-agent.sh -c https://192.168.1.10:8080 -p ABC123
 #
 # Toolchain (ffmpeg, x265, mkvmerge, opusenc, ...) is expected on PATH — provision
 # it separately via the UI Provision page or the Ansible bin-tools play. This
@@ -31,6 +34,13 @@
 #   ENCODE_AGENT_ALLOW_HTTP_UPDATES  set to 1 to allow agent self-updates over
 #                    plain HTTP (auto-enabled when CONTROLLER_URL is http://; the
 #                    agent refuses these downloads otherwise — see agent.go getAuth)
+#   ENCODE_AGENT_CA_CERT  PEM file path of the controller's CA certificate
+#                    (native controller TLS). Appended to the system trust pool
+#                    for every controller request; passed to the service via a
+#                    systemd drop-in. Not needed for http:// controllers.
+#                    The path must not contain $, %, quotes, backticks,
+#                    backslashes or newlines (systemd drop-in limitation —
+#                    the installer rejects them). Spaces are fine.
 set -euo pipefail
 
 REPO="${REPO:-${ENCODE_REPO:-badskater/encode-system}}"
@@ -270,6 +280,41 @@ else
     rm -f "$HTTP_DROPIN_DIR/http-updates.conf"
 fi
 
+# --- custom CA trust (native controller TLS) ---------------------------------
+# ENCODE_AGENT_CA_CERT points the agent at the controller's CA certificate
+# (PEM); the agent APPENDS it to the system trust pool for every controller
+# request (heartbeat + lib/bin/agent downloads). Pass it through to the
+# service via a drop-in so it survives reboots regardless of unit source.
+# The file must exist and be readable now — the agent fail-fasts at startup
+# on a broken path, so catch it here with a clear installer error instead.
+if [ -n "${ENCODE_AGENT_CA_CERT:-}" ]; then
+    # The path is interpolated into a systemd Environment= drop-in below.
+    # systemd expands $VAR/${VAR}, performs %-specifier expansion (%h, %t,
+    # ... — a literal % in a path like /path/100%20ca/ca.crt gets mangled),
+    # and processes backslash escapes inside the quoted value; a literal
+    # quote or newline breaks the assignment — a mangled drop-in silently
+    # points the agent at the wrong (or no) file. Reject those characters at
+    # install time instead; a plain path like /etc/encode-agent/encode-ca.crt
+    # is the supported form (spaces are OK, systemd quotes the assignment).
+    case "$ENCODE_AGENT_CA_CERT" in
+        *'$'*|*'%'*|*'"'*|*"'"*|*'`'*|*'\'*|*$'\n'*)
+            die "ENCODE_AGENT_CA_CERT path must not contain \$, %, quotes, backticks, backslashes or newlines (cannot be carried in a systemd drop-in): $ENCODE_AGENT_CA_CERT — copy the CA to a plain path, e.g. /etc/encode-agent/encode-ca.crt"
+            ;;
+    esac
+    [ -r "$ENCODE_AGENT_CA_CERT" ] || die "ENCODE_AGENT_CA_CERT is not readable: $ENCODE_AGENT_CA_CERT"
+    mkdir -p "$HTTP_DROPIN_DIR"
+    # Unquoted delimiter: expand the path (validated above). systemd quotes
+    # the assignment so paths with spaces survive.
+    cat > "$HTTP_DROPIN_DIR/ca-cert.conf" <<DROPIN
+[Service]
+Environment="ENCODE_AGENT_CA_CERT=$ENCODE_AGENT_CA_CERT"
+DROPIN
+    log "agent CA trust enabled: ENCODE_AGENT_CA_CERT=$ENCODE_AGENT_CA_CERT"
+else
+    # No CA configured: remove a stale drop-in from a prior TLS install.
+    rm -f "$HTTP_DROPIN_DIR/ca-cert.conf"
+fi
+
 # --- enable + start ----------------------------------------------------------
 systemctl daemon-reload
 systemctl enable encode-agent
@@ -283,7 +328,12 @@ if ! systemctl is-active --quiet encode-agent; then
     journalctl -u encode-agent --no-pager -n 20 || true
     die "agent service failed to stay running — check: journalctl -u encode-agent"
 fi
-if curl -fsS "$CONTROLLER_URL/api/health" >/dev/null 2>&1; then
+# Verify reachability with the SAME trust the agent will use: --cacert when
+# a custom CA is configured (a self-signed controller cert fails the default
+# system-trust probe otherwise, producing a misleading warning).
+probe_args=(-fsS)
+if [ -n "${ENCODE_AGENT_CA_CERT:-}" ]; then probe_args+=(--cacert "$ENCODE_AGENT_CA_CERT"); fi
+if curl "${probe_args[@]}" "$CONTROLLER_URL/api/health" >/dev/null 2>&1; then
     log "controller reachable at $CONTROLLER_URL"
 else
     log "WARNING: controller not reachable from this node ($CONTROLLER_URL) — agent will retry"

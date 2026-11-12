@@ -67,7 +67,7 @@ func (s *Server) checkDisk(ctx context.Context, node *model.Node, hb *model.Hear
 			s.Notifier.Alert(ctx, content)
 		} else {
 			st := s.currentSettings(ctx)
-			notify.NewDiscordWithLink(st.DiscordWebhook, st.ControllerURL, s.Log).Alert(ctx, content)
+			notify.NewFanoutFromSettings(st, st.DiscordWebhook, s.mailSender(), s.Log).Alert(ctx, content)
 		}
 		s.Log.Warn("low disk space on node", "node", node.Name,
 			"free_gb", hb.Metrics.DiskFreeGB, "threshold_gb", threshold)

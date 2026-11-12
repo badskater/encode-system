@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
-import type { Settings, UpdateCheck, UpdateManifest } from '../types';
+import type {
+  Settings, SettingsSave, UpdateCheck, UpdateManifest,
+  OffsiteS3, OffsiteSFTP, OffsiteS3Save, OffsiteSFTPSave,
+  Ingest, IngestSave,
+} from '../types';
 import { timeAgo } from '../components/helpers';
 import { useIsAdmin } from '../hooks/useRole';
 import APITokensCard from '../components/APITokensCard';
@@ -33,6 +37,175 @@ function checkPayload(file: File, maxBytes: number, kind: string): string | null
 function clampInt(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;
   return Math.min(hi, Math.max(lo, Math.round(v)));
+}
+
+// isHttpUrl mirrors the server's http(s)-with-host bound for the webhook and
+// ntfy topic fields (new URL rejects scheme-less or host-less inputs).
+function isHttpUrl(v: string): boolean {
+  try {
+    const u = new URL(v);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+// isEmailAddr accepts a bare address or a "Name <addr>" display form — the
+// same shapes net/mail.ParseAddress accepts server-side. The domain does NOT
+// need a dot: ops@localhost is valid on the server (G6), so the client must
+// not be stricter. (Quoted local parts remain a server-only edge case.)
+function isEmailAddr(v: string): boolean {
+  const m = v.match(/<([^>]+)>/);
+  const addr = (m ? m[1] : v).trim();
+  return /^[^\s@]+@[^\s@]+$/.test(addr);
+}
+
+// validateNotifyChannels mirrors the server's settings bounds for the three
+// new channels so a typo is caught before the PUT. Returns an error message
+// or null when valid. Empty fields = channel disabled (always valid).
+function validateNotifyChannels(s: Settings): string | null {
+  if (s.generic_webhook_url && !isHttpUrl(s.generic_webhook_url.trim())) {
+    return 'Generic webhook URL must be an http(s) URL';
+  }
+  if (s.ntfy_topic_url && !isHttpUrl(s.ntfy_topic_url.trim())) {
+    return 'ntfy topic URL must be an http(s) URL (e.g. https://ntfy.sh/mytopic)';
+  }
+  const port = s.smtp_port ?? 0;
+  if (port !== 0 && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    return 'SMTP port must be 0 (default 587) or 1-65535';
+  }
+  const host = (s.smtp_host ?? '').trim();
+  const from = (s.smtp_from ?? '').trim();
+  const to = (s.smtp_to ?? '').trim();
+  if (host && (/\s/.test(host) || host.includes('://'))) {
+    return 'SMTP host must be a hostname (no scheme, no spaces)';
+  }
+  if (host && (!from || !to)) {
+    return 'SMTP from and to are required when a host is set';
+  }
+  if (!host && (from || to)) {
+    return 'SMTP host is required when from/to are set';
+  }
+  if (from && !isEmailAddr(from)) {
+    return 'SMTP from must be a valid email address';
+  }
+  if (to) {
+    for (const addr of to.split(',')) {
+      if (!isEmailAddr(addr.trim())) {
+        return 'SMTP to must be comma-separated valid email addresses';
+      }
+    }
+  }
+  return null;
+}
+
+// validateOffsite mirrors the server's backup_offsite bounds so a typo is
+// caught before the PUT. Disabled destinations need nothing; enabled ones
+// require their connection fields. Credential presence is checked in save()
+// (it needs the typed secret inputs + has_* flags).
+function validateOffsite(s: Settings): string | null {
+  const off = s.backup_offsite;
+  if (!off) return null;
+  const keepN = off.keep_n ?? 0;
+  if (keepN !== 0 && (!Number.isInteger(keepN) || keepN < 1 || keepN > 365)) {
+    return 'Offsite keep_n must be 0 (default 30) or 1-365';
+  }
+  const s3 = off.s3;
+  if (s3?.enabled) {
+    const ep = (s3.endpoint ?? '').trim();
+    if (!ep) return 'S3 endpoint is required when the destination is enabled';
+    if (/\s/.test(ep)) return 'S3 endpoint must not contain spaces';
+    if (!(s3.bucket ?? '').trim()) return 'S3 bucket is required when the destination is enabled';
+    if (/[/\\\s]/.test(s3.bucket ?? '')) return 'S3 bucket must be a plain bucket name (no slashes or spaces)';
+    if (!(s3.access_key ?? '').trim()) return 'S3 access key is required when the destination is enabled';
+  }
+  // Prefix traversal parity with the server (checked even when disabled —
+  // the stored value must always be upload-ready).
+  const prefix = (s3?.prefix ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (prefix && prefix.split('/').some((seg) => seg === '.' || seg === '..')) {
+    return 'S3 prefix must not contain . or .. segments';
+  }
+  const sf = off.sftp;
+  if (sf?.enabled) {
+    const host = (sf.host ?? '').trim();
+    if (!host) return 'SFTP host is required when the destination is enabled';
+    if (/\s/.test(host) || host.includes('://')) return 'SFTP host must be a hostname (no scheme, no spaces)';
+    if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) {
+      return 'SFTP host must not carry a port — set it in the port field (bracketed IPv6 like [::1] is allowed)';
+    }
+    const port = sf.port ?? 0;
+    if (port !== 0 && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+      return 'SFTP port must be 0 (default 22) or 1-65535';
+    }
+    if (!(sf.user ?? '').trim()) return 'SFTP user is required when the destination is enabled';
+    // D1: the bundle carries the shares key — pinning is mandatory. Shape
+    // check only; the server does the real ssh.ParsePublicKey at save.
+    const hk = (sf.host_key ?? '').trim();
+    if (!hk) return 'SFTP host key is required when the destination is enabled — get it with: ssh-keyscan <host>';
+    const fields = hk.split(/\s+/);
+    const b64 = fields.length >= 2 ? fields[1] : fields[0];
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length < 16) {
+      return 'SFTP host key must be a public key (ssh-ed25519 AAAA… or bare base64) — get it with: ssh-keyscan <host>';
+    }
+  }
+  // SFTP path traversal parity with the server.
+  if ((sf?.path ?? '').split('/').some((seg) => seg === '..')) {
+    return 'SFTP path must not contain .. segments';
+  }
+  return null;
+}
+
+// validateIngest mirrors the server's ingest bounds (P11, experimental)
+// so a typo is caught before the PUT. The category map lives in a JSON
+// textarea: it must parse to a plain string→string object with safe
+// folder names. Disabled ingestion needs only shape-valid fields.
+// Returns an error message or null when valid.
+function validateIngest(s: Settings, mapText: string): string | null {
+  const ing = s.ingest;
+  if (!ing) return null;
+  const interval = ing.poll_interval_seconds ?? 0;
+  if (interval !== 0 && (!Number.isInteger(interval) || interval < 10 || interval > 3600)) {
+    return 'Ingest poll interval must be 0 (default 60) or 10-3600 seconds';
+  }
+  // Parse the category map even when disabled — the stored value must
+  // always be sane (server parity).
+  const trimmed = mapText.trim();
+  if (trimmed) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return 'Category map must be valid JSON (an object like {"anime": "Show Name"})';
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return 'Category map must be a JSON object mapping category → series name';
+    }
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!k.trim() || typeof v !== 'string' || !v.trim()) {
+        return 'Category map keys and values must be non-empty strings';
+      }
+      if (/[/\\]|\.\./.test(k) || /[/\\]|\.\./.test(v)) {
+        return 'Category map entries must be plain names (no slashes or ..)';
+      }
+    }
+  }
+  if (!ing.enabled) return null;
+  if (ing.provider !== 'qbittorrent' && ing.provider !== 'rutorrent') {
+    return 'Ingest provider must be qBittorrent or ruTorrent when enabled';
+  }
+  const url = (ing.url ?? '').trim();
+  if (!url || !isHttpUrl(url)) {
+    return 'Ingest client URL must be an http(s) URL when enabled';
+  }
+  const root = (ing.download_root ?? '').trim();
+  if (!root) return 'Download root is required when ingestion is enabled';
+  if (!root.startsWith('/') || root.startsWith('//')) {
+    return 'Download root must be an absolute Unix path (e.g. /mnt/downloads)';
+  }
+  if (root.split('/').some((seg) => seg === '..')) {
+    return 'Download root must not contain .. segments';
+  }
+  return null;
 }
 
 // SettingsPage edits the fleet's runtime configuration from the UI:
@@ -72,6 +245,21 @@ export default function SettingsPage() {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
   const [updateError, setUpdateError] = useState('');
   const [checking, setChecking] = useState(false);
+  // Write-only notification secrets: kept OUT of the settings object (the
+  // API never returns them). Empty on load; a typed value is sent once on
+  // save, then cleared — blank on the next save keeps the stored credential.
+  const [ntfyToken, setNtfyToken] = useState('');
+  const [smtpPassword, setSmtpPassword] = useState('');
+  // Write-only offsite destination secrets (P4): same keep-semantics —
+  // empty on load, sent once on save, then cleared.
+  const [offsiteS3Secret, setOffsiteS3Secret] = useState('');
+  const [offsiteSFTPPassword, setOffsiteSFTPPassword] = useState('');
+  const [offsiteSFTPKey, setOffsiteSFTPKey] = useState('');
+  // Write-only ingest client password (P11): same keep-semantics.
+  const [ingestPassword, setIngestPassword] = useState('');
+  // Category→series map editor: a JSON textarea. The text is the source
+  // of truth while editing; save() parses it into settings.ingest.
+  const [categoryMapText, setCategoryMapText] = useState('{}');
   const isAdmin = useIsAdmin();
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
@@ -85,7 +273,11 @@ export default function SettingsPage() {
     // failure (e.g. nothing published yet) must not make the settings form
     // unusable.
     try {
-      setSettings(await api.settings());
+      const loaded = await api.settings();
+      setSettings(loaded);
+      // Seed the category-map textarea from the stored block (pretty-
+      // printed so the operator can edit it directly).
+      setCategoryMapText(JSON.stringify(loaded.ingest?.category_map ?? {}, null, 2));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -147,8 +339,69 @@ export default function SettingsPage() {
     setSettings((s) => (s ? { ...s, [key]: value } : s));
   }
 
+  // Nested offsite setters (P4): merge into settings.backup_offsite without
+  // disturbing the other destination's fields or the write-only has_* flags.
+  function setOffsite(patch: { keep_n?: number; include_shares_key?: boolean }) {
+    setSettings((s) => (s ? { ...s, backup_offsite: { ...(s.backup_offsite ?? {}), ...patch } } : s));
+  }
+  function setOffS3(patch: Partial<OffsiteS3>) {
+    setSettings((s) => (s ? {
+      ...s,
+      backup_offsite: { ...(s.backup_offsite ?? {}), s3: { ...(s.backup_offsite?.s3 ?? {}), ...patch } },
+    } : s));
+  }
+  function setOffSFTP(patch: Partial<OffsiteSFTP>) {
+    setSettings((s) => (s ? {
+      ...s,
+      backup_offsite: { ...(s.backup_offsite ?? {}), sftp: { ...(s.backup_offsite?.sftp ?? {}), ...patch } },
+    } : s));
+  }
+  // Nested ingest setter (P11): merge into settings.ingest without
+  // disturbing the write-only has_password flag.
+  function setIngest(patch: Partial<Ingest>) {
+    setSettings((s) => (s ? { ...s, ingest: { ...(s.ingest ?? {}), ...patch } } : s));
+  }
+
   async function save() {
     if (!settings) return;
+    // Client-side bounds mirror the server validation for the notification
+    // channels — surface the error before spending a round-trip.
+    const invalid = validateNotifyChannels(settings);
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
+    const invalidOffsite = validateOffsite(settings);
+    if (invalidOffsite) {
+      setError(invalidOffsite);
+      return;
+    }
+    const invalidIngest = validateIngest(settings, categoryMapText);
+    if (invalidIngest) {
+      setError(invalidIngest);
+      return;
+    }
+    // Enabled ingestion with a username needs a credential: either one
+    // already stored (has_password) or one typed now. Mirrors the
+    // server's post-merge check.
+    if (settings.ingest?.enabled && (settings.ingest.username ?? '').trim() &&
+        !settings.ingest.has_password && !ingestPassword) {
+      setError('Ingest password is required when a username is set (blank keeps the stored one; none is stored)');
+      return;
+    }
+    // Enabled offsite destinations need a credential: either one already
+    // stored (has_* flag) or one typed now. Mirrors the server's post-merge
+    // check so the operator gets the error before the round-trip.
+    const off = settings.backup_offsite;
+    if (off?.s3?.enabled && !off.has_s3_secret_key && !offsiteS3Secret.trim()) {
+      setError('S3 secret key is required when the destination is enabled (blank keeps the stored one; none is stored)');
+      return;
+    }
+    if (off?.sftp?.enabled && !off.has_sftp_password && !off.has_sftp_private_key &&
+        !offsiteSFTPPassword && !offsiteSFTPKey.trim()) {
+      setError('SFTP needs a password or private key when enabled (blank keeps the stored ones; none are stored)');
+      return;
+    }
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -165,9 +418,81 @@ export default function SettingsPage() {
         job_retention_days: clampInt(settings.job_retention_days ?? 0, 0, 3650),
         // 0 = disabled; a cleared (NaN) field maps to lo=0, the safe default.
         disk_alert_gb: clampInt(settings.disk_alert_gb ?? 0, 0, 100000),
+        // Stall watchdog: 0 = off; same NaN→0 safe default, ceiling 1 week.
+        stall_timeout_minutes: clampInt(settings.stall_timeout_minutes ?? 0, 0, 10080),
+        // SMTP port: 0 = default 587; NaN (cleared) maps to 0.
+        smtp_port: clampInt(settings.smtp_port ?? 0, 0, 65535),
       };
-      const saved = await api.saveSettings(toSave);
+      // PUT payload: strip the GET-only has_* flags (the server tolerates
+      // them, but they are output-only) and attach typed write-only secrets.
+      // Omitted/empty secret = keep the stored value (shares pattern).
+      const payload = { ...toSave } as SettingsSave & {
+        has_ntfy_token?: boolean;
+        has_smtp_password?: boolean;
+      };
+      delete payload.has_ntfy_token;
+      delete payload.has_smtp_password;
+      if (ntfyToken.trim()) payload.ntfy_token = ntfyToken.trim();
+      if (smtpPassword) payload.smtp_password = smtpPassword;
+      // Offsite block: strip the GET-only has_* flags, clamp numeric
+      // bounds, attach typed write-only secrets (blank = keep stored).
+      if (toSave.backup_offsite) {
+        const o = toSave.backup_offsite;
+        const s3Save: OffsiteS3Save = {
+          enabled: o.s3?.enabled,
+          endpoint: o.s3?.endpoint,
+          bucket: o.s3?.bucket,
+          prefix: o.s3?.prefix,
+          access_key: o.s3?.access_key,
+          use_tls: o.s3?.use_tls,
+        };
+        if (offsiteS3Secret.trim()) s3Save.secret_key = offsiteS3Secret.trim();
+        const sftpSave: OffsiteSFTPSave = {
+          enabled: o.sftp?.enabled,
+          host: o.sftp?.host,
+          port: clampInt(o.sftp?.port ?? 0, 0, 65535),
+          user: o.sftp?.user,
+          path: o.sftp?.path,
+          host_key: o.sftp?.host_key,
+        };
+        if (offsiteSFTPPassword) sftpSave.password = offsiteSFTPPassword;
+        if (offsiteSFTPKey.trim()) sftpSave.private_key = offsiteSFTPKey.trim();
+        payload.backup_offsite = {
+          s3: s3Save,
+          sftp: sftpSave,
+          keep_n: clampInt(o.keep_n ?? 0, 0, 365),
+          include_shares_key: o.include_shares_key ?? true,
+        };
+      }
+      // Ingest block (P11): strip the GET-only has_password flag, parse
+      // the category-map textarea (validated above), clamp the cadence,
+      // attach the typed write-only password (blank = keep stored).
+      if (toSave.ingest) {
+        const ing = toSave.ingest;
+        const ingestSave: IngestSave = {
+          enabled: ing.enabled,
+          provider: ing.provider,
+          url: ing.url,
+          username: ing.username,
+          category: ing.category,
+          category_map: categoryMapText.trim()
+            ? JSON.parse(categoryMapText) as Record<string, string>
+            : {},
+          poll_interval_seconds: clampInt(ing.poll_interval_seconds ?? 0, 0, 3600),
+          download_root: ing.download_root,
+        };
+        if (ingestPassword) ingestSave.password = ingestPassword;
+        payload.ingest = ingestSave;
+      }
+      const saved = await api.saveSettings(payload);
       setSettings(saved);
+      // Secrets were consumed: clear the inputs so the next save keeps them.
+      setNtfyToken('');
+      setSmtpPassword('');
+      setOffsiteS3Secret('');
+      setOffsiteSFTPPassword('');
+      setOffsiteSFTPKey('');
+      setIngestPassword('');
       setNotice('Settings saved. Scanner and new jobs pick them up on the next cycle — no restart needed.');
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
@@ -259,6 +584,71 @@ export default function SettingsPage() {
         placeholder={placeholder}
         disabled={!isAdmin}
         onChange={(e) => setString(key, e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // secretField renders a write-only credential input (SharesCard pattern):
+  // never prefilled, password-type, and a "saved" placeholder when the API
+  // reports the credential exists (has_* flag). Blank on save = keep it.
+  const secretField = (
+    label: string, hint: string, value: string, onChange: (v: string) => void,
+    saved: boolean, placeholder: string,
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <input
+        type="password"
+        aria-label={label}
+        autoComplete="new-password"
+        style={{ width: '100%' }}
+        value={value}
+        placeholder={saved ? '•••• saved — leave blank to keep' : placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // offField is field() for the nested offsite block (values live under
+  // settings.backup_offsite, not at the top level).
+  const offField = (
+    label: string, hint: string, value: string | undefined,
+    onChange: (v: string) => void, placeholder = '',
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <input
+        aria-label={label}
+        style={{ width: '100%' }}
+        value={value ?? ''}
+        placeholder={placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
+    </label>
+  );
+
+  // secretTextarea is secretField for multi-line write-only values (the
+  // SFTP private key PEM): never prefilled, "saved" placeholder, blank keeps.
+  const secretTextarea = (
+    label: string, hint: string, value: string, onChange: (v: string) => void,
+    saved: boolean, placeholder: string,
+  ) => (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span style={{ display: 'block', marginBottom: 2 }}>{label}</span>
+      <textarea
+        aria-label={label}
+        autoComplete="off"
+        rows={4}
+        style={{ width: '100%' }}
+        value={value}
+        placeholder={saved ? '•••• saved — leave blank to keep' : placeholder}
+        disabled={!isAdmin}
+        onChange={(e) => onChange(e.target.value)}
       />
       <span className="muted" style={{ fontSize: 12 }}>{hint}</span>
     </label>
@@ -382,6 +772,21 @@ export default function SettingsPage() {
             />
           </label>
           <label style={{ flex: 1 }}>
+            <span style={{ display: 'block', marginBottom: 2 }}>
+              Stall timeout (minutes, 0 = off)
+            </span>
+            <input
+              type="number"
+              min={0}
+              max={10080}
+              style={{ width: '100%' }}
+              value={settings.stall_timeout_minutes ?? 0}
+              disabled={!isAdmin}
+            onChange={(e) => set('stall_timeout_minutes', Number(e.target.value))}
+              title="Running jobs reporting no step/progress change for this long are failed as stalled (flow retry policy applies). Set above the longest gap between progress updates of any step — heartbeats with unchanged progress do not count. 0 disables."
+            />
+          </label>
+          <label style={{ flex: 1 }}>
             <span style={{ display: 'block', marginBottom: 2 }}>Release group</span>
             <input
               style={{ width: '100%' }}
@@ -480,6 +885,307 @@ export default function SettingsPage() {
         )}
         {settings.updated_at && (
           <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Notification channels: additive transports for the same alerts the
+          Discord card configures (job outcomes, node status, disk space,
+          hourly digest). Each channel is off until configured and works
+          with or without Discord. Secrets are write-only (SharesCard
+          pattern): stored encrypted, never echoed back. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Notification channels (webhook · ntfy · email)</h3>
+        <p className="muted">
+          Extra transports for the same alerts — job outcomes, node status,
+          disk space and the hourly digest. Each channel is off until
+          configured; they work with or without Discord. Secrets are
+          write-only: stored encrypted, never shown again — leave blank to
+          keep the saved value.
+        </p>
+        {field(
+          'Generic webhook URL',
+          'Structured JSON event POSTs (job_finished / alert). http(s) only — payload shape in Docs/md/Operations.md.',
+          'generic_webhook_url',
+          'https://automation.example.com/hook',
+        )}
+        {field(
+          'ntfy topic URL',
+          'Full publish endpoint, e.g. https://ntfy.sh/encode-alerts (self-hosted servers work too).',
+          'ntfy_topic_url',
+          'https://ntfy.sh/encode-alerts',
+        )}
+        {secretField(
+          'ntfy access token (optional)',
+          'Bearer token for protected topics. Write-only — blank keeps the stored token.',
+          ntfyToken, setNtfyToken, !!settings.has_ntfy_token, 'optional',
+        )}
+        {field('SMTP host', 'Mail relay hostname (no scheme). Enables email when host + from + to are all set.', 'smtp_host', 'mail.example.com')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SMTP port (0 = default 587)</span>
+          <input
+            type="number"
+            min={0}
+            max={65535}
+            style={{ width: '100%' }}
+            value={settings.smtp_port ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => set('smtp_port', Number(e.target.value))}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Submission port; authenticated relays must offer STARTTLS.
+          </span>
+        </label>
+        {field('SMTP user (optional)', 'Leave blank for an unauthenticated relay.', 'smtp_user', 'encode-bot')}
+        {secretField(
+          'SMTP password',
+          'Write-only — blank keeps the stored password.',
+          smtpPassword, setSmtpPassword, !!settings.has_smtp_password, 'optional',
+        )}
+        {field('SMTP from', 'Envelope sender, e.g. encode@example.com.', 'smtp_from', 'encode@example.com')}
+        {field('SMTP to', 'Comma-separated recipients, e.g. ops@example.com, oncall@example.com.', 'smtp_to', 'ops@example.com')}
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
+        )}
+        {settings.updated_at && (
+          <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Offsite backups (P4): S3 + SFTP destinations for DB snapshots.
+          Config lives in the settings blob (same Save flow as the channels
+          above); the upload runs after every successful snapshot — the
+          snapshot list itself stays in the DB backups card below. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Offsite backups (S3 · SFTP)</h3>
+        <p className="muted">
+          After every successful snapshot — scheduled or manual — the
+          controller uploads it to each enabled destination and keeps the
+          newest N copies per destination. Upload failures never fail the
+          local backup: they are logged, audited and alerted through the
+          notification channels above. Secrets are write-only: stored
+          encrypted, never shown again — leave blank to keep the saved value.
+        </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="Include shares key in offsite bundle"
+            checked={settings.backup_offsite?.include_shares_key ?? true}
+            disabled={!isAdmin}
+            onChange={(e) => setOffsite({ include_shares_key: e.target.checked })}
+          />
+          <span>Include the shares key in the offsite bundle</span>
+        </label>
+        <span className="muted" style={{ display: 'block', fontSize: 12, marginBottom: 12 }}>
+          The key decrypts every secret stored in the database (share
+          passwords, channel tokens). Bundling it makes an offsite restore
+          self-contained — but the destination must be trusted and
+          access-controlled. Untick for snapshot-only copies (a restore then
+          needs the key file out of band).
+        </span>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Keep N snapshots per destination (0 = default 30)</span>
+          <input
+            type="number"
+            aria-label="Offsite keep N"
+            min={0}
+            max={365}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.keep_n ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setOffsite({ keep_n: Number(e.target.value) })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            After each upload, the oldest generations beyond N are deleted
+            (snapshot and its key together). Valid range 1-365.
+          </span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="S3 destination enabled"
+            checked={!!settings.backup_offsite?.s3?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setOffS3({ enabled: e.target.checked })}
+          />
+          <span><strong>S3 destination</strong> — any plain-S3 endpoint (MinIO, Ceph RGW, AWS)</span>
+        </label>
+        {offField('S3 endpoint', 'host:port or http(s) URL — normalized on save.', settings.backup_offsite?.s3?.endpoint, (v) => setOffS3({ endpoint: v }), 'minio.example.com:9000')}
+        {offField('S3 bucket', 'Bucket that receives the snapshots.', settings.backup_offsite?.s3?.bucket, (v) => setOffS3({ bucket: v }), 'encode-backups')}
+        {offField('S3 prefix (optional)', 'Key namespace inside the bucket, e.g. encode/farm.', settings.backup_offsite?.s3?.prefix, (v) => setOffS3({ prefix: v }), 'encode/')}
+        {offField('S3 access key', 'Access key ID (the secret key below is write-only).', settings.backup_offsite?.s3?.access_key, (v) => setOffS3({ access_key: v }), 'AKIA…')}
+        {secretField(
+          'S3 secret key',
+          'Write-only — blank keeps the stored secret.',
+          offsiteS3Secret, setOffsiteS3Secret, !!settings.backup_offsite?.has_s3_secret_key, 'required when enabled',
+        )}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            aria-label="S3 use TLS"
+            checked={!!settings.backup_offsite?.s3?.use_tls}
+            disabled={!isAdmin}
+            onChange={(e) => setOffS3({ use_tls: e.target.checked })}
+          />
+          <span>Use TLS (https)</span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0' }}>
+          <input
+            type="checkbox"
+            aria-label="SFTP destination enabled"
+            checked={!!settings.backup_offsite?.sftp?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ enabled: e.target.checked })}
+          />
+          <span><strong>SFTP destination</strong> — SSH file transfer</span>
+        </label>
+        {offField('SFTP host', 'Hostname only — the port goes in the field below.', settings.backup_offsite?.sftp?.host, (v) => setOffSFTP({ host: v }), 'backup.example.com')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SFTP port (0 = default 22)</span>
+          <input
+            type="number"
+            aria-label="SFTP port"
+            min={0}
+            max={65535}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.sftp?.port ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ port: Number(e.target.value) })}
+          />
+        </label>
+        {offField('SFTP user', 'SSH account that owns the backup directory.', settings.backup_offsite?.sftp?.user, (v) => setOffSFTP({ user: v }), 'backup')}
+        {offField('SFTP path (optional)', 'Remote directory; empty = the SSH home dir. Created if missing.', settings.backup_offsite?.sftp?.path, (v) => setOffSFTP({ path: v }), '/backups/encode')}
+        {/* D1: host-key pinning. Public material (not a write-only secret),
+            so the stored value round-trips into the field. Required when
+            the destination is enabled — the bundle carries the shares key. */}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>SFTP host key</span>
+          <textarea
+            aria-label="SFTP host key"
+            rows={3}
+            style={{ width: '100%' }}
+            value={settings.backup_offsite?.sftp?.host_key ?? ''}
+            placeholder="ssh-ed25519 AAAA…"
+            disabled={!isAdmin}
+            onChange={(e) => setOffSFTP({ host_key: e.target.value })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Required — pinned on every connection. Paste the server&apos;s public host key
+            (known-hosts style or bare base64); get it with: ssh-keyscan &lt;host&gt;.
+            A mismatch aborts the backup.
+          </span>
+        </label>
+        {secretField(
+          'SFTP password',
+          'Write-only — blank keeps the stored password. A password or a private key is required.',
+          offsiteSFTPPassword, setOffsiteSFTPPassword, !!settings.backup_offsite?.has_sftp_password, 'optional if a key is set',
+        )}
+        {secretTextarea(
+          'SFTP private key (PEM)',
+          'Write-only, unencrypted PEM (passphrase-protected keys are not supported). Blank keeps the stored key.',
+          offsiteSFTPKey, setOffsiteSFTPKey, !!settings.backup_offsite?.has_sftp_private_key, '-----BEGIN OPENSSH PRIVATE KEY-----',
+        )}
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
+        )}
+        {settings.updated_at && (
+          <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Experimental download ingestion (P11): OFF by default. Stages
+          completed torrents' source files into the scripts share; filter
+          scripts stay hand-authored (the scanner queues jobs once both
+          are present). Same save() flow as every other settings card —
+          PUT is a full replace, never a second independent saver. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>
+          Download ingestion{' '}
+          <span className="badge" style={{ background: '#9e6a03', color: '#fff', fontSize: 11, verticalAlign: 'middle' }}>
+            EXPERIMENTAL
+          </span>
+        </h3>
+        <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+          Off by default. When enabled, the controller polls the download client for completed
+          torrents and copies their source video files into the scripts share
+          (&lt;series&gt;/Ep NN/). It stages SOURCES only — author the .avs/.vpy filter script in
+          the episode folder afterwards; the scanner then queues the encode. Release names that
+          cannot be parsed safely are skipped, never guessed.
+        </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            aria-label="Enable download ingestion"
+            checked={!!settings.ingest?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ enabled: e.target.checked })}
+          />
+          <span>Enable download ingestion</span>
+        </label>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Provider</span>
+          <select
+            aria-label="Ingest provider"
+            style={{ width: '100%' }}
+            value={settings.ingest?.provider ?? ''}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ provider: e.target.value as Ingest['provider'] })}
+          >
+            <option value="">— select —</option>
+            <option value="qbittorrent">qBittorrent (WebAPI v2)</option>
+            <option value="rutorrent">ruTorrent (httprpc, best-effort)</option>
+          </select>
+          <span className="muted" style={{ fontSize: 12 }}>
+            qBittorrent is the first-class provider; ruTorrent support is experimental.
+          </span>
+        </label>
+        {offField('Client URL', 'Web base URL of the client (e.g. http://192.168.1.10:8080).', settings.ingest?.url, (v) => setIngest({ url: v }), 'http://192.168.1.10:8080')}
+        {offField('Client username', 'Optional — leave empty for auth-bypassed clients (e.g. qBittorrent localhost whitelist).', settings.ingest?.username, (v) => setIngest({ username: v }), 'admin')}
+        {secretField(
+          'Client password',
+          'Write-only. Blank keeps the stored password.',
+          ingestPassword, setIngestPassword, !!settings.ingest?.has_password, 'client password',
+        )}
+        {offField('Category filter', 'Optional — only this client category/label is ingested. Empty = all (or the mapped categories below).', settings.ingest?.category, (v) => setIngest({ category: v }), 'anime')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Category → series map (JSON)</span>
+          <textarea
+            aria-label="Category to series map (JSON)"
+            rows={4}
+            style={{ width: '100%', fontFamily: 'var(--font-mono, monospace)' }}
+            value={categoryMapText}
+            disabled={!isAdmin}
+            onChange={(e) => setCategoryMapText(e.target.value)}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Maps a client category to the series folder name, overriding the parsed name
+            (the episode is still parsed from the release name). Example: {'{"anime": "Show Name"}'}
+          </span>
+        </label>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Poll interval (seconds)</span>
+          <input
+            type="number"
+            aria-label="Ingest poll interval"
+            style={{ width: '100%' }}
+            min={0}
+            max={3600}
+            value={settings.ingest?.poll_interval_seconds ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ poll_interval_seconds: Number(e.target.value) })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>0 = default 60s; otherwise 10-3600.</span>
+        </label>
+        {offField('Download root (controller-visible)', 'MOUNT REQUIREMENT: the client\'s download directory must be mounted into the controller container at this path. It must directly contain the completed torrent folders.', settings.ingest?.download_root, (v) => setIngest({ download_root: v }), '/mnt/downloads')}
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
         )}
       </div>
 

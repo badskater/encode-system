@@ -1,13 +1,33 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, setToken, setCurrentUser } from '../api/client';
 
 // LoginGate collects a username/password and exchanges them for a session
 // via POST /api/auth/login. Replaces the old static admin-token prompt.
+// When the controller has OIDC enabled (health.oidc_enabled), an additional
+// "Sign in with SSO" button starts the backend authorization-code flow.
 export default function TokenGate({ onDone }: { onDone: () => void }) {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [ssoEnabled, setSsoEnabled] = useState(false);
+
+  // The SSO button is env-gated server-side: health is the unauthenticated
+  // bootstrap call, and oidc_enabled is false/absent on local-only installs
+  // (the default) — the button then never renders. A failed health probe
+  // simply leaves the button hidden; local login still works.
+  useEffect(() => {
+    let alive = true;
+    api
+      .health()
+      .then((h) => {
+        if (alive) setSsoEnabled(h.oidc_enabled === true);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   async function submit() {
     if (!username.trim() || !password) {
@@ -68,6 +88,19 @@ export default function TokenGate({ onDone }: { onDone: () => void }) {
         <button className="btn primary" onClick={submit} disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
+        {ssoEnabled && (
+          <button
+            className="btn"
+            onClick={() => {
+              // Full-page navigation: the backend generates state/nonce/PKCE
+              // and redirects to the identity provider. The callback lands
+              // back on / with the session token in the URL fragment.
+              window.location.assign('/api/auth/oidc/login');
+            }}
+          >
+            Sign in with SSO
+          </button>
+        )}
       </div>
     </div>
   );

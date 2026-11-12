@@ -73,6 +73,7 @@ func DefaultFlow() *model.Flow {
 			{Type: model.StepEncode, Params: map[string]string{}},
 			{Type: model.StepMux},
 			{Type: model.StepType("verify_output")},
+			{Type: model.StepType("quality_gate")},
 			{Type: model.StepReleaseCopy},
 			{Type: model.StepKeyframes},
 		},
@@ -95,6 +96,7 @@ func Default4kFlow() *model.Flow {
 			{Type: model.StepType("encode_4k")},
 			{Type: model.StepMux},
 			{Type: model.StepType("verify_output")},
+			{Type: model.StepType("quality_gate")},
 			{Type: model.StepReleaseCopy},
 			{Type: model.StepKeyframes},
 		},
@@ -115,8 +117,28 @@ func Default4kCPUFlow() *model.Flow {
 			{Type: model.StepType("encode_4k")},
 			{Type: model.StepMux},
 			{Type: model.StepType("verify_output")},
+			{Type: model.StepType("quality_gate")},
 			{Type: model.StepReleaseCopy},
 			{Type: model.StepKeyframes},
+		},
+	}
+}
+
+// DefaultSubsFlow is the SEPARATE post-encode extras pipeline (P6): it
+// extracts subtitles, fonts and chapters from the episode's source and
+// muxes them into the already-encoded output MKV. It runs as its OWN job
+// AFTER the encode flow completes (the operator queues it against the same
+// episode dir; nothing chains it into the encode defaults automatically).
+// Seeded name-guarded on fresh installs only, exactly like the encode
+// defaults — existing flows are never modified.
+func DefaultSubsFlow() *model.Flow {
+	return &model.Flow{
+		Name: "default-subs",
+		Steps: []model.Step{
+			{Type: model.StepType("subtitle_extract")},
+			{Type: model.StepType("font_extract")},
+			{Type: model.StepType("chapter_extract")},
+			{Type: model.StepType("mux_extras")},
 		},
 	}
 }

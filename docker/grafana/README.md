@@ -31,7 +31,7 @@ Add a scrape job to your `prometheus.yml`. The controller serves
 
 ```yaml
 scrape_configs:
-  - job_name: encode-system
+  - job_name: encode
     metrics_path: /metrics
     scrape_interval: 30s
     static_configs:
@@ -43,8 +43,20 @@ scrape_configs:
 ```
 
 After editing, reload Prometheus (`POST /-/reload` on the Prometheus port, or
-restart the container) and verify the `encode-system` job is **UP** in
+restart the container) and verify the `encode` job is **UP** in
 Prometheus → Status → Targets.
+
+The canonical snippet lives at `../observability/prometheus-scrape.yml`
+(host-published target example + shared-network alternative). Keep
+`job_name: encode` — the alert rules match `up{job="encode"}`.
+
+## Alerting and full wiring
+
+For alert rules, Alertmanager → Discord routing, and optional Alloy log
+enrichment — all opt-in assets for an **existing** Prometheus/Grafana stack
+— see [`../observability/README.md`](../observability/README.md). Nothing
+there is applied automatically; merging it into your monitoring stack is a
+deliberate, separate operation.
 
 ## Metrics covered
 
@@ -63,6 +75,12 @@ All panels are built **only** from metrics the controller actually emits
 | `encode_node_enabled` | gauge | `node` | Node Fleet Status |
 | `encode_node_active_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
 | `encode_node_max_concurrent_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
+| `encode_jobs_stalled_total` | counter | — | Stalled Jobs (Watchdog) |
+
+`encode_jobs_stalled_total` (P1 stall watchdog; DB-derived count of
+failed-stalled jobs) is panelled as the **Stalled Jobs (Watchdog)** stat
+tile (green at 0, red at ≥1) and alerted by `EncodeJobStalled`
+(`increase(...[1h]) > 0` for 5m) in `docker/observability/alert-rules.yml`.
 
 ## Notes
 

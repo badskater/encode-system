@@ -71,6 +71,11 @@ func (f *fakeObjectStore) Put(ctx context.Context, bucket, key string, src strin
 	return nil
 }
 
+func (f *fakeObjectStore) Delete(ctx context.Context, bucket, key string) error {
+	delete(f.objects, bucket+"/"+key)
+	return nil
+}
+
 func TestS3DownloadPrefix(t *testing.T) {
 	dir := t.TempDir()
 	f := newFakeObjectStore()

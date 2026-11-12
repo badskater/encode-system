@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql
@@ -31,10 +32,13 @@ type Store struct {
 	dbPath string
 	// dialect selects the SQL backend so q() and friends branch correctly.
 	dialect dialect
-	// aead is the lazily-created cipher protecting share passwords (see
-	// store_share.go). Guarded by nothing: only touched from store methods
-	// which the sqlite pool serializes (MaxOpenConns=1).
-	aead cipher.AEAD
+	// aead is the lazily-created cipher protecting share passwords and the
+	// write-only settings secrets (see store_share.go). Guarded by cipherMu:
+	// encryption runs BEFORE any DB call, so the pool does not serialize it
+	// (and PG pools 10 connections) — concurrent first use must not generate
+	// two different keys.
+	aead     cipher.AEAD
+	cipherMu sync.Mutex
 }
 
 // Open opens (creating if needed) a SQLite database at the given file path or
@@ -171,6 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	if err := s.ensureSharesTable(context.Background()); err != nil {
 		return fmt.Errorf("migrate shares: %w", err)
 	}
+	if err := s.ensureIngestLedger(context.Background()); err != nil {
+		return fmt.Errorf("migrate ingest ledger: %w", err)
+	}
 	if err := s.migrateAuth(context.Background()); err != nil {
 		return err
 	}
@@ -213,6 +220,11 @@ func (s *Store) migrateV2() error {
 		// v2.1: node that most recently failed this job (0 = never). Lets
 		// the dispatcher steer retries away from a node-local fault.
 		`ALTER TABLE jobs ADD COLUMN last_failed_node_id INTEGER NOT NULL DEFAULT 0`,
+		// Resilience batch: last progress timestamp for the stall watchdog.
+		// Stamped on claim (AssignJob) and refreshed by heartbeats that
+		// report a changed step/progress. NULL on rows that predate the
+		// column; the watchdog falls back to started_at for those.
+		`ALTER TABLE jobs ADD COLUMN last_progress_at TEXT`,
 	}
 	for _, alt := range jobAlters {
 		if _, err := s.db.Exec(alt); err != nil {
@@ -319,13 +331,15 @@ func isDuplicateColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column")
 }
 
-// flowOptions is the JSON shape stored in flows.options_json. Only the
-// per-flow retry policy fields live here today; future flow-level options
-// extend this struct. The zero-value struct marshals to {"max_retries":0,
-// "retry_backoff_minutes":0} which the caller interprets as retry OFF.
+// flowOptions is the JSON shape stored in flows.options_json. The per-flow
+// retry policy and job timeout live here; future flow-level options extend
+// this struct. The zero-value struct marshals to {"max_retries":0,
+// "retry_backoff_minutes":0,"job_timeout_minutes":0} which the caller
+// interprets as retry OFF / timeout OFF.
 type flowOptions struct {
 	MaxRetries          int `json:"max_retries"`
 	RetryBackoffMinutes int `json:"retry_backoff_minutes"`
+	JobTimeoutMinutes   int `json:"job_timeout_minutes"`
 }
 
 // marshalFlowOptions serializes a Flow's retry policy into the options_json
@@ -337,6 +351,7 @@ func marshalFlowOptions(f *model.Flow) string {
 	b, err := json.Marshal(flowOptions{
 		MaxRetries:          f.MaxRetries,
 		RetryBackoffMinutes: f.RetryBackoffMinutes,
+		JobTimeoutMinutes:   f.JobTimeoutMinutes,
 	})
 	if err != nil {
 		return "{}"
@@ -357,6 +372,7 @@ func scanFlowOptions(f *model.Flow, optionsJSON string) {
 	}
 	f.MaxRetries = opts.MaxRetries
 	f.RetryBackoffMinutes = opts.RetryBackoffMinutes
+	f.JobTimeoutMinutes = opts.JobTimeoutMinutes
 }
 
 func parseTime(s string) time.Time {
@@ -928,7 +944,7 @@ func (s *Store) AssignJob(ctx context.Context, jobID, nodeID int64) error {
 		return fmt.Errorf("node %d already has %d active job(s) (max %d)", nodeID, active, maxConc)
 	}
 
-	res, err := tx.ExecContext(ctx, s.q(`UPDATE jobs SET status='assigned', node_id=?, started_at=datetime('now') WHERE id=? AND status='pending'`),
+	res, err := tx.ExecContext(ctx, s.q(`UPDATE jobs SET status='assigned', node_id=?, started_at=datetime('now'), last_progress_at=datetime('now') WHERE id=? AND status='pending'`),
 		nodeID, jobID)
 	if err != nil {
 		return err

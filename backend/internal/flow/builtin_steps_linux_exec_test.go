@@ -1,3 +1,5 @@
+//go:build linux
+
 package flow
 
 import (
@@ -101,8 +103,14 @@ echo "x265 stub: encoded to $out"
 `,
 
 		// vspipe: pipe a minimal y4m frame to stdout (x265 stub discards stdin).
+		// When the keyframes step exports ENCODE_KF_LOG, also write a minimal
+		// xvid first-pass log there (the scxvid plugin's artifact) so the
+		// keyframes port completes under the generic stub set.
 		"vspipe": `#!/usr/bin/env bash
 printf 'YUV4MPEG2 W640 H360 F24:1 Ip A0:0\nFRAME\n'
+if [ -n "${ENCODE_KF_LOG:-}" ]; then
+  printf '# XviD 2pass stat file (core version 1.3.7)\n# Please do not modify this file\n\ni 2 0 0 0 0 0\n' > "$ENCODE_KF_LOG"
+fi
 echo "vspipe stub: piped y4m" >&2
 `,
 
@@ -291,7 +299,8 @@ func execTestEnv(t *testing.T, binDir string) (Vars, string) {
 	// Pre-create the muxed MKV so verify_output/crc32_rename/release_copy can find it.
 	mkvName := "Test Series - 01 [1080p].mkv"
 	os.WriteFile(filepath.Join(epDir, mkvName), []byte("fake-mkv-content"), 0o644)
-	// Pre-create the release folder + MKV for keyframes (now refused, so not needed).
+	// Pre-create the release folder + MKV for keyframes (P7: ported via
+	// vapoursynth-scxvid; the step reads the RELEASE MKV, same as Windows).
 	relFolder := filepath.Join(releaseDir, "[TestGroup] Test Series - Raws [1080p]")
 	os.MkdirAll(relFolder, 0o755)
 	os.WriteFile(filepath.Join(relFolder, mkvName), []byte("fake-mkv-content"), 0o644)
@@ -533,33 +542,41 @@ func TestBashVerifyOutputBcGuard(t *testing.T) {
 	}
 }
 
-// TestBashKeyframesRefusedOnLinux: the keyframes template must now be
-// refused by the bash dialect (GAP 2 fix — the previous bash body was a
-// fake: every-240th-frame, not scene-change detection). The refusal error
-// must name keyframes and explain it's a fake/scene-detection issue.
-func TestBashKeyframesRefusedOnLinux(t *testing.T) {
-	_, err := renderBuiltinBash(t, "keyframes")
-	if err == nil {
-		t.Fatal("keyframes must be REFUSED by bash dialect (was a fake — every-240th-frame, not scene detection)")
+// TestBashKeyframesPortedToLinux: the keyframes template is PORTED (P7) —
+// real scene-change detection via vapoursynth-scxvid, replacing the old
+// fake every-240th-frame body that GAP 2 refused. The bash render must
+// succeed and drive vspipe + the scxvid plugin (never the fake).
+func TestBashKeyframesPortedToLinux(t *testing.T) {
+	script, err := renderBuiltinBash(t, "keyframes")
+	if err != nil {
+		t.Fatalf("keyframes must PORT to bash (P7: vapoursynth-scxvid): %v", err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "keyframes") {
-		t.Errorf("refusal error must name 'keyframes': %v", err)
+	for _, want := range []string{
+		"vspipe",
+		"scxvid.Scxvid(",
+		"pip install vapoursynth-scxvid",
+		"ENCODE_STEP keyframes 0",
+		"ENCODE_STEP keyframes 100",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("keyframes bash render missing %q", want)
+		}
 	}
-	// Must mention the fake/scene-detection reason.
-	if !strings.Contains(strings.ToLower(msg), "fake") && !strings.Contains(strings.ToLower(msg), "scene") {
-		t.Errorf("refusal error must explain the fake/scene-detection reason: %v", err)
+	// The old fake must never come back.
+	if strings.Contains(script, "240") && strings.Contains(script, "range(") {
+		t.Error("keyframes bash render looks like the old every-240th-frame fake")
 	}
 }
 
-// TestBashKeyframesNoLongerInBuiltinSources: the keyframes entry must have
-// been removed from builtinBashSources (moved to builtinBashRefused).
-func TestBashKeyframesNoLongerInBuiltinSources(t *testing.T) {
-	if _, stillThere := builtinBashSources["keyframes"]; stillThere {
-		t.Error("keyframes must be removed from builtinBashSources (moved to builtinBashRefused)")
+// TestBashKeyframesInBuiltinSources: the keyframes entry must be back in
+// builtinBashSources (P7) and OUT of builtinBashRefused — the inverse of
+// the GAP 2 pin, updated when the real vapoursynth-scxvid path landed.
+func TestBashKeyframesInBuiltinSources(t *testing.T) {
+	if _, ported := builtinBashSources["keyframes"]; !ported {
+		t.Error("keyframes must be in builtinBashSources (P7: vapoursynth-scxvid port)")
 	}
-	if _, refused := builtinBashRefused["keyframes"]; !refused {
-		t.Error("keyframes must be in builtinBashRefused")
+	if _, refused := builtinBashRefused["keyframes"]; refused {
+		t.Error("keyframes must NOT be in builtinBashRefused anymore (ported in P7)")
 	}
 }
 

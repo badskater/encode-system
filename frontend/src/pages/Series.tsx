@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { Flow, Series } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import CreateSeriesDialog from '../components/CreateSeriesDialog';
+import DeleteSeriesDialog from '../components/DeleteSeriesDialog';
 import { useIsAdmin } from '../hooks/useRole';
 
 // SeriesPage manages per-series flow selection, tag overrides and enable
@@ -14,6 +15,10 @@ export default function SeriesPage() {
   const { data: settings } = usePolling<{ tag: string }>(() => api.settings(), 60000);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  // deleting holds the series whose registry-row deletion is being
+  // confirmed; null = no dialog open. Admin-only (the action itself is
+  // gated below, and the endpoint enforces withAdmin server-side).
+  const [deleting, setDeleting] = useState<Series | null>(null);
   const isAdmin = useIsAdmin();
 
   async function selectFlow(sr: Series, flowId: number) {
@@ -129,6 +134,7 @@ export default function SeriesPage() {
             <th>Paused</th>
             <th>Notify</th>
             <th>Channel</th>
+            {isAdmin && <th>Actions</th>}
           </tr>
         </thead>
         <tbody>
@@ -231,11 +237,24 @@ export default function SeriesPage() {
                   onSave={(u) => changeWebhook(sr, u)}
                 />
               </td>
+              {isAdmin && (
+                <td>
+                  <button
+                    className="btn danger"
+                    style={{ padding: '2px 10px', fontSize: 12 }}
+                    title="Remove the registry row — jobs, history and files are kept"
+                    aria-label={`Delete ${sr.name}`}
+                    onClick={() => setDeleting(sr)}
+                  >
+                    Delete
+                  </button>
+                </td>
+              )}
             </tr>
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={10} className="muted">
+              <td colSpan={isAdmin ? 11 : 10} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>
@@ -249,6 +268,17 @@ export default function SeriesPage() {
           flows={flows ?? []}
           onClose={() => {
             setShowCreate(false);
+            refresh();
+          }}
+        />
+      )}
+
+      {deleting && (
+        <DeleteSeriesDialog
+          series={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={() => {
+            setDeleting(null);
             refresh();
           }}
         />

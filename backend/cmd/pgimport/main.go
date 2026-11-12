@@ -83,6 +83,7 @@ var importOrder = []string{
 	"sessions",
 	"jobs",
 	"node_metrics",
+	"ingest_ledger",
 }
 
 // batchSize is the per-table INSERT batch size. Large enough to amortize

@@ -410,3 +410,643 @@ describe('Settings publish platform picker', () => {
     expect(screen.getByRole('button', { name: /rollback to 0\.7\.0/i })).toBeInTheDocument();
   });
 });
+
+describe('Settings stall timeout', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  it('renders the stall timeout field bound to settings (0 = off by default)', async () => {
+    render(<SettingsPage />);
+    const input = (await screen.findByLabelText(/stall timeout/i)) as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.value).toBe('0');
+  });
+
+  it('reflects a loaded stall_timeout_minutes value', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({ stall_timeout_minutes: 45 }));
+    render(<SettingsPage />);
+    const input = (await screen.findByLabelText(/stall timeout/i)) as HTMLInputElement;
+    expect(input.value).toBe('45');
+  });
+
+  it('sends stall_timeout_minutes in the PUT body after editing and saving', async () => {
+    const saveSpy = vi
+      .spyOn(api, 'saveSettings')
+      .mockResolvedValue(baseSettings({ stall_timeout_minutes: 60 }));
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/stall timeout/i);
+    fireEvent.change(input, { target: { value: '60' } });
+    // The field lives in the Behavior & naming card — its Save button is first.
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.stall_timeout_minutes).toBe(60);
+  });
+
+  it('clamps an out-of-range stall timeout to the 0-10080 bound on save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/stall timeout/i);
+    fireEvent.change(input, { target: { value: '99999' } });
+    const saveButtons = await screen.findAllByRole('button', { name: /save settings/i });
+    fireEvent.click(saveButtons[0]);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Settings;
+    expect(sent.stall_timeout_minutes).toBe(10080);
+  });
+});
+
+describe('Settings notification channels card', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The channels card's Save button is the LAST "Save settings" on the page
+  // (Behavior & naming and Discord notifications render theirs first).
+  async function channelsSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  it('renders the channel fields and write-only secret inputs', async () => {
+    render(<SettingsPage />);
+    expect(await screen.findByLabelText(/generic webhook url/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/ntfy topic url/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp host/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp port/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp from/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/smtp to/i)).toBeInTheDocument();
+    const tok = screen.getByLabelText(/ntfy access token/i) as HTMLInputElement;
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    expect(tok.type).toBe('password');
+    expect(pw.type).toBe('password');
+    // Never prefilled — the API never returns secret values.
+    expect(tok.value).toBe('');
+    expect(pw.value).toBe('');
+  });
+
+  it('shows the saved placeholder when has_* flags are set', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    render(<SettingsPage />);
+    const tok = (await screen.findByLabelText(/ntfy access token/i)) as HTMLInputElement;
+    expect(tok.placeholder).toContain('saved');
+    expect(tok.value).toBe('');
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    expect(pw.placeholder).toContain('saved');
+    expect(pw.value).toBe('');
+  });
+
+  it('sends typed secrets once and clears the inputs after save', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    render(<SettingsPage />);
+    const tok = (await screen.findByLabelText(/ntfy access token/i)) as HTMLInputElement;
+    const pw = screen.getByLabelText(/smtp password/i) as HTMLInputElement;
+    // Assembled at runtime: fake values, redaction-safe.
+    fireEvent.change(tok, { target: { value: 'tok-' + '123' } });
+    fireEvent.change(pw, { target: { value: 'pw-' + '456' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ntfy_token).toBe('tok-' + '123');
+    expect(sent.smtp_password).toBe('pw-' + '456');
+    // Consumed secrets are cleared so the next save keeps them.
+    await waitFor(() => expect(tok.value).toBe(''));
+    expect(pw.value).toBe('');
+  });
+
+  it('omits secret keys when nothing was typed (keep stored values)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ntfy_token).toBeUndefined();
+    expect(sent.smtp_password).toBeUndefined();
+  });
+
+  it('strips the GET-only has_* flags from the PUT payload', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(
+      baseSettings({ has_ntfy_token: true, has_smtp_password: true }),
+    );
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0] as Record<string, unknown>;
+    expect(sent.has_ntfy_token).toBeUndefined();
+    expect(sent.has_smtp_password).toBeUndefined();
+  });
+
+  it('sends channel URLs and SMTP fields in the PUT body', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/generic webhook url/i), {
+      target: { value: 'https://hooks.example.com/x' },
+    });
+    fireEvent.change(screen.getByLabelText(/ntfy topic url/i), {
+      target: { value: 'https://ntfy.sh/encode' },
+    });
+    fireEvent.change(screen.getByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'encode@example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.generic_webhook_url).toBe('https://hooks.example.com/x');
+    expect(sent.ntfy_topic_url).toBe('https://ntfy.sh/encode');
+    expect(sent.smtp_host).toBe('mail.example.com');
+    expect(sent.smtp_from).toBe('encode@example.com');
+    expect(sent.smtp_to).toBe('ops@example.com');
+    expect(sent.smtp_port).toBe(0);
+  });
+
+  it('blocks save on an invalid generic webhook URL', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/generic webhook url/i), {
+      target: { value: 'notaurl' },
+    });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/generic webhook url must be an http/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save on an out-of-range SMTP port', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp port/i), { target: { value: '70000' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp port must be/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when SMTP host is set without from/to', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), {
+      target: { value: 'mail.example.com' },
+    });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp from and to are required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save on an invalid SMTP recipient list', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'encode@example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com, bad' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp to must be comma-separated/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  // G6: the client must accept the same address shapes as the server's
+  // net/mail.ParseAddress — notably dotless domains (ops@localhost), which
+  // the old dot-requiring regex rejected while the server accepted them.
+  it('accepts dotless-domain SMTP addresses like the server (ops@localhost)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'ops@localhost' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'oncall@localhost' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.smtp_from).toBe('ops@localhost');
+    expect(sent.smtp_to).toBe('oncall@localhost');
+  });
+
+  it('accepts a display-name form with a dotless domain', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'Encode Bot <ops@localhost>' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].smtp_from).toBe('Encode Bot <ops@localhost>');
+  });
+
+  it('still blocks genuinely invalid SMTP addresses', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText(/smtp host/i), { target: { value: 'mail.example.com' } });
+    fireEvent.change(screen.getByLabelText(/smtp from/i), { target: { value: 'not-an-email' } });
+    fireEvent.change(screen.getByLabelText(/smtp to/i), { target: { value: 'ops@example.com' } });
+    fireEvent.click(await channelsSaveButton());
+    expect(await screen.findByText(/smtp from must be a valid email/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------- Offsite backups card (P4) ----------
+
+describe('Settings offsite backups card', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The offsite card renders the LAST "Save settings" button on the page.
+  async function offsiteSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  // Fake credentials assembled at runtime (redaction-safe).
+  const s3Secret = 'super' + '-secret-1';
+  const sftpPw = 'sf' + 'tp-pw-1';
+
+  it('renders both destinations disabled and include-key default on', async () => {
+    render(<SettingsPage />);
+    const s3 = (await screen.findByLabelText('S3 destination enabled')) as HTMLInputElement;
+    const sftp = screen.getByLabelText('SFTP destination enabled') as HTMLInputElement;
+    expect(s3.checked).toBe(false);
+    expect(sftp.checked).toBe(false);
+    const inc = screen.getByLabelText('Include shares key in offsite bundle') as HTMLInputElement;
+    expect(inc.checked).toBe(true);
+    // Write-only inputs are password-type / textarea and never prefilled.
+    const sk = screen.getByLabelText('S3 secret key') as HTMLInputElement;
+    expect(sk.type).toBe('password');
+    expect(sk.value).toBe('');
+    const key = screen.getByLabelText('SFTP private key (PEM)') as HTMLTextAreaElement;
+    expect(key.tagName).toBe('TEXTAREA');
+    expect(key.value).toBe('');
+  });
+
+  it('blocks save when S3 is enabled without required fields', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('S3 destination enabled'));
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/S3 endpoint is required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the offsite block with the typed secret, flags stripped', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('S3 destination enabled'));
+    fireEvent.change(screen.getByLabelText('S3 endpoint'), { target: { value: 'minio.example.com:9000' } });
+    fireEvent.change(screen.getByLabelText('S3 bucket'), { target: { value: 'encode-backups' } });
+    fireEvent.change(screen.getByLabelText('S3 access key'), { target: { value: 'AK' + 'IATEST' } });
+    fireEvent.change(screen.getByLabelText('S3 secret key'), { target: { value: s3Secret } });
+    fireEvent.change(screen.getByLabelText('Offsite keep N'), { target: { value: '14' } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    const off = sent.backup_offsite;
+    expect(off).toBeDefined();
+    expect(off!.s3?.enabled).toBe(true);
+    expect(off!.s3?.endpoint).toBe('minio.example.com:9000');
+    expect(off!.s3?.secret_key).toBe(s3Secret);
+    expect(off!.keep_n).toBe(14);
+    expect(off!.include_shares_key).toBe(true);
+    // GET-only has_* flags must not be sent back.
+    expect((off as Record<string, unknown>).has_s3_secret_key).toBeUndefined();
+    expect((off!.s3 as Record<string, unknown>).has_secret_key).toBeUndefined();
+  });
+
+  it('shows the saved placeholder and keeps the stored secret on blank', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      backup_offsite: {
+        has_s3_secret_key: true,
+        keep_n: 7,
+        include_shares_key: true,
+        s3: { enabled: true, endpoint: 'minio.example.com:9000', bucket: 'b', access_key: 'AK' + 'X' },
+      },
+    }));
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const sk = (await screen.findByLabelText('S3 secret key')) as HTMLInputElement;
+    expect(sk.placeholder).toContain('saved');
+    expect(sk.value).toBe('');
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const off = saveSpy.mock.calls[0][0].backup_offsite;
+    expect(off!.s3?.enabled).toBe(true);
+    // Blank secret = keep stored: no secret_key key in the payload at all.
+    expect(off!.s3?.secret_key).toBeUndefined();
+    expect(off!.keep_n).toBe(7);
+  });
+
+  it('rejects an SFTP host carrying a bare-port colon', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com:22' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/set it in the port field/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('requires SFTP credentials when none are stored', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/SFTP needs a password or private key/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects out-of-range keep_n and SFTP port (mirrors the server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText('Offsite keep N'), { target: { value: '999' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/keep_n must be 0 \(default 30\) or 1-365/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('accepts the boundary values keep_n=365 and port=65535', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef' } });
+    fireEvent.change(screen.getByLabelText('SFTP port'), { target: { value: '65535' } });
+    fireEvent.change(screen.getByLabelText('Offsite keep N'), { target: { value: '365' } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const off = saveSpy.mock.calls[0][0].backup_offsite;
+    expect(off!.keep_n).toBe(365);
+    expect(off!.sftp?.port).toBe(65535);
+    expect(off!.sftp?.password).toBe(sftpPw);
+  });
+
+  it('flows the include-shares-key opt-out into the payload', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    const inc = await screen.findByLabelText('Include shares key in offsite bundle');
+    fireEvent.click(inc);
+    expect((inc as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].backup_offsite!.include_shares_key).toBe(false);
+  });
+
+  // ---------- Host-key pinning (D1) + traversal parity (G3) ----------
+
+  // A syntactically valid ed25519 host key blob (client checks shape only;
+  // the server does the real parse). Assembled at runtime, redaction-safe.
+  const hostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'TestHostKeyBlob0123456789abcdef';
+
+  async function enableSftpBase() {
+    fireEvent.click(await screen.findByLabelText('SFTP destination enabled'));
+    fireEvent.change(screen.getByLabelText('SFTP host'), { target: { value: 'backup.example.com' } });
+    fireEvent.change(screen.getByLabelText('SFTP user'), { target: { value: 'backup' } });
+    fireEvent.change(screen.getByLabelText('SFTP password'), { target: { value: sftpPw } });
+  }
+
+  it('blocks save when SFTP is enabled without a host key', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/host key is required.*ssh-keyscan/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a garbage host key with an ssh-keyscan hint', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: 'not-a-host-key' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/host key must be a public key/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the pinned host key in the save payload', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings());
+    render(<SettingsPage />);
+    await enableSftpBase();
+    fireEvent.change(screen.getByLabelText('SFTP host key'), { target: { value: hostKey } });
+    fireEvent.click(await offsiteSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    expect(saveSpy.mock.calls[0][0].backup_offsite!.sftp?.host_key).toBe(hostKey);
+  });
+
+  it('prefills the stored host key on load (public material round-trips)', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      backup_offsite: {
+        keep_n: 7,
+        include_shares_key: true,
+        sftp: { enabled: true, host: 'backup.example.com', user: 'backup', host_key: hostKey },
+        has_sftp_password: true,
+      },
+    }));
+    render(<SettingsPage />);
+    const field = (await screen.findByLabelText('SFTP host key')) as HTMLTextAreaElement;
+    await waitFor(() => expect(field.value).toBe(hostKey));
+  });
+
+  it('rejects traversal segments in the S3 prefix and SFTP path (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText('S3 prefix (optional)'), { target: { value: 'encode/../etc' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/S3 prefix must not contain/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('S3 prefix (optional)'), { target: { value: 'encode/' } });
+    fireEvent.change(screen.getByLabelText('SFTP path (optional)'), { target: { value: '/backups/../etc' } });
+    fireEvent.click(await offsiteSaveButton());
+    expect(await screen.findByText(/SFTP path must not contain/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Settings experimental ingestion card (P11)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The ingest card renders the LAST "Save settings" button on the page
+  // (all cards share the same save() — PUT is a full replace).
+  async function ingestSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  // Fake credential assembled at runtime (redaction-safe).
+  const ingestPw = 'qbit' + '-pw-1';
+
+  async function enableIngestBase() {
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.change(screen.getByLabelText('Client URL'), { target: { value: 'http://192.168.1.10:8080' } });
+    fireEvent.change(screen.getByLabelText('Download root (controller-visible)'), { target: { value: '/mnt/downloads' } });
+  }
+
+  it('renders the experimental badge and defaults to off', async () => {
+    render(<SettingsPage />);
+    expect(await screen.findByText('EXPERIMENTAL')).toBeInTheDocument();
+    const toggle = (await screen.findByLabelText('Enable download ingestion')) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('blocks save when enabled without a client URL (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/client URL must be an http/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when enabled without a download root', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.change(screen.getByLabelText('Client URL'), { target: { value: 'http://192.168.1.10:8080' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/Download root is required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid JSON category map before the PUT', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), { target: { value: '{not json' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/Category map must be valid JSON/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-object category map (array)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), { target: { value: '["anime"]' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/must be a JSON object/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects traversal in category map values (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), {
+      target: { value: '{"anime": "../evil"}' },
+    });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/no slashes or \.\./i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the ingest block with the typed password, then clears it', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({
+      ingest: { enabled: true, provider: 'qbittorrent', has_password: true },
+    }));
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.change(screen.getByLabelText('Client password'), { target: { value: ingestPw } });
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), {
+      target: { value: '{"anime": "Mapped Show"}' },
+    });
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ingest).toMatchObject({
+      enabled: true,
+      provider: 'qbittorrent',
+      url: 'http://192.168.1.10:8080',
+      username: 'qbit-user',
+      password: ingestPw,
+      category_map: { anime: 'Mapped Show' },
+      download_root: '/mnt/downloads',
+    });
+    expect((sent.ingest as Record<string, unknown>).has_password).toBeUndefined();
+    // Password input cleared after save (next save keeps the stored one).
+    await waitFor(() =>
+      expect((screen.getByLabelText('Client password') as HTMLInputElement).value).toBe(''));
+  });
+
+  it('omits the password on a second save (blank keeps stored)', async () => {
+    // The saved response mirrors what a real server returns: the FULL
+    // ingest block (the form re-binds to it, so it must stay valid).
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({
+      ingest: {
+        enabled: true, provider: 'qbittorrent', url: 'http://192.168.1.10:8080',
+        username: 'qbit-user', download_root: '/mnt/downloads', has_password: true,
+      },
+    }));
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.change(screen.getByLabelText('Client password'), { target: { value: ingestPw } });
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    // Second save without typing a password: the payload must not carry one.
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(2));
+    expect(saveSpy.mock.calls[1][0].ingest!.password).toBeUndefined();
+  });
+
+  it('shows the saved placeholder when has_password is set (write-only UX)', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      ingest: { enabled: true, provider: 'qbittorrent', has_password: true },
+    }));
+    render(<SettingsPage />);
+    const pw = (await screen.findByLabelText('Client password')) as HTMLInputElement;
+    expect(pw.value).toBe('');
+    expect(pw.placeholder).toMatch(/saved.*leave blank to keep/i);
+  });
+
+  it('prefills the category map textarea from the stored block', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      ingest: { category_map: { anime: 'Stored Show' } },
+    }));
+    render(<SettingsPage />);
+    const ta = (await screen.findByLabelText('Category to series map (JSON)')) as HTMLTextAreaElement;
+    await waitFor(() => expect(JSON.parse(ta.value)).toEqual({ anime: 'Stored Show' }));
+  });
+
+  it('blocks save when a username is set without any password (mirrors server post-merge)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/password is required when a username is set/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects an out-of-range poll interval (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Ingest poll interval'), { target: { value: '5' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/poll interval must be 0/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+});

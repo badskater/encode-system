@@ -970,6 +970,72 @@
       ],
       "title": "Throughput Counters",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Jobs failed by the stall watchdog (no progress within settings.stall_timeout_minutes). Any non-zero value means the watchdog is firing — jobs are wedging on nodes (hung agent, stalled toolchain, hung share) and being failed + retried. Cumulative DB count since DB start; job pruning can lower it. Alert: EncodeJobStalled.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "id": 9,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": false
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "encode_jobs_stalled_total",
+          "legendFormat": "Stalled",
+          "refId": "A"
+        }
+      ],
+      "title": "Stalled Jobs (Watchdog)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",

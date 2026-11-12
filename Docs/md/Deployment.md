@@ -9,7 +9,7 @@
   - `C:\bin` populated with encode tools (DGIndexNV, x265_x64, mkvmerge, ffmpeg, eac3to, opusenc, SCXvid) — Ansible copies from a staging dir, or publish a bin zip from the UI.
   - The shares mounted at `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` (nfs/smb only).
 - Linux nodes (CPU, no GPU required) with:
-  - Toolchain on `PATH`: `bash`, VapourSynth (`vspipe`), `x265`, `ffmpeg` (decode-only), `opusenc`, `flac`, `mkvmerge` (mkvtoolnix), `mediainfo`, `jq`, `bc`, coreutils (`cksum`/`sha256sum`), `curl`. `dgindex` and `keyframes` steps are refused on Linux (no GPU/DGIndexNV, no faithful SCXvid port) — use a flow that omits them (e.g. a VapourSynth-first `default-4k-cpu` flow).
+  - Toolchain on `PATH`: `bash`, VapourSynth (`vspipe`), `x265`, `ffmpeg` (decode-only), `opusenc`, `flac`, `mkvmerge` (mkvtoolnix), `mediainfo`, `jq`, `bc`, coreutils (`cksum`/`sha256sum`), `curl`. `dgindex` is refused on Linux (no GPU/DGIndexNV) — use a flow that omits it (e.g. a VapourSynth-first `default-4k-cpu` flow). `keyframes` works on Linux: it needs the `vapoursynth-scxvid` pip package (Python ≥ 3.12, the Python VapourSynth uses) plus a source filter (`lsmas` or `ffms2`) and the `resize` (zimg) plugin; the linux-node ansible role installs the pip package automatically.
   - `cifs-utils` + `nfs-common` (Debian) or `nfs-utils` (RHEL) for share mounts; S3 needs nothing.
   - systemd (recommended — the agent ships a `encode-agent.service` unit with `Restart=always`) or run the agent as a bare foreground loop.
 - Ansible control node with `pywinrm` (or SSH) reachability to the Windows hosts — or use the controller's built-in Web UI provisioning (no workstation needed).
@@ -78,7 +78,7 @@ separately (UI → Provision or `infra/ansible/linux-node.yml`).
 
 ```bash
 cd docker
-cp .env.example .env   # set ADMIN_TOKEN, NODE CIDR/allowed names if needed
+cp .env.example .env   # set ENCODE_ADMIN_PASSWORD (or leave empty to auto-generate), ports, storage vars as needed
 docker compose up -d
 ```
 
@@ -110,6 +110,7 @@ First-boot env:
 | `ENCODE_SCAN_INTERVAL` | Seconds between share scans (default `30`). |
 | `ENCODE_TASKS_BEFORE_REBOOT` | Default `10`. |
 | `ENCODE_LISTEN` | Listen address (default `:8080`). |
+| `ENCODE_TLS_CERT` / `ENCODE_TLS_KEY` | Native HTTPS: PEM cert + key file paths. Both set → TLS 1.2+; one set → fail-fast; neither → plain HTTP (default). See [Native HTTPS](#native-https-controller-tls). |
 | `ENCODE_BACKUP_ENABLED` / `ENCODE_BACKUP_EVERY_SECONDS` | Seed the scheduled DB-backup defaults (live-editable afterwards via `PUT /api/backup/settings`). |
 | `ENCODE_GROUP` / `ENCODE_TAG` / `ENCODE_DEFAULT_FLOW` | Seed release naming + the default flow name (live Settings afterwards). |
 | `ENCODE_DISCORD_WEBHOOK` | Seeds the live Settings webhook (saved blank turns notifications off). |
@@ -261,9 +262,19 @@ The `roles/linux-node` role (`roles/linux-node/tasks/main.yml`):
 1. Installs packages: `cifs-utils` + `nfs-common` (Debian/apt) or
    `cifs-utils` + `nfs-utils` (RHEL/dnf) — auto-detected by
    `ansible_os_family`.
-2. Creates the `encode` service user (`system: true`, `nologin` shell)
+2. Installs the `vapoursynth-scxvid` pip plugin for the `keyframes` step:
+   first a preflight asserts the node's `python3` is ≥ 3.12 (the wheel's
+   `Requires-Python`; fails with an actionable message otherwise), then
+   `pip3 install vapoursynth-scxvid` with
+   `environment: PIP_BREAK_SYSTEM_PACKAGES: "1"` for PEP 668 distros
+   (Debian 12+). The env var is used instead of the pip module's
+   `break_system_packages` parameter because that parameter requires
+   ansible-core ≥ 2.17 — the env var works on older cores too (pip itself
+   honors it; same effect). The plugin must land in the SAME Python
+   `vspipe` uses; a venv's site-packages is not auto-loaded.
+3. Creates the `encode` service user (`system: true`, `nologin` shell)
    and agent + bin + mount directories.
-3. Copies the agent binary to `/opt/encode-agent/encode-agent` (0755),
+4. Copies the agent binary to `/opt/encode-agent/encode-agent` (0755),
    writes `/etc/encode-agent/agent.json` (0640, built as a dict and
    serialized with `to_nice_json` so path backslashes are escaped
    correctly; `no_log: true` because it briefly carries a pairing
@@ -271,14 +282,14 @@ The `roles/linux-node` role (`roles/linux-node/tasks/main.yml`):
    `infra/systemd/encode-agent.service` (single source of truth — the
    role never inlines a unit that could drift; `After=` automount units
    + `ReadWritePaths=`/`NoNewPrivileges=`/`PrivateTmp=` hardening).
-4. Mounts CIFS shares (`ansible.posix.mount`, `state: mounted`) with
+5. Mounts CIFS shares (`ansible.posix.mount`, `state: mounted`) with
    per-share 0600 credential files
    (`/etc/encode-agent/cifs-scripts.cred`, `cifs-release.cred`, written
    via `copy content`) and `x-systemd.automount` + `x-systemd.idle-timeout=60`
    + `noauto` opts (so systemd generates a `.automount` unit from fstab
    — a dead NAS never holds the boot path). NFS shares mount the same
    way (no credentials needed).
-5. Enables + starts `encode-agent.service`, waits for the agent to pair
+6. Enables + starts `encode-agent.service`, waits for the agent to pair
    (polls for `<data_dir>/node.token`), then strips the one-shot pairing
    code from `agent.json` (idempotent, atomic-ish copy).
 
@@ -354,7 +365,9 @@ idempotent.
 | Setting | Where | Default | Effect |
 | --- | --- | --- | --- |
 | `ENCODE_BIND_ADDR` | controller `.env` | `0.0.0.0` | bind API to one interface; set `127.0.0.1` behind a reverse proxy |
-| `ENCODE_AGENT_ALLOW_HTTP_UPDATES` | agent node env | unset (refuse) | allow lib/bin/agent downloads over plain HTTP (trusted LAN only) |
+| `ENCODE_TLS_CERT` / `ENCODE_TLS_KEY` | controller `.env` | unset (plain HTTP) | native HTTPS on the controller (both or neither; partial config fail-fasts) |
+| `ENCODE_AGENT_CA_CERT` | agent node env | unset (system roots) | PEM CA file appended to the agent's trust pool for all controller requests (native controller TLS) |
+| `ENCODE_AGENT_ALLOW_HTTP_UPDATES` | agent node env | unset (refuse) | allow lib/bin/agent downloads over plain HTTP (trusted LAN only; unnecessary with an https:// controller) |
 | `ENCODE_BIN_FETCH_PRIVATE` | controller env | unset (refuse) | allow `publishBinFromURL` to fetch from LAN/localhost hosts (SSRF guard opt-in) |
 | `-ServiceUser` / `-ServicePassword` | `install-agent.ps1` | LocalSystem | run the agent service as a least-privilege account |
 
@@ -373,11 +386,443 @@ docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chow
 `provision.yml` over WinRM) and `ansible.posix:2.2.2` (Linux
 `roles/linux-node`'s `ansible.posix.mount` tasks for CIFS/NFS mounts). An
 unpinned rebuild could pull a breaking release and silently break
-provisioning; the pins are the guard. The release bundle ships the
+provisioning; the pins are the guard. Control-side ansible-core is
+deliberately NOT pinned to a minimum: the linux-node role avoids
+core-version-gated module parameters (the scxvid pip task sets
+`PIP_BREAK_SYSTEM_PACKAGES` via `environment:` rather than
+`break_system_packages`, which needs core ≥ 2.17), so provisioning works
+on older cores as well. The release bundle ships the
 `provision/` and `systemd/` trees, and both Dockerfiles COPY them into
 the GHCR image at `/app/provision` and `/app/systemd`
 (`ENCODE_PROVISION_DIR=/app/provision` sets the engine's `PlaybookDir`,
 default in `backend/cmd/controller/main.go`).
+
+## Native HTTPS (controller TLS)
+
+The controller can terminate TLS itself — no reverse proxy required. The
+**whole server** (API, UI, `/metrics`, health) moves to HTTPS on the same
+port, and agents verify the certificate against a CA you distribute.
+
+| Var | Where | Meaning |
+| --- | --- | --- |
+| `ENCODE_TLS_CERT` | controller env / `.env` | PEM certificate file path (inside the container when compose-mounted). |
+| `ENCODE_TLS_KEY` | controller env / `.env` | Matching PEM private key file path. |
+| `ENCODE_AGENT_CA_CERT` | agent node env | PEM CA certificate file. The agent **appends** it to the system trust pool and uses it for EVERY controller request: pairing, heartbeats, completion reports, and lib/bin/agent update downloads. |
+
+Behavior rules (all fail-fast, tested):
+
+- **Both** controller vars set → HTTPS with TLS 1.2 minimum.
+- **Exactly one** set → the controller refuses to start, naming the missing
+  var. It never silently falls back to HTTP.
+- **Neither** set → plain HTTP, byte-identical to previous releases. This is
+  the default; existing deploys need no change.
+- Unreadable/invalid/mismatched cert or key files → startup error with the
+  offending paths.
+- `ENCODE_AGENT_CA_CERT` missing/unreadable/not-PEM → the agent refuses to
+  start. Public CAs keep working (append, never replace). There is no
+  `InsecureSkipVerify` anywhere — a wrong or untrusted cert fails the
+  handshake.
+- With an `https://` controller URL, **`ENCODE_AGENT_ALLOW_HTTP_UPDATES` is
+  no longer needed** — that opt-in only gates plain-HTTP downloads. Remove
+  it (and the `http-updates.conf` systemd drop-in) after the cutover.
+
+### Compose wiring
+
+All three composes (`docker-compose.runtime.yml`, `docker-compose.yml`,
+`docker-compose.ha.yml`) pass `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY` through from
+`.env` (empty default = plain HTTP) and carry commented read-only cert/key
+mounts. To enable:
+
+1. Place the cert + key under the compose dir (e.g. `tls/controller.crt`,
+   `tls/controller.key`; recipe below).
+2. Uncomment the two `./tls/...` volume lines in the compose file.
+3. In `.env` set `ENCODE_TLS_CERT=/tls/controller.crt`,
+   `ENCODE_TLS_KEY=/tls/controller.key`, plus the healthcheck probe override:
+   `ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health` and (self-signed
+   CA only) `ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate`. The flag
+   relaxes ONLY the container's local probe — agents still verify via
+   `ENCODE_AGENT_CA_CERT`. If you verify the probe WITH the CA instead
+   (no `--no-check-certificate`), the URL must use a SAN-covered name/IP:
+   the recipe's SANs are `DNS:encode.lan` + `IP:<CTRL_IP>`, NOT `localhost`,
+   so `--ca-cert` + `https://localhost:8080` fails hostname verification
+   (and a public CA can never cover `localhost`) — use e.g.
+   `ENCODE_HEALTHCHECK_URL=https://<CTRL_IP>:8080/api/health`, or keep
+   `--no-check-certificate` for the loopback probe.
+4. `docker compose -f docker-compose.runtime.yml up -d` (recreates the
+   container). `install.sh` detects the TLS vars and health-probes over
+   https automatically.
+
+HA note: with Traefik terminating TLS at the edge, native TLS is usually
+left unset (Traefik→replica stays HTTP on the internal network). Set it only
+when the replicas themselves must serve HTTPS — and then ALSO set
+`ENCODE_TRAEFIK_SCHEME=https` in `.env`: Traefik's backend scheme defaults to
+`http`, and plain HTTP against a TLS listener 502s every request. The recipe
+below applies unchanged — both replicas mount the same `./tls/` files, so the
+single ownership step covers both.
+
+### Self-signed CA recipe (LAN farms)
+
+Run as root on the controller host (or any trusted machine — the ownership
+step needs root), then copy the files as noted. Adjust the two variables to
+YOUR farm — the SANs must cover every name/IP agents will dial (an
+`https://<ip>:8080` URL needs the **IP SAN**; no DNS lookup happens):
+
+```bash
+CTRL_IP=172.24.92.232          # the address agents use in controller_url
+CTRL_DNS=encode.lan            # optional hostname agents may use instead
+mkdir -p /opt/encode-system/tls && cd /opt/encode-system/tls
+
+# 1. Farm CA. Keep ca.key 0600 and backed up offline — it signs everything
+#    the agents will trust. 10-year lifetime is typical for a private CA.
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -key ca.key -sha256 -days 3650 \
+  -subj "/CN=encode-farm CA" -out ca.crt
+
+# 2. Server key + CSR.
+openssl genrsa -out controller.key 2048
+openssl req -new -key controller.key -subj "/CN=encode-controller" \
+  -out controller.csr
+
+# 3. Sign with SANs for every controller name/IP + serverAuth usage.
+cat > san.cnf <<EOF
+subjectAltName = DNS:${CTRL_DNS}, IP:${CTRL_IP}
+extendedKeyUsage = serverAuth
+keyUsage = digitalSignature, keyEncipherment
+EOF
+openssl x509 -req -in controller.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -days 825 -sha256 -extfile san.cnf -out controller.crt
+
+# 4. Permissions + ownership for the container. Both controller images run
+#    as `encode` = uid 100, gid 101 (docker/Dockerfile on Alpine,
+#    docker/Dockerfile.runtime on Debian; verify with
+#    `docker compose -f docker-compose.runtime.yml exec controller id`).
+#    Bind mounts keep HOST ownership: a root-owned 0600 key is unreadable
+#    inside the container and the controller exits at boot with
+#    "load TLS keypair … permission denied". Own the two mounted files as
+#    the container user. ca.key never enters the container — keep it
+#    root-owned and backed up offline.
+chmod 600 ca.key controller.key
+chown 100:101 controller.crt controller.key
+# Sanity: the SANs must list the IP/hostname agents will use.
+openssl x509 -in controller.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+Controller placement (compose deploy): `controller.crt`/`controller.key` go
+to `/opt/encode-system/tls/` (mounted per the wiring above); set the `.env`
+vars; recreate. Bare-binary deploy: point `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY`
+at the files directly and restart the process — the key must be readable by
+the user the process runs as (the recipe's `chown` covers the uid-100
+container case).
+
+Agent placement — copy **`ca.crt` only** (never `ca.key`) to each node:
+
+```powershell
+# Windows node (elevated PowerShell). Example path for the farm's
+# scheduled-task installs (C:\encode-agent-dist); service installs can use
+# C:\encode-agent\encode-ca.crt the same way.
+# 1. Copy ca.crt to the node, e.g. C:\encode-agent-dist\encode-ca.crt
+# 2. Machine-level env (picked up by services AND scheduled tasks on start):
+[Environment]::SetEnvironmentVariable("ENCODE_AGENT_CA_CERT", "C:\encode-agent-dist\encode-ca.crt", "Machine")
+# 3. Point agent.json at https:
+#    "controller_url": "https://172.24.92.232:8080"
+# 4. Restart the agent:
+Restart-Service encode-agent                       # service installs
+Stop-ScheduledTask EncodeAgentDist; Start-ScheduledTask EncodeAgentDist  # task installs
+```
+
+```bash
+# Linux node: install-agent.sh passes the env through as a systemd drop-in.
+sudo cp ca.crt /etc/encode-agent/encode-ca.crt
+sudo ENCODE_AGENT_CA_CERT=/etc/encode-agent/encode-ca.crt \
+  ./install-agent.sh -c https://<controller>:8080 -p <pairing-code>
+# Existing install instead: write /etc/systemd/system/encode-agent.service.d/ca-cert.conf
+#   [Service]
+#   Environment="ENCODE_AGENT_CA_CERT=/etc/encode-agent/encode-ca.crt"
+# edit controller_url in agent.json to https://, then:
+sudo systemctl daemon-reload && sudo systemctl restart encode-agent
+```
+
+### Switching an existing farm (restart order)
+
+The cutover is **controller first, then nodes**. Old agents keep retrying
+heartbeats every tick against the TLS-only controller (warnings in the log,
+no crash) until they are switched; jobs are held by the drain.
+
+1. Generate the CA + server cert (recipe above); place the files on the
+   controller host. Verify the SANs cover the address agents use.
+2. **Drain the farm** (UI → Settings → Drain mode) or wait for an idle
+   window: a job running during the cutover would lose its completion
+   report (the old-URL agent cannot reach the TLS-only controller), leaving
+   the job to stall-watchdog/orphan recovery. Running jobs finish first.
+3. **Controller**: set the `.env` TLS vars + healthcheck override, uncomment
+   the mounts, `docker compose -f docker-compose.runtime.yml up -d`.
+   Verify: `curl --cacert /opt/encode-system/tls/ca.crt https://<CTRL_IP>:8080/api/health`
+   → `{"status":"ok",...}`. The container must report healthy.
+4. **Each node**: copy `ca.crt`, set `ENCODE_AGENT_CA_CERT` (machine env /
+   systemd drop-in), change `controller_url` to `https://…`, restart the
+   agent (service or scheduled task). Nodes reconnect on the next heartbeat
+   (~5s); confirm `online`/`idle` in UI → Nodes. Repeat node-by-node.
+5. Release the drain. Remove `ENCODE_AGENT_ALLOW_HTTP_UPDATES` (and the
+   `http-updates.conf` drop-in on Linux nodes) — TLS makes it unnecessary.
+   Publish an agent update once to confirm the download path works over TLS.
+
+**Rollback**: remove BOTH `ENCODE_TLS_*` vars AND the healthcheck override
+(`ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS`) from `.env`, recreate
+the controller (plain HTTP returns), and point nodes' `controller_url` back to
+`http://`. A leftover `https://` healthcheck probe against a plain-HTTP
+controller fails (wget exit 4) and the container stays permanently unhealthy.
+The CA env can stay on nodes — it is inert for plain HTTP.
+
+**Publicly trusted certs**: skip the CA recipe — use a cert from your normal
+issuer (or Let's Encrypt via the Traefik HA path). Agents need no
+`ENCODE_AGENT_CA_CERT` then (system roots already trust it), and the
+healthcheck needs no `--no-check-certificate`.
+
+## Optional OIDC login
+
+The controller can offer **Sign in with SSO** (OpenID Connect) next to the
+local username/password form. It is **OFF by default and entirely optional**
+— a LAN farm with local accounts needs none of this, and with the vars unset
+the controller registers no OIDC routes and behaves exactly as before.
+Local login keeps working unchanged when OIDC is enabled; both coexist.
+
+### Environment variables
+
+| Var | Required | Meaning |
+| --- | --- | --- |
+| `ENCODE_OIDC_ISSUER` | yes* | Provider identifier URL. Must EXACTLY match the `iss` in the provider's discovery document (`<issuer>/.well-known/openid-configuration`). |
+| `ENCODE_OIDC_CLIENT_ID` | yes* | Client ID registered on the provider. |
+| `ENCODE_OIDC_CLIENT_SECRET` | yes* | Client secret. Never logged; treat like any credential (`.env` perms, secrets manager). |
+| `ENCODE_OIDC_REDIRECT_URL` | yes* | The controller's callback URL, e.g. `https://encode.example.com/api/auth/oidc/callback`. Must EXACTLY match a redirect URI registered on the provider. |
+| `ENCODE_OIDC_ADMIN_GROUP` | no | Group name that grants the **admin** role. Unset = no group mapping (see below). |
+| `ENCODE_OIDC_GROUPS_CLAIM` | no | ID-token claim carrying the group list (default `groups`). |
+
+\* All four core vars together enable OIDC. **All unset = disabled** (the
+default). **A partial set fails fast at startup** with an error naming the
+missing vars — the controller never silently falls back to local-only when
+you intended SSO (same contract as `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY`).
+
+Docker deploys: all six vars are passed through by every compose file
+(`docker-compose.yml`, `docker-compose.runtime.yml`, `docker-compose.ha.yml`);
+set them in `.env` (commented template in `docker/.env.example`).
+
+### Provider setup (generic)
+
+Works with any standards-compliant OIDC provider — pocket-id, Authelia,
+Keycloak, Authentik, etc.:
+
+1. Create a **confidential client** (authorization-code flow) for the
+   controller. Note the client ID and secret.
+2. Register the redirect URI **exactly** as
+   `https://<controller-host>/api/auth/oidc/callback` (scheme, host, port and
+   path must match `ENCODE_OIDC_REDIRECT_URL` character-for-character).
+3. Ensure the provider issues the `openid profile email` scopes and includes
+   `preferred_username` (or `email`) in the ID token.
+4. For role mapping, make the provider emit the user's groups in the ID
+   token (Keycloak: a "group membership" mapper on the client; Authelia:
+   `groups` claim via access-control configuration; pocket-id: user groups).
+   Set `ENCODE_OIDC_ADMIN_GROUP` to the group that should be admin.
+5. **NTP-sync the controller host.** ID-token expiry is verified with ZERO
+   clock-skew leeway (`go-oidc`; only the optional `nbf` claim gets a 5-minute
+   grace). A controller clock drifting ahead of the IdP rejects fresh tokens
+   as expired — SSO logins fail while local login keeps working.
+6. Set the four core vars (+ optional two) and restart the controller. The
+   login page shows **Sign in with SSO** only when enabled — the UI learns
+   the flag from the unauthenticated `/api/health` bootstrap (`oidc_enabled`).
+
+Example `.env` (Keycloak-style realm):
+
+```bash
+ENCODE_OIDC_ISSUER=https://keycloak.example.com/realms/farm
+ENCODE_OIDC_CLIENT_ID=encode-system
+ENCODE_OIDC_CLIENT_SECRET=<from the client's Credentials tab>
+ENCODE_OIDC_REDIRECT_URL=https://encode.example.com/api/auth/oidc/callback
+ENCODE_OIDC_ADMIN_GROUP=encode-admins
+```
+
+### Accounts and role mapping
+
+- **First SSO login auto-provisions** a local account. Username derivation:
+  `preferred_username` → email local part → `sub`, sanitized to `[a-z0-9._-]`
+  (separator runs collapse to `-`). Lowercasing is **ASCII-only** and every
+  non-ASCII rune becomes a separator, so Unicode confusables (`İ`, the Kelvin
+  sign `K`, fullwidth letters) can never fold into ASCII lookalikes such as
+  `admin`. Names longer than 64 chars become the first 56 chars + `-` + a
+  7-char lowercase hex SHA-256 digest of the **raw `sub`** — two distinct IdP
+  subjects whose names share a long prefix can never merge into one account.
+  The derivation is deterministic, so repeat logins reuse the same account —
+  no duplicates.
+- **New accounts get the viewer role**, or **admin** when
+  `ENCODE_OIDC_ADMIN_GROUP` is set and the groups claim contains it (exact
+  match, not substring).
+- **Existing accounts**: with `ENCODE_OIDC_ADMIN_GROUP` set, the role is
+  **synced on every login in both directions** (in the group → admin, out →
+  viewer). With no admin group configured, existing accounts **keep their
+  stored role** — nothing is mapped, and an existing admin is never silently
+  demoted. Plan IdP usernames so they do not collide with local accounts
+  unless you intend them to be the same account (matching is exact on the
+  derived, lowercased username).
+- SSO-provisioned accounts have **no local password** (local login for them
+  is always 401). An admin can set one via user management to make the
+  account hybrid; deleting the account removes SSO access too (it will be
+  re-provisioned on the next SSO login).
+- Sessions are ordinary controller sessions: same 24h sliding expiry, same
+  logout/revocation, same role enforcement as local login. Every SSO login
+  writes an `auth.oidc_login` audit event (actor = username, detail carries
+  the role and whether the account was just provisioned).
+
+> **Admin-collision warning.** An IdP identity whose derived username is
+> `admin` (e.g. `preferred_username=admin`) lands on the **local admin
+> account** — derivation matches local accounts exactly. Without
+> `ENCODE_OIDC_ADMIN_GROUP`, anyone the IdP authenticates under that name
+> gets a **passwordless admin session**. With the admin group configured,
+> group sync can **demote the local admin** (and their live sessions) when
+> the colliding IdP identity is outside the group — a lockout risk. Plan IdP
+> usernames so privileged local account names cannot be derived; for
+> privileged accounts prefer `sub`-derived names (leave `preferred_username`
+> and `email` unset or unique per user) and treat the local `admin` name as
+> reserved.
+
+### Security notes
+
+- The flow is authorization-code with **state** (single-use, 10-minute TTL),
+  **nonce** (bound into the ID token and checked) and **PKCE** (S256).
+  **Login CSRF is blocked by a browser-binding flow cookie**, not by the
+  state alone: `/api/auth/oidc/login` sets a crypto-random `encode_oidc_flow`
+  cookie (HttpOnly, SameSite=Lax, Secure when the request is TLS, scoped to
+  `/api/auth/oidc`, 10-minute MaxAge). Only its SHA-256 hash is stored
+  server-side; the callback verifies it in constant time and clears the
+  cookie on every outcome. An attacker-initiated flow cannot be completed by
+  the victim's browser — the victim carries no matching cookie, so the
+  callback is rejected and no session is issued.
+- The ID token is verified via `go-oidc`: signature against the provider's
+  JWKS, issuer, audience and expiry. Any failure rejects the login. Expiry
+  has **zero clock-skew leeway** — keep the controller host NTP-synced
+  (setup step 5).
+- **Throttling**: `/api/auth/oidc/login` uses the same lockout mechanism as
+  local login (5 attempts → 30 s cooldown) with a **separate counter**, so
+  OIDC bursts cannot lock out local login and vice versa. A completed
+  callback resets the lockout.
+- **Error hygiene**: failed callbacks return a generic `OIDC login failed`
+  to the browser; controller logs keep only a sanitized error class/HTTP
+  status. Raw IdP error bodies — which may echo authorization codes, secrets
+  or PII — never reach the client or the logs.
+- The session token reaches the SPA in the URL **fragment** (`/#oidc=…`),
+  which browsers never send to servers or logs; the SPA consumes and strips
+  it immediately. **HTTPS is strongly recommended** for the controller (see
+  §Native HTTPS or the Traefik HA path) — over plain HTTP the fragment is
+  still exposed to anything observing the browser side.
+- The redirect URL must match the provider's registered URI exactly; a
+  mismatch is rejected by the provider before any token is issued.
+- Discovery is lazy: the controller boots even if the IdP is down; the first
+  SSO attempt then returns 503 and retries discovery on the next attempt.
+- **HA (two replicas)**: pending login flows live in the memory of the
+  replica that started them. The callback must reach the SAME replica —
+  enable sticky sessions on the load balancer, or run SSO on a single
+  replica. Without stickiness, callbacks that land on the other replica fail
+  with "unknown or expired login state" and the user simply retries.
+
+### Disabling / rollback
+
+Unset the four core vars (or blank them in `.env`) and restart: the routes
+and the SSO button disappear, local login is untouched. Already-provisioned
+accounts and their sessions remain (sessions expire on the normal TTL);
+delete the accounts via user management if you want them gone.
+
+## Download ingestion (experimental, off by default)
+
+P11 can poll a BitTorrent client for completed downloads and stage their
+source video files into the scripts share, where the scanner picks them
+up once an operator authors the `.avs`/`.vpy` filter script. The feature
+is **OFF by default** and **experimental**; nothing changes on upgrade
+until it is explicitly enabled on the Settings page. See Operations.md
+§Download ingestion for the workflow, observability and diagnosis.
+
+### Mount requirement (read first)
+
+Ingestion copies files — it does not download them. The controller must
+see the client's completed downloads on a local path:
+
+- `ingest.download_root` is the **controller-visible** directory that
+  corresponds to the client's download root — the directory that
+  **directly contains the completed torrent folders**.
+- The client must save completed torrents **directly under that root**
+  (flat layout). Per-category subfolders are not resolved: the controller
+  maps a torrent to `download_root/<basename of the client save path>`
+  and verifies it exists before staging (missing = skip + log).
+- Symlinked torrent folders are resolved and must stay **inside**
+  `download_root`; a symlink pointing outside the root is refused
+  (symlink-escape containment).
+- Example: qBittorrent saves to `/downloads/complete` on the download
+  host; the controller container mounts that same directory at
+  `/mnt/downloads` → set `download_root: /mnt/downloads`. A torrent saved
+  as `/downloads/complete/Show.S01E01` is read from
+  `/mnt/downloads/Show.S01E01`.
+
+Compose wiring (controller service):
+
+```yaml
+volumes:
+  - /srv/downloads/complete:/mnt/downloads:ro
+```
+
+A read-only mount is sufficient (ingestion only reads the download side;
+writes go to the scripts share). The scripts share must already be
+mounted at `scripts_root` as for normal scanning.
+
+### qBittorrent setup (first-class)
+
+1. Enable the Web UI (Tools → Options → Web UI) and note its port.
+2. Either create a user for the controller, or whitelist the controller's
+   IP ("Bypass authentication for clients on localhost" / IP whitelist)
+   and leave the ingest username empty.
+3. (Optional) Create a category (e.g. `anime`) and set the ingest
+   `category` filter or the category→series map. Completed torrents in
+   that category are polled via `torrents/info?filter=completed`.
+4. Settings page → Download ingestion: provider `qbittorrent`, URL
+   `http://<host>:<port>`, credentials, download root. Save.
+
+Sessions use the cookie login (`/api/v2/auth/login`). Both protocol
+generations are supported: 4.x–5.1 answer `200 "Ok."` / `"Fails."`,
+≥5.2 answers `204` on success and `401` on bad credentials (verified
+against upstream qBittorrent source; both generations are covered by
+mock-server regression tests). An expired/rejected session (403, or
+401 on the ≥5.2 auth paths) is re-logged-in once automatically.
+Repeated failed logins can get the controller IP banned by qBittorrent
+— fix credentials, then unban.
+
+### ruTorrent setup (best-effort, experimental)
+
+1. Enable the **httprpc** plugin (it ships with ruTorrent; the client
+   calls `plugins/httprpc/action.php`).
+2. Put HTTP **Basic** auth in front of ruTorrent (or leave it open on a
+   trusted LAN); digest-only auth is not supported.
+3. Use ruTorrent **labels** as categories (the client matches
+   `d.custom1`); the category filter/map works on labels.
+4. Settings page: provider `rutorrent`, URL = the ruTorrent web root
+   (e.g. `http://host/rutorrent`), credentials, download root.
+
+Limitations (documented, not bugs to file): completion is read from the
+appended `d.get_complete` command (fallback `left_bytes=0` on builds that
+drop it); single-file torrents resolve their save dir as the parent of
+`d.get_base_path`; only Basic auth; no per-torrent retry tuning. Prefer
+qBittorrent for production use.
+
+### Enable / disable / rollback
+
+- Enable: Settings card (admin) or `PUT /api/settings` with the `ingest`
+  block. The password is write-only (blank keeps the stored one) and
+  AES-GCM encrypted with the shares key — back up the key file alongside
+  the DB as usual.
+- Disable: uncheck "Enable download ingestion" and save. Every poll tick
+  becomes a no-op; staged files and the `ingest_ledger` table are left
+  untouched. No restart needed.
+- Rollback: the feature is additive (settings JSON blob + one new table).
+  Older binaries ignore the `ingest` settings key; the `ingest_ledger`
+  table is harmless to leave in place. On Postgres the table is created
+  by `CREATE TABLE IF NOT EXISTS` on every open (fresh and upgrade).
+- HA: the poll loop holds advisory lock **1008**; only the leader replica
+  polls. No additional configuration is required.
 
 ## Post-deploy validation
 
@@ -429,7 +874,12 @@ Release-workflow operational notes:
 - **The farm controller (172.24.92.232) runs the release pipeline as of
   v1.18.1** (migrated 2026-09-30 from the hand-rolled bind-mount compose):
   `docker-compose.runtime.yml`, GHCR image, named volumes
-  (`encode-system_encode-{state,scripts,release}`). Upgrades are now
+  (`encode-system_encode-{state,scripts,release}`). **It currently runs
+  v1.19.3 on SQLite and STAYS there until the P13 rollout** — the upgrade
+  to v1.23.0, the SQLite→Postgres cutover and the native-TLS cutover are
+  one operator-scheduled operation (validated runbooks: the fleet-ops
+  skill + §Native HTTPS below), not part of tagging the release.
+  Upgrades are
   `install.sh vX.Y.Z` with data preserved. Migration carry-over recipe
   (state volume → `encode-state` incl. `encode.db` + `encode.db.shares-key`,
   bind dirs → the scripts/release volumes) plus one manual step: the image

@@ -336,6 +336,9 @@ func (s *Server) handleAgentPair(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "node name already registered")
 		return
 	}
+	// F5: a (re-)registered node starts with a clean cancel queue — any
+	// prior agent process for this identity is gone by definition.
+	s.clearPendingCancels(node.ID)
 	pc, err := s.Store.ConsumePairingCode(ctx, codeHash, node.ID)
 	if err != nil {
 		// Extremely unlikely (code validated above); roll back and surface

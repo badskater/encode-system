@@ -113,6 +113,9 @@ func fleetLink(controllerURL string) string {
 // long error are truncated together so the whole payload always fits.
 const discordCap = 2000
 
+// Name identifies the channel in logs (Channel interface).
+func (d *Discord) Name() string { return "discord" }
+
 // JobFinished formats and posts the outcome. Failures carry the error and a
 // short log tail so the alert is actionable without opening the UI. When a
 // job failed after exhausting its automatic retry budget, the retry count is
@@ -192,7 +195,7 @@ func (d *Discord) post(ctx context.Context, content string) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
-		d.Log.Warn("discord notify failed", "err", err)
+		d.Log.Warn("discord notify failed", "channel", "discord", "err", redactErr(err, d.WebhookURL))
 		return
 	}
 	defer resp.Body.Close()

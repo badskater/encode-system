@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   retry_count INTEGER NOT NULL DEFAULT 0,
   next_retry_at TEXT,
   last_failed_node_id BIGINT NOT NULL DEFAULT 0,
+  last_progress_at TEXT,
   created_at TEXT NOT NULL DEFAULT %s,
   started_at TEXT,
   finished_at TEXT
@@ -219,6 +220,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS ingest_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  provider TEXT NOT NULL,
+  torrent_hash TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  series TEXT NOT NULL DEFAULT '',
+  episode TEXT NOT NULL DEFAULT '',
+  staged_path TEXT NOT NULL,
+  staged_at TEXT NOT NULL DEFAULT %s,
+  UNIQUE(provider, torrent_hash)
+);
 `
 
 // migratePG creates the full Postgres schema from scratch. Unlike the SQLite
@@ -248,6 +261,15 @@ func (s *Store) migratePG() error {
 	schema := strings.ReplaceAll(pgSchemaTemplate, "%s", pgTimestampDefault)
 	if _, err := s.db.ExecContext(context.Background(), schema); err != nil {
 		return fmt.Errorf("migratePG schema: %w", err)
+	}
+	// Resilience batch: jobs.last_progress_at for the stall watchdog. The
+	// fresh schema above carries it; this idempotent ALTER covers PG
+	// databases created by an older build (CREATE TABLE IF NOT EXISTS does
+	// not add columns to an existing table). ADD COLUMN IF NOT EXISTS is
+	// a no-op on fresh databases.
+	if _, err := s.db.ExecContext(context.Background(),
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TEXT`); err != nil {
+		return fmt.Errorf("migratePG jobs.last_progress_at: %w", err)
 	}
 	// SQLite compatibility functions: the stats queries use SQLite-specific
 	// functions (julianday, strftime, date, SUBSTR, json_extract, substr)

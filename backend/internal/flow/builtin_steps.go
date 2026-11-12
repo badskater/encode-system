@@ -35,6 +35,11 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		encode4kTemplate(),
 		muxTemplate(),
 		verifyOutputTemplate(),
+		qualityGateTemplate(),
+		subtitleExtractTemplate(),
+		fontExtractTemplate(),
+		chapterExtractTemplate(),
+		muxExtrasTemplate(),
 		crc32RenameTemplate(),
 		releaseCopyTemplate(),
 		keyframesTemplate(),
@@ -548,8 +553,14 @@ func keyframesTemplate() *model.StepTemplate {
     $destDir = Join-Path $Job.ReleaseDir $Job.ReleaseFolder
     $mkv = Join-Path $destDir $Job.OutputName
     $kf = Join-Path $destDir "$($Job.Series) - $($Job.Episode) Keyframes.txt"
-    if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkv" }
-    if ((Test-Path -LiteralPath $kf) -and ((Get-Item -LiteralPath $kf).LastWriteTime -gt (Get-Item -LiteralPath $mkv).LastWriteTime)) {
+    # Flattened display copies for error messages: CR/LF inside a path must
+    # never split an echoed error into a line-start ENCODE_STEP marker.
+    $mkvFlat = $mkv -replace '[\r\n]', ' '
+    $kfFlat = $kf -replace '[\r\n]', ' '
+    if (-not (Test-Path -LiteralPath $mkv)) { throw "release MKV not found: $mkvFlat" }
+    # -PathType Leaf: a DIRECTORY named Keyframes.txt is not an artifact and
+    # must never satisfy the fresh-skip (bash parity: [[ -f "$kf" ]]).
+    if ((Test-Path -LiteralPath $kf -PathType Leaf) -and ((Get-Item -LiteralPath $kf).LastWriteTime -gt (Get-Item -LiteralPath $mkv).LastWriteTime)) {
         Write-Output "keyframes file exists and is newer than the MKV, skipping"
         Write-Output "ENCODE_STEP keyframes 100"
         return
@@ -579,20 +590,82 @@ func keyframesTemplate() *model.StepTemplate {
         $psi.RedirectStandardError = $true
         $psi.UseShellExecute = $false
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $outTask = $proc.StandardOutput.ReadToEndAsync()
-        $errTask = $proc.StandardError.ReadToEndAsync()
-        $src = [System.IO.File]::OpenRead($y4m)
-        try { $src.CopyTo($proc.StandardInput.BaseStream) } finally { $src.Close() }
-        $proc.StandardInput.Close()
-        $proc.WaitForExit()
-        foreach ($line in (($outTask.Result + [Environment]::NewLine + $errTask.Result) -split [Environment]::NewLine)) {
-            if ($line.Trim()) { Write-Output "[SCXvid] $($line.Trim())" }
+        # Live line capture: two background runspaces read stdout/stderr
+        # line by line into a concurrent queue; the loop below echoes each
+        # line AS IT ARRIVES while the y4m is pumped in asynchronously.
+        # (ReadToEndAsync buffered everything until WaitForExit — the whole
+        # step ran silent.) SCXvid-standalone emits NO parseable progress
+        # (verified against soyokaze/SCXvid-standalone scxvid.c: error lines
+        # only), so no percentages are fabricated here — long Windows
+        # keyframes runs need the stall-timeout guidance in Operations.md.
+        $lines = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $readers = @()
+        foreach ($stream in @($proc.StandardOutput, $proc.StandardError)) {
+            $rs = [powershell]::Create()
+            [void]$rs.AddScript({
+                param($reader, $queue)
+                try {
+                    while ($null -ne ($l = $reader.ReadLine())) { $queue.Enqueue($l) }
+                } catch { }
+            }).AddArgument($stream).AddArgument($lines)
+            $readers += ,@($rs, $rs.BeginInvoke())
         }
-        if ($proc.ExitCode -ne 0) { throw "SCXvid exited with code $($proc.ExitCode)" }
+        $src = [System.IO.File]::OpenRead($y4m)
+        $copyTask = $src.CopyToAsync($proc.StandardInput.BaseStream)
+        $stdinClosed = $false
+        try {
+            while ($true) {
+                $l = $null
+                while ($lines.TryDequeue([ref]$l)) {
+                    if ($l.Trim()) { Write-Output "[SCXvid] $($l.Trim())" }
+                }
+                if (-not $stdinClosed -and ($copyTask.IsCompleted -or $proc.HasExited)) {
+                    try { $proc.StandardInput.Close() } catch { }
+                    $stdinClosed = $true
+                }
+                if ($stdinClosed -and $proc.WaitForExit(100)) { break }
+                Start-Sleep -Milliseconds 50
+            }
+            # No-timeout WaitForExit flushes pending async output; then give
+            # the reader runspaces a bounded moment to hit EOF and drain.
+            $proc.WaitForExit()
+            foreach ($pair in $readers) {
+                if ($pair[1].AsyncWaitHandle.WaitOne(5000)) { [void]$pair[0].EndInvoke($pair[1]) }
+            }
+            $l = $null
+            while ($lines.TryDequeue([ref]$l)) {
+                if ($l.Trim()) { Write-Output "[SCXvid] $($l.Trim())" }
+            }
+            if ($proc.ExitCode -ne 0) {
+                # Drop any partial direct-write log so the fresh-skip never
+                # trusts a failed run's artifact on retry (bash parity).
+                try { if (Test-Path -LiteralPath $kf) { Remove-Item -LiteralPath $kf -Force } } catch { }
+                throw "SCXvid exited with code $($proc.ExitCode)"
+            }
+            if ($copyTask.IsFaulted) { throw "failed to feed y4m to SCXvid: $($copyTask.Exception.InnerException.Message)" }
+        } finally {
+            foreach ($pair in $readers) { $pair[0].Dispose() }
+            $src.Close()
+            if (-not $stdinClosed) { try { $proc.StandardInput.Close() } catch { } }
+        }
     } finally {
         try { if (Test-Path -LiteralPath $y4m) { Remove-Item -LiteralPath $y4m -Force } } catch { }
     }
-    if (-not (Test-Path -LiteralPath $kf)) { throw "SCXvid finished but $kf was not created" }
+    if (-not (Test-Path -LiteralPath $kf -PathType Leaf)) { throw "SCXvid finished but $kfFlat was not created" }
+    # Log content validity (bash parity): xvidcore writes the two header
+    # comment lines at plugin CREATE (plugin_2pass1.c), before any frame —
+    # a header-only log means ZERO frames processed, not a static clip
+    # (which still yields one b/p stats line per frame). Require at least
+    # one real frame-stats line; drop the invalid artifact so the
+    # fresh-skip never trusts it.
+    $hasFrameLine = $false
+    foreach ($line in @(Get-Content -LiteralPath $kf)) {
+        if ($line -match '^[ipbs](\s+[0-9]+){6}\s*$') { $hasFrameLine = $true; break }
+    }
+    if (-not $hasFrameLine) {
+        try { Remove-Item -LiteralPath $kf -Force } catch { }
+        throw "SCXvid finished but the keyframes log has no frame lines (zero frames processed): $kfFlat"
+    }
     Write-Output "ENCODE_STEP keyframes 100"
 }`,
 	}

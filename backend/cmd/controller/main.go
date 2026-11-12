@@ -21,6 +21,7 @@ import (
 	"github.com/badskater/encode-system/backend/internal/api"
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/oidc"
 	"github.com/badskater/encode-system/backend/internal/provision"
 	"github.com/badskater/encode-system/backend/internal/s3"
 	"github.com/badskater/encode-system/backend/internal/scanner"
@@ -67,6 +68,36 @@ func main() {
 		log = log.With("instance", instanceID)
 	}
 	slog.SetDefault(log)
+
+	// Native HTTPS (optional): ENCODE_TLS_CERT + ENCODE_TLS_KEY (PEM file
+	// paths) move the WHOLE server — API, /metrics, health, UI — to TLS
+	// (1.2 minimum). Exactly one set fails fast HERE, before any state is
+	// touched; neither keeps the plain-HTTP default byte-identical. Cert
+	// load errors (missing/unreadable/mismatched files) also fail fast with
+	// the offending paths. See Docs/md/Deployment.md §Native HTTPS.
+	tlsCfg, err := resolveTLSConfig(os.Getenv("ENCODE_TLS_CERT"), os.Getenv("ENCODE_TLS_KEY"), log)
+	if err != nil {
+		log.Error("tls config", "err", err)
+		os.Exit(1)
+	}
+
+	// Optional OIDC login (P10): ENCODE_OIDC_ISSUER + ENCODE_OIDC_CLIENT_ID
+	// + ENCODE_OIDC_CLIENT_SECRET + ENCODE_OIDC_REDIRECT_URL enable SSO next
+	// to local login. All unset = disabled (the default, zero behavior
+	// change); a partial set fails fast HERE, before any state is touched
+	// (same pattern as TLS above). The client secret is never logged.
+	oidcCfg, err := oidc.Resolve(
+		os.Getenv("ENCODE_OIDC_ISSUER"),
+		os.Getenv("ENCODE_OIDC_CLIENT_ID"),
+		os.Getenv("ENCODE_OIDC_CLIENT_SECRET"),
+		os.Getenv("ENCODE_OIDC_REDIRECT_URL"),
+		os.Getenv("ENCODE_OIDC_ADMIN_GROUP"),
+		os.Getenv("ENCODE_OIDC_GROUPS_CLAIM"),
+	)
+	if err != nil {
+		log.Error("oidc config", "err", err)
+		os.Exit(1)
+	}
 
 	// Management-plane admin account. Username defaults to "admin". The
 	// password comes from ENCODE_ADMIN_PASSWORD, but ONLY on the boot that
@@ -147,6 +178,7 @@ func main() {
 		GitHubRepo:          env("ENCODE_GITHUB_REPO", "badskater/encode-system"),
 		GitHubAPI:           env("ENCODE_GITHUB_API", "https://api.github.com"),
 		Version:             Version,
+		OIDC:                oidcCfg,
 	}
 
 	srv, err := api.New(st, up, log, cfg)
@@ -272,6 +304,25 @@ func main() {
 	// ctx as the scanner/digest loops so SIGTERM stops all of them cleanly.
 	srv.StartRetentionLoop(ctx)
 
+	// Stall watchdog: 30s pass that fails RUNNING jobs whose last progress
+	// (claim stamp / changed-step-or-progress heartbeats) is older than
+	// settings.StallTimeoutMinutes (0 = off, the default). Catches wedged
+	// encodes that keep heartbeating the same percentage — the gap between
+	// agent-side job timeouts and orphan recovery. Failures route through
+	// the normal failure path so flow retry policy applies. HA: wrapped in
+	// RunLoopSupervisor (LockKeyStallWatchdog) so only one replica fails
+	// stalled jobs. Bound to the same ctx so SIGTERM stops it cleanly.
+	srv.StartStallWatchdogLoop(ctx)
+
+	// Experimental download ingestion (P11, OFF by default): polls the
+	// configured BitTorrent client (qBittorrent first-class, ruTorrent
+	// best-effort) for completed downloads and stages their source video
+	// files into the scripts share. Filter scripts stay hand-authored —
+	// the scanner queues jobs once source + script are both present.
+	// HA: wrapped in RunLoopSupervisor (LockKeyIngest=1008) so only one
+	// replica polls. Bound to the same ctx so SIGTERM stops it cleanly.
+	srv.StartIngestLoop(ctx)
+
 	// DB backup scheduler: periodic snapshots under <dataDir>/backups (SQLite
 	// VACUUM INTO or PG logical dump), keeps the newest 24 scheduled ones;
 	// manual snapshots are never auto-pruned. Enabled/interval live-adjustable
@@ -288,6 +339,13 @@ func main() {
 		Enabled:  env("ENCODE_BACKUP_ENABLED", "false") == "true",
 		Every:    time.Duration(clampInt(envInt("ENCODE_BACKUP_EVERY_SECONDS", 21600), 3600, 86400)) * time.Second,
 	}
+	// Offsite backups (P4): after every successful snapshot — scheduled AND
+	// manual — copy it (plus the shares key, unless opted out) to each
+	// enabled destination in settings.backup_offsite and prune to keep_n.
+	// Upload failures are logged/audited/notified, never fail the local
+	// backup. The hook detaches its own goroutine, so this never blocks the
+	// scheduler tick or the manual-backup HTTP response.
+	srv.Backup.AfterSnapshot = srv.OffsiteAfterSnapshot
 	// On Postgres, open a second *sql.DB over the same DSN for the backup
 	// dump path (catalog + SELECT * per table). The store keeps its own
 	// private *sql.DB (no exported accessor), so the backup opens its own
@@ -337,9 +395,20 @@ func main() {
 	}()
 
 	log.Info("controller starting", "listen", *listen, "data", *dataDir,
-		"scripts_root", cfg.ScriptsRoot, "scan_interval_s", cfg.ScanIntervalSeconds)
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("http server", "err", err)
+		"scripts_root", cfg.ScriptsRoot, "scan_interval_s", cfg.ScanIntervalSeconds,
+		"tls", tlsCfg != nil)
+	// One server, one port: with TLS configured the SAME mux (API, metrics,
+	// health, SPA) is served over HTTPS. Empty cert/key file names are valid
+	// here because the keypair is already loaded into TLSConfig.
+	var serveErr error
+	if tlsCfg != nil {
+		httpSrv.TLSConfig = tlsCfg
+		serveErr = httpSrv.ListenAndServeTLS("", "")
+	} else {
+		serveErr = httpSrv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Error("http server", "err", serveErr)
 		os.Exit(1)
 	}
 	log.Info("controller stopped")

@@ -46,17 +46,23 @@ func TestHealthEndpointIncludesInstance(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
-	var got map[string]string
+	// map[string]any: health carries a boolean (oidc_enabled, P10) alongside
+	// the string fields — the assertions below are unchanged.
+	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("unmarshal: %v (%s)", err, body)
 	}
 	// Additive: status stays "ok" (legacy contract).
 	if got["status"] != "ok" {
-		t.Errorf("status = %q, want \"ok\" (must stay additive)", got["status"])
+		t.Errorf("status = %v, want \"ok\" (must stay additive)", got["status"])
 	}
 	// New field: instance identifies this replica.
 	if got["instance"] != wantInstance {
-		t.Errorf("instance = %q, want %q", got["instance"], wantInstance)
+		t.Errorf("instance = %v, want %q", got["instance"], wantInstance)
+	}
+	// P10: OIDC disabled by default — the flag must be present and false.
+	if got["oidc_enabled"] != false {
+		t.Errorf("oidc_enabled = %v, want false on a local-only install", got["oidc_enabled"])
 	}
 	// The legacy TestHealthEndpoint asserts the body CONTAINS "ok" — a
 	// substring check. Confirm that still holds.

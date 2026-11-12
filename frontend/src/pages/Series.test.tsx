@@ -2,6 +2,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import SeriesPage from './Series';
 import { api } from '../api/client';
+import { RoleContext } from '../hooks/useRole';
 import type { Series } from '../types';
 
 // usePolling resolves fn() immediately on mount; mocking the api methods is
@@ -379,5 +380,75 @@ describe('Series page webhook channel cell', () => {
     fireEvent.change(input2, { target: { value: 'http://evil.example/hook' } });
     fireEvent.keyDown(input2, { key: 'Enter', code: 'Enter' });
     expect(patchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Series page delete action', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows a Delete action for admins and opens the confirm dialog with counts', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ jobs: 24, episodes_done: 12, episodes_total: 24 }),
+    ]);
+    mockEmpty();
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Show A' }));
+    // The confirm dialog shows the series' progress counts.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByText('12/24 episodes encoded')).toBeInTheDocument();
+    expect(screen.getByText(/jobs, history and files on the shares are kept/i)).toBeInTheDocument();
+  });
+
+  it('hides the Delete action (and Actions column) for viewers', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    render(
+      <RoleContext.Provider value="viewer">
+        <SeriesPage />
+      </RoleContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /delete/i })).not.toBeInTheDocument();
+    expect(screen.queryByText('Actions')).not.toBeInTheDocument();
+  });
+
+  it('confirm calls DELETE and refreshes the list; cancel does not', async () => {
+    const listSpy = vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    const deleteSpy = vi.spyOn(api, 'deleteSeries').mockResolvedValue(undefined);
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+
+    // Cancel path: dialog closes, no API call.
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Show A' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    // Confirm path: DELETE fires with the series id, dialog closes and the
+    // list is re-fetched.
+    const callsBefore = listSpy.mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Show A' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete series' }));
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith(1));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await waitFor(() => expect(listSpy.mock.calls.length).toBeGreaterThan(callsBefore));
+  });
+
+  it('surfaces a delete failure in the dialog', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    vi.spyOn(api, 'deleteSeries').mockRejectedValue(new Error('admin role required'));
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Show A' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete series' }));
+    await waitFor(() => expect(screen.getByText('admin role required')).toBeInTheDocument());
+    // Dialog stays open so the operator sees the failure.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 });

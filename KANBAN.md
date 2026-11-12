@@ -12,6 +12,174 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
+- P12 release prep (v1.23.0): docs sync + GOOS=windows `internal/flow` build
+  fix + DeleteShare RowsAffected idiom landed; remaining: chunked full-diff
+  review, squash PR #49 → main, tag v1.23.0, release-asset verification.
+- P13 farm rollout: the farm controller (172.24.92.232) STAYS ON v1.19.3
+  until P13 — upgrade to v1.23.0 + SQLite→Postgres cutover (validated
+  runbook in the fleet-ops skill) + native TLS cutover are one scheduled
+  operation, not yet executed.
+
+## Release v1.23.0 (pending tag)
+
+- Scope: the resilience batch P1–P11 below — job/step timeouts + stall
+  watchdog, opt-in observability assets, notification channels (webhook /
+  ntfy / email), offsite backups (S3 + SFTP), quality_gate (VMAF/SSIM),
+  default-subs extraction flow, Linux keyframes (vapoursynth-scxvid),
+  series delete, native controller HTTPS, optional OIDC login, experimental
+  download ingestion. 21 builtins, 4 factory flows, 11 Prometheus metrics.
+- Delivery: branch `feat/resilience-batch` → PR #49 → squash-merge after
+  CI green + full-diff review → tag v1.23.0 → release workflow builds
+  controller + windows/linux agents + pgimport + encodectl + SPA + deploy
+  bundle + GHCR image.
+- Farm note: production (232) runs v1.19.3 on the release pipeline
+  (docker-compose.runtime.yml, SQLite). It is NOT upgraded by this release
+  entry — the upgrade + PG cutover + TLS is P13, operator-scheduled.
+- Gates at prep time: gofmt clean, go vet, full `go test ./... -count=1`
+  (1,095 backend tests), PG store+api+pgimport suites green on a scratch
+  16.4 cluster, linux controller + windows agent builds, and
+  `GOOS=windows go build ./...` (new gate — the internal/flow cross-build
+  had been broken since 2abcaa6; fixed by making the bash dialect
+  Linux-only by build tag, matching the agent-never-imports-flow design).
+  Frontend: 311 vitest tests / 25 files, lint/tsc/build green.
+
+## Done (Resilience batch P1–P11, 2026-11)
+
+- **P1 — job/step timeouts + stall watchdog** (09e8efc, spec fix ea2589a,
+  quality fixes 3ca0a5b): flows carry `job_timeout_minutes` (options_json)
+  + per-step `timeout_minutes` (steps_json), validated 0–10080 on create,
+  PUT AND import; agent payload adds `job_timeout_minutes` +
+  `step_timeouts:[{index,step,timeout_minutes}]`. Agent watchdog kills the
+  process tree on expiry (Linux process-group SIGKILL / Windows
+  `taskkill /T /F`, 3×200ms kill retry; timeout reason wins over a late
+  exit 0); step deadlines re-arm per step INSTANCE (name change or ≥50-pt
+  progress reset), clamped to the job deadline; S3 staging runs under the
+  job deadline. Controller: `settings.stall_timeout_minutes` (0=off),
+  `jobs.last_progress_at` touched only on CHANGED step/progress,
+  `StartStallWatchdogLoop` 30s tick under advisory lock 1007, guarded
+  `FailStalledJob` (never overwrites a concurrently-completed job) →
+  retry policy + audit `job.stalled` + notify; online nodes get a
+  `cancel_job_ids` heartbeat instruction so the agent kills + deregisters
+  the wedged run (single-node retry dedupe fix). Metric
+  `encode_jobs_stalled_total` (DB-derived, undercounts retry-to-success).
+- **P2 — opt-in observability assets** (633e826): `docker/observability/`
+  (Prometheus scrape snippet, 5 alert rules, Alertmanager→Discord example,
+  Alloy JSON-log enrichment, wiring README) + cross-links from
+  `docker/grafana/`. Self-contained and opt-in by user directive — the
+  shared network-wide onprem-observability stack is NOT touched.
+- **P3 — notification channels** (76cbd18, hardening 8f2fed8):
+  `notify.Channel` + parallel `Fanout` (panic-contained); generic webhook
+  (JSON `job_finished`/`alert` events), ntfy (Title/Priority headers,
+  optional Bearer), email (bounded net/smtp, STARTTLS). Settings:
+  `generic_webhook_url`, `ntfy_topic_url`/`ntfy_token`,
+  `smtp_host/port/user/from/to/password` — secrets WRITE-ONLY, AES-GCM
+  with the shares key (shares pattern, not the plain Discord webhook).
+  Skip rules (mute/digest/silent-auto-retry) above the fan-out; node-alert
+  gate = any configured channel. Hardening: cipher-init mutex + O_EXCL key
+  creation, RedactURL at every channel log site, fail-closed settings PUT
+  on unreadable stored row, non-admin GET masks URL query secrets,
+  sanitizeHeader + control-char series validation.
+- **P4 — offsite backups S3 + SFTP** (d7c3826, hardening ef452b0):
+  `settings.backup_offsite` (s3 reusing internal/s3; sftp via pkg/sftp over
+  x/crypto/ssh). AfterSnapshot hook on scheduled AND manual snapshots,
+  10-min detached bound covering destination construction, panic
+  recover, audit `backup.offsite`/`backup.offsite_failed` + channel alert.
+  Snapshot + `.shares-key` companion (include_shares_key default true),
+  `keep_n` retention (0=default 30, 1–365) pruned companion-first by UTC
+  name order, never the just-uploaded generation, foreign objects
+  untouched. SFTP host-key pinning REQUIRED (ssh.FixedHostKey), temp
+  `.partial-<hex>` + Chmod 0600 + PosixRename, unreadable shares key fails
+  the run. Secrets write-only + encrypted; PG restore invalidates the
+  cached cipher (key swap picked up without restart).
+- **P5 — quality_gate builtin** (b8d0387, hardening 70422e1): sampled
+  VMAF (libvmaf JSON) with loud SSIM fallback, params
+  metric/threshold/sampling (defaults 90 VMAF / 0.95 SSIM / every 12th
+  frame), `scale2ref` operand-order contract pinned, quality.json +
+  ENCODE_METRIC quality_score/quality_metric (numeric). Seeded after
+  verify_output in NEW default flows only (name-guarded). Hardening:
+  fail-closed score validation both dialects (NaN/Infinity/out-of-range),
+  file-IDENTITY self-compare guard (symlink+hardlink), ffprobe frame-count
+  pre-check, param trim/leading-zero parity, HA seed-race tolerance.
+- **P6 — subtitle/font/chapter extraction + mux_extras** (b7a6cc2,
+  security fixes 8b3595f): four new builtins (PS + bash), seeded as the
+  SEPARATE `default-subs` flow (fresh installs only, never the default
+  flag; operator queues it after encode). Artifacts: subs_<id>_<lang>.<ext>
+  + subs.json, fonts/<id>_<name> + fonts.json, chapters.xml; manifests
+  always rewritten. mux_extras: output param → release name → newest
+  non-source MKV (identity-guarded), strip-flags idempotency, unique
+  `.mux_extras.<pid>.<rand>.tmp.mkv` + per-episode lock (flock /
+  FileShare.None interop). Security batch: PS 5.1 legacy-arg MSVCRT
+  pre-escaping in EncodeLib Invoke-Tool (mkvmerge flag-injection fix,
+  winsim.py oracle + live Legacy proof), manifest array-type gates +
+  path containment, C0/DEL sanitization + 200-char caps, line-anchored
+  agent marker regexes, NUL-safe bash discovery, single-pass jq.
+- **P7 — Linux keyframes via vapoursynth-scxvid** (45594db, hardening
+  3a4ed78): the bash refusal is lifted — `.vpy` + vspipe, release MKV →
+  640x360 YUV420P8, `use_slices=True`; the xvid first-pass log IS the
+  Keyframes.txt artifact on both platforms (parity by construction,
+  verified upstream). Hardening: guarded publish (errexit-dead StepCall
+  wrapper audit), live progress streaming both dialects (Windows SCXvid
+  prints nothing parseable — documented stall-watchdog guidance), log
+  frame-line validity, PIP_BREAK_SYSTEM_PACKAGES + Python≥3.12 preflight,
+  validateSeriesName at job create. Detailed card below.
+- **P8 — series delete, history-preserving** (493021f, micro-fix b073d04):
+  `DELETE /api/series/{id}` admin, registry row ONLY (jobs.series is
+  denormalized TEXT — history/stats/files survive), audit `series.delete`,
+  204/404/403; UI confirm dialog with progress counts. Scanner interaction
+  pinned: ready-episode folders re-register next scan; scaffold-only stays
+  deleted. Bonus fix: UpsertSeriesByName `INSERT OR IGNORE` → `ON CONFLICT
+  DO NOTHING` (scanner registration was silently broken on EVERY PG scan).
+  Micro-fix: concurrent-delete 404 mapping (series + share), DeleteSeries
+  RowsAffected idiom, runbook override/mute detail.
+- **P9 — native controller HTTPS** (3c83729, runbook fix c42879d, quality
+  fixes 62b1194): `ENCODE_TLS_CERT`+`ENCODE_TLS_KEY` → ListenAndServeTLS on
+  the same mux (API/UI/metrics/health), TLS 1.2 floor, partial config
+  fail-fast before store open, neither = plain HTTP byte-identical. Agent
+  `ENCODE_AGENT_CA_CERT` appends to the system pool on the ONE shared
+  client (pair/heartbeat/complete + all downloads); no InsecureSkipVerify.
+  Compose passthrough + env-gated healthchecks in all 3 composes;
+  install.sh https probe; install-agent.sh ca-cert drop-in;
+  install-agent.ps1 -CaCert machine env. Runbook: Deployment §Native HTTPS
+  (openssl CA recipe, chown 100:101 — gid verified from the shipped image)
+  + Operations §Native TLS runbook. Quality batch: TLS-1.1 test
+  non-vacuity, rollback healthcheck texts, ENCODE_TRAEFIK_SCHEME for HA,
+  CA-path %-blocklist, leaf-anchor + cert-validity warnings.
+- **P10 — optional OIDC login** (893de0e, hardening c001d02): env-gated
+  SSO, OFF by default, NOT deployed. Four core vars
+  ENCODE_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET/REDIRECT_URL (partial =
+  fail-fast) + optional ADMIN_GROUP/GROUPS_CLAIM. internal/oidc: lazy
+  discovery, authorization-code + state + nonce + PKCE S256, single-use
+  flow state (10-min TTL, 1024 cap), deterministic username derivation
+  (preferred_username → email → sub; ASCII-only sanitize; 56-char +
+  7-hex sub-hash truncation — distinct subjects never merge), viewer
+  default / admin iff group, bidirectional role sync ONLY when AdminGroup
+  configured, passwordless provisioned accounts. Hardening: browser-binding
+  encode_oidc_flow cookie (login CSRF), sanitized error summaries (no IdP
+  bodies), bounded token exchange (ClientContext), separate login throttle,
+  nil-guard re-read. Session token via /#oidc fragment; SSO button gated on
+  /api/health oidc_enabled. Deps: go-oidc/v3 + x/oauth2 + go-jose/v4.
+- **P11 — experimental download ingestion** (69f7884, protocol fix 34822f0,
+  pgimport order 1b2580a, CI-flake fix 1eb2d0a, hardening c91e401):
+  `settings.ingest` (qbittorrent|rutorrent, off by default, EXPERIMENTAL).
+  internal/ingest: bounded clients (30s), qBit WebAPI v2 (both protocol
+  generations: 4.x–5.1 200+"Ok." / ≥5.2 204+401, re-login once on 401|403)
+  + ruTorrent httprpc (Basic auth, d.get_complete). Conservative parser
+  (S01E01/01x01/anime-dash/bare-number; refuses multi-season/packs/years/
+  resolutions/traversal; 1024-rune cap, single-pass bracket strip).
+  Staging: download_root flat-layout mount requirement, temp+rename,
+  symlink-escape containment re-verified AFTER open (/proc/self/fd /
+  GetFinalPathNameByHandle), samples excluded, multi-CD parent-prefix
+  names, single-file torrents from the save root. Dedupe: ingest_ledger
+  (provider,torrent_hash) UNIQUE, written only on full success;
+  zero-file collision → ledger + ingest.duplicate audit, no alert.
+  RunLoopSupervisor lock 1008, per-poll cap 500, 1h skip-log cooldown,
+  audit ingest.staged + channel alert. CI fixes: ingest_ledger added to
+  pgimport importOrder; TestMigratePGFresh isolated to its own database.
+- Verification pattern (every phase): TDD fix batches RED→GREEN, full
+  uncached gates + cross-builds, PG store/api (+pgimport from P11 on) on
+  scratch 16.4 clusters, real-pwsh/ffmpeg e2e where applicable, spec +
+  adversarial quality review with parent-verified findings. Frontend grew
+  254 → 311 tests across the batch.
 
 ## Done (Linux keyframes via vapoursynth-scxvid, 2026-11-12)
 

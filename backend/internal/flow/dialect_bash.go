@@ -1,4 +1,14 @@
+//go:build linux
+
 // Package flow: BashDialect.
+//
+// LINUX-ONLY BY DESIGN: the bash built-in step sources live in the
+// *_linux.go files (builtin_steps_linux.go and friends), and bash
+// rendering only ever happens on the Linux-built controller — the
+// Windows build of this module exists for the agent, which executes
+// rendered scripts and never imports flow. DialectForPlatform is split
+// per platform (dialect_linux.go / dialect_other.go) so non-Linux builds
+// compile without the bash sources.
 //
 // BashDialect implements Dialect for Linux nodes. The design goal is
 // injection-safety parity with PowerShellDialect: every interpolated

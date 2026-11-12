@@ -50,10 +50,10 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 ### Controller (`backend/cmd/controller`)
 
 - **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
-- **Queue** persists jobs in SQLite. Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
+- **Queue** persists jobs in SQLite (default) or Postgres (`ENCODE_DATABASE_URL`; see the dialect layer below). Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained script — PowerShell (`.ps1`) for Windows nodes or bash (`.sh`) for Linux nodes, selected at dispatch time via `DialectForPlatform(node.Platform)`. PowerShell scripts call functions from `EncodeLib.ps1` (dot-sourced by the preamble); bash scripts are self-contained (the shared `find_source_file` helper is emitted into every render). For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
-- **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel/delete/set-priority/set-flow, single-job delete, prune, SSE log stream), flows (incl. duplicate), step templates, series, shares, scanner config, scan-now trigger, settings, stats, metrics, audit log, API tokens, DB backups (incl. restore), updates (agent/lib/bin + rollback + GitHub release check), user CRUD. Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle). Two roles: **admin** (full access) and **viewer** (read-only — sees all monitoring surfaces, no mutations); read routes use `withAnyUser`, mutations and management surfaces stay `withAdmin`. **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session (read-scope maps to viewer-equivalent, restricted to GET/HEAD). A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA, unauthenticated).
+- **UI API** under `/api/*` for the SPA: nodes, jobs (incl. bulk retry/cancel/delete/set-priority/set-flow, single-job delete, prune, SSE log stream), flows (incl. duplicate), step templates, series, shares, scanner config, scan-now trigger, settings, stats, metrics, audit log, API tokens, DB backups (incl. restore), updates (agent/lib/bin + rollback + GitHub release check), user CRUD. Management-plane auth is a normal username/password login (`POST /api/auth/login` issues session tokens; bcrypt-hashed passwords; sliding 24h expiry; logout revokes; 5-failure throttle), plus **optional OIDC SSO** when enabled via env (off by default; see the OIDC subsystem below — same sessions, same roles). Two roles: **admin** (full access) and **viewer** (read-only — sees all monitoring surfaces, no mutations); read routes use `withAnyUser`, mutations and management surfaces stay `withAdmin`. **Scoped API tokens** (`/api/tokens`, scopes `admin`/`read`, hashed at rest) give external automation the same API without a session (read-scope maps to viewer-equivalent, restricted to GET/HEAD). A Prometheus endpoint is served at `GET /metrics` (mounted outside the SPA, unauthenticated).
 
 ### Store: dialect layer (SQLite default, Postgres optional)
 
@@ -111,8 +111,12 @@ remains the default). The HA facts:
 
 - **Advisory-lock singleton loops.** Background loops that must run exactly
   once across the fleet (scanner, retention prune, digest flush, backup
-  scheduler, node-status alert) take a Postgres advisory lock (`pg_try_advisory_lock`) before each
-  iteration. On SQLite this is a no-op (always-locked) because there is only
+  scheduler, node-status alert, stall watchdog, download ingestion) take a
+  Postgres advisory lock (`pg_try_advisory_lock`) before each
+  iteration. Lock keys: scanner 1001, retention 1002, digest 1003,
+  disk-alert 1004 (reserved), backup 1005, node-alert 1006, stall watchdog
+  1007, ingest 1008 (`internal/store/leader.go`). On SQLite this is a no-op
+  (always-locked) because there is only
   ever one writer; on PG only the replica holding the lock runs the loop,
   the other skips. A replica killed mid-loop releases its advisory lock on
   connection close, and the other replica's loop acquires it on its next
@@ -205,13 +209,13 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
   (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
   render error; `Write-Output` is the one translated cmdlet (→ `echo`).
-- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 19
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 20
   of 21 built-in templates carry bash-native sources
   (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
   `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
   `encode_4k`, `mux`, `verify_output`, `quality_gate`, `subtitle_extract`,
   `font_extract`, `chapter_extract`, `mux_extras`, `crc32_rename`,
-  `release_copy`, `discord_notify`. Tool mappings: `vspipe -c y4m | x265`
+  `release_copy`, `keyframes`, `discord_notify`. Tool mappings: `vspipe -c y4m | x265`
   (video, args mirrored verbatim from the PS template — ffmpeg never
   video-encodes), `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac`
   (audio), `ffmpeg` libvmaf/ssim comparison (`quality_gate` — measurement,
@@ -232,7 +236,8 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   mirrors its `num_slices = num_threads`). Requires `pip install
   vapoursynth-scxvid` (provisioned by the linux-node ansible role).
 
-- **Built-in templates** (seeded at boot, editable, not deletable):
+- **Built-in templates** (**21**, seeded at boot, editable, not deletable —
+  `flow.BuiltinStepTemplates()`):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
   `verify_output`, `quality_gate`, `subtitle_extract`, `font_extract`,
@@ -389,7 +394,24 @@ Any number of flows can be saved; exactly one carries `is_default`
 (atomic swap). Resolution order for new jobs: series flow → default flow →
 configured default name. Flows export/import as JSON; the export embeds any
 custom step templates the flow uses (built-ins resolve at the destination),
-and import refuses flows referencing unknown templates.
+and import refuses flows referencing unknown templates. Import runs the
+same timeout validation as create/PUT (`job_timeout_minutes` and per-step
+`timeout_minutes`, 0–10080).
+
+**Four factory flows** seed name-guarded on first boot (`seedDefaultFlow`
+in `internal/api/server.go`; an existing flow — factory or user-edited —
+is never touched, and the operator's default-flag choice survives
+restarts; HA boot races tolerate the UNIQUE violation):
+
+| Flow | Steps | Pipeline |
+| --- | --- | --- |
+| `default-1080` | 9 | source_rename → dgindex → audio → encode → mux → verify_output → quality_gate → release_copy → keyframes |
+| `default-4k` | 10 | source_rename → dgindex → hdr_probe → audio_lang → encode_4k → mux → verify_output → quality_gate → release_copy → keyframes |
+| `default-4k-cpu` | 9 | the 4K chain without dgindex (CPU source filter in the `.avs`/`.vpy` instead of a GPU `.dgi` index) |
+| `default-subs` | 4 | subtitle_extract → font_extract → chapter_extract → mux_extras — a SEPARATE post-encode job, never the default flag |
+
+`quality_gate` is seeded into NEW installs' encode defaults only; existing
+fleets add it manually from the step palette.
 
 ## Contracts
 
@@ -401,6 +423,7 @@ and import refuses flows referencing unknown templates.
 {
   "node": "enc-01",
   "agent_version": "0.3.0",
+  "platform": "windows",
   "tasks_since_boot": 4,
   "job_id": "j_018",
   "job_status": "running",
@@ -415,7 +438,11 @@ and import refuses flows referencing unknown templates.
 }
 ```
 
-`metrics` is optional (old agents omit it). GPU fields are `-1` when the node
+`platform` (`"windows"`/`"linux"`, from `runtime.GOOS`) selects the script
+dialect at dispatch; an absent field (old agent) keeps the prior stored
+value. Concurrency-capable agents report every in-flight job in a `jobs`
+array (the legacy single-job fields above stay populated for the first job
+so old controllers keep working). `metrics` is optional (old agents omit it). GPU fields are `-1` when the node
 has no GPU / `nvidia-smi` is absent; `encode_fps` is parsed live from the
 current job's `run.log` tail (x265/ffmpeg fps lines), `0` when idle.
 Collection is best-effort with a bounded timeout budget — a metrics failure
@@ -426,12 +453,25 @@ Response:
 ```json
 {
   "instruction": "job|jobs|reboot|update|cancel|none",
-  "job": { "id": "j_019", "script": "<rendered ps1>", "vars": { }, "flow": "default-1080" },
+  "job": {
+    "id": "j_019", "script": "<rendered ps1>", "vars": { }, "flow": "default-1080",
+    "job_timeout_minutes": 240,
+    "step_timeouts": [ { "index": 3, "step": "encode", "timeout_minutes": 180 } ]
+  },
   "reboot": { "delay_seconds": 30 },
   "update": { "agent_version": "0.4.0", "agent_sha256": "...", "lib_version": 3, "lib_sha256": "..." },
   "cancel_job_ids": [42]
 }
 ```
+
+Job-payload timeout fields (`model.JobPayload`, additive — old agents
+ignore them): `job_timeout_minutes` bounds the whole job on the agent
+(0/absent = no limit; S3 staging included); `step_timeouts` carries one
+`{index, step, timeout_minutes}` entry per limited step (`step` = the
+`ENCODE_STEP` marker name; `index` is diagnostic — the agent keys
+enforcement on the marker name). `cancel_job_ids` lists jobs the
+controller already finalized server-side (stall watchdog) whose process
+trees the agent must kill and deregister without a completion report.
 
 ### Job completion
 
@@ -592,9 +632,15 @@ controller re-caps `log_full` at 1 MiB defensively.
   flow (≥2 samples) minus elapsed, never negative, `-1` = no estimate; the
   UI blends it with reported progress.
 - **Prometheus `/metrics`** — mounted outside the SPA at `GET /metrics`
-  (unauthenticated, LAN scrape): `encode_jobs_pending/assigned/running`,
-  `encode_jobs_done_total/failed_total/cancelled_total`,
+  (unauthenticated, LAN scrape), **11 series**:
+  `encode_jobs_pending/assigned/running`,
+  `encode_jobs_done_total/failed_total/cancelled_total/stalled_total`,
   `encode_node_online/enabled/active_jobs/max_concurrent_jobs` per node.
+  `encode_jobs_stalled_total` is DB-derived (COUNT of failed rows with a
+  `stalled:` error prefix — HA-consistent, no per-replica counter) and
+  undercounts stalls that auto-retried to success. The Grafana dashboard
+  (`docker/grafana/`) panels 10 of the 11; the stall counter is
+  scrape-ready but not yet panelled.
 - **Audit log** — mutating admin actions write an audit row (actor = session
   username or `api-token:<name>`, action like `settings.update`, object like
   `node:3`, small JSON detail — never secrets). `GET /api/audit?limit=N`;
@@ -736,6 +782,141 @@ controller re-caps `log_full` at 1 MiB defensively.
   stderr), 2 usage. Built as `encodectl-linux-amd64` (version ldflags) and
   shipped in the release assets + deploy tarball.
 
+## Resilience-batch subsystems (2026-11)
+
+### Notification channels (`internal/notify`)
+
+Discord stays the default transport; three additive channels ship
+off-by-default behind a `notify.Channel` interface and a parallel `Fanout`
+dispatcher (panic-contained — one channel's failure or timeout is logged
+and never blocks the others). `BuildChannels` constructs the configured
+set from the live settings row on every alert, so Settings-page edits
+apply without a restart:
+
+- **Generic webhook** (`generic_webhook_url`) — JSON POST per event:
+  `job_finished` (job facts + timestamp + deep link) or `alert`
+  (operational messages: node status, disk, digest summaries).
+- **ntfy** (`ntfy_topic_url`, optional write-only `ntfy_token`) — topic
+  POST with `Title`/`Priority` headers (failed/alert = 4, done/digest = 3).
+- **Email** (`smtp_host`/`smtp_port`/`smtp_user`/`smtp_from`/`smtp_to`,
+  write-only `smtp_password`) — plain-text mail through a BOUNDED
+  `net/smtp` exchange (10s timeout; `smtp.SendMail` has none and runs
+  inside heartbeat/complete handlers). Port 0 → 587; STARTTLS when
+  offered; host+from+to together enable the channel.
+
+The skip rules (per-series mute, digest buffering, silent auto-retry)
+live ABOVE the fan-out, so every channel inherits them; the node-alert
+loop fires when ANY channel is configured (`notify.AnyConfigured`).
+Secrets follow the storage-shares pattern (`json:"-"` on the model,
+`has_*` flags on GET, AES-GCM at rest with the shares key, blank-on-PUT
+keeps the stored value); non-admin GETs mask credential-bearing query
+values in channel URLs, and every channel error log renders URLs through
+`notify.RedactURL` (including URLs embedded in transport-error strings).
+Operator details: Operations.md § Notification channels.
+
+### Optional OIDC login (`internal/oidc`)
+
+Env-gated SSO, **OFF by default and not deployed on the reference farm**.
+All four core vars (`ENCODE_OIDC_ISSUER`, `ENCODE_OIDC_CLIENT_ID`,
+`ENCODE_OIDC_CLIENT_SECRET`, `ENCODE_OIDC_REDIRECT_URL`) together enable
+it; a partial set fail-fasts at startup BEFORE the store opens (the TLS
+pattern); all unset = no routes registered, byte-identical local-only
+behavior. Optional `ENCODE_OIDC_ADMIN_GROUP` + `ENCODE_OIDC_GROUPS_CLAIM`
+(default `groups`) map IdP groups to the admin role.
+
+- **Flow**: authorization-code + single-use state (10-min TTL, 1024 cap)
+  + nonce (constant-time compare — go-oidc does not check it) + PKCE
+  S256, bound to the browser by an `encode_oidc_flow` cookie (HttpOnly,
+  SameSite=Lax, Secure-on-TLS; hash-only server-side) against login CSRF.
+  Discovery is LAZY (controller boots with the IdP down; first login 503s,
+  failures never cached); every outbound exchange is bounded (15s).
+- **Provisioning**: deterministic username derivation
+  (`preferred_username` → email local part → `sub`; ASCII-only sanitize,
+  `[a-z0-9._-]`, 64 cap with a 56-char + 7-hex SHA-256-of-raw-sub suffix so
+  distinct subjects never merge). New accounts: viewer, or admin iff the
+  configured group is in the claim; existing accounts sync roles BOTH
+  directions only when an admin group is configured (no silent demotion
+  otherwise). Provisioned accounts have an empty password hash (local
+  login always 401 until an admin sets one). Sessions are ordinary
+  controller sessions; audit `auth.oidc_login`.
+- **SPA integration**: the session token arrives in the URL fragment
+  (`/#oidc=…`, consumed and stripped once); the SSO button is gated on the
+  unauthenticated `/api/health` `oidc_enabled` flag. HA limitation:
+  pending flows are per-replica memory → the callback needs sticky
+  sessions (like the SSE log hub). Deps: go-oidc/v3 + x/oauth2 +
+  go-jose/v4. Setup/role-mapping/security: Deployment.md §Optional OIDC
+  login; diagnosis: Operations.md §OIDC login.
+
+### Download ingestion (`internal/ingest`, experimental)
+
+**OFF by default, EXPERIMENTAL.** The controller polls a BitTorrent
+client for COMPLETED downloads and stages their source video files into
+the scripts share (`settings.ingest`: `enabled`, `provider`
+qbittorrent|rutorrent, `url`, `username`, write-only `password`,
+`category`, `category_map` JSON, `poll_interval_seconds` 0=default 60s
+(10–3600), `download_root`). It never writes filter scripts and never
+creates jobs — an operator authors the `.avs`/`.vpy`, then the scanner
+queues the episode as usual.
+
+- **Clients**: bounded (30s timeout, no `http.DefaultClient`).
+  qBittorrent WebAPI v2 (cookie login; BOTH protocol generations —
+  4.x–5.1 `200 "Ok."`/`"Fails."`, ≥5.2 `204` success / `401` bad creds;
+  one automatic re-login on 401|403) and ruTorrent httprpc (Basic auth,
+  `mode=list` + appended `d.get_complete`, label = `d.custom1`).
+- **Parser**: conservative release-name parsing (S01E01 / 01x01 /
+  anime-dash / bare number); multi-season, packs, years, resolutions and
+  traversal are REFUSED, never guessed; 1024-rune cap + single-pass
+  bracket strip. The category map overrides the series only.
+- **Staging**: `download_root/<basename(client save path)>` — a documented
+  FLAT-layout mount requirement (per-category subfolders are not
+  resolved); video extensions only; temp+rename per file; symlink-escape
+  containment re-verified AFTER opening each file against the opened
+  handle's final path (`/proc/self/fd` on Linux,
+  `GetFinalPathNameByHandle` on Windows); samples excluded; multi-CD
+  files keep parent-dir-prefixed names; existing files skipped;
+  partial-failure cleanup (the ledger is written only on full success,
+  so re-polls resume safely).
+- **Dedupe + loop**: `ingest_ledger` table (`provider,torrent_hash`
+  UNIQUE, `ON CONFLICT DO NOTHING`); `RunLoopSupervisor` advisory lock
+  1008 (leader-only on HA); per-poll cap 500 torrents; per-hash 1h
+  skip-log cooldown; audit `ingest.staged` / `ingest.duplicate` +
+  a channel alert reminding the operator to author the script.
+  Settings secrets follow the shares pattern; client URLs with embedded
+  userinfo are rejected and every error log is URL-redacted.
+  Operator details: Operations.md §Download ingestion; mount wiring:
+  Deployment.md §Download ingestion.
+
+### Settings (live single-row JSON blob)
+
+`GET|PUT /api/settings` — one row, no per-field migrations; new fields
+are additive. Field groups (json tags, `internal/model/model.go`):
+
+- **Paths & naming**: `controller_url`, `scripts_root`, `release_root`,
+  `node_bin_dir`/`node_scripts_dir`/`node_release_dir` (Windows render
+  paths), `linux_bin_dir`/`linux_scripts_dir`/`linux_release_dir` (Linux
+  overrides; empty = fall back to the Windows values), legacy
+  `nfs_server`/`scripts_share`/`release_share`, `group`, `tag`.
+- **Scanner & fleet**: `scan_interval_seconds`, `tasks_before_reboot`,
+  `drain_mode`, `disk_alert_gb`, `job_retention_days`.
+- **Notifications**: `discord_webhook` (plain round-trip),
+  `generic_webhook_url`, `ntfy_topic_url`, `smtp_host`/`smtp_port`/
+  `smtp_user`/`smtp_from`/`smtp_to`, `notify_digest`,
+  `notify_node_status`.
+- **Resilience**: `stall_timeout_minutes` (0 = off; validated 0–10080).
+- **Offsite backups**: `backup_offsite` block (`s3`, `sftp`, `keep_n`,
+  `include_shares_key` — see the store section above).
+- **Ingestion**: `ingest` block (experimental, above).
+
+Secrets (`ntfy_token`, `smtp_password`, the offsite destination
+credentials, the ingest password) are `json:"-"` on the model with
+`has_*` presence flags on GET, AES-GCM encrypted inside the settings blob
+with the shares key, blank-on-PUT keeps the stored value, and an omitted
+nested block keeps the stored block wholesale. A PUT that cannot decrypt
+the stored row FAILS CLOSED (500, restore-the-shares-key message) rather
+than wiping secrets. Non-admin GETs mask credential-bearing query values
+and the offsite S3 access key. Env vars seed defaults only; the stored
+row wins afterwards.
+
 ## Runtime flows
 
 1. User drops `Ep 05/` with `src.m2ts` + `1080.vpy` into `scripts/<Series>/` (or uploads the same keys to an S3 scripts bucket).
@@ -756,7 +937,7 @@ controller re-caps `log_full` at 1 MiB defensively.
 
 ## Security and observability
 
-- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). Management plane: session tokens issued at login, stored SHA-256-hashed at rest, sliding 24h expiry; scoped API tokens (`admin`/`read`) hashed at rest for automation. TLS optional behind reverse proxy.
+- Agent tokens: random per-node tokens issued at node registration, stored hashed (SHA-256, constant-time verify). Management plane: session tokens issued at login, stored SHA-256-hashed at rest, sliding 24h expiry; scoped API tokens (`admin`/`read`) hashed at rest for automation. **Native TLS**: `ENCODE_TLS_CERT` + `ENCODE_TLS_KEY` (PEM paths) serve the WHOLE mux (API/UI/metrics/health) over HTTPS with a TLS 1.2 floor; exactly one var set fail-fasts at startup before the store opens, neither = plain HTTP byte-identical. Agents trust a custom CA via `ENCODE_AGENT_CA_CERT` (appended to the system pool on the one shared HTTP client covering pairing/heartbeats/completion AND lib/bin/agent downloads; no `InsecureSkipVerify` anywhere). A reverse proxy in front remains supported. Runbooks: Deployment §Native HTTPS, Operations §Native TLS runbook.
 - Auto-update payloads (agent binary + EncodeLib.ps1) are SHA-256 verified by the agent against the manifest before install; downloads are size-capped. Request bodies are capped at 1 MiB (job completion reports at 4 MiB — JSON escaping inflates a 1 MiB log past the general cap).
 - Share credentials (SMB password, S3 secret key) are AES-GCM encrypted with a key file beside the DB and never serialized in API responses (`has_password` only).
 - Mutating admin actions write to the audit log (actor, action, object, small JSON detail — never secrets or full bodies).

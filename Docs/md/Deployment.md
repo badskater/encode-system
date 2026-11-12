@@ -78,7 +78,7 @@ separately (UI → Provision or `infra/ansible/linux-node.yml`).
 
 ```bash
 cd docker
-cp .env.example .env   # set ADMIN_TOKEN, NODE CIDR/allowed names if needed
+cp .env.example .env   # set ENCODE_ADMIN_PASSWORD (or leave empty to auto-generate), ports, storage vars as needed
 docker compose up -d
 ```
 
@@ -874,7 +874,12 @@ Release-workflow operational notes:
 - **The farm controller (172.24.92.232) runs the release pipeline as of
   v1.18.1** (migrated 2026-09-30 from the hand-rolled bind-mount compose):
   `docker-compose.runtime.yml`, GHCR image, named volumes
-  (`encode-system_encode-{state,scripts,release}`). Upgrades are now
+  (`encode-system_encode-{state,scripts,release}`). **It currently runs
+  v1.19.3 on SQLite and STAYS there until the P13 rollout** — the upgrade
+  to v1.23.0, the SQLite→Postgres cutover and the native-TLS cutover are
+  one operator-scheduled operation (validated runbooks: the fleet-ops
+  skill + §Native HTTPS below), not part of tagging the release.
+  Upgrades are
   `install.sh vX.Y.Z` with data preserved. Migration carry-over recipe
   (state volume → `encode-state` incl. `encode.db` + `encode.db.shares-key`,
   bind dirs → the scripts/release volumes) plus one manual step: the image

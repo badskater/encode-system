@@ -76,6 +76,11 @@ All panels are built **only** from metrics the controller actually emits
 | `encode_node_active_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
 | `encode_node_max_concurrent_jobs` | gauge | `node` | Per-Node Slot Utilization, Node Fleet Status, Per-Node Slot Saturation |
 
+The controller emits an 11th series, `encode_jobs_stalled_total` (P1 stall
+watchdog; DB-derived count of failed-stalled jobs) — scrape-ready but not
+yet panelled here. Add a stat/timeseries panel for it if you want stall
+visibility in Grafana.
+
 ## Notes
 
 - The `/metrics` endpoint is **unauthenticated** by design (verified in

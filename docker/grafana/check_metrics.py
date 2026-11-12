@@ -26,6 +26,7 @@ KNOWN_METRICS = {
     "encode_jobs_done_total",
     "encode_jobs_failed_total",
     "encode_jobs_cancelled_total",
+    "encode_jobs_stalled_total",
     "encode_node_online",
     "encode_node_enabled",
     "encode_node_active_jobs",

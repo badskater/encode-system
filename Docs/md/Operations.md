@@ -2,7 +2,7 @@
 
 ## Health checks
 
-- Controller: `GET /api/health` → `{"status":"ok"}`. Include in any container orchestrator liveness config. With native TLS enabled the same endpoint is served over HTTPS (`curl --cacert ca.crt https://<controller>:8080/api/health`); the compose healthcheck switches via `ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS` — see the Native TLS runbook below.
+- Controller: `GET /api/health` → `{"status":"ok","instance":"<id>","oidc_enabled":false}` (+ `version` when the build is ldflags-stamped). Include in any container orchestrator liveness config. With native TLS enabled the same endpoint is served over HTTPS (`curl --cacert ca.crt https://<controller>:8080/api/health`); the compose healthcheck switches via `ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS` — see the Native TLS runbook below.
 - Node considered stale when no heartbeat for 3× the heartbeat interval (default 15s → stale at 45s). UI shows `offline`.
 
 ## Logs
@@ -63,7 +63,7 @@
 | Read a node's agent log without WinRM | UI → Nodes → **Log**: the tail the agent ships in its heartbeat (last ~40 lines, pretty-printed). Empty until the node runs agent ≥1.18. |
 | Check per-job quality/output stats | Jobs → job detail: `ENCODE_METRIC` values (vmaf, quality_score, bitrate, durations, sizes) reported by the flow script. |
 | Watch node health | UI → Nodes: live CPU/RAM/disk/GPU/fps chips; click **Metrics** for 1h/6h/24h sparklines. |
-| Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs`. |
+| Scrape fleet state for monitoring | `GET /metrics` (Prometheus text format, controller port): `encode_jobs_pending/assigned/running`, `encode_jobs_done_total/failed_total/cancelled_total/stalled_total`, per-node `encode_node_online/enabled/active_jobs/max_concurrent_jobs` (11 series; `stalled_total` is DB-derived and undercounts stalls that auto-retried to success). |
 | Back up / restore the controller DB | Settings → **DB backups**: enable scheduled snapshots + interval, download any snapshot. Restore: click **Restore** on a snapshot (admin-only, `POST /api/backup/{name}/restore`) — on SQLite the controller swaps the backup over the live DB and exits for a restart (see restore runbook below); on Postgres the restore is an in-place single transaction (no restart). |
 | Automate against the API | Settings → API tokens: create a scoped token (`read` or `admin`, shown once) and send it as `Authorization: Bearer <token>`. Delete tokens when done; usage is audited as `api-token:<name>`. |
 | Review who changed what | UI → **Audit** page (`GET /api/audit`): every mutating admin action with actor, action, object, detail. |
@@ -741,7 +741,8 @@ A replica killed mid-loop releases its Postgres advisory lock on
 connection close. The surviving replica's singleton loop acquires the lock
 on its next retry (15s poll interval; total failover ≈ 10s keepalive
 detection + 15s retry ≈ ≤25s), so background loops (scanner, prune,
-digest flush, backup scheduler) re-home automatically. Job dispatch is
+digest flush, backup scheduler, node-status alert, stall watchdog,
+download ingestion — lock keys 1001–1008) re-home automatically. Job dispatch is
 unaffected: the conditional `UPDATE … WHERE status='pending'` guard means
 only one replica can flip a given job, and the `FOR UPDATE` node-row lock
 serializes capacity checks — killing a replica mid-heartbeat never
@@ -1069,9 +1070,12 @@ the current farm host is `172.24.92.232:8080`).
 The dashboard JSON lives at `docker/grafana/encode-system-dashboard.json`
 (uid `encode-system`, `schemaVersion` 39, 30s refresh, templated
 `${DS_PROMETHEUS}` datasource). It uses only `stat`, `timeseries`, `table`,
-and `gauge` panels — all built **only** from the 10 metrics the controller
+and `gauge` panels — all built **only** from metrics the controller
 actually emits (verified against `backend/internal/api/prometheus.go`; no
-synthetic series).
+synthetic series). It panels 10 of the 11 emitted series;
+`encode_jobs_stalled_total` (P1 stall watchdog) is scrape-ready but not
+yet panelled — add a stat/timeseries panel for it if you want stall
+visibility in Grafana.
 
 ### Opt-in Prometheus wiring and alerting
 

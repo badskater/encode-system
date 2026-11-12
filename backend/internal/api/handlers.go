@@ -1090,6 +1090,14 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "series and episode_dir required")
 		return
 	}
+	// Same name contract as series create: control chars (incl. CR/LF),
+	// traversal and reserved characters are refused here too — a hostile
+	// Series reaches rendered jobs and error echoes, where a smuggled
+	// newline could forge line-start ENCODE_STEP markers (P7 review Q5).
+	if err := validateSeriesName(req.Series); err != nil {
+		writeErr(w, http.StatusBadRequest, "series: "+err.Error())
+		return
+	}
 	if req.ScriptType != "avs" && req.ScriptType != "vpy" {
 		writeErr(w, http.StatusBadRequest, "script_type must be avs or vpy")
 		return

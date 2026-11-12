@@ -136,16 +136,24 @@ func (d BashDialect) ParamsLiteral(st model.Step, t *model.StepTemplate) string 
 // marker (identical text to PS), the params as local variables, the
 // function invocation, and a failure handler that emits the
 // ENCODE_STEP_FAILED marker (identical text to PS) and exits nonzero.
-// bash's `set -e` (from the preamble) makes any nonzero function exit
-// trigger the per-step ERR trap.
+//
+// ERREXIT SEMANTICS (P7 review Q1): the `{ fn; } || { ...; }` shape puts
+// the function call in a || context, which DISABLES set -e and the ERR
+// trap for every command INSIDE the function — bash exempts commands
+// whose failure is tested. The wrapper therefore only catches a nonzero
+// FUNCTION exit; it cannot catch an unchecked failing command mid-body.
+// Step bodies must handle every critical command explicitly (see
+// bashSourceKeyframes for the guarded pattern); the ERR trap below is a
+// belt-and-braces guard for commands outside the wrapper, not a safety
+// net inside it.
 func (d BashDialect) StepCall(idx int, t *model.StepTemplate, st model.Step, safeType, fn string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n# --- Step %d: %s ---\n", idx+1, d.Comment(t.Key))
 	fmt.Fprintf(&b, "echo 'ENCODE_STEP %s start'\n", safeType)
-	// Set up params as locals, then call the function. The ERR trap
-	// fires on the first failing command inside the function, emits the
-	// failure marker with the step name, and exits 1. trap is cleared
-	// after the step so a later step's failure doesn't reuse it.
+	// Set up params as locals, then call the function. A nonzero function
+	// exit triggers the || handler, which emits the failure marker with
+	// the step name and exits 1. trap is cleared after the step so a later
+	// step's failure doesn't reuse it.
 	fmt.Fprintf(&b, "trap 'echo \"ENCODE_STEP_FAILED %s $LINENO\"; exit 1' ERR\n", safeType)
 	b.WriteString("{\n")
 	b.WriteString(d.ParamsLiteral(st, t))

@@ -1023,25 +1023,46 @@ const bashSourceKeyframes = `keyframes () {
     local dest_dir="$ReleaseDir/$ReleaseFolder"
     local mkv="$dest_dir/$OutputName"
     local kf="$dest_dir/$Series - $Episode Keyframes.txt"
+    # Flattened display copies for error echoes: CR/LF inside a path must
+    # never split an echo into a line-start ENCODE_STEP marker (forgery).
+    local mkv_disp="${mkv//$'\n'/ }" kf_disp="${kf//$'\n'/ }"
+    mkv_disp="${mkv_disp//$'\r'/ }"
+    kf_disp="${kf_disp//$'\r'/ }"
     if ! [[ -e "$mkv" ]]; then
-        echo "release MKV not found: $mkv"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+        echo "release MKV not found: $mkv_disp"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
     fi
-    if [[ -e "$kf" ]] && [[ "$kf" -nt "$mkv" ]]; then
+    # -f, NOT -e: a DIRECTORY named Keyframes.txt is not an artifact and
+    # must never satisfy the fresh-skip — it falls through to the guarded
+    # stale-rm below and fails closed.
+    if [[ -f "$kf" ]] && [[ "$kf" -nt "$mkv" ]]; then
         echo 'keyframes file exists and is newer than the MKV, skipping'
         echo 'ENCODE_STEP keyframes 100'
         return 0
     fi
     if [[ -e "$kf" ]]; then
         echo 'keyframes file is stale (older than MKV), regenerating'
-        rm -f -- "$kf"
+        rm -f -- "$kf" || {
+            echo "failed to remove stale keyframes file: $kf_disp"
+            echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+        }
     fi
     echo '[keyframes] vspipe -> scxvid (xvid first-pass log)'
-    # Unique work dir (episode side) for the generated script + vspipe
-    # stderr; unique log temp NEXT TO the artifact so the final rename is
-    # atomic on the release filesystem.
+    # Unique work dir (episode side) for the generated script; unique log
+    # temp NEXT TO the artifact so the final rename is atomic on the
+    # release filesystem. NOTE: the StepCall wrapper '{ fn; } || {...}'
+    # DISABLES errexit/ERR inside this function — every critical command
+    # below carries an explicit failure guard (a swallowed rm/mv failure
+    # used to publish 100 + JOB_DONE with no artifact).
     local tmpd log
-    tmpd=$(mktemp -d "$EpisodeDir/.keyframes.XXXXXX")
-    log=$(mktemp "$dest_dir/.scxvid.XXXXXX")
+    tmpd=$(mktemp -d "$EpisodeDir/.keyframes.XXXXXX") || {
+        echo 'keyframes: failed to create temp work dir'
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
+    log=$(mktemp "$dest_dir/.scxvid.XXXXXX") || {
+        echo 'keyframes: failed to create temp log file'
+        rm -rf -- "$tmpd"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
     export ENCODE_KF_SOURCE="$mkv"
     export ENCODE_KF_LOG="$log"
     cat > "$tmpd/script.vpy" <<'VPY'
@@ -1069,19 +1090,52 @@ clip = core.resize.Bicubic(clip, width=640, height=360, format=vs.YUV420P8)
 clip = scxvid.Scxvid(clip, log=log, use_slices=True)
 clip.set_output()
 VPY
+    if ! [[ -s "$tmpd/script.vpy" ]]; then
+        echo 'keyframes: failed to write the generated .vpy script'
+        rm -rf -- "$tmpd"; rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
     # Whole clip to a null sink: scxvid must see every frame in order for
-    # the log to be complete. stderr (progress/errors) is echoed with a
-    # prefix, mirroring how the PS body echoes SCXvid output.
-    local rc=0
-    "$vspipe" -c y4m "$tmpd/script.vpy" - > /dev/null 2> "$tmpd/vspipe.log" || rc=$?
-    unset ENCODE_KF_SOURCE ENCODE_KF_LOG
-    local line
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line//$'\r'/}"
-        if [[ "$line" =~ [^[:space:]] ]]; then
+    # the log to be complete. -p makes vspipe stream 'Frame: N/M (fps)'
+    # progress to stderr (CR-terminated, ~2Hz — upstream vspipe.cpp). The
+    # pipeline reads it LIVE: chunks are split on CR/LF, echoed with the
+    # [vspipe] prefix, and Frame lines become throttled ENCODE_STEP markers
+    # so the controller's stall watchdog (refreshes last_progress_at only
+    # on progress CHANGE) sees a long run advancing. vspipe's exit code is
+    # captured through a temp rc file — the pipeline's own status is the
+    # reader's, not vspipe's.
+    local last_pct=0 last_emit
+    last_emit=$(date +%s)
+    { "$vspipe" -p -c y4m "$tmpd/script.vpy" - > /dev/null; echo "$?" > "$tmpd/vspipe.rc"; } 2>&1 | while IFS= read -r -d $'\r' chunk || [[ -n "$chunk" ]]; do
+        # A chunk is CR-delimited but may embed LF-terminated error lines;
+        # iterate every complete line in it.
+        local line
+        while IFS= read -r line; do
+            [[ "$line" =~ [^[:space:]] ]] || continue
             echo "[vspipe] $line"
-        fi
-    done < "$tmpd/vspipe.log"
+            if [[ "$line" =~ ^Frame:\ ([0-9]+)/([0-9]+) ]]; then
+                local n="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}"
+                if (( m > 0 )); then
+                    local pct=$(( n * 100 / m ))
+                    if (( pct > 99 )); then pct=99; fi
+                    local now
+                    now=$(date +%s)
+                    # Throttle: >=2% change or >=5s since the last marker;
+                    # never repeat or regress. 100 stays reserved for the
+                    # publish marker below.
+                    if (( pct > last_pct )) && { (( pct >= last_pct + 2 )) || (( now - last_emit >= 5 )); }; then
+                        echo "ENCODE_STEP keyframes $pct"
+                        last_pct=$pct
+                        last_emit=$now
+                    fi
+                fi
+            fi
+        done <<< "$chunk"
+    done
+    unset ENCODE_KF_SOURCE ENCODE_KF_LOG
+    local rc
+    rc=$(cat "$tmpd/vspipe.rc" 2>/dev/null || echo 1)
+    if ! [[ "$rc" =~ ^[0-9]+$ ]]; then rc=1; fi
     rm -rf -- "$tmpd"
     if (( rc != 0 )); then
         rm -f -- "$log"
@@ -1093,7 +1147,27 @@ VPY
         rm -f -- "$log"
         echo 'ENCODE_STEP_FAILED keyframes'; exit 1
     fi
-    mv -f -- "$log" "$kf"
+    # Log content validity: xvidcore writes the two header comment lines at
+    # plugin CREATE (plugin_2pass1.c rc_2pass1_create), BEFORE any frame is
+    # processed — a header-only log means ZERO frames, not a static clip
+    # (which still yields one b/p stats line per frame). Require at least
+    # one real frame-stats line before publishing.
+    if ! grep -Eq '^[ipbs]([[:space:]]+[0-9]+){6}[[:space:]]*$' "$log"; then
+        echo "scxvid finished but the keyframes log has no frame lines (zero frames processed)"
+        rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    mv -f -- "$log" "$kf" || {
+        rm -f -- "$log"
+        echo "failed to move keyframes log into place: $kf_disp"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    }
+    # Post-publish check: 'mv file dir/' SUCCEEDS by moving the file INSIDE
+    # the directory — only a regular file at $kf is a published artifact.
+    if ! [[ -f "$kf" ]]; then
+        echo "keyframes publish did not produce a regular file: $kf_disp"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
     echo 'ENCODE_STEP keyframes 100'
 }`
 

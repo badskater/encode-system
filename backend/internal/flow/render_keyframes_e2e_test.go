@@ -50,9 +50,12 @@ const kfXvidLogFixture = "# XviD 2pass stat file (core version 1.3.7)\n" +
 	"p 2 0 795 125 6540 1004\n" +
 	"p 2 0 781 139 6412 985\n"
 
-// kfXvidLogHeaderOnly: the zero-scene-change edge — a valid log with no
-// frame lines at all (e.g. a perfectly static clip). The step must treat
-// it as a successful artifact, not an error.
+// kfXvidLogHeaderOnly: the ZERO-FRAME failure edge. xvidcore writes the
+// two header comment lines at plugin CREATE (plugin_2pass1.c
+// rc_2pass1_create), BEFORE any frame is processed — so a header-only log
+// means the run died before frame 1, NOT a "perfectly static clip" (a
+// static clip still yields one b/p stats line per frame; see
+// kfXvidLogStaticClip). The step must fail closed on this content.
 const kfXvidLogHeaderOnly = "# XviD 2pass stat file (core version 1.3.7)\n" +
 	"# Please do not modify this file\n" +
 	"\n"
@@ -66,7 +69,7 @@ const kfXvidLogHeaderOnly = "# XviD 2pass stat file (core version 1.3.7)\n" +
 const kfVspipeStub = `#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 printf '%s\n' "$@" > "$dir/vspipe_args.txt"
-if [ -f "$dir/vspipe_exit" ]; then
+if [ -f "$dir/vspipe_exit" ] && [ ! -f "$dir/vspipe_progress" ]; then
   rc=$(cat "$dir/vspipe_exit")
   if [ -f "$dir/vspipe_plugin_error" ]; then
     printf "Failed to evaluate the script: Python exception: No module named 'scxvid'\n" >&2
@@ -75,12 +78,23 @@ if [ -f "$dir/vspipe_exit" ]; then
   fi
   exit "$rc"
 fi
-# Invocation contract: vspipe -c y4m <script> - (null sink via stdout).
-if [ "$1" != "-c" ] || [ "$2" != "y4m" ] || [ "$4" != "-" ]; then
-  echo "vspipe stub: expected '-c y4m <script> -', got: $*" >&2
+# Invocation contract: vspipe -p -c y4m <script> - (null sink via stdout;
+# -p streams live Frame: N/M progress for the stall watchdog).
+if [ "$1" != "-p" ] || [ "$2" != "-c" ] || [ "$3" != "y4m" ] || [ "$5" != "-" ]; then
+  echo "vspipe stub: expected '-p -c y4m <script> -', got: $*" >&2
   exit 1
 fi
-script="$3"
+script="$4"
+if [ -f "$dir/vspipe_exit" ] && [ -f "$dir/vspipe_progress" ]; then
+  # Combined mode: stream progress, THEN fail (rc capture must survive
+  # the live pipeline even when output preceded the failure).
+  for ((i = 1; i <= 10; i++)); do
+    printf 'Frame: %d/10 (10.00 fps)\r' "$i" >&2
+    sleep 0.05
+  done
+  echo "vspipe stub: simulated crash after progress" >&2
+  exit "$(cat "$dir/vspipe_exit")"
+fi
 if [ ! -f "$script" ]; then
   echo "vspipe stub: script file not found: $script" >&2
   exit 1
@@ -121,7 +135,19 @@ if [ ! -f "$dir/vspipe_no_log" ]; then
     cat "$dir/kf_log_fixture" > "$ENCODE_KF_LOG"
   fi
 fi
-echo "Frame: 16/16 (stub)" >&2
+if [ -f "$dir/vspipe_progress" ]; then
+  # Live-progress mode: CR-terminated Frame: N/M lines exactly like real
+  # vspipe -p (fprintf(stderr, "Frame: %d/%d (%.2f fps)\r", ...)).
+  # First 5 frames paced 0.25s apart (liveness oracle); the rest fast
+  # (throttle oracle: 100 frame lines must yield far fewer markers).
+  for ((i = 1; i <= 100; i++)); do
+    if (( i <= 5 )); then sleep 0.25; fi
+    printf 'Frame: %d/100 (10.00 fps)\r' "$i" >&2
+  done
+  printf 'Output 100 frames in 1.30 seconds (76.92 fps)\n' >&2
+else
+  echo "Frame: 16/16 (stub)" >&2
+fi
 exit 0
 `
 
@@ -136,13 +162,26 @@ echo "ffmpeg stub: y4m written to $out"
 
 // kfScxvidExeStub (Windows side): real contract — the output log file is
 // the ONLY argument, y4m arrives on STDIN. Writes the SAME fixture the
-// bash-side vspipe stub writes (byte-parity oracle).
+// bash-side vspipe stub writes (byte-parity oracle). Sidecars:
+// scxvid_exit (forced exit code), kf_log_payload (alternate log bytes),
+// scxvid_slow_lines (paced stderr lines — the live-read oracle).
 const kfScxvidExeStub = `#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 cat > /dev/null
 printf '%s\n' "$@" > "$dir/scxvid_args.txt"
 if [ -f "$dir/scxvid_exit" ]; then exit "$(cat "$dir/scxvid_exit")"; fi
-cat "$dir/kf_log_fixture" > "$1"
+if [ -f "$dir/scxvid_slow_lines" ]; then
+  # Paced stderr lines with a 0.4s tail sleep: live line reads echo each
+  # line as it arrives; ReadToEndAsync buffers all of them until exit.
+  echo "SCXvid stub: line one" >&2; sleep 0.4
+  echo "SCXvid stub: line two" >&2; sleep 0.4
+  echo "SCXvid stub: line three" >&2; sleep 0.4
+fi
+if [ -f "$dir/kf_log_payload" ]; then
+  cat "$dir/kf_log_payload" > "$1"
+else
+  cat "$dir/kf_log_fixture" > "$1"
+fi
 echo "SCXvid stub: log written to $1"
 `
 
@@ -333,13 +372,13 @@ func TestKeyframesBashE2EWritesXvidLog(t *testing.T) {
 	if !bytes.Equal(got, []byte(kfXvidLogFixture)) {
 		t.Errorf("Keyframes.txt bytes differ from the xvid log fixture\ngot:\n%s\nwant:\n%s", got, kfXvidLogFixture)
 	}
-	// The stub recorded the invocation: -c y4m <script> -.
+	// The stub recorded the invocation: -p -c y4m <script> -.
 	args, err := os.ReadFile(filepath.Join(e.binDir, "vspipe_args.txt"))
 	if err != nil {
 		t.Fatalf("vspipe was not invoked: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
-	if len(lines) != 4 || lines[0] != "-c" || lines[1] != "y4m" || lines[3] != "-" {
+	if len(lines) != 5 || lines[0] != "-p" || lines[1] != "-c" || lines[2] != "y4m" || lines[4] != "-" {
 		t.Errorf("vspipe invocation shape wrong: %q", lines)
 	}
 	kfAssertNoTempLeftovers(t, e)
@@ -620,26 +659,9 @@ func TestKeyframesBashE2EMissingReleaseMkv(t *testing.T) {
 	}
 }
 
-// TestKeyframesBashE2EHeaderOnlyLog: log edge case — a valid xvid log with
-// zero frame lines (no scene changes) is a successful artifact, published
-// byte-for-byte. The step must not require 'i' lines or a minimum size.
-func TestKeyframesBashE2EHeaderOnlyLog(t *testing.T) {
-	e := kfSetup(t, false)
-	kfSidecar(t, e, "kf_log_payload", kfXvidLogHeaderOnly)
-	text, err := kfRunBash(t, e)
-	t.Logf("output:\n%s", text)
-	if err != nil {
-		t.Fatalf("header-only log run failed: %v", err)
-	}
-	if !strings.Contains(text, "ENCODE_STEP keyframes 100") {
-		t.Errorf("missing completion marker:\n%s", text)
-	}
-	got, err := os.ReadFile(e.kfPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, []byte(kfXvidLogHeaderOnly)) {
-		t.Errorf("header-only log not published byte-for-byte:\n%q", got)
-	}
-	kfAssertNoTempLeftovers(t, e)
-}
+// TestKeyframesBashE2EHeaderOnlyLog: INVERTED by the P7 quality review —
+// a header-only log is the ZERO-FRAME failure edge (the header is written
+// at plugin CREATE, before any frame; see kfXvidLogHeaderOnly). Coverage
+// moved to TestKeyframesE2EInvalidLogFailsClosed (both dialects) in
+// render_keyframes_guards_test.go; the valid zero-scene-change case is
+// TestKeyframesE2EStaticClipLogPasses.

@@ -57,7 +57,10 @@ echo "ffmpeg stub done"`,
 		"SCXvid.exe": `#!/usr/bin/env bash
 # real contract: scxvid {output_log_file} < {input y4m on stdin}
 cat > /dev/null
-: > "$1"
+# Minimal VALID xvid first-pass log: header + one frame-stats line. The
+# keyframes step rejects zero-frame logs (header is written at plugin
+# CREATE, before any frame — header-only means a crashed run).
+printf '# XviD 2pass stat file (core version 1.3.7)\n# Please do not modify this file\n\ni 2 0 0 0 0 0\n' > "$1"
 echo "SCXvid stub done"`,
 	}
 	for name, body := range stubs {

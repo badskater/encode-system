@@ -69,8 +69,8 @@ func TestBashKeyframesVspipeInvocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render keyframes: %v", err)
 	}
-	if !strings.Contains(script, `"$vspipe" -c y4m "$tmpd/script.vpy" - > /dev/null`) {
-		t.Error("keyframes must run vspipe -c y4m <script> - to a null sink (whole-clip processing)")
+	if !strings.Contains(script, `"$vspipe" -p -c y4m "$tmpd/script.vpy" - > /dev/null`) {
+		t.Error("keyframes must run vspipe -p -c y4m <script> - to a null sink (whole-clip processing; -p streams live Frame: N/M progress for the stall watchdog)")
 	}
 	// Tool resolution follows the bash builtin convention: PATH first,
 	// BinDir fallback, executable check with an actionable error.
@@ -101,19 +101,34 @@ func TestBashKeyframesArtifactContract(t *testing.T) {
 		`local kf="$dest_dir/$Series - $Episode Keyframes.txt"`,
 		// Input is the RELEASE MKV, not the episode source.
 		`export ENCODE_KF_SOURCE="$mkv"`,
-		// Skip/stale semantics (verbatim PS messages).
+		// Skip/stale semantics (verbatim PS messages). The skip check is
+		// -f, NOT -e: a DIRECTORY named Keyframes.txt is not an artifact
+		// and must never satisfy the fresh-skip (P7 review Q1).
+		`[[ -f "$kf" ]]`,
 		`[[ "$kf" -nt "$mkv" ]]`,
 		"keyframes file exists and is newer than the MKV, skipping",
 		"keyframes file is stale (older than MKV), regenerating",
 		// Failure texts. -s (non-empty), not -e: mktemp pre-creates the
 		// temp file, so a plugin that wrote nothing must still fail.
-		"release MKV not found: $mkv",
+		"release MKV not found:",
 		"scxvid finished but the keyframes log was not created",
 		"vspipe exited with code $rc",
 		`if ! [[ -s "$log" ]]; then`,
+		// Log content validity (Q4): >=1 real frame-stats line. The xvid
+		// header is written at plugin CREATE — header-only = zero frames.
+		"no frame lines (zero frames processed)",
+		`grep -Eq '^[ipbs]([[:space:]]+[0-9]+){6}[[:space:]]*$' "$log"`,
 		// Atomic publish: temp log next to the artifact, renamed on success.
 		`log=$(mktemp "$dest_dir/.scxvid.XXXXXX")`,
-		`mv -f -- "$log" "$kf"`,
+		// Explicit error guards (Q1): the StepCall `{ fn; } || {...}`
+		// wrapper DISABLES errexit/ERR inside the function, so every
+		// critical command must handle its own failure.
+		`rm -f -- "$kf" || {`,
+		`mv -f -- "$log" "$kf" || {`,
+		`tmpd=$(mktemp -d "$EpisodeDir/.keyframes.XXXXXX") || {`,
+		// Post-publish regular-file check: catches a stale DIRECTORY named
+		// Keyframes.txt even if mv "succeeds" (mv file dir/ moves INSIDE).
+		`if ! [[ -f "$kf" ]]; then`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("keyframes artifact contract missing %q", want)

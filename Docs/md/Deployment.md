@@ -261,9 +261,19 @@ The `roles/linux-node` role (`roles/linux-node/tasks/main.yml`):
 1. Installs packages: `cifs-utils` + `nfs-common` (Debian/apt) or
    `cifs-utils` + `nfs-utils` (RHEL/dnf) — auto-detected by
    `ansible_os_family`.
-2. Creates the `encode` service user (`system: true`, `nologin` shell)
+2. Installs the `vapoursynth-scxvid` pip plugin for the `keyframes` step:
+   first a preflight asserts the node's `python3` is ≥ 3.12 (the wheel's
+   `Requires-Python`; fails with an actionable message otherwise), then
+   `pip3 install vapoursynth-scxvid` with
+   `environment: PIP_BREAK_SYSTEM_PACKAGES: "1"` for PEP 668 distros
+   (Debian 12+). The env var is used instead of the pip module's
+   `break_system_packages` parameter because that parameter requires
+   ansible-core ≥ 2.17 — the env var works on older cores too (pip itself
+   honors it; same effect). The plugin must land in the SAME Python
+   `vspipe` uses; a venv's site-packages is not auto-loaded.
+3. Creates the `encode` service user (`system: true`, `nologin` shell)
    and agent + bin + mount directories.
-3. Copies the agent binary to `/opt/encode-agent/encode-agent` (0755),
+4. Copies the agent binary to `/opt/encode-agent/encode-agent` (0755),
    writes `/etc/encode-agent/agent.json` (0640, built as a dict and
    serialized with `to_nice_json` so path backslashes are escaped
    correctly; `no_log: true` because it briefly carries a pairing
@@ -271,14 +281,14 @@ The `roles/linux-node` role (`roles/linux-node/tasks/main.yml`):
    `infra/systemd/encode-agent.service` (single source of truth — the
    role never inlines a unit that could drift; `After=` automount units
    + `ReadWritePaths=`/`NoNewPrivileges=`/`PrivateTmp=` hardening).
-4. Mounts CIFS shares (`ansible.posix.mount`, `state: mounted`) with
+5. Mounts CIFS shares (`ansible.posix.mount`, `state: mounted`) with
    per-share 0600 credential files
    (`/etc/encode-agent/cifs-scripts.cred`, `cifs-release.cred`, written
    via `copy content`) and `x-systemd.automount` + `x-systemd.idle-timeout=60`
    + `noauto` opts (so systemd generates a `.automount` unit from fstab
    — a dead NAS never holds the boot path). NFS shares mount the same
    way (no credentials needed).
-5. Enables + starts `encode-agent.service`, waits for the agent to pair
+6. Enables + starts `encode-agent.service`, waits for the agent to pair
    (polls for `<data_dir>/node.token`), then strips the one-shot pairing
    code from `agent.json` (idempotent, atomic-ish copy).
 
@@ -373,7 +383,12 @@ docker compose -f docker-compose.runtime.yml run --rm --user 0 --entrypoint chow
 `provision.yml` over WinRM) and `ansible.posix:2.2.2` (Linux
 `roles/linux-node`'s `ansible.posix.mount` tasks for CIFS/NFS mounts). An
 unpinned rebuild could pull a breaking release and silently break
-provisioning; the pins are the guard. The release bundle ships the
+provisioning; the pins are the guard. Control-side ansible-core is
+deliberately NOT pinned to a minimum: the linux-node role avoids
+core-version-gated module parameters (the scxvid pip task sets
+`PIP_BREAK_SYSTEM_PACKAGES` via `environment:` rather than
+`break_system_packages`, which needs core ≥ 2.17), so provisioning works
+on older cores as well. The release bundle ships the
 `provision/` and `systemd/` trees, and both Dockerfiles COPY them into
 the GHCR image at `/app/provision` and `/app/systemd`
 (`ENCODE_PROVISION_DIR=/app/provision` sets the engine's `PlaybookDir`,

@@ -643,7 +643,11 @@ controller re-caps `log_full` at 1 MiB defensively.
   claim, refreshed only by heartbeats reporting a CHANGED step/progress) is
   older than `settings.stall_timeout_minutes` (0 = off). The threshold must
   exceed the longest interval without step/progress change in any healthy
-  job — not the heartbeat cadence. The fail transition is a guarded UPDATE
+  job — not the heartbeat cadence. The Linux keyframes step streams
+  throttled `ENCODE_STEP` progress for exactly this reason; Windows
+  keyframes (SCXvid-standalone) has no parseable progress and marks only
+  start/finish — see Operations.md § Keyframes for the threshold guidance.
+  The fail transition is a guarded UPDATE
   (`FailStalledJob`: only if still running/assigned AND still stale), so a
   job that completes inside the detection window is never overwritten and
   duplicate snapshots never burn two retries. The failure flows through the

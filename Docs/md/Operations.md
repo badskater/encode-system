@@ -282,13 +282,40 @@ Operational notes:
   MKV skips the step; an older one is regenerated. Linux writes the log to
   a unique temp file next to the artifact and renames it on success, so a
   failed run never leaves a partial file that the skip check would treat
-  as fresh on retry.
+  as fresh on retry. The skip check requires a REGULAR file — a directory
+  named `Keyframes.txt` never satisfies it, and every publish-critical
+  command (stale removal, temp creation, rename) fails the step explicitly
+  on error; a post-publish check confirms a regular file landed. Windows
+  drops partial/invalid direct-write logs on failure for the same reason.
+- **Log validity**: the published log must contain at least one real
+  frame-stats line (`i`/`p`/`b`/`s` + six numbers). xvidcore writes the
+  two header comment lines at plugin CREATE, before any frame is
+  processed — a header-only log means ZERO frames were processed (a
+  crashed run), not a static clip; a genuinely static clip still yields
+  one `b`/`p` line per frame and passes. Junk/whitespace-only/header-only
+  logs fail the step in both dialects.
 - **Input is the RELEASE MKV**, not the raw source — run the step after
   `release_copy` (as the default flows do). Without the release MKV the
   step fails with `release MKV not found`.
 - **Runtime**: detection encodes every frame with xvid at 640x360 — expect
   minutes per episode, not seconds. Seeking is not used (the plugin
   processes from frame 0); the whole clip runs in one vspipe pass.
+- **Progress + stall watchdog (Linux)**: `vspipe -p` streams
+  `Frame: N/M` progress; the step parses it and emits throttled
+  `ENCODE_STEP keyframes <pct>` markers (≥2% change or ≥5s, capped at 99
+  until publish). The controller's stall watchdog refreshes
+  `last_progress_at` only on step/progress CHANGE, so these markers keep
+  long keyframes runs alive under `settings.stall_timeout_minutes`.
+- **Progress + stall watchdog (Windows) — known limitation**:
+  SCXvid-standalone emits NO parseable progress (verified against
+  soyokaze/SCXvid-standalone `scxvid.c`: the frame loop prints nothing;
+  only error lines go to stderr). The step echoes those lines live, but
+  there is no honest percentage to report, so none is fabricated. A
+  Windows keyframes step therefore reports progress only at start (0) and
+  finish (100): set `settings.stall_timeout_minutes` ABOVE the longest
+  expected Windows keyframes runtime (minutes per episode on slow nodes),
+  or 0 to disable the watchdog. A too-low threshold fails healthy Windows
+  keyframes runs and burns retries. Linux nodes are unaffected.
 
 ## Notification channels
 
@@ -717,7 +744,7 @@ and the replicas reconnect + re-acquire their advisory locks on restart.
 - **x265 fork crash on odd dimensions**: step fails with non-zero exit; inspect `run.log` for the x265 banner error; usually a filter-script issue (`.avs` crop values).
 - **opusenc missing**: audio step fails fast with "required tool not found" — Ansible `bin-tools` play or a bin-package push fixes.
 - **Reboot during a job**: controller defers reboot instructions until the node reports idle; a crash-reboot mid-job leaves the job orphaned — recovery fails it with a clear retry message (retry policy honored) instead of staying `running` forever.
-- **Wedged encode (job stalled)**: with `settings.stall_timeout_minutes` > 0 the watchdog fails running jobs that report no step/progress change for that long (unchanged heartbeats do not count), applies the flow retry policy, and — when the node is online — sends a `cancel` instruction on the next heartbeat so the agent kills the stuck process tree and frees the slot. Set the threshold above the longest gap between progress updates of any step (a long encode that only marks start/finish needs a threshold above its whole runtime); a too-low threshold fails healthy jobs. The `encode_jobs_stalled_total` metric counts currently failed-stalled jobs, so stalls that auto-retry to success are not reflected.
+- **Wedged encode (job stalled)**: with `settings.stall_timeout_minutes` > 0 the watchdog fails running jobs that report no step/progress change for that long (unchanged heartbeats do not count), applies the flow retry policy, and — when the node is online — sends a `cancel` instruction on the next heartbeat so the agent kills the stuck process tree and frees the slot. Set the threshold above the longest gap between progress updates of any step (a long encode that only marks start/finish needs a threshold above its whole runtime — notably Windows keyframes, see § Keyframes → Progress + stall watchdog (Windows)); a too-low threshold fails healthy jobs. The `encode_jobs_stalled_total` metric counts currently failed-stalled jobs, so stalls that auto-retry to success are not reflected.
 - **Node stuck in reboot_pending**: attempts expire after a 10-minute grace period and the node rejoins automatically; check the agent log (`<data_dir>\agent.log`) if the node never actually reboots (permissions, pending reboot).
 - **Node offline after an agent self-update**: the swap sidecar relaunches the task, but if it didn't fire, `Start-ScheduledTask -TaskName EncodeAgentDist` over WinRM; the agent stages the pending `.exe.new`, exits once more, and comes back on the new version (~1 min). Also check for a **stale pre-swap process**: two `encode-agent.exe` PIDs double-heartbeat — kill the one with the earlier StartTime. On Linux the `swap-update.sh` sidecar retries the `mv` (15 attempts, logged to `swap-update.log` in the data dir) then either exits to let systemd's `Restart=always` relaunch (detected via `INVOCATION_ID` + `systemctl is-active encode-agent`) or relaunches the new binary directly via `setsid`; check `swap-update.log` and `journalctl -u encode-agent` if the node never returns.
 - **Two jobs on one node beyond its slots**: impossible by store constraint (active jobs ≤ `max_concurrent_jobs`), but if the DB is restored manually, verify with `GET /api/jobs?status=running`.

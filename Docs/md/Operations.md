@@ -200,12 +200,46 @@ becomes the default flow.
   source is never modified; an `output` param pointing at the source is a
   loud error. No encoded output found → loud tool error (run the encode
   flow first).
-- **Atomic replace + idempotency**: mkvmerge writes
-  `.mux_extras.tmp.mkv` in the episode dir, the result is verified
-  non-empty, then renamed over the encoded output — a failed mux never
-  corrupts it. The encoded input is read with
+- **Atomic replace + idempotency**: mkvmerge writes a UNIQUE temp
+  `.mux_extras.<pid>.<rand>.tmp.mkv` in the episode dir, the result is
+  verified non-empty, then renamed over the encoded output — a failed mux
+  never corrupts it, and the temp is cleaned up on every exit path. A
+  per-episode lock (`.mux_extras.lock`; bash `flock` with a 600s timeout,
+  PowerShell `FileShare.None` open loop on the same file) serializes
+  concurrent `mux_extras` runs on one episode dir — two jobs (or a retry
+  racing the original) can no longer destroy each other's output. Output
+  discovery excludes both the unique temp pattern and the legacy fixed
+  `.mux_extras.tmp.mkv` name. The encoded input is read with
   `--no-subtitles --no-chapters --no-attachments`, so re-running the flow
   REPLACES the extras instead of duplicating them.
+- **Untrusted-metadata hardening**: track names/languages come from the
+  SOURCE file. Both dialects strip C0 control characters + DEL and cap
+  names at 200 chars at extraction (and re-sanitize manifest values in
+  `mux_extras`), so metadata can never forge `ENCODE_STEP`/`ENCODE_METRIC`
+  protocol lines (markers are line-anchored in the agent) or split bash
+  records. Manifests must be JSON ARRAYS — scalars, objects and empty
+  files fail closed; an empty array is a graceful no-extras success.
+  Manifest file entries are validated (relative names only, no `..`,
+  separators, drive letters or control chars) and their RESOLVED paths
+  must stay inside the episode dir (symlink-escape guard). Chapter
+  `num_entries` must be 1–9 digits per edition in both dialects. Flag
+  truthiness (`true`/`1`/`"true"`/`"yes"`) and MIME case-folding are
+  identical across dialects.
+- **Windows PowerShell 5.1 argument escaping**: the agent's fallback
+  interpreter on Windows nodes is PS 5.1, whose LEGACY native-argument
+  serialization wraps quotes without escaping them — an untrusted
+  track_name could inject mkvmerge flags (e.g. `--attach-file` exfil).
+  `EncodeLib.ps1` `Invoke-Tool` pre-escapes every argument with MSVCRT
+  (`CommandLineToArgvW`) rules on PS < 7; pwsh 7+ Standard passing is
+  unchanged. Validated against a CommandLineToArgvW oracle and live
+  Legacy-mode full-flow runs.
+- **Windows command-line ceiling**: `CreateProcess` caps the command line
+  at 32767 characters. A mux with very many subtitle tracks (each carries
+  language/name/flag options) can approach that ceiling on Windows nodes;
+  the 200-char name cap bounds per-track growth. If mkvmerge fails to
+  launch with a command-line-too-long error, reduce the track count (the
+  bash dialect on Linux nodes has no such limit — `execve` argv is bounded
+  only by memory).
 - **Release copy**: `default-subs` modifies the episode-dir MKV only. The
   release folder copy made by the encode flow is NOT refreshed
   automatically — append a `release_copy` step to the flow (or copy

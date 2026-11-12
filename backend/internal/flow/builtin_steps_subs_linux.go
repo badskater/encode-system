@@ -78,12 +78,19 @@ const bashSourceSubtitleExtract = `subtitle_extract () {
             esac
             file="subs_${id}_${lang}.${ext}"
             extract_args+=("${id}:${EpisodeDir}/${file}")
-            [[ "$def" == "true" ]] && def='yes' || def='no'
-            [[ "$frc" == "true" ]] && frc='yes' || frc='no'
+            # Normalized flag truthiness (PS ConvertTo-FlagYesNo parity):
+            # true/1/"true"/"yes" case-insensitive -> yes, else no.
+            case "${def,,}" in true|1|yes) def='yes' ;; *) def='no' ;; esac
+            case "${frc,,}" in true|1|yes) frc='yes' ;; *) frc='no' ;; esac
             entry=$(jq -n --arg file "$file" --arg language "$lang" --arg track_name "$name" --arg default_track "$def" --arg forced_track "$frc" '{file:$file,language:$language,track_name:$track_name,default_track:$default_track,forced_track:$forced_track}')
             entries="${entries}${entry}"$'\n'
             echo "[subtitle_extract] track $id ($lang, $codec) -> $file"
-        done < <(printf '%s' "$ident" | jq -r '.tracks[]? | select(.type=="subtitles") | [.id, (.properties.language // "und"), (.properties.track_name // ""), (.properties.default_track // false), (.properties.forced_track // false), (.properties.codec_id // "")] | map(tostring) | join("\u001f")')
+            # Untrusted metadata is sanitized IN jq: the properties object
+            # is guarded (a track may carry none / a non-object), language
+            # and track_name lose C0 controls + DEL, and the name is capped
+            # at 200 chars BEFORE it reaches file names, manifests or
+            # echoed command lines (marker/flag injection).
+        done < <(printf '%s' "$ident" | jq -r '.tracks[]? | select(.type=="subtitles") | ((.properties // {}) | if type == "object" then . else {} end) as $p | [.id, ($p.language // "und" | tostring | gsub("[\\u0000-\\u001f\\u007f]"; "")), ($p.track_name // "" | tostring | gsub("[\\u0000-\\u001f\\u007f]"; "") | .[0:200]), ($p.default_track // false), ($p.forced_track // false), ($p.codec_id // "")] | map(tostring) | join("\u001f")')
         "$mkvextract" "${extract_args[@]}" 2>&1 | sed 's/^/[mkvextract] /' || {
             echo "subtitle_extract: mkvextract exited with code $?"
             echo 'ENCODE_STEP_FAILED subtitle_extract'; exit 1
@@ -146,6 +153,9 @@ const bashSourceFontExtract = `font_extract () {
     # Unit-separator delimited (non-whitespace IFS keeps empty fields).
     while IFS=$'\x1f' read -r id fname mime; do
         [[ -z "$id" ]] && continue
+        # MIME types are case-insensitive — lowercase before matching so
+        # FONT/TTF extracts exactly like font/ttf (PS parity).
+        mime="${mime,,}"
         is_font=false
         case "$mime" in
             application/x-truetype-font|application/vnd.ms-opentype|application/font-sfnt|application/x-font-ttf|application/x-font-otf|application/font-woff|font/ttf|font/otf|font/woff|font/collection|font/sfnt) is_font=true ;;
@@ -240,9 +250,31 @@ const bashSourceChapterExtract = `chapter_extract () {
         echo "chapter_extract: mkvmerge -J exited with code $?"
         echo 'ENCODE_STEP_FAILED chapter_extract'; exit 1
     }
-    # Chapter editions live at the top level; sum their entry counts.
-    local total
-    total=$(printf '%s' "$ident" | jq '[.chapters[]?.num_entries] | add // 0')
+    # Chapter editions live at the top level; validate EVERY edition's
+    # num_entries before summing (fail closed, PS parity). jq emits one
+    # line per edition: the count as text, or the INVALID sentinel for a
+    # non-object edition / missing / null num_entries. Capture + rc check
+    # so a jq failure can never degrade into a silent "no chapters".
+    local ed_lines
+    ed_lines=$(printf '%s' "$ident" | jq -r '(.chapters | if . == null then [] elif type == "array" then . else [.] end)[] | if type == "object" and has("num_entries") and (.num_entries != null) then (.num_entries | tostring) else "INVALID" end') || {
+        echo "chapter_extract: failed to parse chapter editions from mkvmerge identify output"
+        echo 'ENCODE_STEP_FAILED chapter_extract'; exit 1
+    }
+    local total=0 ed
+    while IFS= read -r ed; do
+        [[ -z "$ed" ]] && continue
+        if [[ "$ed" == "INVALID" ]]; then
+            echo "chapter_extract: invalid chapter edition (expected an object with num_entries)"
+            echo 'ENCODE_STEP_FAILED chapter_extract'; exit 1
+        fi
+        if [[ ! "$ed" =~ ^[0-9]{1,9}$ ]]; then
+            echo "chapter_extract: invalid chapter num_entries '$ed'"
+            echo 'ENCODE_STEP_FAILED chapter_extract'; exit 1
+        fi
+        # 10# forces decimal (leading zeros are not octal); the 9-digit
+        # cap keeps the sum inside 64-bit arithmetic.
+        total=$((total + 10#$ed))
+    done <<< "$ed_lines"
     local dest="$EpisodeDir/chapters.xml"
     if [[ "$total" == "0" ]]; then
         echo "[chapter_extract] no chapters in $src - skipping"
@@ -283,15 +315,28 @@ const bashSourceMuxExtras = `mux_extras () {
         echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
     fi
     # --- gather extracted extras (manifests written by the extract steps) ---
+    # Manifests are a trust boundary even though machine-written: they must
+    # be JSON ARRAYS. jq 'length' on a scalar returns its string length
+    # (fail-open strip-and-succeed) — gate on type FIRST. Real jq on an
+    # empty file emits nothing, exit 0; with -e that becomes exit 4, so an
+    # empty/truncated manifest fails closed here too.
     local subs_json="$EpisodeDir/subs.json" fonts_json="$EpisodeDir/fonts.json" chapters_xml="$EpisodeDir/chapters.xml"
     local n_subs=0 n_fonts=0 has_chapters=false
     if [[ -f "$subs_json" ]]; then
+        jq -e 'type == "array"' "$subs_json" >/dev/null || {
+            echo 'mux_extras: subs.json is unreadable (manifest must be a JSON array)'
+            echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+        }
         n_subs=$(jq 'length' "$subs_json") || {
             echo 'mux_extras: subs.json is unreadable'
             echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
         }
     fi
     if [[ -f "$fonts_json" ]]; then
+        jq -e 'type == "array"' "$fonts_json" >/dev/null || {
+            echo 'mux_extras: fonts.json is unreadable (manifest must be a JSON array)'
+            echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+        }
         n_fonts=$(jq 'length' "$fonts_json") || {
             echo 'mux_extras: fonts.json is unreadable'
             echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
@@ -303,25 +348,91 @@ const bashSourceMuxExtras = `mux_extras () {
         echo 'ENCODE_STEP mux_extras 100'
         return 0
     fi
-    # Validate manifest entries before touching anything.
-    local sfile ffile
+    # ONE jq pass per manifest (O(1) jq calls, no per-entry subprocesses):
+    # US-delimited records captured once, reused for validation AND arg
+    # building. The subs query sanitizes language/track_name (C0+DEL strip,
+    # 200-char cap) in jq — defense in depth for hand-placed manifests.
+    # Capture + rc check: a jq failure must never degrade into "no entries".
+    local sub_records='' font_files=''
     if (( n_subs > 0 )); then
-        while IFS= read -r sfile; do
-            [[ -z "$sfile" ]] && continue
-            if ! [[ -e "$EpisodeDir/$sfile" ]]; then
+        sub_records=$(jq -r '.[] | [(.file // ""), (.language // "und" | tostring | gsub("[\\u0000-\\u001f\\u007f]"; "")), (.track_name // "" | tostring | gsub("[\\u0000-\\u001f\\u007f]"; "") | .[0:200]), (.default_track // "no"), (.forced_track // "no")] | map(tostring) | join("\u001f")' "$subs_json") || {
+            echo 'mux_extras: subs.json is unreadable (entry parse failed)'
+            echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+        }
+    fi
+    if (( n_fonts > 0 )); then
+        font_files=$(jq -r '.[] | (.file // "")' "$fonts_json") || {
+            echo 'mux_extras: fonts.json is unreadable (entry parse failed)'
+            echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+        }
+    fi
+    # Validate manifest entries before touching anything: relative names
+    # only (no separators, '..', drive letters or control chars), existing
+    # regular files, and the RESOLVED path must stay inside the episode
+    # dir (a relative symlink pointing out is an exfil vector).
+    local ep_resolved
+    ep_resolved=$(realpath -e -- "$EpisodeDir") || {
+        echo "mux_extras: episode dir not resolvable: $EpisodeDir"
+        echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+    }
+    local sfile ffile line resolved
+    local -a sub_fields
+    if (( n_subs > 0 )); then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            IFS=$'\x1f' read -r -a sub_fields <<< "$line"
+            # Exactly 5 US-delimited fields: a file name carrying a newline
+            # or unit separator splits/shifts the record — fail closed.
+            if (( ${#sub_fields[@]} != 5 )); then
+                echo 'mux_extras: unsafe subtitle file entry (malformed manifest record)'
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+            sfile="${sub_fields[0]}"
+            if [[ -z "$sfile" ]]; then
+                echo 'mux_extras: subs.json entry without a file name'
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+            if [[ "$sfile" == *\\* || "$sfile" == /* || "$sfile" == *..* || "$sfile" =~ ^[A-Za-z]: || "$sfile" =~ [[:cntrl:]] ]]; then
+                echo "mux_extras: unsafe subtitle file entry '$sfile' (expected a relative path inside the episode dir)"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+            if [[ ! -f "$EpisodeDir/$sfile" ]]; then
                 echo "mux_extras: subtitle file from subs.json missing: $EpisodeDir/$sfile (re-run subtitle_extract)"
                 echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
             fi
-        done < <(jq -r '.[].file' "$subs_json")
+            resolved=$(realpath -e -- "$EpisodeDir/$sfile") || {
+                echo "mux_extras: subtitle file entry '$sfile' not resolvable"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            }
+            if [[ "$resolved" != "$ep_resolved"/* ]]; then
+                echo "mux_extras: subtitle file entry '$sfile' escapes the episode dir"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+        done <<< "$sub_records"
     fi
     if (( n_fonts > 0 )); then
         while IFS= read -r ffile; do
-            [[ -z "$ffile" ]] && continue
-            if ! [[ -e "$EpisodeDir/$ffile" ]]; then
+            if [[ -z "$ffile" ]]; then
+                echo 'mux_extras: fonts.json entry without a file name'
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+            if [[ "$ffile" == *\\* || "$ffile" == /* || "$ffile" == *..* || "$ffile" =~ ^[A-Za-z]: || "$ffile" =~ [[:cntrl:]] ]]; then
+                echo "mux_extras: unsafe font file entry '$ffile' (expected a relative path inside the episode dir)"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+            if [[ ! -f "$EpisodeDir/$ffile" ]]; then
                 echo "mux_extras: font file from fonts.json missing: $EpisodeDir/$ffile (re-run font_extract)"
                 echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
             fi
-        done < <(jq -r '.[].file' "$fonts_json")
+            resolved=$(realpath -e -- "$EpisodeDir/$ffile") || {
+                echo "mux_extras: font file entry '$ffile' not resolvable"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            }
+            if [[ "$resolved" != "$ep_resolved"/* ]]; then
+                echo "mux_extras: font file entry '$ffile' escapes the episode dir"
+                echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+            fi
+        done <<< "$font_files"
     fi
 
     # --- locate the encoded output (NEVER the source) ---
@@ -339,7 +450,7 @@ const bashSourceMuxExtras = `mux_extras () {
             echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
         fi
         local candidate="$EpisodeDir/$explicit"
-        if ! [[ -e "$candidate" ]]; then
+        if ! [[ -f "$candidate" ]]; then
             echo "mux_extras: output param file not found: $candidate"
             echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
         fi
@@ -351,15 +462,19 @@ const bashSourceMuxExtras = `mux_extras () {
     else
         # Standard release naming first (what mux writes and release_copy
         # reads), then newest non-source MKV (covers crc32_rename outputs).
+        # NUL-delimited records end to end: a file name with an embedded
+        # newline must be picked WHOLE (line parsing truncated it and muxed
+        # into a junk file). Both mux temp patterns are excluded so a
+        # crashed run's leftover is never picked.
         local c
-        while IFS= read -r c; do
+        while IFS= read -r -d '' c; do
             [[ -z "$c" ]] && continue
             if [[ -n "$src" && "$c" -ef "$src" ]]; then continue; fi
             out="$c"
             break
         done < <(
-            if [[ -e "$EpisodeDir/$OutputName" ]]; then printf '%s\n' "$EpisodeDir/$OutputName"; fi
-            find "$EpisodeDir" -maxdepth 1 -type f -name '*.mkv' ! -name '.mux_extras.tmp.mkv' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+            if [[ -f "$EpisodeDir/$OutputName" ]]; then printf '%s\0' "$EpisodeDir/$OutputName"; fi
+            find "$EpisodeDir" -maxdepth 1 -type f -name '*.mkv' ! -name '.mux_extras.*.tmp.mkv' ! -name '.mux_extras.tmp.mkv' -printf '%T@ %p\0' | sort -z -rn | sed -z 's/^[^ ]* //'
         )
     fi
     if [[ -z "$out" ]]; then
@@ -369,11 +484,26 @@ const bashSourceMuxExtras = `mux_extras () {
     echo "[mux_extras] encoded output: $out"
     echo 'ENCODE_STEP mux_extras 20'
 
+    # --- per-episode lock + UNIQUE temp: concurrent mux_extras runs on the
+    # same episode dir (two jobs, or a retry racing the original) must
+    # serialize — a fixed temp name let them destroy each other's output
+    # while both reported success. flock on .mux_extras.lock is shared with
+    # the PS port (its FileShare.None open uses flock on Unix too).
+    local lockfile="$EpisodeDir/.mux_extras.lock"
+    exec 9>"$lockfile"
+    if ! flock -w 600 9; then
+        echo "mux_extras: could not acquire the episode mux lock within 600s ($lockfile)"
+        echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
+    fi
+    local tmp="$EpisodeDir/.mux_extras.$$.${RANDOM}.tmp.mkv"
+    # Own-tmp cleanup on EVERY exit path (the trap fires on script exit,
+    # including the failure exits below; cleared after the atomic rename).
+    MUX_EXTRAS_TMP="$tmp"
+    trap 'if [[ -n "${MUX_EXTRAS_TMP:-}" ]]; then rm -f -- "$MUX_EXTRAS_TMP"; fi' EXIT
+
     # --- mkvmerge: encoded first (keep video+audio, strip old extras so
     # re-runs replace instead of duplicating), then one input per sub file
     # with its flags; chapters + fonts ride the global options. ---
-    local tmp="$EpisodeDir/.mux_extras.tmp.mkv"
-    rm -f -- "$tmp"
     local args=(-o "$tmp" --quiet)
     if [[ "$has_chapters" == "true" ]]; then
         args+=(--chapters "$chapters_xml")
@@ -382,29 +512,27 @@ const bashSourceMuxExtras = `mux_extras () {
         while IFS= read -r ffile; do
             [[ -z "$ffile" ]] && continue
             args+=(--attach-file "$EpisodeDir/$ffile")
-        done < <(jq -r '.[].file' "$fonts_json")
+        done <<< "$font_files"
     fi
     args+=(--no-subtitles --no-chapters --no-attachments "$out")
     if (( n_subs > 0 )); then
-        local line slang sname sdef sfrc def_flag frc_flag
+        local slang sname sdef sfrc def_flag frc_flag
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            sfile=$(printf '%s' "$line" | jq -r '.file')
-            slang=$(printf '%s' "$line" | jq -r '.language // "und"')
+            IFS=$'\x1f' read -r -a sub_fields <<< "$line"
+            sfile="${sub_fields[0]}"; slang="${sub_fields[1]}"; sname="${sub_fields[2]}"; sdef="${sub_fields[3]}"; sfrc="${sub_fields[4]}"
             [[ "$slang" =~ ^[a-z]{2,3}$ ]] || slang='und'
-            sname=$(printf '%s' "$line" | jq -r '.track_name // ""')
-            sdef=$(printf '%s' "$line" | jq -r '.default_track // "no"')
-            sfrc=$(printf '%s' "$line" | jq -r '.forced_track // "no"')
             args+=(--no-video --no-audio --language "0:$slang")
             if [[ -n "$sname" ]]; then
                 args+=(--track-name "0:$sname")
             fi
+            # Normalized flag truthiness (PS ConvertTo-FlagYesNo parity).
             def_flag='no'
-            [[ "$sdef" == "yes" ]] && def_flag='yes'
+            case "${sdef,,}" in true|1|yes) def_flag='yes' ;; esac
             frc_flag='no'
-            [[ "$sfrc" == "yes" ]] && frc_flag='yes'
+            case "${sfrc,,}" in true|1|yes) frc_flag='yes' ;; esac
             args+=(--default-track-flag "0:$def_flag" --forced-display-flag "0:$frc_flag" "$EpisodeDir/$sfile")
-        done < <(jq -c '.[]' "$subs_json")
+        done <<< "$sub_records"
     fi
     echo "[mux_extras] mkvmerge ${args[*]}"
     local rc=0
@@ -429,6 +557,9 @@ const bashSourceMuxExtras = `mux_extras () {
         echo "mux_extras: failed to replace output: $out"
         echo 'ENCODE_STEP_FAILED mux_extras'; exit 1
     }
+    MUX_EXTRAS_TMP=''
+    flock -u 9
+    exec 9>&-
     echo 'ENCODE_STEP mux_extras 80'
     local ch_log='no'
     [[ "$has_chapters" == "true" ]] && ch_log='yes'

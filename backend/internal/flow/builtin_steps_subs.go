@@ -51,11 +51,13 @@
 //     and --attach-file (global attachment option) carry the extracted
 //     chapters/fonts. Natural input order keeps video, audio, then subs.
 //
-//   - Atomic replace: mkvmerge writes .mux_extras.tmp.mkv in the episode
-//     dir (same filesystem), the result is verified non-empty, then
-//     renamed over the output (Move-Item -Force / mv -f). A failed or
-//     partial mux never corrupts the encoded output; the temp is cleaned
-//     up on every exit path.
+//   - Atomic replace: mkvmerge writes a UNIQUE temp
+//     .mux_extras.<pid>.<rand>.tmp.mkv in the episode dir (same
+//     filesystem), the result is verified non-empty, then renamed over
+//     the output (Move-Item -Force / mv -f). A per-episode lock
+//     (.mux_extras.lock) serializes concurrent runs; the temp is cleaned
+//     up on every exit path and discovery excludes both temp patterns.
+//     A failed or partial mux never corrupts the encoded output.
 //
 //   - Tool resolution: Windows resolves mkvmerge.exe/mkvextract.exe from
 //     $Job.BinDir via Resolve-Tool; Linux uses the system PATH with a
@@ -157,12 +159,22 @@ const subtitleExtractPS = `function Invoke-SubtitleExtract {
             if ($id -notmatch '^[0-9]+$' -or $id.Length -gt 6) {
                 throw "subtitle_extract: invalid subtitle track id '$id'"
             }
+            # Null-safe properties access (StrictMode): a track may carry
+            # no properties object at all — default everything then.
+            $props = $null
+            if ($null -ne $t.PSObject.Properties['properties']) { $props = $t.properties }
+            # Untrusted metadata: strip C0 controls + DEL from language and
+            # track_name and cap the name BEFORE they reach file names,
+            # manifests or echoed command lines (marker/flag injection).
+            $langRaw = ''
+            if ($null -ne $props -and $null -ne $props.PSObject.Properties['language'] -and $null -ne $props.language) { $langRaw = [string]$props.language }
+            $langRaw = $langRaw -replace '[\x00-\x1F\x7F]', ''
             $lang = 'und'
-            if ($t.properties.PSObject.Properties['language'] -and $t.properties.language -match '^[a-z]{2,3}$') { $lang = $t.properties.language }
+            if ($langRaw -match '^[a-z]{2,3}$') { $lang = $langRaw }
             # Extension from the Matroska codec id; unknown codecs extract
             # as raw .sub (logged) rather than guessing a text format.
             $codecId = ''
-            if ($null -ne $t.properties.PSObject.Properties['codec_id']) { $codecId = [string]$t.properties.codec_id }
+            if ($null -ne $props -and $null -ne $props.PSObject.Properties['codec_id'] -and $null -ne $props.codec_id) { $codecId = [string]$props.codec_id }
             $ext = 'sub'
             switch ($codecId) {
                 'S_TEXT/UTF8'  { $ext = 'srt' }
@@ -177,11 +189,16 @@ const subtitleExtractPS = `function Invoke-SubtitleExtract {
             $file = "subs_${id}_${lang}.${ext}"
             $extractArgs += "${id}:$(Join-Path $Job.EpisodeDir $file)"
             $name = ''
-            if ($t.properties.PSObject.Properties['track_name'] -and $t.properties.track_name) { $name = [string]$t.properties.track_name }
-            $def = 'no'
-            if ($t.properties.PSObject.Properties['default_track'] -and $t.properties.default_track) { $def = 'yes' }
-            $frc = 'no'
-            if ($t.properties.PSObject.Properties['forced_track'] -and $t.properties.forced_track) { $frc = 'yes' }
+            if ($null -ne $props -and $null -ne $props.PSObject.Properties['track_name'] -and $null -ne $props.track_name) {
+                $name = ([string]$props.track_name) -replace '[\x00-\x1F\x7F]', ''
+                if ($name.Length -gt 200) { $name = $name.Substring(0, 200) }
+            }
+            $defVal = $null
+            if ($null -ne $props -and $null -ne $props.PSObject.Properties['default_track']) { $defVal = $props.default_track }
+            $def = ConvertTo-FlagYesNo $defVal
+            $frcVal = $null
+            if ($null -ne $props -and $null -ne $props.PSObject.Properties['forced_track']) { $frcVal = $props.forced_track }
+            $frc = ConvertTo-FlagYesNo $frcVal
             $manifest += [ordered]@{ file = $file; language = $lang; track_name = $name; default_track = $def; forced_track = $frc }
             Write-Output "[subtitle_extract] track $id ($lang, $codecId) -> $file"
         }
@@ -231,9 +248,12 @@ const fontExtractPS = `function Invoke-FontExtract {
         $mime = ''
         if ($a.PSObject.Properties['content_type'] -and $a.content_type) { $mime = [string]$a.content_type }
         elseif ($a.PSObject.Properties['mime_type'] -and $a.mime_type) { $mime = [string]$a.mime_type }
+        # MIME types are case-insensitive — lowercase before matching so
+        # FONT/TTF extracts exactly like font/ttf (bash parity).
+        $mime = $mime.ToLowerInvariant()
         $fname = ''
         if ($a.PSObject.Properties['file_name'] -and $a.file_name) { $fname = [string]$a.file_name }
-        $isFont = ($mime -in $fontMimes) -or $mime.ToLowerInvariant().StartsWith('font/')
+        $isFont = ($mime -in $fontMimes) -or $mime.StartsWith('font/')
         if (-not $isFont -and $fname -match '\.(ttf|otf|woff|ttc)$') { $isFont = $true }
         if ($isFont) { $fonts += $a }
     }
@@ -255,6 +275,7 @@ const fontExtractPS = `function Invoke-FontExtract {
             $mime = ''
             if ($a.PSObject.Properties['content_type'] -and $a.content_type) { $mime = [string]$a.content_type }
             elseif ($a.PSObject.Properties['mime_type'] -and $a.mime_type) { $mime = [string]$a.mime_type }
+            $mime = $mime.ToLowerInvariant()
             $fname = ''
             if ($a.PSObject.Properties['file_name'] -and $a.file_name) { $fname = [string]$a.file_name }
             # Sanitize the attachment name for the filesystem (no path
@@ -309,13 +330,25 @@ const chapterExtractPS = `function Invoke-ChapterExtract {
     $ident = ([string]::Join([char]10, $raw)) | ConvertFrom-Json
     # mkvmerge -J reports chapter editions at the top level; an edition
     # with zero entries carries no chapters. Sum entries across editions.
+    # EVERY edition is validated (fail closed, bash parity): a non-object
+    # edition or a missing/null num_entries is an invalid edition; a
+    # present value must be 1-9 digits (no negatives, floats or overflow).
     $editions = @()
     if ($null -ne $ident.PSObject.Properties['chapters'] -and $null -ne $ident.chapters) { $editions = @($ident.chapters) }
-    $totalEntries = 0
+    $totalEntries = [long]0
     foreach ($ed in $editions) {
-        if ($null -ne $ed.PSObject.Properties['num_entries'] -and $ed.num_entries -match '^[0-9]{1,9}$') {
-            $totalEntries += [int]$ed.num_entries
+        if ($null -eq $ed -or $ed -isnot [pscustomobject] -or $null -eq $ed.PSObject.Properties['num_entries'] -or $null -eq $ed.num_entries) {
+            throw "chapter_extract: invalid chapter edition (expected an object with num_entries)"
         }
+        if ($ed.num_entries -is [System.Array]) {
+            throw "chapter_extract: invalid chapter num_entries (expected a scalar)"
+        }
+        $n = [string]$ed.num_entries
+        # \A..\z — .NET's $ would tolerate a trailing newline.
+        if ($n -notmatch '\A[0-9]{1,9}\z') {
+            throw "chapter_extract: invalid chapter num_entries '$n'"
+        }
+        $totalEntries += [long]$n
     }
     $dest = Join-Path $Job.EpisodeDir 'chapters.xml'
     if ($totalEntries -eq 0) {
@@ -349,6 +382,11 @@ const muxExtrasPS = `function Invoke-MuxExtras {
         throw "mux_extras: MKVToolNix tools missing (mkvmerge.exe in $($Job.BinDir)) - install the mkvtoolnix package. $($_.Exception.Message)"
     }
     # --- gather extracted extras (manifests written by the extract steps) ---
+    # Manifests are a trust boundary even though machine-written: they must
+    # be JSON ARRAYS. Array-ness is decided on the RAW text (first
+    # non-whitespace char '[') because ConvertFrom-Json unwraps single-
+    # element arrays and returns $null for '[]' — then @() wrap restores
+    # the array shape (5.1-safe). Scalars/objects/empty files fail closed.
     $subs = @()
     $subsJson = Join-Path $Job.EpisodeDir 'subs.json'
     if (Test-Path -LiteralPath $subsJson) {
@@ -357,6 +395,7 @@ const muxExtrasPS = `function Invoke-MuxExtras {
             # Fail CLOSED on an empty/truncated manifest (bash jq errors on
             # it; ConvertFrom-Json would silently return null = "no subs").
             if ($rawSubs.Trim() -eq '') { throw "empty file" }
+            if (-not $rawSubs.TrimStart().StartsWith('[')) { throw "manifest must be a JSON array" }
             $sj = $rawSubs | ConvertFrom-Json
             if ($null -ne $sj) { $subs = @($sj) }
         } catch {
@@ -369,6 +408,7 @@ const muxExtrasPS = `function Invoke-MuxExtras {
         try {
             $rawFonts = [System.IO.File]::ReadAllText($fontsJson)
             if ($rawFonts.Trim() -eq '') { throw "empty file" }
+            if (-not $rawFonts.TrimStart().StartsWith('[')) { throw "manifest must be a JSON array" }
             $fj = $rawFonts | ConvertFrom-Json
             if ($null -ne $fj) { $fonts = @($fj) }
         } catch {
@@ -382,23 +422,47 @@ const muxExtrasPS = `function Invoke-MuxExtras {
         Write-Output "ENCODE_STEP mux_extras 100"
         return
     }
-    # Validate manifest entries before touching anything.
+    # Validate manifest entries before touching anything: relative names
+    # only (no separators, '..', drive letters or control chars), existing
+    # regular files, and the RESOLVED path must stay inside the episode
+    # dir (a relative symlink pointing out is an exfil vector).
+    $epRoot = [System.IO.Path]::GetFullPath($Job.EpisodeDir)
+    try { $epRoot = [System.IO.Path]::GetFullPath((Resolve-LinkFullPath $Job.EpisodeDir)) } catch { }
+    $epPrefix = $epRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    $pathComparison = [System.StringComparison]::Ordinal
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) { $pathComparison = [System.StringComparison]::OrdinalIgnoreCase }
     foreach ($s in $subs) {
-        if ($null -eq $s.PSObject.Properties['file'] -or -not $s.file) {
+        if ($null -eq $s -or $s -isnot [pscustomobject] -or $null -eq $s.PSObject.Properties['file'] -or $null -eq $s.file) {
             throw "mux_extras: subs.json entry without a file name"
         }
-        $sp = Join-Path $Job.EpisodeDir ([string]$s.file)
-        if (-not (Test-Path -LiteralPath $sp)) {
+        $sf = [string]$s.file
+        if ($sf -eq '' -or $sf.Contains('\') -or $sf.StartsWith('/') -or $sf.Contains('..') -or $sf -match '^[A-Za-z]:' -or $sf -match '[\x00-\x1F\x7F]') {
+            throw "mux_extras: unsafe subtitle file entry '$sf' (expected a relative path inside the episode dir)"
+        }
+        $sp = Join-Path $Job.EpisodeDir $sf
+        if (-not (Test-Path -LiteralPath $sp -PathType Leaf)) {
             throw "mux_extras: subtitle file from subs.json missing: $sp (re-run subtitle_extract)"
+        }
+        $resolved = [System.IO.Path]::GetFullPath((Resolve-LinkFullPath $sp))
+        if (-not $resolved.StartsWith($epPrefix, $pathComparison)) {
+            throw "mux_extras: subtitle file entry '$sf' escapes the episode dir"
         }
     }
     foreach ($f in $fonts) {
-        if ($null -eq $f.PSObject.Properties['file'] -or -not $f.file) {
+        if ($null -eq $f -or $f -isnot [pscustomobject] -or $null -eq $f.PSObject.Properties['file'] -or $null -eq $f.file) {
             throw "mux_extras: fonts.json entry without a file name"
         }
-        $fp = Join-Path $Job.EpisodeDir ([string]$f.file)
-        if (-not (Test-Path -LiteralPath $fp)) {
+        $ff = [string]$f.file
+        if ($ff -eq '' -or $ff.Contains('\') -or $ff.StartsWith('/') -or $ff.Contains('..') -or $ff -match '^[A-Za-z]:' -or $ff -match '[\x00-\x1F\x7F]') {
+            throw "mux_extras: unsafe font file entry '$ff' (expected a relative path inside the episode dir)"
+        }
+        $fp = Join-Path $Job.EpisodeDir $ff
+        if (-not (Test-Path -LiteralPath $fp -PathType Leaf)) {
             throw "mux_extras: font file from fonts.json missing: $fp (re-run font_extract)"
+        }
+        $resolved = [System.IO.Path]::GetFullPath((Resolve-LinkFullPath $fp))
+        if (-not $resolved.StartsWith($epPrefix, $pathComparison)) {
+            throw "mux_extras: font file entry '$ff' escapes the episode dir"
         }
     }
 
@@ -410,7 +474,7 @@ const muxExtrasPS = `function Invoke-MuxExtras {
     if ($explicit -ne '') {
         Assert-SafeName -Value $explicit -What "output name"
         $candidate = Join-Path $Job.EpisodeDir $explicit
-        if (-not (Test-Path -LiteralPath $candidate)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             throw "mux_extras: output param file not found: $candidate"
         }
         # File-identity guard: an explicit param pointing at the source
@@ -422,12 +486,13 @@ const muxExtrasPS = `function Invoke-MuxExtras {
     } else {
         # Standard release naming first (exactly what mux writes and
         # release_copy reads), then newest non-source MKV (covers outputs
-        # renamed by crc32_rename in the encode job).
+        # renamed by crc32_rename in the encode job). Both mux temp patterns
+        # are excluded so a crashed run's leftover is never picked.
         $candidates = @()
         $standard = Join-Path $Job.EpisodeDir $Job.OutputName
-        if (Test-Path -LiteralPath $standard) { $candidates += $standard }
+        if (Test-Path -LiteralPath $standard -PathType Leaf) { $candidates += $standard }
         $candidates += @(Get-ChildItem -LiteralPath $Job.EpisodeDir -Filter '*.mkv' -File |
-            Where-Object { $_.Name -ne '.mux_extras.tmp.mkv' } |
+            Where-Object { $_.Name -notlike '.mux_extras.*.tmp.mkv' -and $_.Name -ne '.mux_extras.tmp.mkv' } |
             Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
         foreach ($c in $candidates) {
             if ($src -and (Test-SameFile $c $src)) { continue }
@@ -441,32 +506,63 @@ const muxExtrasPS = `function Invoke-MuxExtras {
     Write-Output "[mux_extras] encoded output: $out"
     Write-Output "ENCODE_STEP mux_extras 20"
 
-    # --- mkvmerge: encoded first (keep video+audio, strip old extras so
-    # re-runs replace instead of duplicating), then one input per sub file
-    # with its flags; chapters + fonts ride the global options. ---
-    $tmp = Join-Path $Job.EpisodeDir '.mux_extras.tmp.mkv'
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-    $arguments = @('-o', $tmp, '--quiet')
-    if ($hasChapters) { $arguments += @('--chapters', $chaptersXml) }
-    foreach ($f in $fonts) {
-        $arguments += @('--attach-file', (Join-Path $Job.EpisodeDir ([string]$f.file)))
-    }
-    $arguments += @('--no-subtitles', '--no-chapters', '--no-attachments', $out)
-    foreach ($s in $subs) {
-        $lang = 'und'
-        if ($s.PSObject.Properties['language'] -and $s.language -match '^[a-z]{2,3}$') { $lang = [string]$s.language }
-        $arguments += @('--no-video', '--no-audio', '--language', "0:$lang")
-        if ($s.PSObject.Properties['track_name'] -and $s.track_name) {
-            $arguments += @('--track-name', "0:$([string]$s.track_name)")
+    # --- per-episode lock + UNIQUE temp: concurrent mux_extras runs on the
+    # same episode dir (two jobs, or a retry racing the original) must
+    # serialize — a fixed temp name let them destroy each other's output
+    # while both reported success. The lock file is shared with the bash
+    # port (flock on the same inode); FileShare.None gives mutual exclusion
+    # between PS runs (and, via .NET's Unix flock emulation, bash runs too).
+    $lockPath = Join-Path $Job.EpisodeDir '.mux_extras.lock'
+    $lockStream = $null
+    $lockDeadline = [DateTime]::UtcNow.AddSeconds(600)
+    while ($null -eq $lockStream) {
+        try {
+            $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch {
+            if ([DateTime]::UtcNow -ge $lockDeadline) {
+                throw "mux_extras: could not acquire the episode mux lock within 600s ($lockPath)"
+            }
+            Start-Sleep -Milliseconds 200
         }
-        $def = 'no'
-        if ($s.PSObject.Properties['default_track'] -and $s.default_track -eq 'yes') { $def = 'yes' }
-        $frc = 'no'
-        if ($s.PSObject.Properties['forced_track'] -and $s.forced_track -eq 'yes') { $frc = 'yes' }
-        $arguments += @('--default-track-flag', "0:$def", '--forced-display-flag', "0:$frc", (Join-Path $Job.EpisodeDir ([string]$s.file)))
     }
-    Write-Output "[mux_extras] mkvmerge $($arguments -join ' ')"
+    $tmp = Join-Path $Job.EpisodeDir ".mux_extras.$PID.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp.mkv"
     try {
+        # --- mkvmerge: encoded first (keep video+audio, strip old extras so
+        # re-runs replace instead of duplicating), then one input per sub file
+        # with its flags; chapters + fonts ride the global options. ---
+        $arguments = @('-o', $tmp, '--quiet')
+        if ($hasChapters) { $arguments += @('--chapters', $chaptersXml) }
+        foreach ($f in $fonts) {
+            $arguments += @('--attach-file', (Join-Path $Job.EpisodeDir ([string]$f.file)))
+        }
+        $arguments += @('--no-subtitles', '--no-chapters', '--no-attachments', $out)
+        foreach ($s in $subs) {
+            # Re-sanitize untrusted manifest metadata (defense in depth —
+            # the extract steps already sanitize, but a hand-placed or
+            # older manifest may carry control chars / marker text).
+            $langRaw = ''
+            if ($null -ne $s.PSObject.Properties['language'] -and $null -ne $s.language) { $langRaw = [string]$s.language }
+            $langRaw = $langRaw -replace '[\x00-\x1F\x7F]', ''
+            $lang = 'und'
+            if ($langRaw -match '^[a-z]{2,3}$') { $lang = $langRaw }
+            $arguments += @('--no-video', '--no-audio', '--language', "0:$lang")
+            $name = ''
+            if ($null -ne $s.PSObject.Properties['track_name'] -and $null -ne $s.track_name) {
+                $name = ([string]$s.track_name) -replace '[\x00-\x1F\x7F]', ''
+                if ($name.Length -gt 200) { $name = $name.Substring(0, 200) }
+            }
+            if ($name -ne '') {
+                $arguments += @('--track-name', "0:$name")
+            }
+            $defVal = $null
+            if ($null -ne $s.PSObject.Properties['default_track']) { $defVal = $s.default_track }
+            $def = ConvertTo-FlagYesNo $defVal
+            $frcVal = $null
+            if ($null -ne $s.PSObject.Properties['forced_track']) { $frcVal = $s.forced_track }
+            $frc = ConvertTo-FlagYesNo $frcVal
+            $arguments += @('--default-track-flag', "0:$def", '--forced-display-flag', "0:$frc", (Join-Path $Job.EpisodeDir ([string]$s.file)))
+        }
+        Write-Output "[mux_extras] mkvmerge $($arguments -join ' ')"
         Invoke-Tool -ExePath $mkvmerge -Arguments $arguments -Label 'mkvmerge'
         if (-not (Test-Path -LiteralPath $tmp)) {
             throw "mux_extras: mkvmerge finished but $tmp was not created"
@@ -477,9 +573,11 @@ const muxExtrasPS = `function Invoke-MuxExtras {
         # Atomic replace: same-directory rename over the encoded output.
         Move-Item -LiteralPath $tmp -Destination $out -Force
     } finally {
+        # Own-tmp cleanup on EVERY path + lock release.
         if (Test-Path -LiteralPath $tmp) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
+        $lockStream.Dispose()
     }
     Write-Output "ENCODE_STEP mux_extras 80"
     $chLog = 'no'

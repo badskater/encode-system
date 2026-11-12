@@ -16,7 +16,8 @@ func TestMetricTrackerParsing(t *testing.T) {
 	mt.observe("ENCODE_STEP encode 50")           // not a metric
 	mt.observe("ENCODE_METRIC bogus")             // no '='
 	mt.observe("ENCODE_METRIC nan=notanumber")    // bad float
-	mt.observe("[x265] ENCODE_METRIC vmaf=95.00") // embedded prefix ok, last wins
+	mt.observe("[x265] ENCODE_METRIC vmaf=99.00") // mid-line: IGNORED (markers are line-based, Q11)
+	mt.observe("ENCODE_METRIC vmaf=95.00")        // line-start last wins
 	mt.observe("ENCODE_METRIC  spaced = 1.5")     // spaces around '='
 
 	got := mt.snapshot()

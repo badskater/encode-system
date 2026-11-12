@@ -460,7 +460,13 @@ func (a *Agent) getAuth(ctx context.Context, path string, w io.Writer) error {
 	return err
 }
 
-var stepLine = regexp.MustCompile(`ENCODE_STEP (\w+) (\d+(?:\.\d+)?)`)
+// stepLine matches the ENCODE_STEP progress marker ONLY at line start.
+// Markers are line-based protocol messages: untrusted metadata echoed
+// mid-line (e.g. a hostile track_name inside an mkvmerge command line)
+// must not forge progress, step timings or the timeout re-arm hook.
+// All scan sites (live progress, step tracker, instance boundary) share
+// this one regex.
+var stepLine = regexp.MustCompile(`^ENCODE_STEP (\w+) (\d+(?:\.\d+)?)`)
 
 // executeJob runs one job: write the rendered script, invoke PowerShell,
 // parse progress lines, and report completion. The execution limits come

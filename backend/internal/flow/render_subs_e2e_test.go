@@ -25,9 +25,12 @@ import (
 // is installed (it is on this host) and skips otherwise.
 
 // subsMkvmergeStub: -J mode cats the identify sidecar; mux mode records
-// every argument (one per line) for the Go assertions, enforces the
-// temp-file name and the strip-flags-before-encoded contract, then writes
-// a recognizable output derived from the encoded input.
+// every argument (one per line AND NUL-separated for exactness) for the Go
+// assertions, enforces the per-invocation temp-file PATTERN and the
+// strip-flags-before-encoded contract, then writes a recognizable output
+// derived from the encoded input. Sidecars: mkvmerge_exit, mkvmerge_no_output,
+// mux_sleep (sleep before writing), mux_write_sleep (write PART1, sleep, then
+// append PART2 + inputs — exposes concurrent tmp-file corruption).
 const subsMkvmergeStub = `#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 for a in "$@"; do
@@ -39,6 +42,7 @@ for a in "$@"; do
 done
 # --- mux mode ---
 printf '%s\n' "$@" > "$dir/mkvmerge_args.txt"
+printf '%s\0' "$@" > "$dir/mkvmerge_args.nul"
 out=""
 prev=""
 for a in "$@"; do
@@ -46,13 +50,14 @@ for a in "$@"; do
   prev="$a"
 done
 case "$(basename "$out")" in
-  .mux_extras.tmp.mkv) ;;
-  *) echo "mkvmerge stub: output must be the atomic temp file, got: $out" >&2; exit 1 ;;
+  .mux_extras.*.tmp.mkv) ;;
+  *) echo "mkvmerge stub: output must match the atomic temp pattern .mux_extras.*.tmp.mkv, got: $out" >&2; exit 1 ;;
 esac
 rc=0
 [ -f "$dir/mkvmerge_exit" ] && rc=$(cat "$dir/mkvmerge_exit")
 if [ "$rc" != "0" ]; then exit "$rc"; fi
 if [ -f "$dir/mkvmerge_no_output" ]; then exit 0; fi
+if [ -f "$dir/mux_sleep" ]; then sleep "$(cat "$dir/mux_sleep")"; fi
 # Encoded input = first EXISTING .mkv argument (the temp does not exist
 # yet; subtitle/font inputs carry other extensions).
 enc=""
@@ -79,6 +84,17 @@ done
 if [ "$prev3" != "--no-subtitles" ] || [ "$prev2" != "--no-chapters" ] || [ "$prev1" != "--no-attachments" ]; then
   echo "mkvmerge stub: encoded input must follow --no-subtitles --no-chapters --no-attachments" >&2
   exit 1
+fi
+# Write-then-sleep mode: a partial file exists DURING the mux so a
+# concurrent run deleting/overwriting the shared tmp is observable.
+if [ -f "$dir/mux_write_sleep" ]; then
+  printf 'PART1-' > "$out"
+  sleep "$(cat "$dir/mux_write_sleep")"
+  printf 'PART2\n' >> "$out"
+  for a in "$@"; do
+    if [ -f "$a" ] && [ "$a" != "$out" ]; then echo "--- input: $a" >> "$out"; cat "$a" >> "$out"; fi
+  done
+  exit 0
 fi
 { cat "$enc"; echo "MUXED-EXTRAS"; } > "$out"
 echo "mkvmerge stub: muxed $enc -> $out" >&2
@@ -136,27 +152,83 @@ exit 0
 `
 
 // subsJQStub implements EXACTLY the jq invocations the four bash templates
-// issue (identify parsing, manifest construction/slurp, manifest reads).
+// issue, FAITHFUL to real jq 1.7 semantics (the previous stub crashed on
+// empty input, masking the silent-success bug on empty manifests — P6
+// review Q3/Q5):
+//   - empty input → NO output, exit 0 (with -e: exit 4)
+//   - -e → exit 1 when the last output value is false/null, 4 when nothing
+//     was output, 0 otherwise
+//   - parse errors exit 2; runtime errors (iterate/index scalars, mixed
+//     add) exit 5; unsupported queries exit 3 (loud, never silent)
+//   - 'length': null→0, number→abs, string/array/object→len, bool→error
+//   - // substitutes ONLY null/false; tostring: bools lowercase,
+//     integral floats normalize to int form (jq: 4.0|tostring == "4")
+//   - gsub("[\\u0000-\\u001f\\u007f]";"") strips C0+DEL (Q1b sanitization)
 const subsJQStub = `#!/usr/bin/env python3
-import sys, json
+import sys, json, re
 
 args = sys.argv[1:]
+raw = '-r' in args
+compact = '-c' in args
+eflag = '-e' in args
+
+def die(msg, code=5):
+    sys.stderr.write('jq: error: ' + msg + '\n')
+    sys.exit(code)
+
+last = None
+n_out = 0
+
+def emit(v):
+    global last, n_out
+    last = v
+    n_out += 1
+    if raw and isinstance(v, str):
+        print(v)
+    else:
+        print(json.dumps(v))
+
+def finish():
+    if eflag:
+        if n_out == 0:
+            sys.exit(4)
+        if last is None or last is False:
+            sys.exit(1)
+    sys.exit(0)
 
 def alt(v, default):
     # jq '//': substitute only for null/false (empty strings are truthy).
     return default if v is None or v is False else v
 
-if '-n' in args:
-    out = {}
-    i = 0
-    while i < len(args):
-        if args[i] in ('--arg', '--argjson'):
-            out[args[i+1]] = json.loads(args[i+2]) if args[i] == '--argjson' else args[i+2]
-            i += 3
-        else:
-            i += 1
-    print(json.dumps(out))
-    sys.exit(0)
+def tostring(v):
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if v is None:
+        return 'null'
+    if isinstance(v, str):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return json.dumps(v)
+
+def index(v, key):
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v.get(key)
+    die('Cannot index %s with "%s"' % (type(v).__name__, key))
+
+def iterate(v):
+    # .[] — arrays yield elements, objects yield values, scalars error.
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return list(v.values())
+    die('Cannot iterate over %s' % json.dumps(v))
+
+def sanitize(v):
+    # gsub("[\\u0000-\\u001f\\u007f]"; "") — strip C0 controls + DEL.
+    return re.sub('[\x00-\x1f\x7f]', '', v)
 
 def slurp(text):
     dec = json.JSONDecoder()
@@ -170,6 +242,21 @@ def slurp(text):
             idx += 1
     return vals
 
+if '-n' in args:
+    out = {}
+    i = 0
+    while i < len(args):
+        if args[i] == '--arg':
+            out[args[i+1]] = args[i+2]
+            i += 3
+        elif args[i] == '--argjson':
+            out[args[i+1]] = json.loads(args[i+2])
+            i += 3
+        else:
+            i += 1
+    print(json.dumps(out))
+    sys.exit(0)
+
 if '-s' in args:
     data = slurp(sys.stdin.read())
     q = [a for a in args if not a.startswith('-')][0]
@@ -177,66 +264,115 @@ if '-s' in args:
         print(json.dumps(data))
     elif q == '.[].file':
         for v in data:
-            print(v['file'])
+            emit(index(v, 'file'))
     else:
-        sys.exit(1)
-    sys.exit(0)
+        die('unsupported slurp query ' + q, 3)
+    finish()
 
 pos = [a for a in args if not a.startswith('-')]
 q = pos[0]
-data = json.load(open(pos[1])) if len(pos) > 1 else json.load(sys.stdin)
+try:
+    text = open(pos[1], encoding='utf-8').read() if len(pos) > 1 else sys.stdin.read()
+except UnicodeDecodeError:
+    die('invalid UTF-8 input', 2)
+if text.strip() == '':
+    # Real jq on empty input: no output, exit 0 (exit 4 with -e).
+    finish()
+try:
+    data = json.loads(text)
+except ValueError as e:
+    die('parse error: %s' % e, 2)
 
-def tsv(vals):
-    # map(tostring) | join unit-separator: non-whitespace delimiter so
-    # bash read keeps empty fields (jq tostring: bools lowercase).
-    out = []
-    for v in vals:
-        if isinstance(v, bool):
-            s = 'true' if v else 'false'
-        elif v is None:
-            s = 'null'
-        else:
-            s = str(v)
-        out.append(s)
-    print('\x1f'.join(out))
-
-if q == '[.tracks[]? | select(.type=="subtitles")] | length':
-    print(len([t for t in data.get('tracks', []) if t.get('type') == 'subtitles']))
-elif q == '.tracks[]? | select(.type=="subtitles") | [.id, (.properties.language // "und"), (.properties.track_name // ""), (.properties.default_track // false), (.properties.forced_track // false), (.properties.codec_id // "")] | map(tostring) | join("\\u001f")':
-    for t in data.get('tracks', []):
-        if t.get('type') != 'subtitles':
-            continue
-        p = t.get('properties', {})
-        tsv([t.get('id'), alt(p.get('language'), 'und'), alt(p.get('track_name'), ''),
-             alt(p.get('default_track'), False), alt(p.get('forced_track'), False),
-             alt(p.get('codec_id'), '')])
+if q == 'type == "array"':
+    emit(isinstance(data, list))
+elif q == '[.tracks[]? | select(.type=="subtitles")] | length':
+    tracks = data.get('tracks') if isinstance(data, dict) else None
+    n = 0
+    if isinstance(tracks, (list, dict)):
+        for t in (tracks if isinstance(tracks, list) else tracks.values()):
+            if index(t, 'type') == 'subtitles':
+                n += 1
+    emit(n)
+elif q == '.tracks[]? | select(.type=="subtitles") | ((.properties // {}) | if type == "object" then . else {} end) as $p | [.id, ($p.language // "und" | tostring | gsub("[\\\\u0000-\\\\u001f\\\\u007f]"; "")), ($p.track_name // "" | tostring | gsub("[\\\\u0000-\\\\u001f\\\\u007f]"; "") | .[0:200]), ($p.default_track // false), ($p.forced_track // false), ($p.codec_id // "")] | map(tostring) | join("\\u001f")':
+    tracks = data.get('tracks') if isinstance(data, dict) else None
+    if isinstance(tracks, (list, dict)):
+        for t in (tracks if isinstance(tracks, list) else tracks.values()):
+            if index(t, 'type') != 'subtitles':
+                continue
+            p = alt(index(t, 'properties'), {})
+            if not isinstance(p, dict):
+                p = {}
+            vals = [index(t, 'id'),
+                    sanitize(tostring(alt(index(p, 'language'), 'und'))),
+                    sanitize(tostring(alt(index(p, 'track_name'), '')))[:200],
+                    alt(index(p, 'default_track'), False),
+                    alt(index(p, 'forced_track'), False),
+                    alt(index(p, 'codec_id'), '')]
+            emit('\x1f'.join(tostring(v) for v in vals))
 elif q == '.attachments[]? | [.id, (.file_name // ""), (.content_type // .mime_type // "")] | map(tostring) | join("\\u001f")':
-    for a in data.get('attachments', []):
-        tsv([a.get('id'), alt(a.get('file_name'), ''),
-             alt(alt(a.get('content_type'), a.get('mime_type')), '')])
-elif q == '[.chapters[]?.num_entries] | add // 0':
-    print(sum(c.get('num_entries', 0) for c in data.get('chapters', [])))
+    atts = data.get('attachments') if isinstance(data, dict) else None
+    if isinstance(atts, (list, dict)):
+        for a in (atts if isinstance(atts, list) else atts.values()):
+            vals = [index(a, 'id'), alt(index(a, 'file_name'), ''),
+                    alt(alt(index(a, 'content_type'), index(a, 'mime_type')), '')]
+            emit('\x1f'.join(tostring(v) for v in vals))
+elif q == '(.chapters | if . == null then [] elif type == "array" then . else [.] end)[] | if type == "object" and has("num_entries") and (.num_entries != null) then (.num_entries | tostring) else "INVALID" end':
+    ch = data.get('chapters') if isinstance(data, dict) else None
+    if ch is None:
+        ch = []
+    elif not isinstance(ch, list):
+        ch = [ch]
+    for c in ch:
+        if isinstance(c, dict) and 'num_entries' in c and c['num_entries'] is not None:
+            emit(tostring(c['num_entries']))
+        else:
+            emit('INVALID')
 elif q == 'length':
-    print(len(data))
+    if data is None:
+        emit(0)
+    elif isinstance(data, bool):
+        die('boolean has no length', 5)
+    elif isinstance(data, (int, float)):
+        emit(abs(data))
+    else:
+        emit(len(data))
 elif q == '.[].file':
-    for v in data:
-        print(v['file'])
+    for v in iterate(data):
+        emit(index(v, 'file'))
+elif q == '.[] | (.file // "")':
+    # fonts manifest single-pass read: missing/null file -> "" so bash
+    # fails closed with "entry without a file name" (PS parity).
+    for v in iterate(data):
+        emit(alt(index(v, 'file'), ''))
+elif q == '.[] | [(.file // ""), (.language // "und" | tostring | gsub("[\\\\u0000-\\\\u001f\\\\u007f]"; "")), (.track_name // "" | tostring | gsub("[\\\\u0000-\\\\u001f\\\\u007f]"; "") | .[0:200]), (.default_track // "no"), (.forced_track // "no")] | map(tostring) | join("\\u001f")':
+    for v in iterate(data):
+        vals = [alt(index(v, 'file'), ''),
+                sanitize(tostring(alt(index(v, 'language'), 'und'))),
+                sanitize(tostring(alt(index(v, 'track_name'), '')))[:200],
+                alt(index(v, 'default_track'), 'no'),
+                alt(index(v, 'forced_track'), 'no')]
+        emit('\x1f'.join(tostring(x) for x in vals))
 elif q == '.[]':
-    for v in data:
-        print(json.dumps(v))
+    for v in iterate(data):
+        if compact:
+            print(json.dumps(v, separators=(',', ':')))
+        else:
+            print(json.dumps(v))
+        n_out += 1
+        last = v
 elif q == '.file':
-    print(alt(data.get('file'), ''))
+    emit(alt(index(data, 'file'), ''))
 elif q == '.language // "und"':
-    print(alt(data.get('language'), 'und'))
+    emit(alt(index(data, 'language'), 'und'))
 elif q == '.track_name // ""':
-    print(alt(data.get('track_name'), ''))
+    emit(alt(index(data, 'track_name'), ''))
 elif q == '.default_track // "no"':
-    print(alt(data.get('default_track'), 'no'))
+    emit(alt(index(data, 'default_track'), 'no'))
 elif q == '.forced_track // "no"':
-    print(alt(data.get('forced_track'), 'no'))
+    emit(alt(index(data, 'forced_track'), 'no'))
 else:
-    sys.stderr.write('jq stub: unsupported query: ' + q + '\n')
-    sys.exit(1)
+    die('unsupported query: ' + q, 3)
+finish()
 `
 
 // --- identify fixtures (real schema-v20 shape) -------------------------
@@ -342,20 +478,29 @@ type subsCase struct {
 	preChapters     bool
 	corruptSubsJSON bool
 	emptySubsJSON   bool
+	rawSubsJSON     string // pre-placed subs.json VERBATIM (shape/traversal attacks)
+	rawFontsJSON    string // pre-placed fonts.json VERBATIM
+	muxWriteSleep   string // mkvmerge stub: write PART1, sleep N, append PART2
 
 	wantFail   bool
 	wantSubstr []string
 	wantPS     []string
 	wantBash   []string
 	wantAbsent []string
+	// wantAbsentLines: no output LINE (trimmed) may equal any of these —
+	// catches forged protocol markers embedded mid-line in echoed args.
+	wantAbsentLines []string
 
 	wantFiles              []string
 	wantNoFiles            []string
+	wantNoMuxTmp           bool // no .mux_extras.*.tmp.mkv leftover in epDir
 	wantNoMkvmergeCall     bool
 	wantNoMkvextractCall   bool
 	wantMkvmergeArgs       []string                    // exact recorded mkvmerge argument sequence
 	wantMkvmergeArgsFn     func(epDir string) []string // args expectation needing the case's epDir
-	checkOutput            string                      // output file to inspect (default: standard name)
+	wantMkvmergeArgsNulFn  func(epDir string) []string // exact argv via the NUL log (newline-safe)
+	wantMkvmergeArgsCheck  func(args []string, epDir string) error
+	checkOutput            string // output file to inspect (default: standard name)
 	wantOutputContains     string
 	wantOutputUnchanged    bool
 	outputOriginal         string // captured pre-run content for wantOutputUnchanged
@@ -477,7 +622,7 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 		}
 	}
 	// Pre-placed extraction artifacts (mux_extras single-step cases).
-	if len(tc.preSubs) > 0 || tc.corruptSubsJSON || tc.emptySubsJSON {
+	if len(tc.preSubs) > 0 || tc.corruptSubsJSON || tc.emptySubsJSON || tc.rawSubsJSON != "" {
 		entries := make([]subsManifestEntry, 0, len(tc.preSubs))
 		for _, s := range tc.preSubs {
 			if err := os.WriteFile(filepath.Join(epDir, s.file), []byte("sub-content"), 0o644); err != nil {
@@ -489,7 +634,9 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 			})
 		}
 		raw := "{not valid json"
-		if tc.emptySubsJSON {
+		if tc.rawSubsJSON != "" {
+			raw = tc.rawSubsJSON
+		} else if tc.emptySubsJSON {
 			raw = ""
 		} else if !tc.corruptSubsJSON {
 			b, err := json.Marshal(entries)
@@ -502,7 +649,7 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 			t.Fatal(err)
 		}
 	}
-	if len(tc.preFonts) > 0 {
+	if len(tc.preFonts) > 0 || tc.rawFontsJSON != "" {
 		if err := os.MkdirAll(filepath.Join(epDir, "fonts"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -516,13 +663,22 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 			}
 			entries = append(entries, fontEntry{File: f})
 		}
-		b, err := json.Marshal(entries)
-		if err != nil {
+		raw := ""
+		if tc.rawFontsJSON != "" {
+			raw = tc.rawFontsJSON
+		} else {
+			b, err := json.Marshal(entries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw = string(b)
+		}
+		if err := os.WriteFile(filepath.Join(epDir, "fonts.json"), []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(epDir, "fonts.json"), b, 0o644); err != nil {
-			t.Fatal(err)
-		}
+	}
+	if tc.muxWriteSleep != "" {
+		writeStub(binDir, "mux_write_sleep", tc.muxWriteSleep)
 	}
 	if tc.preChapters {
 		if err := os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte("<Chapters></Chapters>"), 0o644); err != nil {
@@ -543,7 +699,7 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 		if err := os.MkdirAll(minDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for _, tool := range []string{"bash", "find", "sort", "head", "tr", "grep", "sed", "wc", "cut", "tail", "python3", "cat", "dirname", "cp", "mkdir", "rm", "mv", "stat", "basename"} {
+		for _, tool := range []string{"bash", "find", "sort", "head", "tr", "grep", "sed", "wc", "cut", "tail", "python3", "cat", "dirname", "cp", "mkdir", "rm", "mv", "stat", "basename", "flock", "realpath", "sleep"} {
 			p, err := exec.LookPath(tool)
 			if err != nil {
 				t.Skipf("coreutils tool %q not available: %v", tool, err)
@@ -565,7 +721,7 @@ func subsSetup(t *testing.T, tc subsCase, exeSuffix string) (Vars, string, strin
 				}
 			}
 		}
-		for _, sidecar := range []string{"identify.json", "identify_exit", "mkvmerge_exit", "mkvmerge_no_output", "mkvextract_exit", "mkvextract_skip_file", "chapters_payload.xml"} {
+		for _, sidecar := range []string{"identify.json", "identify_exit", "mkvmerge_exit", "mkvmerge_no_output", "mkvextract_exit", "mkvextract_skip_file", "chapters_payload.xml", "mux_write_sleep", "mux_sleep"} {
 			p := filepath.Join(binDir, sidecar)
 			if _, err := os.Stat(p); err == nil {
 				if err := os.Symlink(p, filepath.Join(minDir, sidecar)); err != nil {
@@ -590,6 +746,20 @@ func subsRender(t *testing.T, tc subsCase, v Vars, d Dialect) string {
 		t.Fatalf("render: %v", err)
 	}
 	return script
+}
+
+// subsReadNulArgs reads the NUL-separated argv log the mkvmerge stub
+// writes (exact even when an argument contains newlines).
+func subsReadNulArgs(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("mkvmerge was not invoked (no NUL argv log): %v", err)
+	}
+	if len(raw) == 0 {
+		return []string{}
+	}
+	return strings.Split(string(raw[:len(raw)-1]), "\x00")
 }
 
 func subsAssert(t *testing.T, tc subsCase, text string, runErr error, epDir, binDir string, ps bool) {
@@ -635,6 +805,25 @@ func subsAssert(t *testing.T, tc subsCase, text string, runErr error, epDir, bin
 			t.Errorf("output must NOT contain %q\n%s", absent, text)
 		}
 	}
+	if len(tc.wantAbsentLines) > 0 {
+		for _, line := range strings.Split(text, "\n") {
+			trimmed := strings.TrimSpace(line)
+			for _, absent := range tc.wantAbsentLines {
+				if trimmed == absent {
+					t.Errorf("output must NOT contain a line equal to %q (forged marker)\n%s", absent, text)
+				}
+			}
+		}
+	}
+	if tc.wantNoMuxTmp {
+		leftovers, _ := filepath.Glob(filepath.Join(epDir, ".mux_extras.*.tmp.mkv"))
+		if len(leftovers) > 0 {
+			t.Errorf("mux temp leftovers must be cleaned up: %v\n%s", leftovers, text)
+		}
+		if _, err := os.Stat(filepath.Join(epDir, MuxExtrasTempName)); err == nil {
+			t.Errorf("legacy fixed-name temp leftover present\n%s", text)
+		}
+	}
 	for _, f := range tc.wantFiles {
 		if _, err := os.Stat(filepath.Join(epDir, f)); err != nil {
 			t.Errorf("expected file %s missing: %v\n%s", f, err, text)
@@ -666,6 +855,24 @@ func subsAssert(t *testing.T, tc subsCase, text string, runErr error, epDir, bin
 			if got[i] != tc.wantMkvmergeArgs[i] {
 				t.Errorf("mkvmerge arg %d = %q, want %q\n%s", i, got[i], tc.wantMkvmergeArgs[i], text)
 			}
+		}
+	}
+	if tc.wantMkvmergeArgsNulFn != nil {
+		want := tc.wantMkvmergeArgsNulFn(epDir)
+		got := subsReadNulArgs(t, filepath.Join(binDir, "mkvmerge_args.nul"))
+		if len(got) != len(want) {
+			t.Fatalf("mkvmerge argv count = %d, want %d\ngot:  %q\nwant: %q\n%s", len(got), len(want), got, want, text)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("mkvmerge argv[%d] = %q, want %q\n%s", i, got[i], want[i], text)
+			}
+		}
+	}
+	if tc.wantMkvmergeArgsCheck != nil {
+		got := subsReadNulArgs(t, filepath.Join(binDir, "mkvmerge_args.nul"))
+		if err := tc.wantMkvmergeArgsCheck(got, epDir); err != nil {
+			t.Errorf("mkvmerge argv contract: %v\ngot: %q\n%s", err, got, text)
 		}
 	}
 	extractArgsPath := filepath.Join(binDir, "mkvextract_args.txt")
@@ -915,6 +1122,103 @@ func subtitleExtractCases() []subsCase {
 		identify:  subsIdentify(langTracks, []any{}, []any{}),
 		wantFiles: []string{"subs_30_und.srt", "subs_31_und.srt"},
 	})
+	// --- hostile untrusted metadata (P6 review Q1b/Q8/Q10/Q11) ---------
+	// track_name/language come from the SOURCE FILE (untrusted). Control
+	// characters must be stripped and length capped BEFORE they reach
+	// manifests, TSV fields, filenames or echoed command lines.
+	cases = append(cases,
+		subsCase{
+			name: "hostile_name_quotes_flags", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng", `x" --attach-file C:\secret y" z`, false, false)), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: `x" --attach-file C:\secret y" z`, DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			name: "hostile_name_newline_marker", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng", "line1\nENCODE_STEP mux_extras 100", false, false)), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "line1ENCODE_STEP mux_extras 100", DefaultTrack: "no", ForcedTrack: "no"},
+			},
+			wantAbsentLines: []string{"ENCODE_STEP mux_extras 100"},
+		},
+		subsCase{
+			// Q10: unit-separator in the name must not shift the bash TSV
+			// fields — both dialects produce the IDENTICAL manifest.
+			name: "hostile_name_unit_separator", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng", "a\x1ftrue\x1fyes", false, false)), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "atrueyes", DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			name: "hostile_name_control_chars", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng", "a\rb	c\x00d\x7fe", false, false)), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "abcde", DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			name: "hostile_name_length_cap", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng", strings.Repeat("x", 300), false, false)), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: strings.Repeat("x", 200), DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			// Q8: .NET regex $ allows a trailing newline — sanitization must
+			// strip it so 'eng\n' validates as eng (bash parity).
+			name: "language_trailing_newline", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				subsTrack(2, "S_TEXT/UTF8", "eng\n", "N", false, false)), []any{}, []any{}),
+			wantFiles: []string{"subs_2_eng.srt"},
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "N", DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			// Q8: a track WITHOUT a properties object — PS StrictMode must
+			// not throw; both dialects default everything.
+			name: "track_without_properties", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				map[string]any{"id": 2, "type": "subtitles", "codec": "S_TEXT/UTF8"}), []any{}, []any{}),
+			wantFiles: []string{"subs_2_und.sub"},
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_und.sub", Language: "und", TrackName: "", DefaultTrack: "no", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			// Q8: numeric default_track=1 — PS truthiness said yes, bash
+			// =="true" said no. Normalized truthiness: true/1/"true"/"yes".
+			name: "numeric_default_track", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				map[string]any{"id": 2, "type": "subtitles", "codec": "S_TEXT/UTF8",
+					"properties": map[string]any{"codec_id": "S_TEXT/UTF8", "language": "eng",
+						"track_name": "N", "default_track": 1, "forced_track": 0}}), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "N", DefaultTrack: "yes", ForcedTrack: "no"},
+			},
+		},
+		subsCase{
+			name: "string_flag_variants", step: "subtitle_extract",
+			identify: subsIdentify(append(subsVideoAudio(),
+				map[string]any{"id": 2, "type": "subtitles", "codec": "S_TEXT/UTF8",
+					"properties": map[string]any{"codec_id": "S_TEXT/UTF8", "language": "eng",
+						"track_name": "A", "default_track": "true", "forced_track": "yes"}},
+				map[string]any{"id": 3, "type": "subtitles", "codec": "S_TEXT/UTF8",
+					"properties": map[string]any{"codec_id": "S_TEXT/UTF8", "language": "eng",
+						"track_name": "B", "default_track": "1", "forced_track": "false"}}), []any{}, []any{}),
+			wantSubsManifest: []subsManifestEntry{
+				{File: "subs_2_eng.srt", Language: "eng", TrackName: "A", DefaultTrack: "yes", ForcedTrack: "yes"},
+				{File: "subs_3_eng.srt", Language: "eng", TrackName: "B", DefaultTrack: "yes", ForcedTrack: "no"},
+			},
+		},
+	)
 	return cases
 }
 
@@ -997,6 +1301,19 @@ func fontExtractCases() []subsCase {
 			name: "mkvextract_missing_output", step: "font_extract", mkvextractSkip: true,
 			wantFail: true, wantSubstr: []string{"was not created"},
 		},
+		{
+			// Q8: uppercase MIME — PS -in is case-insensitive (extracted),
+			// bash case patterns were case-sensitive (skipped). Both must
+			// extract after lowercasing the MIME.
+			name: "font_uppercase_mime", step: "font_extract",
+			identify: subsIdentify(subsVideoAudio(), []any{
+				map[string]any{"id": 10, "file_name": "cover.png", "content_type": "FONT/TTF"},
+				map[string]any{"id": 11, "file_name": "mixed.otf", "content_type": "Application/Vnd.Ms-OpenType"},
+			}, []any{}),
+			wantFiles:         []string{"fonts/10_cover.png", "fonts/11_mixed.otf"},
+			wantFontsManifest: []string{"fonts/10_cover.png", "fonts/11_mixed.otf"},
+			wantSubstr:        []string{"extracted 2 font attachment(s)"},
+		},
 	}
 }
 
@@ -1045,6 +1362,52 @@ func chapterExtractCases() []subsCase {
 			name: "mkvextract_missing_output", step: "chapter_extract", mkvextractSkip: true,
 			wantFail: true, wantSubstr: []string{"was not created"},
 		},
+		// --- num_entries validation parity (P6 review Q6) ---------------
+		// Both dialects must reject the SAME invalid shapes: >9 digits,
+		// negative, float, scalar edition, missing num_entries. PS used to
+		// silently skip invalid editions; bash swallowed jq errors.
+		{
+			name: "num_entries_ten_digits", step: "chapter_extract",
+			identify:             subsIdentify(subsVideoAudio(), []any{}, []any{map[string]any{"num_entries": 1234567890}}),
+			wantFail:             true,
+			wantSubstr:           []string{"invalid chapter num_entries"},
+			wantNoMkvextractCall: true,
+		},
+		{
+			name: "num_entries_negative", step: "chapter_extract",
+			identify:             subsIdentify(subsVideoAudio(), []any{}, []any{map[string]any{"num_entries": -5}}),
+			wantFail:             true,
+			wantSubstr:           []string{"invalid chapter num_entries"},
+			wantNoMkvextractCall: true,
+		},
+		{
+			name: "num_entries_float", step: "chapter_extract",
+			identify:             subsIdentify(subsVideoAudio(), []any{}, []any{map[string]any{"num_entries": 2.5}}),
+			wantFail:             true,
+			wantSubstr:           []string{"invalid chapter num_entries"},
+			wantNoMkvextractCall: true,
+		},
+		{
+			name: "num_entries_scalar_edition", step: "chapter_extract",
+			identify:             subsIdentify(subsVideoAudio(), []any{}, []any{5}),
+			wantFail:             true,
+			wantSubstr:           []string{"invalid chapter edition"},
+			wantNoMkvextractCall: true,
+		},
+		{
+			name: "num_entries_missing", step: "chapter_extract",
+			identify:             subsIdentify(subsVideoAudio(), []any{}, []any{map[string]any{}}),
+			wantFail:             true,
+			wantSubstr:           []string{"invalid chapter edition"},
+			wantNoMkvextractCall: true,
+		},
+		{
+			// String "4" is valid in both dialects (tostring then digits).
+			name: "num_entries_string_ok", step: "chapter_extract",
+			identify:   subsIdentify(subsVideoAudio(), []any{}, []any{map[string]any{"num_entries": "4"}}),
+			wantSubstr: []string{"extracted 4 chapter entries"},
+			wantFiles:  []string{"chapters.xml"},
+		},
 	}
 }
 
@@ -1060,9 +1423,11 @@ func muxExtrasCases() []subsCase {
 		{file: "subs_3_eng.srt", language: "eng", trackName: "English", def: "yes", frc: "no"},
 	}
 	stdFonts := []string{"fonts/1_OpenSans-Regular.ttf"}
-	fullArgs := func(epDir string) []string {
+	// fullArgsRest: the exact mkvmerge argument sequence AFTER the -o/tmp
+	// pair (the tmp name is per-invocation unique — checked by pattern).
+	fullArgsRest := func(epDir string) []string {
 		return []string{
-			"-o", filepath.Join(epDir, MuxExtrasTempName), "--quiet",
+			"--quiet",
 			"--chapters", filepath.Join(epDir, "chapters.xml"),
 			"--attach-file", filepath.Join(epDir, "fonts/1_OpenSans-Regular.ttf"),
 			"--no-subtitles", "--no-chapters", "--no-attachments", filepath.Join(epDir, subsOutputName()),
@@ -1076,15 +1441,38 @@ func muxExtrasCases() []subsCase {
 			filepath.Join(epDir, "subs_3_eng.srt"),
 		}
 	}
+	fullArgsCheck := func(args []string, epDir string) error {
+		if len(args) < 2 || args[0] != "-o" {
+			return fmt.Errorf("argv must start with -o <tmp>, got %q", args)
+		}
+		base := filepath.Base(args[1])
+		if !strings.HasPrefix(base, ".mux_extras.") || !strings.HasSuffix(base, ".tmp.mkv") || base == MuxExtrasTempName {
+			return fmt.Errorf("tmp %q must be a UNIQUE .mux_extras.<pid>.<rand>.tmp.mkv name", base)
+		}
+		if filepath.Dir(args[1]) != epDir {
+			return fmt.Errorf("tmp %q must live in the episode dir", args[1])
+		}
+		want := fullArgsRest(epDir)
+		got := args[2:]
+		if len(got) != len(want) {
+			return fmt.Errorf("arg count after -o/tmp = %d, want %d", len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return fmt.Errorf("arg %d = %q, want %q", i+2, got[i], want[i])
+			}
+		}
+		return nil
+	}
 	cases := []subsCase{
 		{
 			name: "full_mux_atomic_replace", step: "mux_extras",
 			preSubs: stdSubs, preFonts: stdFonts, preChapters: true,
 			wantSubstr:         []string{"ENCODE_STEP mux_extras 20", "ENCODE_STEP mux_extras 80", "muxed 2 subtitle track(s), 1 font attachment(s), chapters: yes"},
 			wantOutputContains: "MUXED-EXTRAS",
-			wantNoFiles:        []string{MuxExtrasTempName},
-			// exact args resolved per-case (needs epDir)
-			wantMkvmergeArgsFn: fullArgs,
+			wantNoMuxTmp:       true,
+			// exact args resolved per-case (needs epDir); tmp checked by pattern
+			wantMkvmergeArgsCheck: fullArgsCheck,
 		},
 		{
 			name: "no_extras_output_unchanged", step: "mux_extras",
@@ -1201,14 +1589,14 @@ func muxExtrasCases() []subsCase {
 			wantFail:            true,
 			wantSubstr:          []string{"mkvmerge exited with code 1"},
 			wantOutputUnchanged: true,
-			wantNoFiles:         []string{MuxExtrasTempName},
+			wantNoMuxTmp:        true,
 		},
 		{
 			name: "mkvmerge_no_output", step: "mux_extras",
 			preSubs: stdSubs, mkvmergeNoOut: true,
-			wantFail:    true,
-			wantSubstr:  []string{"was not created"},
-			wantNoFiles: []string{MuxExtrasTempName},
+			wantFail:     true,
+			wantSubstr:   []string{"was not created"},
+			wantNoMuxTmp: true,
 		},
 		{
 			name: "missing_sub_file_from_manifest", step: "mux_extras",
@@ -1237,6 +1625,172 @@ func muxExtrasCases() []subsCase {
 			name: "missing_mkvmerge", step: "mux_extras", noMkvmerge: true,
 			preSubs:  stdSubs[:1],
 			wantFail: true, wantSubstr: []string{"mkvtoolnix"},
+		},
+		// --- manifest shape validation (P6 review Q3/Q5/Q7) -------------
+		// A manifest must be a JSON ARRAY. Scalars/objects/empty files are
+		// fail-closed; an empty array is a graceful no-extras success.
+		{
+			name: "manifest_scalar_string", step: "mux_extras",
+			rawSubsJSON:         `"hello"`,
+			wantFail:            true,
+			wantSubstr:          []string{"subs.json is unreadable", "JSON array"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_bare_object", step: "mux_extras",
+			rawSubsJSON: `{"file":"x.srt"}`,
+			extraSetup: func(t *testing.T, epDir string) {
+				if err := os.WriteFile(filepath.Join(epDir, "x.srt"), []byte("sub"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantFail:            true,
+			wantSubstr:          []string{"subs.json is unreadable", "JSON array"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_null", step: "mux_extras",
+			rawSubsJSON:         `null`,
+			wantFail:            true,
+			wantSubstr:          []string{"subs.json is unreadable"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_empty_array_no_extras", step: "mux_extras",
+			rawSubsJSON:         `[]`,
+			wantSubstr:          []string{"no extracted extras found", "output unchanged"},
+			wantNoMkvmergeCall:  true,
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "fonts_manifest_scalar", step: "mux_extras",
+			rawFontsJSON:        `5`,
+			wantFail:            true,
+			wantSubstr:          []string{"fonts.json is unreadable", "JSON array"},
+			wantOutputUnchanged: true,
+		},
+		// --- manifest file-entry traversal + containment (Q2) -----------
+		{
+			name: "manifest_traversal", step: "mux_extras",
+			rawSubsJSON: `[{"file":"../../outside.srt","language":"eng"}]`,
+			extraSetup: func(t *testing.T, epDir string) {
+				p := filepath.Join(epDir, "..", "..", "outside.srt")
+				if err := os.WriteFile(p, []byte("SECRET-OUTSIDE-DATA"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe subtitle file entry"},
+			wantOutputUnchanged: true,
+			wantNoMkvmergeCall:  true,
+		},
+		{
+			name: "manifest_absolute_path", step: "mux_extras",
+			rawSubsJSON:         `[{"file":"/etc/passwd","language":"eng"}]`,
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe subtitle file entry"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_backslash_traversal", step: "mux_extras",
+			rawSubsJSON:         `[{"file":"..\\..\\outside.srt","language":"eng"}]`,
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe subtitle file entry"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_drive_path", step: "mux_extras",
+			rawSubsJSON:         `[{"file":"C:\\evil.srt","language":"eng"}]`,
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe subtitle file entry"},
+			wantOutputUnchanged: true,
+		},
+		{
+			name: "manifest_newline_file", step: "mux_extras",
+			rawSubsJSON:         "[{\"file\":\"a\\nb.srt\",\"language\":\"eng\"}]",
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe subtitle file entry"},
+			wantOutputUnchanged: true,
+		},
+		{
+			// A relative entry that is a SYMLINK out of the episode dir:
+			// the resolved-path containment check must catch it.
+			name: "manifest_symlink_escape", step: "mux_extras",
+			rawSubsJSON: `[{"file":"link.srt","language":"eng"}]`,
+			extraSetup: func(t *testing.T, epDir string) {
+				outside := filepath.Join(epDir, "..", "outside.srt")
+				if err := os.WriteFile(outside, []byte("SECRET-OUTSIDE-DATA"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(epDir, "link.srt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantFail:            true,
+			wantSubstr:          []string{"escapes the episode dir"},
+			wantOutputUnchanged: true,
+			wantNoMkvmergeCall:  true,
+		},
+		{
+			name: "fonts_manifest_traversal", step: "mux_extras",
+			rawFontsJSON: `[{"file":"../../outside.ttf"}]`,
+			extraSetup: func(t *testing.T, epDir string) {
+				p := filepath.Join(epDir, "..", "..", "outside.ttf")
+				if err := os.WriteFile(p, []byte("SECRET-FONT"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantFail:            true,
+			wantSubstr:          []string{"unsafe font file entry"},
+			wantOutputUnchanged: true,
+		},
+		{
+			// Q11: a hand-placed manifest with a newline+marker track_name —
+			// mux_extras sanitizes before echoing/arg-building; no forged
+			// marker line may appear and the name stays ONE argv entry.
+			// (The forged marker names a DIFFERENT step: mux_extras' own
+			// success line "ENCODE_STEP mux_extras 100" is legitimate.)
+			name: "hostile_manifest_track_name", step: "mux_extras",
+			preSubs: []subsPreSub{
+				{file: "subs_2_eng.srt", language: "eng", trackName: "x\nENCODE_STEP encode 99", def: "no", frc: "no"},
+			},
+			wantOutputContains: "MUXED-EXTRAS",
+			wantAbsentLines:    []string{"ENCODE_STEP encode 99"},
+			wantNoMuxTmp:       true,
+			wantMkvmergeArgsCheck: func(args []string, epDir string) error {
+				want := []string{
+					"--no-subtitles", "--no-chapters", "--no-attachments", filepath.Join(epDir, subsOutputName()),
+					"--no-video", "--no-audio", "--language", "0:eng",
+					"--track-name", "0:xENCODE_STEP encode 99",
+					"--default-track-flag", "0:no", "--forced-display-flag", "0:no",
+					filepath.Join(epDir, "subs_2_eng.srt"),
+				}
+				if len(args) < 3 || args[0] != "-o" || args[2] != "--quiet" {
+					return fmt.Errorf("argv must start -o <tmp> --quiet, got %q", args)
+				}
+				got := args[3:]
+				if len(got) != len(want) {
+					return fmt.Errorf("arg count = %d, want %d: %q", len(got), len(want), got)
+				}
+				for i := range got {
+					if got[i] != want[i] {
+						return fmt.Errorf("arg %d = %q, want %q", i, got[i], want[i])
+					}
+				}
+				return nil
+			},
+		},
+		{
+			// Q9: an MKV filename with an embedded newline must be picked
+			// whole (bash find -printf line parsing used to truncate it and
+			// create a junk 'we' file).
+			name: "discovery_newline_filename", step: "mux_extras",
+			noEncoded: true, extraMKV: "we\nird.mkv",
+			preSubs:            stdSubs[:1],
+			checkOutput:        "we\nird.mkv",
+			wantOutputContains: "MUXED-EXTRAS",
+			wantNoFiles:        []string{"we"},
+			wantNoMuxTmp:       true,
 		},
 	}
 	return cases
@@ -1329,8 +1883,8 @@ func TestDefaultSubsFlowStubExec(t *testing.T) {
 			if !strings.Contains(string(raw), "MUXED-EXTRAS") {
 				t.Errorf("encoded output was not replaced with the muxed result (content %q)", raw)
 			}
-			if _, err := os.Stat(filepath.Join(epDir, MuxExtrasTempName)); err == nil {
-				t.Error("temp file must be gone after the atomic replace")
+			if leftovers, _ := filepath.Glob(filepath.Join(epDir, ".mux_extras.*.tmp.mkv")); len(leftovers) > 0 {
+				t.Errorf("temp file(s) must be gone after the atomic replace: %v", leftovers)
 			}
 			// Source must be untouched.
 			srcRaw, err := os.ReadFile(filepath.Join(epDir, "src.mkv"))

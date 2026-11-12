@@ -43,6 +43,54 @@ function Resolve-Tool {
     return $path
 }
 
+# Test-LegacyNativeArgumentPassing reports whether this PowerShell
+# serializes native-command arguments with the LEGACY algorithm (wrap in
+# quotes WITHOUT escaping embedded quotes/backslashes). Windows
+# PowerShell 5.1 always does; pwsh 7+ defaults to Standard (correct)
+# passing. Deliberately a separate function so tests can override it to
+# force the legacy path under pwsh 7 ($PSNativeCommandArgumentPassing =
+# 'Legacy') and exercise the 5.1 escaping on Linux CI.
+function Test-LegacyNativeArgumentPassing {
+    return ($PSVersionTable.PSVersion.Major -lt 7)
+}
+
+# ConvertTo-LegacyNativeArgument pre-escapes ONE argument with the MSVCRT
+# (CommandLineToArgvW) rules so the legacy 5.1 serializer passes it
+# through VERBATIM and the target's CRT parser reconstructs it exactly:
+#   - 2n+1 backslashes before a double quote encode n backslashes + quote
+#   - trailing backslashes are doubled so the closing wrap quote is not
+#     escaped
+#   - the result is always wrapped in double quotes
+# The legacy NeedQuotes check does not count escaped quotes and sees the
+# whitespace INSIDE the outer quote pair, so it never re-wraps the result
+# (validated against live pwsh Legacy passing + a CommandLineToArgvW
+# simulator over hostile shapes: quotes, backslashes, spaces, newlines,
+# empty strings, flag-injection payloads). Without this, an untrusted
+# mkvmerge track_name like 'x" --attach-file C:\secret y" z' breaks out
+# of its argument and injects mkvmerge flags on PS 5.1 nodes.
+function ConvertTo-LegacyNativeArgument {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Argument
+    )
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Argument.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$sb.Append('\' * (2 * $backslashes + 1))
+            [void]$sb.Append('"')
+        } else {
+            if ($backslashes -gt 0) { [void]$sb.Append('\' * $backslashes) }
+            [void]$sb.Append($ch)
+        }
+        $backslashes = 0
+    }
+    [void]$sb.Append('\' * (2 * $backslashes))
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 # Invoke-Tool runs an external process, streams its output with a prefix, and
 # throws when the exit code is non-zero. Stdout/stderr are merged so x265's
 # progress (written to stderr) appears in order in the job log.
@@ -53,6 +101,13 @@ function Invoke-Tool {
         [string] $Label = (Split-Path $ExePath -Leaf)
     )
     Write-Output "[$Label] starting: $ExePath $($Arguments -join ' ')"
+    if (Test-LegacyNativeArgumentPassing) {
+        # PS 5.1 / Legacy passing: pre-escape every argument (MSVCRT rules)
+        # so untrusted metadata cannot break out and inject tool flags.
+        # pwsh 7+ Standard passing already escapes correctly — leave the
+        # arguments untouched there.
+        $Arguments = @($Arguments | ForEach-Object { ConvertTo-LegacyNativeArgument -Argument $_ })
+    }
     # Windows PowerShell 5.1 wraps native stderr as ErrorRecords; under
     # ErrorActionPreference=Stop that aborts on harmless progress output
     # (x265 writes progress to stderr). Relax EAP for the native call and
@@ -222,6 +277,28 @@ function Assert-SafeName {
     if ($Value -match '[\\/:*?"<>|]' -or $Value.Contains('..') -or $Value.Trim() -eq '') {
         throw "unsafe $What value: '$Value' (path separators, '..' or reserved characters are not allowed)"
     }
+}
+
+# ConvertTo-FlagYesNo normalizes a track-flag value to 'yes'/'no' with the
+# SAME truthiness as the bash port: true / 1 / "true" / "yes"
+# (case-insensitive, strings trimmed) → 'yes'; everything else
+# (false / 0 / "no" / missing / null) → 'no'. mkvmerge -J reports booleans,
+# but hand-edited manifests and older identify output carry numbers and
+# strings — both dialects must agree on every shape.
+function ConvertTo-FlagYesNo {
+    param($Value)
+    if ($null -eq $Value) { return 'no' }
+    if ($Value -is [bool]) {
+        if ($Value) { return 'yes' }
+        return 'no'
+    }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        if ($Value -eq 1) { return 'yes' }
+        return 'no'
+    }
+    $s = ([string]$Value).Trim().ToLowerInvariant()
+    if ($s -eq 'true' -or $s -eq 'yes' -or $s -eq '1') { return 'yes' }
+    return 'no'
 }
 
 # Write-EncodeMetric emits one ENCODE_METRIC key=value line for the agent to

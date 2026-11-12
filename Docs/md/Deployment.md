@@ -622,7 +622,11 @@ Keycloak, Authentik, etc.:
    token (Keycloak: a "group membership" mapper on the client; Authelia:
    `groups` claim via access-control configuration; pocket-id: user groups).
    Set `ENCODE_OIDC_ADMIN_GROUP` to the group that should be admin.
-5. Set the four core vars (+ optional two) and restart the controller. The
+5. **NTP-sync the controller host.** ID-token expiry is verified with ZERO
+   clock-skew leeway (`go-oidc`; only the optional `nbf` claim gets a 5-minute
+   grace). A controller clock drifting ahead of the IdP rejects fresh tokens
+   as expired — SSO logins fail while local login keeps working.
+6. Set the four core vars (+ optional two) and restart the controller. The
    login page shows **Sign in with SSO** only when enabled — the UI learns
    the flag from the unauthenticated `/api/health` bootstrap (`oidc_enabled`).
 
@@ -639,9 +643,14 @@ ENCODE_OIDC_ADMIN_GROUP=encode-admins
 ### Accounts and role mapping
 
 - **First SSO login auto-provisions** a local account. Username derivation:
-  `preferred_username` → email local part → `sub`, lowercased and sanitized
-  to `[a-z0-9._-]` (separator runs collapse to `-`, 64-char cap). The
-  derivation is deterministic, so repeat logins reuse the same account —
+  `preferred_username` → email local part → `sub`, sanitized to `[a-z0-9._-]`
+  (separator runs collapse to `-`). Lowercasing is **ASCII-only** and every
+  non-ASCII rune becomes a separator, so Unicode confusables (`İ`, the Kelvin
+  sign `K`, fullwidth letters) can never fold into ASCII lookalikes such as
+  `admin`. Names longer than 64 chars become the first 56 chars + `-` + a
+  7-char lowercase hex SHA-256 digest of the **raw `sub`** — two distinct IdP
+  subjects whose names share a long prefix can never merge into one account.
+  The derivation is deterministic, so repeat logins reuse the same account —
   no duplicates.
 - **New accounts get the viewer role**, or **admin** when
   `ENCODE_OIDC_ADMIN_GROUP` is set and the groups claim contains it (exact
@@ -662,12 +671,42 @@ ENCODE_OIDC_ADMIN_GROUP=encode-admins
   writes an `auth.oidc_login` audit event (actor = username, detail carries
   the role and whether the account was just provisioned).
 
+> **Admin-collision warning.** An IdP identity whose derived username is
+> `admin` (e.g. `preferred_username=admin`) lands on the **local admin
+> account** — derivation matches local accounts exactly. Without
+> `ENCODE_OIDC_ADMIN_GROUP`, anyone the IdP authenticates under that name
+> gets a **passwordless admin session**. With the admin group configured,
+> group sync can **demote the local admin** (and their live sessions) when
+> the colliding IdP identity is outside the group — a lockout risk. Plan IdP
+> usernames so privileged local account names cannot be derived; for
+> privileged accounts prefer `sub`-derived names (leave `preferred_username`
+> and `email` unset or unique per user) and treat the local `admin` name as
+> reserved.
+
 ### Security notes
 
-- The flow is authorization-code with **state** (single-use, 10-minute TTL,
-  CSRF), **nonce** (bound into the ID token and checked) and **PKCE** (S256).
-  The ID token is verified via `go-oidc`: signature against the provider's
-  JWKS, issuer, audience and expiry. Any failure rejects the login.
+- The flow is authorization-code with **state** (single-use, 10-minute TTL),
+  **nonce** (bound into the ID token and checked) and **PKCE** (S256).
+  **Login CSRF is blocked by a browser-binding flow cookie**, not by the
+  state alone: `/api/auth/oidc/login` sets a crypto-random `encode_oidc_flow`
+  cookie (HttpOnly, SameSite=Lax, Secure when the request is TLS, scoped to
+  `/api/auth/oidc`, 10-minute MaxAge). Only its SHA-256 hash is stored
+  server-side; the callback verifies it in constant time and clears the
+  cookie on every outcome. An attacker-initiated flow cannot be completed by
+  the victim's browser — the victim carries no matching cookie, so the
+  callback is rejected and no session is issued.
+- The ID token is verified via `go-oidc`: signature against the provider's
+  JWKS, issuer, audience and expiry. Any failure rejects the login. Expiry
+  has **zero clock-skew leeway** — keep the controller host NTP-synced
+  (setup step 5).
+- **Throttling**: `/api/auth/oidc/login` uses the same lockout mechanism as
+  local login (5 attempts → 30 s cooldown) with a **separate counter**, so
+  OIDC bursts cannot lock out local login and vice versa. A completed
+  callback resets the lockout.
+- **Error hygiene**: failed callbacks return a generic `OIDC login failed`
+  to the browser; controller logs keep only a sanitized error class/HTTP
+  status. Raw IdP error bodies — which may echo authorization codes, secrets
+  or PII — never reach the client or the logs.
 - The session token reaches the SPA in the URL **fragment** (`/#oidc=…`),
   which browsers never send to servers or logs; the SPA consumes and strips
   it immediately. **HTTPS is strongly recommended** for the controller (see

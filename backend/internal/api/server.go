@@ -82,6 +82,10 @@ type Server struct {
 	// 503 when nil).
 	Backup   *BackupManager
 	throttle *loginThrottle
+	// oidcThrottle is the login-start lockout for /api/auth/oidc/login —
+	// the same mechanism as throttle but a SEPARATE counter, so OIDC bursts
+	// can never lock out local login (and vice versa).
+	oidcThrottle *loginThrottle
 	// Notifier, when non-nil, overrides the live Discord notifier resolved
 	// from settings on each job-outcome alert. Tests inject a recording
 	// notifier here to assert whether a notification fired (the auto-retry
@@ -181,6 +185,7 @@ func New(st *store.Store, up *update.Store, log *slog.Logger, cfg Config) (*Serv
 	}
 	s := &Server{
 		Store: st, Update: up, Log: log, Cfg: cfg, throttle: &loginThrottle{},
+		oidcThrottle:   &loginThrottle{},
 		digest:         &digestState{buf: notify.NewDigestBuffer()},
 		logHub:         newLogHub(),
 		diskGuard:      &diskGuardState{last: map[int64]time.Time{}},

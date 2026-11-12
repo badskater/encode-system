@@ -1,6 +1,8 @@
 // Package oidctest provides an in-process mock OIDC provider (discovery
-// document + JWKS + token endpoint, RSA-signed ID tokens) for tests. It is
-// imported only by test code and never linked into the controller binary.
+// document + JWKS + token endpoint, RSA-signed ID tokens) for tests. This
+// PACKAGE is imported only by test code, but the go-jose library itself IS
+// linked into the controller binary — go-oidc uses it for JWKS and ID-token
+// verification. Only this mock signer is test-only.
 package oidctest
 
 import (
@@ -8,6 +10,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -38,6 +41,9 @@ type Provider struct {
 	groups            []string
 	groupsClaim       string
 	omitIDToken       bool
+	tokenErrStatus    int
+	tokenErrBody      string
+	tokenDelay        time.Duration
 	lastCode          string
 	lastCodeVerifier  string
 }
@@ -125,6 +131,20 @@ func (p *Provider) OmitNonce() { p.mu.Lock(); defer p.mu.Unlock(); p.omitNonce =
 // OmitIDToken makes the token response carry no id_token.
 func (p *Provider) OmitIDToken() { p.mu.Lock(); defer p.mu.Unlock(); p.omitIDToken = true }
 
+// SetTokenError makes the token endpoint reply with the given HTTP status
+// and raw body instead of signing an ID token (error-path tests; the body
+// may carry secret-shaped content to prove it is never echoed).
+func (p *Provider) SetTokenError(status int, body string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokenErrStatus, p.tokenErrBody = status, body
+}
+
+// SetTokenDelay stalls the token endpoint by d before responding, so tests
+// can prove outbound exchanges are bounded. The stall ends early when the
+// caller disconnects (request context cancelled), keeping cleanup fast.
+func (p *Provider) SetTokenDelay(d time.Duration) { p.mu.Lock(); defer p.mu.Unlock(); p.tokenDelay = d }
+
 // LastCodeVerifier returns the code_verifier received on the last token
 // exchange (lets tests prove PKCE was actually sent).
 func (p *Provider) LastCodeVerifier() string {
@@ -146,6 +166,17 @@ func (p *Provider) handleToken(w http.ResponseWriter, r *http.Request) {
 	defer p.mu.Unlock()
 	p.lastCode = r.PostFormValue("code")
 	p.lastCodeVerifier = r.PostFormValue("code_verifier")
+	if p.tokenDelay > 0 {
+		select {
+		case <-time.After(p.tokenDelay):
+		case <-r.Context().Done():
+		}
+	}
+	if p.tokenErrStatus != 0 {
+		w.WriteHeader(p.tokenErrStatus)
+		io.WriteString(w, p.tokenErrBody)
+		return
+	}
 	if p.lastCode == "" {
 		http.Error(w, `{"error":"invalid_request"}`, http.StatusBadRequest)
 		return

@@ -871,6 +871,9 @@ curl -s http://<controller>:8080/api/health | jq .oidc_enabled
 # Start a flow by hand (browser does this via the SSO button):
 curl -sI http://<controller>:8080/api/auth/oidc/login
 # 302 → Location: <issuer>/authorize?...state=...&nonce=...&code_challenge=...
+#       + Set-Cookie: encode_oidc_flow=… (HttpOnly, SameSite=Lax, 10-min
+#         MaxAge) — binds the flow to THIS browser; the callback verifies it.
+# 429 → login-start lockout (5 attempts → 30 s; see diagnosis below).
 # 503 → provider discovery failed (see diagnosis below).
 
 # SSO logins are audited like other auth events:
@@ -891,7 +894,13 @@ curl -sI http://<controller>:8080/api/auth/oidc/login
 - **HA**: pending flows are per-replica memory — the IdP callback must reach
   the replica that started the login (sticky sessions on the LB). Without
   stickiness users see intermittent "unknown or expired login state" and
-  must retry; this is the documented limitation, not a bug.
+  must retry; this is the documented limitation, not a bug. The flow cookie
+  travels with the browser and does not remove the stickiness requirement.
+- **Login CSRF protection is cookie-bound**: the callback requires the
+  `encode_oidc_flow` cookie set at `/login` (hash verified in constant time).
+  A flow started in one browser cannot be completed in another — the generic
+  client error is `OIDC login failed`; the controller log carries only a
+  sanitized error class/status, never raw IdP error bodies.
 
 ### Diagnosis
 
@@ -900,8 +909,11 @@ curl -sI http://<controller>:8080/api/auth/oidc/login
 | Controller refuses to start, `oidc config … missing` | Partial env: some but not all four core vars set. Set all four or none (fail-fast by design). |
 | SSO button missing | `oidc_enabled` false — vars not set in the controller's actual environment (check `.env` → compose passthrough), or an old UI bundle. |
 | `GET /api/auth/oidc/login` → 503 | Discovery failed: issuer URL wrong/unreachable from the controller, or the IdP is down. Check `curl <issuer>/.well-known/openid-configuration` FROM the controller host/container. Retried on every attempt — no restart needed once the IdP recovers. |
+| `GET /api/auth/oidc/login` → 429 | Login-start lockout: 5 attempts within the window → 30 s cooldown (same mechanism as local login, separate counter). A completed SSO callback resets it. |
 | Callback → 401 `unknown or expired login state` | Login took >10 min, the callback was replayed, the controller restarted mid-flow, or (HA) the callback hit the other replica. Start the login again; on HA enable sticky sessions. |
-| Callback → 401 `nonce mismatch` / verification error | Provider misconfiguration (wrong client, token for another audience, clock skew beyond expiry). Check the provider's client ID/secret and the controller clock. |
+| Callback → 401, log `login flow cookie missing or mismatched` | The callback reached a different browser/profile than the one that started the login (cookies blocked, cross-browser login-CSRF attempt, or the 10-min flow cookie expired). Start the login again in the same browser. |
+| Callback → 401 `OIDC login failed`, log `id token verification failed` / `id token nonce mismatch` | Provider misconfiguration (wrong client, token for another audience) or clock skew: expiry is checked with ZERO leeway — verify NTP on the controller host. Check the provider's client ID/secret. |
+| Callback → 401 `OIDC login failed`, log `token exchange rejected (HTTP …)` | The IdP rejected the code exchange (status in the log; the raw IdP body is deliberately not logged). Check client secret, redirect-URI registration and code lifetime at the provider. |
 | Provider rejects the redirect | `ENCODE_OIDC_REDIRECT_URL` does not exactly match a registered redirect URI (scheme/host/port/path). |
 | User gets viewer instead of admin | Groups claim not emitted by the provider, wrong claim name (`ENCODE_OIDC_GROUPS_CLAIM`), group name mismatch (exact match), or `ENCODE_OIDC_ADMIN_GROUP` unset (no mapping → existing roles kept, new users viewer). Inspect the ID token's claims at the provider side. |
 | SSO user cannot log in locally | By design: provisioned accounts have no local password. Set one via user management if hybrid access is wanted. |

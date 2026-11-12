@@ -94,6 +94,111 @@ func TestUsernameDeterministic(t *testing.T) {
 	}
 }
 
+// ---------- Truncation collision safety (quality review Q1) ----------
+
+// Two DISTINCT IdP subjects whose preferred_username truncates to the same
+// 64-char prefix must NEVER share one local account: the over-long name gets
+// a collision-resistant suffix derived from the raw sub.
+func TestUsernameTruncationCollisionResistant(t *testing.T) {
+	prefix := strings.Repeat("a", 70)
+	u1, err := Username(prefix+"-victim", "", "sub-victim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u2, err := Username(prefix+"-attacker", "", "sub-attacker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u1 == u2 {
+		t.Fatalf("distinct subjects merged into one account: %q", u1)
+	}
+	for _, u := range []string{u1, u2} {
+		if len(u) > maxUsernameLen {
+			t.Fatalf("username exceeds cap: %q (%d)", u, len(u))
+		}
+		// Shape: 56-char prefix + '-' + 7 lowercase hex chars.
+		if len(u) != collisionPrefixLen+1+collisionHashLen {
+			t.Fatalf("unexpected suffix shape: %q (%d)", u, len(u))
+		}
+		suffix := u[len(u)-collisionHashLen:]
+		for _, r := range suffix {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				t.Fatalf("suffix not lowercase hex: %q", u)
+			}
+		}
+		if u[collisionPrefixLen] != '-' {
+			t.Fatalf("missing separator before hash: %q", u)
+		}
+		if !strings.HasPrefix(u, strings.Repeat("a", collisionPrefixLen)) {
+			t.Fatalf("prefix lost: %q", u)
+		}
+	}
+	// Deterministic: same identity → same name on every login.
+	again, _ := Username(prefix+"-victim", "", "sub-victim")
+	if again != u1 {
+		t.Fatalf("collision-resistant derivation not deterministic: %q vs %q", again, u1)
+	}
+}
+
+// Names at or under the cap keep their exact shape — no suffix is appended.
+func TestUsernameShortNamesUnchanged(t *testing.T) {
+	exact := strings.Repeat("b", maxUsernameLen)
+	u, err := Username(exact, "", "sub")
+	if err != nil || u != exact {
+		t.Fatalf("64-char name altered: %q err=%v", u, err)
+	}
+	u, err = Username("alice", "", "sub")
+	if err != nil || u != "alice" {
+		t.Fatalf("short name altered: %q err=%v", u, err)
+	}
+}
+
+// The suffix keys on the RAW sub, so it also separates long subjects used
+// directly as the username fallback.
+func TestUsernameLongSubjectCollisionResistant(t *testing.T) {
+	prefix := strings.Repeat("z", 80)
+	u1, err := Username("", "", prefix+"|one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u2, err := Username("", "", prefix+"|two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u1 == u2 || len(u1) > maxUsernameLen || len(u2) > maxUsernameLen {
+		t.Fatalf("long subjects collided: %q vs %q", u1, u2)
+	}
+}
+
+// ---------- ASCII-first sanitization (quality review Q2) ----------
+
+// Unicode case folding must never manufacture ASCII letters: U+0130 (İ)
+// folds to 'i' and U+212A (K) folds to 'k' under strings.ToLower, which let
+// 'admİn' land on the local 'admin' account. Non-ASCII runes become
+// separators BEFORE any lowercasing.
+func TestSanitizeConfusablesNeverASCII(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"admİn", "adm-n"},      // U+0130 must NOT become 'i'
+		{"Admİn", "adm-n"},      // mixed case + confusable
+		{"adm\u212An", "adm-n"}, // Kelvin sign must NOT become 'k'
+		{"\u212A", ""},          // lone Kelvin sign → empty
+		{"İ", ""},               // lone dotted capital I → empty
+		{"ａｄｍｉｎ", ""},           // fullwidth stays non-ASCII (sub fallback)
+		{"Ａdmin", "dmin"},       // fullwidth A → separator, trimmed
+		{"Alice", "alice"},      // plain ASCII lowercasing still works
+		{"ADMIN", "admin"},      // ASCII uppercase still folds
+	} {
+		if got := sanitizeUsername(tc.in); got != tc.want {
+			t.Errorf("sanitizeUsername(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// End-to-end: the confusable derives a NON-admin username.
+	u, err := Username("admİn", "", "sub-conf")
+	if err != nil || u != "adm-n" {
+		t.Fatalf("Username(admİn) = %q err=%v, want adm-n", u, err)
+	}
+}
+
 // ---------- Role mapping ----------
 
 func TestRoleForAdminGroup(t *testing.T) {

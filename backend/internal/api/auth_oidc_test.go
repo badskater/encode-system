@@ -48,44 +48,29 @@ func newOIDCEnv(t *testing.T, mock *oidctest.Provider, adminGroup string) *testE
 }
 
 // oidcStart drives GET /api/auth/oidc/login and returns the authorization
-// redirect query (state, nonce, code_challenge, ...).
+// redirect query (state, nonce, code_challenge, ...). The flow cookie set by
+// the response is available via oidcStartCookie.
 func oidcStart(t *testing.T, tsURL string) url.Values {
 	t.Helper()
-	resp, err := noRedirectClient().Get(tsURL + "/api/auth/oidc/login")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("oidc login status = %d, want 302", resp.StatusCode)
-	}
-	loc, err := url.Parse(resp.Header.Get("Location"))
-	if err != nil {
-		t.Fatalf("bad authorization redirect: %v", err)
-	}
-	if loc.Path != "/authorize" {
-		t.Fatalf("redirect path = %q, want the provider /authorize", loc.Path)
-	}
-	return loc.Query()
+	q, _ := oidcStartCookie(t, tsURL)
+	return q
 }
 
-// oidcCallback drives GET /api/auth/oidc/callback without following redirects.
+// oidcCallback drives GET /api/auth/oidc/callback WITHOUT a flow cookie
+// (negative tests); oidcCallbackCookie presents one.
 func oidcCallback(t *testing.T, tsURL, code, state string) *http.Response {
 	t.Helper()
-	resp, err := noRedirectClient().Get(tsURL + "/api/auth/oidc/callback?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp
+	return oidcCallbackCookie(t, tsURL, code, state, nil)
 }
 
-// oidcFullLogin runs the whole flow and returns the issued session token
-// (extracted from the SPA redirect fragment).
+// oidcFullLogin runs the whole flow (with the browser-binding flow cookie)
+// and returns the issued session token (extracted from the SPA redirect
+// fragment).
 func oidcFullLogin(t *testing.T, tsURL string, mock *oidctest.Provider) string {
 	t.Helper()
-	q := oidcStart(t, tsURL)
+	q, c := oidcStartCookie(t, tsURL)
 	mock.SetNonce(q.Get("nonce"))
-	resp := oidcCallback(t, tsURL, "auth-code", q.Get("state"))
+	resp := oidcCallbackCookie(t, tsURL, "auth-code", q.Get("state"), c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("callback status = %d, want 302", resp.StatusCode)
@@ -316,9 +301,9 @@ func TestOIDCBadStateRejected(t *testing.T) {
 	mock := oidctest.New(t, testOIDCClientID)
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
-	oidcStart(t, ts.URL) // discovery cached, a real flow exists
+	_, c := oidcStartCookie(t, ts.URL) // discovery cached, a real flow exists
 
-	resp := oidcCallback(t, ts.URL, "auth-code", "not-a-real-state")
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", "not-a-real-state", c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad state = %d, want 401", resp.StatusCode)
@@ -330,16 +315,16 @@ func TestOIDCReplayedCallbackRejected(t *testing.T) {
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
 
-	q := oidcStart(t, ts.URL)
+	q, c := oidcStartCookie(t, ts.URL)
 	mock.SetNonce(q.Get("nonce"))
 	state := q.Get("state")
-	resp := oidcCallback(t, ts.URL, "auth-code", state)
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", state, c)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("first callback = %d", resp.StatusCode)
 	}
 	// Replay the exact same callback URL — the state is single-use.
-	resp = oidcCallback(t, ts.URL, "auth-code", state)
+	resp = oidcCallbackCookie(t, ts.URL, "auth-code", state, c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("replayed callback = %d, want 401", resp.StatusCode)
@@ -350,9 +335,9 @@ func TestOIDCBadNonceRejected(t *testing.T) {
 	mock := oidctest.New(t, testOIDCClientID)
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
-	q := oidcStart(t, ts.URL)
+	q, c := oidcStartCookie(t, ts.URL)
 	mock.SetNonce("a-different-nonce")
-	resp := oidcCallback(t, ts.URL, "auth-code", q.Get("state"))
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", q.Get("state"), c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad nonce = %d, want 401", resp.StatusCode)
@@ -363,10 +348,10 @@ func TestOIDCMissingNonceRejected(t *testing.T) {
 	mock := oidctest.New(t, testOIDCClientID)
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
-	q := oidcStart(t, ts.URL)
+	q, c := oidcStartCookie(t, ts.URL)
 	mock.SetNonce(q.Get("nonce"))
 	mock.OmitNonce()
-	resp := oidcCallback(t, ts.URL, "auth-code", q.Get("state"))
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", q.Get("state"), c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("missing nonce = %d, want 401", resp.StatusCode)
@@ -377,10 +362,10 @@ func TestOIDCWrongAudienceRejected(t *testing.T) {
 	mock := oidctest.New(t, testOIDCClientID)
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
-	q := oidcStart(t, ts.URL)
+	q, c := oidcStartCookie(t, ts.URL)
 	mock.SetNonce(q.Get("nonce"))
 	mock.SetAudience("another-application")
-	resp := oidcCallback(t, ts.URL, "auth-code", q.Get("state"))
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", q.Get("state"), c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("wrong audience = %d, want 401", resp.StatusCode)
@@ -391,10 +376,10 @@ func TestOIDCExpiredTokenRejected(t *testing.T) {
 	mock := oidctest.New(t, testOIDCClientID)
 	e := newOIDCEnv(t, mock, "")
 	ts := e.serve(t)
-	q := oidcStart(t, ts.URL)
+	q, c := oidcStartCookie(t, ts.URL)
 	mock.SetNonce(q.Get("nonce"))
 	mock.SetExpiry(-time.Minute)
-	resp := oidcCallback(t, ts.URL, "auth-code", q.Get("state"))
+	resp := oidcCallbackCookie(t, ts.URL, "auth-code", q.Get("state"), c)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expired token = %d, want 401", resp.StatusCode)

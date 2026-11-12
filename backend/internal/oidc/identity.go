@@ -1,6 +1,8 @@
 package oidc
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 
@@ -11,6 +13,14 @@ import (
 // limit, but OIDC usernames come from an external identity provider and must
 // stay bounded and display-safe.
 const maxUsernameLen = 64
+
+// Over-long names keep a collisionPrefixLen-char prefix plus '-' and a
+// collisionHashLen-char hex digest of the raw sub (56 + 1 + 7 = 64), so two
+// distinct subjects truncating to the same prefix never share one account.
+const (
+	collisionPrefixLen = 56
+	collisionHashLen   = 7
+)
 
 // Identity is the subset of ID-token claims the controller consumes.
 type Identity struct {
@@ -27,14 +37,41 @@ type Identity struct {
 // repeated logins of the same identity always land on the same local account
 // (auto-provisioning is idempotent). An identity with no usable candidate is
 // rejected — the controller never invents a random username.
+//
+// Over-long names are made collision-resistant instead of plain-truncated:
+// a 56-char prefix plus a 7-char hex digest of the RAW sub. Plain truncation
+// merged distinct IdP subjects sharing a 64-char prefix into ONE local
+// account (role sync then let one identity flip the other's role).
 func Username(preferredUsername, email, subject string) (string, error) {
 	candidates := []string{preferredUsername, emailLocalPart(email), subject}
 	for _, c := range candidates {
-		if u := sanitizeUsername(c); u != "" {
+		u := sanitizeUsername(c)
+		if u == "" {
+			continue
+		}
+		if len(u) <= maxUsernameLen {
 			return u, nil
 		}
+		return collisionResistantName(u, c, subject), nil
 	}
 	return "", errors.New("OIDC identity has no usable username (preferred_username, email and sub are all empty or invalid)")
+}
+
+// collisionResistantName shortens an over-long sanitized name to a fixed
+// prefix plus '-' and a short SHA-256 digest of the raw subject. The digest
+// keys on the provider-side identity (sub), so distinct subjects always get
+// distinct accounts even when their names share the whole prefix; the same
+// identity keeps the same name on every login. When the provider sent no
+// sub, the raw candidate is hashed instead (still deterministic).
+func collisionResistantName(sanitized, rawCandidate, subject string) string {
+	// sanitized is ASCII-only, so byte slicing is rune-safe.
+	prefix := strings.Trim(sanitized[:collisionPrefixLen], "-._")
+	hashSrc := subject
+	if hashSrc == "" {
+		hashSrc = rawCandidate
+	}
+	sum := sha256.Sum256([]byte(hashSrc))
+	return prefix + "-" + hex.EncodeToString(sum[:])[:collisionHashLen]
 }
 
 // emailLocalPart returns the part before the last '@' (the domain is never
@@ -47,34 +84,37 @@ func emailLocalPart(email string) string {
 }
 
 // sanitizeUsername normalizes an external candidate to the app's username
-// shape: lowercase, restricted to [a-z0-9._-], runs of separators collapsed
-// to a single '-', leading/trailing separators trimmed, capped at
-// maxUsernameLen. Lowercasing keeps matching stable across providers that
-// differ in case (local accounts are matched exactly, so "Alice" and "alice"
-// are deliberately distinct accounts — documented in Docs/md/Deployment.md).
+// shape: restricted to [a-z0-9._-], runs of separators collapsed to a single
+// '-', leading/trailing separators trimmed. Lowercasing is ASCII-ONLY and
+// happens per rune AFTER the non-ASCII decision: every non-ASCII rune becomes
+// a separator, so Unicode case folding can never manufacture ASCII letters
+// (strings.ToLower maps U+0130 İ→'i' and U+212A K→'k', which let 'admİn'
+// land on the local 'admin' account). The length cap lives in Username,
+// which can apply the collision-resistant suffix. Local accounts are matched
+// exactly, so "Alice" and "alice" are deliberately distinct accounts —
+// documented in Docs/md/Deployment.md.
 func sanitizeUsername(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
 	var b strings.Builder
 	prevSep := false
 	for _, r := range s {
 		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			prevSep = false
 		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_':
 			b.WriteRune(r)
 			prevSep = false
 		default:
-			// Every other rune (spaces, '@', '|', unicode, control chars)
-			// becomes a single collapsed '-'.
+			// Every other rune (spaces, '@', '|', ALL non-ASCII including
+			// confusables, control chars) becomes a single collapsed '-'.
 			if !prevSep {
 				b.WriteRune('-')
 				prevSep = true
 			}
 		}
 	}
-	out := strings.Trim(b.String(), "-._")
-	if len(out) > maxUsernameLen {
-		out = strings.Trim(out[:maxUsernameLen], "-._")
-	}
-	return out
+	return strings.Trim(b.String(), "-._")
 }
 
 // RoleFor maps the identity's groups to a local role: admin when AdminGroup

@@ -197,6 +197,61 @@ func TestStageSymlinkEscapeRefused(t *testing.T) {
 	}
 }
 
+// TestStageSymlinkedDirEscapeRefused proves a torrent directory that is
+// a symlink resolving OUTSIDE download_root is refused: containment must
+// be checked against the resolved download root, not only against the
+// resolved torrent dir (which trivially contains its own escaped files).
+func TestStageSymlinkedDirEscapeRefused(t *testing.T) {
+	root := t.TempDir()    // download_root
+	outside := t.TempDir() // separate tree outside the root
+	if err := os.WriteFile(filepath.Join(outside, "a.mkv"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "Show")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	dest := t.TempDir()
+	tor := Torrent{Hash: "h", SavePath: "/d/Show", Files: []File{{Name: "a.mkv"}}}
+	_, err := Stage(context.Background(), root, tor, dest)
+	if err == nil || !strings.Contains(err.Error(), "outside download_root") {
+		t.Fatalf("symlinked dir escaping download_root must be refused, got %v", err)
+	}
+	entries, _ := os.ReadDir(dest)
+	if len(entries) != 0 {
+		t.Fatalf("escaped stage wrote files: %v", entries)
+	}
+}
+
+// TestStageSymlinkedDirInsideRootAllowed is the positive control: a
+// torrent dir symlinked to another location INSIDE download_root still
+// stages (the containment fix must not break legitimate symlinks).
+func TestStageSymlinkedDirInsideRootAllowed(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real", "Show")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "a.mkv"), []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(root, "Show")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	dest := t.TempDir()
+	tor := Torrent{Hash: "h", SavePath: "/d/Show", Files: []File{{Name: "a.mkv"}}}
+	staged, err := Stage(context.Background(), root, tor, dest)
+	if err != nil {
+		t.Fatalf("in-root symlinked dir must stage: %v", err)
+	}
+	if len(staged) != 1 || staged[0] != "a.mkv" {
+		t.Fatalf("staged = %v", staged)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "a.mkv"))
+	if err != nil || string(got) != "video" {
+		t.Fatalf("staged content: %q err=%v", got, err)
+	}
+}
+
 // TestStageCancelledContext proves a cancelled ctx stops staging.
 func TestStageCancelledContext(t *testing.T) {
 	root := seedTorrent(t, "Show", map[string]string{"a.mkv": "x"})

@@ -750,6 +750,9 @@ see the client's completed downloads on a local path:
   (flat layout). Per-category subfolders are not resolved: the controller
   maps a torrent to `download_root/<basename of the client save path>`
   and verifies it exists before staging (missing = skip + log).
+- Symlinked torrent folders are resolved and must stay **inside**
+  `download_root`; a symlink pointing outside the root is refused
+  (symlink-escape containment).
 - Example: qBittorrent saves to `/downloads/complete` on the download
   host; the controller container mounts that same directory at
   `/mnt/downloads` → set `download_root: /mnt/downloads`. A torrent saved
@@ -779,9 +782,14 @@ mounted at `scripts_root` as for normal scanning.
 4. Settings page → Download ingestion: provider `qbittorrent`, URL
    `http://<host>:<port>`, credentials, download root. Save.
 
-Sessions use the cookie login (`/api/v2/auth/login`); an expired session
-(403) is re-logged-in once automatically. Repeated failed logins can get
-the controller IP banned by qBittorrent — fix credentials, then unban.
+Sessions use the cookie login (`/api/v2/auth/login`). Both protocol
+generations are supported: 4.x–5.1 answer `200 "Ok."` / `"Fails."`,
+≥5.2 answers `204` on success and `401` on bad credentials (verified
+against upstream qBittorrent source; both generations are covered by
+mock-server regression tests). An expired/rejected session (403, or
+401 on the ≥5.2 auth paths) is re-logged-in once automatically.
+Repeated failed logins can get the controller IP banned by qBittorrent
+— fix credentials, then unban.
 
 ### ruTorrent setup (best-effort, experimental)
 

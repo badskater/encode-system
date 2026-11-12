@@ -16,9 +16,10 @@ import (
 
 // QBit is a bounded qBittorrent WebAPI v2 client (first-class provider).
 // Auth is the cookie session flow: POST /api/v2/auth/login returns a SID
-// cookie; an expired session answers 403 and the client re-logs in once
-// and retries the request. Every exchange is bounded by httpTimeout and
-// the caller's context.
+// cookie; an expired or rejected session answers 403 (4.x–5.1) or 401
+// (≥5.2 auth paths) and the client re-logs in once and retries the
+// request. Every exchange is bounded by httpTimeout and the caller's
+// context.
 type QBit struct {
 	base     string // normalized base URL, no trailing slash
 	username string
@@ -53,9 +54,17 @@ func NewQBit(baseURL, username, password string, log *slog.Logger) (*QBit, error
 	}, nil
 }
 
-// login performs the WebAPI v2 cookie login. qBittorrent answers 200 with
-// body "Ok." on success and "Fails." on bad credentials; 403 means the
-// IP is banned. The SID cookie is stored in the client's jar.
+// login performs the WebAPI v2 cookie login across both protocol
+// generations (verified against upstream qbittorrent/qBittorrent,
+// src/webui/api/authcontroller.cpp + src/webui/webapplication.cpp):
+//   - 4.x–5.1 (v4_6_x/v5_0_x/v5_1_x): 200 with body "Ok." on success,
+//     "Fails." on bad credentials.
+//   - ≥5.2 (v5_2_x/v5_3_x/master): success sets only the API status and
+//     null result data renders as 204 (no body); bad credentials throw
+//     APIErrorType::Unauthorized → 401.
+//
+// 403 on login means the IP is banned in both generations. The SID
+// cookie is stored in the client's jar.
 func (q *QBit) login(ctx context.Context) error {
 	form := url.Values{}
 	form.Set("username", q.username)
@@ -78,20 +87,28 @@ func (q *QBit) login(ctx context.Context) error {
 	switch {
 	case resp.StatusCode == http.StatusForbidden:
 		return fmt.Errorf("qbittorrent login: IP banned (403)")
+	case resp.StatusCode == http.StatusUnauthorized:
+		// ≥5.2: bad credentials are 401, not 200 "Fails.".
+		return fmt.Errorf("qbittorrent login: authentication failed (401)")
+	case resp.StatusCode == http.StatusNoContent:
+		// ≥5.2: login success carries no body.
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("qbittorrent login: HTTP %d", resp.StatusCode)
 	case strings.TrimSpace(string(body)) != "Ok.":
-		// "Fails." = bad credentials. Never echo the body verbatim into
-		// logs beyond this fixed classification.
+		// 4.x–5.1: "Fails." = bad credentials. Never echo the body
+		// verbatim into logs beyond this fixed classification.
 		return fmt.Errorf("qbittorrent login: authentication failed")
 	}
 	q.loggedIn = true
 	return nil
 }
 
-// get runs an authenticated GET. On 403 (expired session) it re-logs in
-// ONCE and retries; a second 403 is a hard error. With no credentials
-// configured a 403 means auth is required but unavailable.
+// get runs an authenticated GET. On 401 or 403 (expired/rejected
+// session) it re-logs in ONCE and retries; a second failure is a hard
+// error. 403 is the no-session status on every generation (4.x–5.1 and
+// the ≥5.2 private-endpoint check); 401 covers the ≥5.2 Unauthorized
+// paths. With no credentials configured either status means auth is
+// required but unavailable.
 func (q *QBit) get(ctx context.Context, path string, query url.Values) ([]byte, error) {
 	if !q.loggedIn && q.username != "" {
 		if err := q.login(ctx); err != nil {
@@ -102,9 +119,9 @@ func (q *QBit) get(ctx context.Context, path string, query url.Values) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusForbidden {
+	if status == http.StatusForbidden || status == http.StatusUnauthorized {
 		if q.username == "" {
-			return nil, fmt.Errorf("qbittorrent: %s: 403 (auth required but no username configured)", path)
+			return nil, fmt.Errorf("qbittorrent: %s: %d (auth required but no username configured)", path, status)
 		}
 		q.loggedIn = false
 		if err := q.login(ctx); err != nil {

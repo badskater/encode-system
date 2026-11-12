@@ -21,8 +21,9 @@ import (
 //
 // Path safety: torrent file names are untrusted input. Absolute paths,
 // ".." traversal and symlink escapes out of the torrent directory are
-// refused; destination names are flattened to their base name (the
-// scanner reads flat episode folders).
+// refused; a symlinked torrent dir resolving outside download_root is
+// refused as well; destination names are flattened to their base name
+// (the scanner reads flat episode folders).
 //
 // On the first failure the in-flight temp file is removed and the error
 // returned; files already renamed stay (the caller writes the dedupe
@@ -52,6 +53,18 @@ func Stage(ctx context.Context, downloadRoot string, t Torrent, destDir string) 
 	realTorrentDir, err := filepath.EvalSymlinks(torrentDir)
 	if err != nil {
 		return nil, fmt.Errorf("torrent %s: resolve dir: %w", t.Hash, err)
+	}
+	// The resolved torrent dir must still live under the resolved
+	// download root: a symlinked torrent dir pointing outside the root
+	// would otherwise pass the per-file check below (which compares
+	// against the torrent dir itself) and stage foreign files. The
+	// mount is operator-trusted, but the containment claim must hold.
+	realRoot, err := filepath.EvalSymlinks(downloadRoot)
+	if err != nil {
+		return nil, fmt.Errorf("torrent %s: resolve download_root: %w", t.Hash, err)
+	}
+	if !strings.HasPrefix(realTorrentDir, realRoot+string(filepath.Separator)) {
+		return nil, fmt.Errorf("torrent %s: directory %q resolves outside download_root (symlink escape refused)", t.Hash, base)
 	}
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, fmt.Errorf("torrent %s: create episode dir: %w", t.Hash, err)

@@ -13,23 +13,29 @@ import (
 )
 
 // fakeQBit is a mock qBittorrent WebAPI v2 server: cookie login, completed
-// list with category filter, per-torrent file lists, and a 403-expiry
-// knob to prove the re-login retry. Credentials are assembled by
+// list with category filter, per-torrent file lists, and an expiry knob
+// to prove the re-login retry. Credentials are assembled by
 // concatenation so the harness redactor never sees a secret-shaped
-// literal.
+// literal. gen5 switches the login protocol to the ≥5.2 generation
+// (204 success / 401 bad creds); expiryStatus overrides the
+// expired-session status on data endpoints (default 403, the 4.x–5.1
+// behavior).
 type fakeQBit struct {
-	srv         *httptest.Server
-	user        string
-	pass        string
-	logins      atomic.Int64
-	listCalls   atomic.Int64
-	filesCalls  atomic.Int64
-	failFirst   atomic.Bool // when true, the FIRST info request answers 403
-	badCreds    bool
-	torrents    []qbitTorrent
-	filesByHash map[string][]qbitFile
-	filesFail   map[string]bool // hashes whose files endpoint 500s
-	lastQuery   string
+	srv          *httptest.Server
+	user         string
+	pass         string
+	logins       atomic.Int64
+	listCalls    atomic.Int64
+	filesCalls   atomic.Int64
+	failFirst    atomic.Bool // when true, the FIRST info request answers with the expiry status
+	badCreds     bool
+	banLogin     bool // login answers 403 (banned IP) in both generations
+	gen5         bool // ≥5.2 login protocol: 204 success, 401 bad credentials
+	expiryStatus int  // expired-session status on data endpoints (0 = 403)
+	torrents     []qbitTorrent
+	filesByHash  map[string][]qbitFile
+	filesFail    map[string]bool // hashes whose files endpoint 500s
+	lastQuery    string
 }
 
 func newFakeQBit(t *testing.T) *fakeQBit {
@@ -47,23 +53,38 @@ func newFakeQBit(t *testing.T) *fakeQBit {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		if f.banLogin {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		r.ParseForm()
 		if f.badCreds || r.FormValue("username") != f.user || r.FormValue("password") != f.pass {
+			if f.gen5 {
+				// ≥5.2: bad credentials throw APIErrorType::Unauthorized → 401.
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			fmt.Fprint(w, "Fails.")
 			return
 		}
 		http.SetCookie(w, &http.Cookie{Name: "SID", Value: "mock-session-1", Path: "/"})
+		if f.gen5 {
+			// ≥5.2: login success sets only the API status; null result
+			// data renders as 204 No Content (no "Ok." body).
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		fmt.Fprint(w, "Ok.")
 	})
 	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
 		f.listCalls.Add(1)
 		f.lastQuery = r.URL.RawQuery
 		if !f.hasSID(r) {
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(f.expiredStatus())
 			return
 		}
 		if f.failFirst.CompareAndSwap(true, false) {
-			w.WriteHeader(http.StatusForbidden) // expired session
+			w.WriteHeader(f.expiredStatus()) // expired session
 			return
 		}
 		list := f.torrents
@@ -85,7 +106,7 @@ func newFakeQBit(t *testing.T) *fakeQBit {
 	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
 		f.filesCalls.Add(1)
 		if !f.hasSID(r) {
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(f.expiredStatus())
 			return
 		}
 		hash := r.URL.Query().Get("hash")
@@ -107,6 +128,16 @@ func newFakeQBit(t *testing.T) *fakeQBit {
 func (f *fakeQBit) hasSID(r *http.Request) bool {
 	c, err := r.Cookie("SID")
 	return err == nil && c.Value == "mock-session-1"
+}
+
+// expiredStatus is the status an expired/absent session gets on data
+// endpoints: 403 by default (4.x–5.1, and still the ≥5.2 no-session
+// check), overridable to 401 to exercise the ≥5.2 Unauthorized paths.
+func (f *fakeQBit) expiredStatus() int {
+	if f.expiryStatus != 0 {
+		return f.expiryStatus
+	}
+	return http.StatusForbidden
 }
 
 func (f *fakeQBit) client(t *testing.T) *QBit {

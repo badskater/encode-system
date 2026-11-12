@@ -926,6 +926,14 @@ into the scripts share. It is **OFF by default** and **experimental** —
 qBittorrent (WebAPI v2) is the first-class provider; ruTorrent (httprpc
 plugin) is best-effort.
 
+**qBittorrent version support:** both WebAPI protocol generations are
+handled — 4.x–5.1 (login `200 "Ok."` / `"Fails."`, expired session 403)
+and ≥5.2 (login success `204` with no body, bad credentials `401`;
+verified against upstream `src/webui/api/authcontroller.cpp` +
+`src/webui/webapplication.cpp`). An expired/rejected session is
+re-logged-in once on **401 or 403**. Both generations are covered by
+mock-server regression tests.
+
 ### Workflow (sources only — scripts stay hand-authored)
 
 1. Ingestion copies the torrent's video files (`.mkv/.mp4/.ts/.m2ts`)
@@ -971,8 +979,9 @@ series name; the episode is still parsed from the name.
 | --- | --- |
 | `directory … not visible under download_root` | The client's download directory is not mounted into the controller at `download_root`, or the torrent saves into a per-category subfolder. Mount the directory that DIRECTLY contains the torrent folders (see Deployment.md). |
 | `release name unparseable; skipped` | The name carries no safe episode signal (or is multi-season/a pack). Rename the torrent or stage manually; the parser never guesses. |
-| `qbittorrent login: authentication failed` | Wrong credentials, or the WebUI user differs from the configured one. Password is write-only — re-type it on the Settings card. |
-| `qbittorrent … 403` repeating | Session expiry is retried once automatically; persistent 403 = IP ban (qBittorrent bans after repeated failed logins) or auth required with no username configured. |
+| `qbittorrent login: authentication failed` | Wrong credentials, or the WebUI user differs from the configured one (`Fails.` on 4.x–5.1, HTTP 401 on ≥5.2). Password is write-only — re-type it on the Settings card. |
+| `qbittorrent … 401/403` repeating | Session expiry is retried once automatically (re-login on 401 or 403); persistent 403 = IP ban (qBittorrent bans after repeated failed logins) or auth required with no username configured. |
+| `directory … resolves outside download_root` | The torrent folder is a symlink pointing outside `download_root`. Point it at a real folder inside the root (or a symlink that stays inside); staging refuses the escape. |
 | `rutorrent rpc: HTTP 401/403` | Web-server auth in front of ruTorrent rejects the Basic credentials; digest-only auth is not supported (experimental limitation). |
 | Torrent completed but never staged | Check the category filter / map keys (ruTorrent matches the LABEL, `d.custom1`), and that the torrent is actually complete (`d.get_complete`, fallback `left_bytes=0`). |
 | Same torrent staged twice after a DB restore | The ledger restored from an older snapshot lost the row; staging skips existing files, so the re-stage is harmless. |
@@ -980,8 +989,9 @@ series name; the episode is still parsed from the name.
 ### Safety notes
 
 - Torrent file names are untrusted: absolute paths, `..` traversal and
-  symlink escapes out of the torrent directory are refused; destinations
-  are flattened to base names inside the episode folder.
+  symlink escapes out of the torrent directory are refused; a symlinked
+  torrent directory resolving outside `download_root` is refused too;
+  destinations are flattened to base names inside the episode folder.
 - Every HTTP exchange is bounded (30 s client timeout + poll context);
   one bad torrent or category never stops the batch or the loop.
 - Disabling ingestion (`enabled=false`) makes every tick a no-op; the

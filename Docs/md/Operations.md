@@ -120,6 +120,31 @@ looks like the source.
   threshold is a quality rejection ("score X is below threshold Y"). Both
   fail the step, but the log message tells you which happened. A rejected
   encode still reports its score and writes `quality.json` before failing.
+- **Fail-closed scores**: a parsed score must be a finite number inside the
+  metric's range (VMAF 0–100, SSIM 0–1). Non-finite values (`NaN`,
+  `Infinity` — which some JSON parsers accept), negative or out-of-range
+  scores fail the step as a tool error ("failing closed"); they never pass
+  the gate and never reach `quality.json`/`ENCODE_METRIC`. Metric lines use
+  fixed decimals (4 for VMAF, 6 for SSIM) in the invariant culture.
+- **Self-compare guard**: with no source present, the source finder can
+  return the output MKV itself. The step compares FILE IDENTITY (resolved
+  symlink targets plus hardlink identity — volume serial + file index on
+  Windows, device + inode on Linux), not path strings, and treats a match
+  as "no source". A `src.mkv` symlink/hardlink to the encode cannot fake a
+  perfect score.
+- **Frame-count pre-check**: before comparing, the step ffprobes both
+  inputs (`nb_frames`, falling back to `count_packets` — MKV often reports
+  `N/A`). A mismatch (e.g. 24-frame source vs 48-frame encode after
+  IVTC/trim drift) fails with both counts named, because the comparison
+  would silently mispair frames. Missing ffprobe logs a WARNING and skips
+  the check; it never breaks the gate.
+- **Filtergraph contract**: the source is scaled to the encode's dimensions
+  with `[ref][dist]scale2ref` (reference FIRST) and the metric filter
+  receives `[dists][refs]` (distorted first). Swapped operands silently
+  flip scores (measured: SSIM 0.979 → 0.930 across the 0.95 threshold), so
+  both the render-contract tests and the e2e stub pin the exact operand
+  order. `scale2ref` is deprecated in ffmpeg 7.1+; the planned drop-in is
+  `scale=rw:rh` — keep the operand order when migrating.
 - **Tuning**: VMAF 90 suits anime at CRF ~15; lower it (e.g. 85) for
   grain-heavy sources, raise it for archive-grade encodes. SSIM 0.95 is a
   structural-loss floor, not a perceptual target — prefer VMAF when the

@@ -100,9 +100,10 @@ const qualityGatePS = `function Invoke-QualityGate {
     $src = ''
     try { $src = Find-SourceFile $Job.EpisodeDir } catch { $src = '' }
     # Find-SourceFile's fallback picks ANY media file in the dir — with no
-    # source present that can be the output MKV itself. Comparing the encode
-    # against itself would fake a perfect score, so treat it as no source.
-    if ($src -and (Get-Item -LiteralPath $src).FullName -eq (Get-Item -LiteralPath $mkv).FullName) {
+    # source present that can be the output MKV itself, directly OR via a
+    # symlink/hardlink. Comparing the encode against itself would fake a
+    # perfect score, so compare FILE IDENTITY (Test-SameFile), not paths.
+    if ($src -and (Test-SameFile $src $mkv)) {
         $src = ''
     }
     if (-not $src) {
@@ -141,6 +142,48 @@ const qualityGatePS = `function Invoke-QualityGate {
         throw "quality_gate: threshold $threshold out of range for $metric (0-$max)"
     }
 
+    # --- frame-count parity (ffprobe) ---
+    # A source/encode frame-count mismatch (IVTC, trims, dropped frames)
+    # silently MISPAIRS frames in the comparison and scores stale frames.
+    # Diagnose it up front with ffprobe (ships with ffmpeg). ffprobe missing
+    # is non-fatal: warn loudly and skip the check rather than break the gate.
+    function Get-QgFrameCount {
+        param([string]$Probe, [string]$Path)
+        # nb_frames from container metadata first; MKV commonly reports N/A,
+        # so fall back to counting packets. Empty output = count unknown.
+        $queries = @(
+            ,@('-v','error','-select_streams','v:0','-show_entries','stream=nb_frames','-of','default=noprint_wrappers=1:nokey=1')
+            ,@('-v','error','-select_streams','v:0','-count_packets','-show_entries','stream=nb_read_packets','-of','default=noprint_wrappers=1:nokey=1')
+        )
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            foreach ($q in $queries) {
+                $raw = & $Probe @q $Path 2>$null
+                if ($LASTEXITCODE -ne 0) { return $null }
+                $n = ([string]::Join('', @($raw | ForEach-Object { [string]$_ }))).Trim()
+                if ($n -match '^[0-9]+$' -and $n.Length -le 15) { return [long]$n }
+            }
+        } finally { $ErrorActionPreference = $prevEAP }
+        return $null
+    }
+    $ffprobe = Join-Path $Job.BinDir 'ffprobe.exe'
+    if (-not (Test-Path -LiteralPath $ffprobe)) {
+        # Select-Object -First 1: Get-Command can return multiple PATH
+        # matches; .Source on the array would stringify into one bad name.
+        $probeCmd = Get-Command 'ffprobe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $ffprobe = if ($probeCmd) { $probeCmd.Source } else { $null }
+    }
+    if ($ffprobe) {
+        $nOut = Get-QgFrameCount $ffprobe $mkv
+        $nSrc = Get-QgFrameCount $ffprobe $src
+        if ($null -ne $nOut -and $null -ne $nSrc -and $nOut -ne $nSrc) {
+            throw "quality_gate: frame-count mismatch: encode has $nOut frames but source has $nSrc frames (IVTC/trim drift?) - comparison would mispair frames"
+        }
+    } else {
+        Write-Output "[quality] WARNING: ffprobe not available - skipping frame-count mismatch check"
+    }
+
     # --- libvmaf probe + loud SSIM fallback ---
     $fallbackUsed = $false
     $effective = $metric
@@ -173,6 +216,9 @@ const qualityGatePS = `function Invoke-QualityGate {
     # the pairing exact), re-timestamp to consecutive frames, normalize to
     # 10-bit 4:2:0 (8-bit source vs 10-bit encode is the farm's normal case),
     # scale the source to the encode's dimensions, then libvmaf/ssim.
+    # NOTE: scale2ref is deprecated (ffmpeg 7.1+); the planned drop-in is
+    # scale=rw:rh (reference width/height). Keep the reference-FIRST operand
+    # order when migrating — swapped operands silently flip the scores.
     $sel = "select='not(mod(n\,$sampling))',setpts=N/FRAME_RATE/TB,format=yuv420p10le"
     $graph = "[0:v]${sel}[dist];[1:v]${sel}[ref];[ref][dist]scale2ref[refs][dists];[dists][refs]"
     $filter = if ($effective -eq 'vmaf') { "${graph}libvmaf=log_fmt=json:log_path=quality_vmaf.json" } else { "${graph}ssim=stats_file=quality_ssim.log" }
@@ -200,6 +246,7 @@ const qualityGatePS = `function Invoke-QualityGate {
 
     # --- score parsing (distinct from a below-threshold verdict) ---
     $score = 0.0
+    $scoreRaw = ''
     $scoreParsed = $false
     $sampledFrames = 0
     if ($effective -eq 'vmaf') {
@@ -212,10 +259,22 @@ const qualityGatePS = `function Invoke-QualityGate {
             if ($null -ne $j.PSObject.Properties['pooled_metrics'] -and $null -ne $j.pooled_metrics) {
                 $vm = $j.pooled_metrics.PSObject.Properties['vmaf']
                 if ($null -ne $vm -and $null -ne $vm.Value -and $null -ne $vm.Value.PSObject.Properties['mean']) {
-                    $score = [double]$vm.Value.mean
-                    $scoreParsed = $true
-                    $sampledFrames = @($j.frames).Count
+                    $mean = $vm.Value.mean
+                    # ConvertFrom-Json accepts NaN/Infinity literals, bools
+                    # and strings; only a JSON NUMBER is a score candidate
+                    # (finiteness + range are validated below).
+                    if ($null -ne $mean -and $mean -isnot [bool] -and $mean -isnot [string]) {
+                        $score = [double]$mean
+                        $scoreRaw = $score.ToString($invCulture)
+                        $scoreParsed = $true
+                    }
                 }
+            }
+            if ($scoreParsed) {
+                # frames:null must count as 0 (bash jq length parity) —
+                # @($null).Count is 1 and would fake a sampled frame.
+                $framesProp = $j.PSObject.Properties['frames']
+                $sampledFrames = if ($null -eq $framesProp -or $null -eq $framesProp.Value) { 0 } else { @($framesProp.Value).Count }
             }
         } catch { }
         if (-not $scoreParsed) {
@@ -224,13 +283,22 @@ const qualityGatePS = `function Invoke-QualityGate {
     } else {
         # The ssim filter prints its summary to stderr: "SSIM Y:... All:<score> (...)".
         foreach ($line in $rawOut) {
-            if ($line -match 'All:(-?[0-9]+(?:\.[0-9]+)?)') { $score = [double]::Parse($Matches[1], $invCulture); $scoreParsed = $true }
+            if ($line -match 'All:(-?[0-9]+(?:\.[0-9]+)?)') { $score = [double]::Parse($Matches[1], $invCulture); $scoreRaw = $Matches[1]; $scoreParsed = $true }
         }
         $sstatsPath = Join-Path $Job.EpisodeDir 'quality_ssim.log'
         if (Test-Path -LiteralPath $sstatsPath) { $sampledFrames = @(Get-Content -LiteralPath $sstatsPath).Count }
         if (-not $scoreParsed) {
             throw "quality_gate: could not parse SSIM score from ffmpeg output (no 'All:' summary line)"
         }
+    }
+    # Fail CLOSED on non-finite / out-of-range scores. ConvertFrom-Json
+    # accepts NaN/Infinity literals and NaN -lt threshold is always FALSE,
+    # so an unvalidated score would PASS the gate, write invalid JSON and
+    # emit a metric line the agent silently drops. The range check also
+    # bounds the fixed-decimal metric line below (no 309-digit numbers).
+    $scoreMax = if ($effective -eq 'vmaf') { 100.0 } else { 1.0 }
+    if (-not [double]::IsFinite($score) -or $score -lt 0 -or $score -gt $scoreMax) {
+        throw "quality_gate: $effective score '$scoreRaw' is outside the valid range 0-$scoreMax (non-finite or out-of-range; failing closed)"
     }
     if ($sampledFrames -le 0) {
         throw "quality_gate: comparison produced no sampled frames (check that source and encode are playable video)"

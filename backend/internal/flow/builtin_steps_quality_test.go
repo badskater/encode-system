@@ -30,6 +30,12 @@ func TestQualityGateRenderBothDialects(t *testing.T) {
 		`select='not(mod(n\`,
 		`,setpts=N/FRAME_RATE/TB,format=yuv420p10le`,
 		"[0:v]", "[1:v]", "scale2ref",
+		// EXACT scale2ref operand order (Q3): reference FIRST ([ref][dist])
+		// so the SOURCE is scaled to the encode's dimensions, and the metric
+		// filter takes [dists][refs] (distorted first). Substring presence of
+		// "scale2ref" alone let a swapped graph pass review while real ffmpeg
+		// flipped SSIM 0.979 -> 0.930 across the 0.95 threshold.
+		"[ref][dist]scale2ref[refs][dists];[dists][refs]",
 		// Default sampling factor 12 (drift guard vs the Go constant).
 		QualityGateDefaultSampling,
 		// libvmaf probe via ffmpeg -filters.
@@ -66,11 +72,21 @@ func TestQualityGateRenderBothDialects(t *testing.T) {
 		"threshold must be numeric",
 		"out of range for",
 		"VMAF-scale but libvmaf is unavailable",
+		// Fail-closed score validation (Q1): non-finite / out-of-range
+		// scores are tool errors, never a passing verdict.
+		"failing closed",
+		// Frame-count parity pre-check (Q5) + graceful ffprobe-missing path.
+		"frame-count mismatch",
+		"ffprobe not available",
 	}
 	psOnly := []string{
 		"function Invoke-QualityGate",
 		"Resolve-Tool $Job.BinDir 'ffmpeg.exe'",
 		"Find-SourceFile $Job.EpisodeDir",
+		// File-IDENTITY self-compare guard (Q2): path-string equality is
+		// bypassed by symlinks AND hardlinks.
+		"Test-SameFile",
+		"IsFinite",
 		"Push-Location -LiteralPath $Job.EpisodeDir",
 		"ConvertFrom-Json",
 		"ConvertTo-Json",
@@ -81,7 +97,7 @@ func TestQualityGateRenderBothDialects(t *testing.T) {
 		"find_source_file \"$EpisodeDir\"",
 		"command -v bc",
 		"command -v jq",
-		"jq -r '.pooled_metrics.vmaf.mean // empty'",
+		"jq -r '.pooled_metrics.vmaf.mean | select(type == \"number\") // empty'",
 		"jq -n --arg metric",
 		"cd \"$EpisodeDir\"",
 	}
@@ -102,6 +118,18 @@ func TestQualityGateRenderBothDialects(t *testing.T) {
 	for _, want := range bashOnly {
 		if !strings.Contains(bash, want) {
 			t.Errorf("bash render missing %q", want)
+		}
+	}
+
+	// Negative graph contract (Q3): the SWAPPED operand order must not
+	// appear in either dialect — it scales the encode to the source dims
+	// and flips the scores (real ffmpeg: SSIM 0.979 -> 0.930).
+	for _, d := range []struct{ name, body string }{{"PS", ps}, {"bash", bash}} {
+		if strings.Contains(d.body, "[dist][ref]scale2ref") {
+			t.Errorf("%s render carries SWAPPED scale2ref operands ([dist][ref])", d.name)
+		}
+		if strings.Contains(d.body, "[refs][dists]libvmaf") || strings.Contains(d.body, "[refs][dists]ssim") {
+			t.Errorf("%s render feeds the metric filter swapped inputs ([refs][dists])", d.name)
 		}
 	}
 

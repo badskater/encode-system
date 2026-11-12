@@ -398,6 +398,15 @@ func (s *Server) seedDefaultFlow() error {
 	for _, seed := range []*model.Flow{flow.DefaultFlow(), flow.Default4kFlow(), flow.Default4kCPUFlow()} {
 		if _, err := s.Store.FlowByName(ctx, seed.Name); err != nil {
 			if _, err := s.Store.CreateFlow(ctx, seed); err != nil {
+				// HA first-boot race: two replicas can both pass the name
+				// check before either inserts. A UNIQUE violation means the
+				// other replica already seeded this flow — re-check and
+				// continue silently instead of failing startup.
+				if isUniqueConstraintErr(err) {
+					if _, recheckErr := s.Store.FlowByName(ctx, seed.Name); recheckErr == nil {
+						continue
+					}
+				}
 				return fmt.Errorf("seed flow %q: %w", seed.Name, err)
 			}
 			s.Log.Info("seeded flow", "name", seed.Name, "steps", len(seed.Steps))
@@ -411,9 +420,13 @@ func (s *Server) seedDefaultFlow() error {
 		def := flow.DefaultFlow()
 		def.Name = s.Cfg.DefaultFlowName
 		if _, err := s.Store.CreateFlow(ctx, def); err != nil {
-			return fmt.Errorf("seed default flow %q: %w", def.Name, err)
+			// Same concurrent-seed tolerance as the factory loop above.
+			if !isUniqueConstraintErr(err) {
+				return fmt.Errorf("seed default flow %q: %w", def.Name, err)
+			}
+		} else {
+			s.Log.Info("seeded flow", "name", def.Name, "steps", len(def.Steps))
 		}
-		s.Log.Info("seeded flow", "name", def.Name, "steps", len(def.Steps))
 		if fl, err = s.Store.FlowByName(ctx, s.Cfg.DefaultFlowName); err != nil {
 			return fmt.Errorf("resolve default flow: %w", err)
 		}

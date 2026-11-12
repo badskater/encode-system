@@ -56,6 +56,19 @@ for a in "$@"; do
   [ "$prev" = "-lavfi" ] && filter="$a"
   prev="$a"
 done
+# Graph-structure guard: scale2ref MUST take [ref][dist] (reference first,
+# scaling the source to the encode's dimensions) and the metric filter MUST
+# receive [dists][refs] (distorted first). Swapped operands silently flip
+# scores on real ffmpeg (SSIM 0.979 -> 0.930 across the 0.95 threshold), so
+# a structurally wrong graph fails the scenario instead of faking a score.
+if ! printf '%s' "$filter" | grep -Eq '\[ref\]\[dist\]scale2ref'; then
+  echo "ffmpeg stub: bad filtergraph: scale2ref operands must be [ref][dist] (reference first)" >&2
+  exit 1
+fi
+if ! printf '%s' "$filter" | grep -Eq '\[dists\]\[refs\](libvmaf|ssim)='; then
+  echo "ffmpeg stub: bad filtergraph: metric filter inputs must be [dists][refs] (distorted first)" >&2
+  exit 1
+fi
 rc=0
 [ -f "$dir/ffmpeg_exit" ] && rc=$(cat "$dir/ffmpeg_exit")
 case "$filter" in
@@ -85,10 +98,40 @@ echo "ffmpeg stub: comparison done" >&2
 exit "$rc"
 `
 
+// qgFFprobeStub answers the frame-count queries the step issues:
+// stream=nb_frames (container metadata) and the -count_packets /
+// nb_read_packets fallback. The last argument is the input path; src.mkv
+// gets the source count, anything else the encode count (defaults 48/48 =
+// match). Sidecars: probe_src_frames / probe_out_frames (counts),
+// probe_na (nb_frames answers N/A, forcing the count_packets fallback),
+// probe_fail (exit 1 — the step must skip the check gracefully).
+const qgFFprobeStub = `#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+path=""
+for a in "$@"; do path="$a"; done
+count=48
+case "$path" in
+  *src.mkv) [ -f "$dir/probe_src_frames" ] && count=$(cat "$dir/probe_src_frames") ;;
+  *) [ -f "$dir/probe_out_frames" ] && count=$(cat "$dir/probe_out_frames") ;;
+esac
+if [ -f "$dir/probe_fail" ]; then exit 1; fi
+if [ -f "$dir/probe_na" ]; then
+  for a in "$@"; do
+    case "$a" in
+      *nb_read_packets*) echo "$count"; exit 0 ;;
+    esac
+  done
+  echo "N/A"
+  exit 0
+fi
+echo "$count"
+`
+
 // qgJQStub implements EXACTLY the three jq invocations the bash template
-// issues: -r '.pooled_metrics.vmaf.mean // empty' FILE, -r '.frames |
-// length' FILE, and -n --arg/--argjson object construction. python3 is a
-// test-host dependency (the generic exec suite's bc stub already uses it).
+// issues: -r '.pooled_metrics.vmaf.mean | select(type == "number") // empty'
+// FILE, -r '.frames | length' FILE, and -n --arg/--argjson object
+// construction. python3 is a test-host dependency (the generic exec suite's
+// bc stub already uses it).
 const qgJQStub = `#!/usr/bin/env python3
 import sys, json
 args = sys.argv[1:]
@@ -119,7 +162,12 @@ except Exception:
     sys.exit(1)
 if 'pooled_metrics' in q:
     try:
-        print(data['pooled_metrics']['vmaf']['mean'])
+        m = data['pooled_metrics']['vmaf']['mean']
+        # select(type == "number"): strings/bools/null are NOT scores
+        # (NaN/Infinity parse as floats here, exactly like jq; the step's
+        # regex/range validation rejects them downstream).
+        if isinstance(m, (int, float)) and not isinstance(m, bool):
+            print(m)
     except (KeyError, TypeError):
         pass  # '// empty' -> no output
 elif 'length' in q:
@@ -145,15 +193,22 @@ PY
 // ffmpeg 9 / libvmaf 2.x): pooled_metrics.vmaf.mean + one frames[] entry
 // per compared frame.
 func qgVMAFLog(mean float64, frames int) string {
+	return qgVMAFLogRaw(fmt.Sprintf("%g", mean), frames)
+}
+
+// qgVMAFLogRaw is qgVMAFLog with the mean as a RAW JSON literal so tests
+// can inject the malformed forms ConvertFrom-Json/jq accept but a real
+// libvmaf never emits: NaN, Infinity, 1e999, 1e308, strings, booleans.
+func qgVMAFLogRaw(mean string, frames int) string {
 	var b strings.Builder
 	b.WriteString(`{"version":"2.3.1","fps":24.0,"frames":[`)
 	for i := 0; i < frames; i++ {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		fmt.Fprintf(&b, `{"frameNum":%d,"metrics":{"vmaf":%g}}`, i, mean)
+		fmt.Fprintf(&b, `{"frameNum":%d,"metrics":{"vmaf":%s}}`, i, mean)
 	}
-	fmt.Fprintf(&b, `],"pooled_metrics":{"vmaf":{"min":%g,"max":%g,"mean":%g,"harmonic_mean":%g}}}`,
+	fmt.Fprintf(&b, `],"pooled_metrics":{"vmaf":{"min":%s,"max":%s,"mean":%s,"harmonic_mean":%s}}}`,
 		mean, mean, mean, mean)
 	return b.String()
 }
@@ -166,7 +221,9 @@ type qgCase struct {
 
 	filters        string  // -filters sidecar ("" = file absent -> no libvmaf)
 	vmafMean       float64 // >0: write a vmaf.json sidecar with this mean
+	vmafMeanRaw    string  // raw JSON mean literal (overrides vmafMean): NaN/Infinity/1e999/...
 	vmafFrames     int     // frames[] length (default 13 when vmafMean>0)
+	vmafFramesNull bool    // frames: null (PS must count 0 like bash, not 1)
 	vmafBadJSON    bool    // write garbage instead of a valid log
 	noVmafLog      bool    // ffmpeg exits 0 but writes no log at all
 	ssimScore      string  // All: value (default "0.99")
@@ -175,8 +232,14 @@ type qgCase struct {
 	ssimNoSummary  bool    // stats file but no stderr summary line
 	ffmpegExit     int     // comparison-run exit code
 	noFFmpeg       bool    // no ffmpeg on PATH or in BinDir
+	noFFprobe      bool    // no ffprobe anywhere (frame-count check skips with warning)
 	noMKV          bool    // muxed output absent
 	noSource       bool    // source media absent
+	sourceLink     string  // "" | "symlink" | "hardlink": src.mkv links to the output MKV
+	probeSrcFrames int     // ffprobe stub source frame count (default 48)
+	probeOutFrames int     // ffprobe stub encode frame count (default 48)
+	probeNA        bool    // nb_frames answers N/A -> count_packets fallback
+	probeFail      bool    // ffprobe exits 1 -> check skipped gracefully
 	wantFail       bool
 	wantSubstr     []string // output must contain (both dialects)
 	wantPS         []string // PS-only output substrings
@@ -345,6 +408,152 @@ func qgParamValidationCases() []qgCase {
 	}
 }
 
+// qgHardeningCases is the quality-review regression table: every row was a
+// CONFIRMED fail-open or parity gap at b8d0387 (adversarial probes with real
+// pwsh + ffmpeg). Each must fail CLOSED (tool error, never a pass marker or
+// a quality_score metric) or behave identically in both dialects.
+func qgHardeningCases() []qgCase {
+	// failClosedScore: a malformed score must be a TOOL error — no pass
+	// marker, no metric line, no quality.json (nothing parsed is reportable).
+	failClosedScore := func(extra ...string) qgCase {
+		return qgCase{
+			filters:    qgFiltersWithLibvmaf,
+			wantFail:   true,
+			wantSubstr: append([]string{"ENCODE_STEP_FAILED quality_gate"}, extra...),
+			wantAbsent: []string{"ENCODE_METRIC quality_score=", "ENCODE_METRIC quality_metric="},
+		}
+	}
+	cases := []qgCase{}
+	// Q1: non-finite / out-of-range VMAF means. ConvertFrom-Json accepts
+	// NaN/Infinity literals; NaN -lt 90 is FALSE, so the unguarded PS gate
+	// PASSED and wrote invalid JSON + a metric the agent silently drops.
+	for _, raw := range []string{"NaN", "Infinity", "1e999", "1e308", "-5.0", "150.0", strings.Repeat("9", 400), `"95.5"`, "true"} {
+		c := failClosedScore()
+		c.name = "vmaf_mean_" + raw
+		if len(c.name) > 60 {
+			c.name = c.name[:60]
+		}
+		c.vmafMeanRaw = raw
+		// Both dialects must fail CLOSED; the exact tool-error class differs
+		// by form: NaN/Infinity/exponent forms parse to non-finite doubles
+		// on PS (range guard) but fail bash's parse regex; string/bool form
+		// is rejected by both type guards; a 400-digit integer overflows
+		// ConvertFrom-Json (parse error) while bash's bc range guard catches
+		// it. Every path is a loud tool error, never a verdict.
+		switch raw {
+		case "NaN", "Infinity", "1e999", "1e308":
+			c.wantBash = []string{"could not parse VMAF score"}
+			c.wantPS = []string{"failing closed"}
+		case "-5.0", "150.0":
+			c.wantBash = []string{"failing closed"}
+			c.wantPS = []string{"failing closed"}
+		case strings.Repeat("9", 400):
+			c.wantBash = []string{"failing closed"}
+			c.wantPS = []string{"could not parse VMAF score"}
+		default: // string / bool mean
+			c.wantBash = []string{"could not parse VMAF score"}
+			c.wantPS = []string{"could not parse VMAF score"}
+		}
+		cases = append(cases, c)
+	}
+	// Q1: SSIM scale edges (explicit ssim, so no libvmaf probe is needed).
+	for _, sc := range []string{"1.5", "-0.5", "NaN"} {
+		c := failClosedScore()
+		c.name = "ssim_score_" + sc
+		c.params = map[string]string{"metric": "ssim"}
+		c.ssimScore = sc
+		if sc == "NaN" {
+			c.wantSubstr = []string{"ENCODE_STEP_FAILED quality_gate", "could not parse SSIM score"}
+		} else {
+			c.wantSubstr = []string{"ENCODE_STEP_FAILED quality_gate", "failing closed"}
+		}
+		cases = append(cases, c)
+	}
+	// G1: frames:null — PS @($null).Count is 1, bash jq length is 0. Both
+	// must treat it as zero sampled frames (tool error), never pass.
+	cases = append(cases, qgCase{
+		name: "vmaf_frames_null", filters: qgFiltersWithLibvmaf, vmafFramesNull: true,
+		wantFail:   true,
+		wantSubstr: []string{"ENCODE_STEP_FAILED quality_gate", "no sampled frames"},
+		wantAbsent: []string{"ENCODE_METRIC quality_score="},
+	})
+	// Q2: the self-compare guard must compare FILE IDENTITY — a src.mkv
+	// symlink or hardlink to the output MKV faked VMAF 100 on PS (path
+	// string equality missed both; bash -ef already caught them).
+	for _, link := range []string{"symlink", "hardlink"} {
+		cases = append(cases, qgCase{
+			name: "self_compare_" + link, filters: qgFiltersWithLibvmaf, vmafMean: 100,
+			sourceLink: link,
+			wantFail:   true,
+			wantSubstr: []string{"ENCODE_STEP_FAILED quality_gate", "no source media file found"},
+			wantAbsent: []string{"ENCODE_METRIC quality_score="},
+		})
+	}
+	// Q4: param-trim parity — PS trims metric/threshold/sampling, bash did
+	// not, so ' 12 ' passed PS and failed bash. Both must accept padding.
+	cases = append(cases, qgCase{
+		name: "params_padded", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		params:       map[string]string{"metric": " vmaf ", "threshold": " 90 ", "sampling": " 12 "},
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	// G2: leading-zero thresholds — jq --argjson rejects '090' (invalid
+	// JSON number) while PS parses 90. Both must accept and agree.
+	cases = append(cases, qgCase{
+		name: "threshold_leading_zero", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		params:       map[string]string{"threshold": "090"},
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	cases = append(cases, qgCase{
+		name: "threshold_leading_zero_ssim", filters: qgFiltersWithLibvmaf, ssimScore: "0.97",
+		params:       map[string]string{"metric": "ssim", "threshold": "00.95"},
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "ssim", artScore: 0.97, artThreshold: 0.95, artFrames: 13,
+	})
+	// Q5: frame-count mismatch silently mispaired frames (24-frame source
+	// vs 48-frame encode scored stale frames and exited 0). The ffprobe
+	// pre-check must name BOTH counts and fail; equal counts proceed.
+	cases = append(cases, qgCase{
+		name: "frame_count_mismatch", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		probeSrcFrames: 24, probeOutFrames: 48,
+		wantFail: true,
+		wantSubstr: []string{
+			"ENCODE_STEP_FAILED quality_gate", "frame-count mismatch",
+			"encode has 48 frames", "source has 24 frames",
+		},
+		wantAbsent: []string{"ENCODE_METRIC quality_score="},
+	})
+	cases = append(cases, qgCase{
+		name: "frame_count_equal", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		probeSrcFrames: 48, probeOutFrames: 48,
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	// MKV containers commonly report nb_frames=N/A (verified on real
+	// ffmpeg 9): the count_packets fallback must supply the counts.
+	cases = append(cases, qgCase{
+		name: "frame_count_na_fallback", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		probeNA:      true,
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	cases = append(cases, qgCase{
+		name: "frame_count_probe_fail", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		probeFail:    true,
+		wantSubstr:   []string{"ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	// ffprobe missing is non-fatal: warn loudly, skip the check, gate runs.
+	cases = append(cases, qgCase{
+		name: "ffprobe_missing", filters: qgFiltersWithLibvmaf, vmafMean: 95.5,
+		noFFprobe:    true,
+		wantSubstr:   []string{"WARNING: ffprobe not available", "ENCODE_STEP quality_gate 100"},
+		wantArtifact: true, artMetric: "vmaf", artScore: 95.5, artThreshold: 90, artFrames: 13,
+	})
+	return cases
+}
+
 // qgSetup builds the stub toolchain + episode tree for one case and returns
 // the render Vars, the episode dir, and the PATH to run with.
 func qgSetup(t *testing.T, tc qgCase, exeSuffix string) (Vars, string, string) {
@@ -377,6 +586,14 @@ func qgSetup(t *testing.T, tc qgCase, exeSuffix string) (Vars, string, string) {
 		switch {
 		case tc.vmafBadJSON:
 			writeStub(binDir, "vmaf.json", "{not valid json")
+		case tc.vmafFramesNull:
+			writeStub(binDir, "vmaf.json", `{"frames":null,"pooled_metrics":{"vmaf":{"mean":95.5}}}`)
+		case tc.vmafMeanRaw != "":
+			n := tc.vmafFrames
+			if n == 0 {
+				n = 13
+			}
+			writeStub(binDir, "vmaf.json", qgVMAFLogRaw(tc.vmafMeanRaw, n))
 		case tc.vmafMean > 0:
 			n := tc.vmafFrames
 			if n == 0 {
@@ -402,6 +619,23 @@ func qgSetup(t *testing.T, tc qgCase, exeSuffix string) (Vars, string, string) {
 		if tc.ffmpegExit != 0 {
 			writeStub(binDir, "ffmpeg_exit", fmt.Sprintf("%d", tc.ffmpegExit))
 		}
+		// ffprobe stub + frame-count sidecars (absent entirely for the
+		// ffprobe-missing case so neither PATH nor BinDir can satisfy it).
+		if !tc.noFFprobe {
+			writeStub(binDir, "ffprobe"+exeSuffix, qgFFprobeStub)
+			if tc.probeSrcFrames != 0 && tc.probeSrcFrames != 48 {
+				writeStub(binDir, "probe_src_frames", fmt.Sprintf("%d", tc.probeSrcFrames))
+			}
+			if tc.probeOutFrames != 0 && tc.probeOutFrames != 48 {
+				writeStub(binDir, "probe_out_frames", fmt.Sprintf("%d", tc.probeOutFrames))
+			}
+			if tc.probeNA {
+				writeStub(binDir, "probe_na", "1")
+			}
+			if tc.probeFail {
+				writeStub(binDir, "probe_fail", "1")
+			}
+		}
 	}
 
 	// jq + bc stubs (bash only needs them, but harmless for PS runs).
@@ -423,20 +657,39 @@ func qgSetup(t *testing.T, tc qgCase, exeSuffix string) (Vars, string, string) {
 		if err := os.WriteFile(mkv, []byte("fake-mkv"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		// Q2 regression: src.mkv as a symlink/hardlink to the output MKV.
+		// Find-SourceFile still returns it; only a FILE-IDENTITY guard can
+		// tell it apart from a real source.
+		if tc.sourceLink != "" && !tc.noSource {
+			src := filepath.Join(epDir, "src.mkv")
+			if err := os.Remove(src); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if tc.sourceLink == "symlink" {
+				err = os.Symlink(mkv, src)
+			} else {
+				err = os.Link(mkv, src)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 
 	v := Vars{BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: releaseDir, Group: "TestGroup", Tag: "1080p"}
 
 	// PATH: stub dir first, real coreutils behind. For the missing-ffmpeg
-	// case build a MINIMAL path (coreutils symlinks + jq/bc/python3, no
-	// ffmpeg) so a host-installed ffmpeg can never satisfy the lookup.
+	// and missing-ffprobe cases build a MINIMAL path (coreutils symlinks +
+	// jq/bc/python3, plus the ffmpeg stub unless it is the missing tool) so
+	// a host-installed binary can never satisfy the lookup.
 	path := binDir + ":/usr/bin:/bin:/usr/local/bin"
-	if tc.noFFmpeg {
+	if tc.noFFmpeg || tc.noFFprobe {
 		minDir := filepath.Join(root, "minbin")
 		if err := os.MkdirAll(minDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for _, tool := range []string{"bash", "find", "sort", "head", "tr", "grep", "sed", "wc", "cut", "tail", "python3"} {
+		for _, tool := range []string{"bash", "find", "sort", "head", "tr", "grep", "sed", "wc", "cut", "tail", "python3", "cat", "dirname", "cp"} {
 			p, err := exec.LookPath(tool)
 			if err != nil {
 				t.Skipf("coreutils tool %q not available: %v", tool, err)
@@ -449,6 +702,24 @@ func qgSetup(t *testing.T, tc qgCase, exeSuffix string) (Vars, string, string) {
 		for _, tool := range []string{"jq", "bc"} {
 			if err := os.Symlink(filepath.Join(binDir, tool), filepath.Join(minDir, tool)); err != nil {
 				t.Fatal(err)
+			}
+		}
+		if !tc.noFFmpeg {
+			// bash resolves ffmpeg via PATH; keep the stub reachable while
+			// ffprobe stays absent (PS resolves it from BinDir, where the
+			// setup above deliberately did not write it).
+			if err := os.Symlink(filepath.Join(binDir, "ffmpeg"+exeSuffix), filepath.Join(minDir, "ffmpeg"+exeSuffix)); err != nil {
+				t.Fatal(err)
+			}
+			// The stub reads its sidecars relative to its OWN directory
+			// ($0 = the minbin symlink), so mirror them here too.
+			for _, sidecar := range []string{"filters.txt", "vmaf.json", "ssim_score", "ssim_frames", "ssim_no_summary", "ffmpeg_exit"} {
+				p := filepath.Join(binDir, sidecar)
+				if _, err := os.Stat(p); err == nil {
+					if err := os.Symlink(p, filepath.Join(minDir, sidecar)); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 		}
 		path = minDir
@@ -560,6 +831,7 @@ func TestQualityGateBashStubExec(t *testing.T) {
 		t.Skip("bash not installed; skipping bash execution test")
 	}
 	cases := append(qgCases(), qgParamValidationCases()...)
+	cases = append(cases, qgHardeningCases()...)
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -582,6 +854,63 @@ func TestQualityGateBashStubExec(t *testing.T) {
 	}
 }
 
+// TestQualityGateFFmpegStubGraphGuard proves the e2e ffmpeg stub enforces
+// the filtergraph OPERAND ORDER, not just the presence of scale2ref: the
+// correct [ref][dist] graph runs, a swapped scale2ref or swapped metric
+// inputs fail the scenario. This is the runtime half of the Q3 contract
+// (the render-contract half pins the exact operand order in the template).
+func TestQualityGateFFmpegStubGraphGuard(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not installed; skipping stub graph guard test")
+	}
+	dir := t.TempDir()
+	stubPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(stubPath, []byte(qgFFmpegStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "filters.txt"), []byte(qgFiltersWithLibvmaf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "vmaf.json"), []byte(qgVMAFLog(95.5, 13)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sel := `select='not(mod(n\,12))',setpts=N/FRAME_RATE/TB,format=yuv420p10le`
+	prefix := "[0:v]" + sel + "[dist];[1:v]" + sel + "[ref];"
+	metric := "libvmaf=log_fmt=json:log_path=quality_vmaf.json"
+	graphs := []struct {
+		name   string
+		graph  string
+		wantOK bool
+	}{
+		{"correct", prefix + "[ref][dist]scale2ref[refs][dists];[dists][refs]" + metric, true},
+		{"swapped_scale2ref", prefix + "[dist][ref]scale2ref[refs][dists];[dists][refs]" + metric, false},
+		{"swapped_metric_inputs", prefix + "[ref][dist]scale2ref[refs][dists];[refs][dists]" + metric, false},
+	}
+	for _, g := range graphs {
+		g := g
+		t.Run(g.name, func(t *testing.T) {
+			work := t.TempDir()
+			cmd := exec.Command(bash, stubPath, "-nostdin", "-hide_banner", "-nostats",
+				"-i", "out.mkv", "-i", "src.mkv", "-lavfi", g.graph, "-an", "-sn", "-dn", "-f", "null", "-")
+			cmd.Dir = work
+			out, runErr := cmd.CombinedOutput()
+			if g.wantOK {
+				if runErr != nil {
+					t.Fatalf("stub rejected the CORRECT graph: %v\n%s", runErr, out)
+				}
+				return
+			}
+			if runErr == nil {
+				t.Fatalf("stub ACCEPTED a swapped filtergraph (must fail)\n%s", out)
+			}
+			if !strings.Contains(string(out), "bad filtergraph") {
+				t.Errorf("stub failure must name the graph problem\n%s", out)
+			}
+		})
+	}
+}
+
 // TestQualityGatePowerShellStubExec is the PS parity of the bash stub-exec
 // suite (same scenarios, ffmpeg.exe stub executed via shebang). Skipped when
 // pwsh is absent, exactly like render_verify_e2e_test.go.
@@ -598,6 +927,7 @@ func TestQualityGatePowerShellStubExec(t *testing.T) {
 		t.Fatalf("EncodeLib.ps1 not found at %s", libPath)
 	}
 	cases := append(qgCases(), qgParamValidationCases()...)
+	cases = append(cases, qgHardeningCases()...)
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

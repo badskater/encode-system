@@ -47,14 +47,17 @@ const bashSourceQualityGate = `quality_gate () {
     fi
 
     # --- params + validation (mirrors the PS template) ---
-    local m="$metric"
+    # PS trims all three params; bash must too, or padded values (' 12 ')
+    # pass one dialect and fail the other (parity review Q4).
+    local m
+    m=$(printf '%s' "$metric" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
     [[ -z "$m" ]] && m='vmaf'
-    m=$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')
     if [[ "$m" != 'vmaf' && "$m" != 'ssim' ]]; then
         echo "quality_gate: invalid metric '$m' (expected vmaf or ssim)"
         echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
     fi
-    local sampling_n="$sampling"
+    local sampling_n
+    sampling_n=$(printf '%s' "$sampling" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$sampling_n" ]] && sampling_n=12
     # Length cap keeps bash arithmetic from overflowing on absurd inputs
     # (the PS integer cast would throw); 1000 is the max, so >4 digits fails.
@@ -62,7 +65,8 @@ const bashSourceQualityGate = `quality_gate () {
         echo "quality_gate: sampling must be an integer 1-1000 (got '$sampling_n')"
         echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
     fi
-    local thr="$threshold" thr_explicit=false
+    local thr thr_explicit=false
+    thr=$(printf '%s' "$threshold" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     if [[ -z "$thr" ]]; then
         if [[ "$m" == 'vmaf' ]]; then thr='90'; else thr='0.95'; fi
     else
@@ -71,12 +75,48 @@ const bashSourceQualityGate = `quality_gate () {
             echo "quality_gate: threshold must be numeric (got '$thr')"
             echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
         fi
+        # jq --argjson rejects leading-zero JSON numbers ('090') while PS
+        # parses them as 90. Normalize so both dialects accept the same
+        # forms (validation bounds above/below still apply).
+        thr=$(printf '%s' "$thr" | sed -E 's/^0+([0-9])/\1/')
     fi
     local max='100'
     [[ "$m" == 'ssim' ]] && max='1'
     if (( $(echo "$thr < 0 || $thr > $max" | bc -l) )); then
         echo "quality_gate: threshold $thr out of range for $m (0-$max)"
         echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
+    fi
+
+    # --- frame-count parity (ffprobe) ---
+    # A source/encode frame-count mismatch (IVTC, trims, dropped frames)
+    # silently MISPAIRS frames in the comparison and scores stale frames.
+    # Diagnose it up front with ffprobe (ships with ffmpeg). ffprobe missing
+    # is non-fatal: warn loudly and skip the check rather than break the gate.
+    qg_frame_count() {
+        # nb_frames from container metadata first; MKV commonly reports N/A,
+        # so fall back to counting packets. Empty output = count unknown.
+        local probe="$1" path="$2" n
+        n=$("$probe" -v error -select_streams v:0 -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "$path" 2>/dev/null) || return 0
+        n=$(printf '%s' "$n" | tr -d '[:space:]')
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( ${#n} <= 15 )); then printf '%s' "$n"; return 0; fi
+        n=$("$probe" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=noprint_wrappers=1:nokey=1 "$path" 2>/dev/null) || return 0
+        n=$(printf '%s' "$n" | tr -d '[:space:]')
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( ${#n} <= 15 )); then printf '%s' "$n"; fi
+        return 0
+    }
+    local ffprobe
+    ffprobe=$(command -v ffprobe 2>/dev/null || true)
+    [[ -z "$ffprobe" ]] && ffprobe="$BinDir/ffprobe"
+    if [[ -x "$ffprobe" ]]; then
+        local n_out n_src
+        n_out=$(qg_frame_count "$ffprobe" "$mkv")
+        n_src=$(qg_frame_count "$ffprobe" "$src")
+        if [[ -n "$n_out" && -n "$n_src" && "$n_out" != "$n_src" ]]; then
+            echo "quality_gate: frame-count mismatch: encode has $n_out frames but source has $n_src frames (IVTC/trim drift?) - comparison would mispair frames"
+            echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
+        fi
+    else
+        echo '[quality] WARNING: ffprobe not available - skipping frame-count mismatch check'
     fi
 
     # --- libvmaf probe + loud SSIM fallback ---
@@ -103,6 +143,9 @@ const bashSourceQualityGate = `quality_gate () {
     echo 'ENCODE_STEP quality_gate 20'
 
     # --- sampled comparison (same filtergraph as the PS template) ---
+    # NOTE: scale2ref is deprecated (ffmpeg 7.1+); the planned drop-in is
+    # scale=rw:rh (reference width/height). Keep the reference-FIRST operand
+    # order when migrating - swapped operands silently flip the scores.
     local sel="select='not(mod(n\\,$sampling_n))',setpts=N/FRAME_RATE/TB,format=yuv420p10le"
     local graph="[0:v]${sel}[dist];[1:v]${sel}[ref];[ref][dist]scale2ref[refs][dists];[dists][refs]"
     local filter
@@ -136,7 +179,7 @@ const bashSourceQualityGate = `quality_gate () {
             echo "quality_gate: ffmpeg exited 0 but wrote no VMAF log ($vlog) - cannot parse a score"
             echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
         fi
-        score=$(jq -r '.pooled_metrics.vmaf.mean // empty' "$vlog" 2>/dev/null || true)
+        score=$(jq -r '.pooled_metrics.vmaf.mean | select(type == "number") // empty' "$vlog" 2>/dev/null || true)
         sampled_frames=$(jq -r '.frames | length' "$vlog" 2>/dev/null || true)
         if [[ -z "$score" || ! "$score" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
             echo "quality_gate: could not parse VMAF score from $vlog (pooled_metrics.vmaf.mean missing)"
@@ -154,6 +197,16 @@ const bashSourceQualityGate = `quality_gate () {
         fi
     fi
     [[ -z "$sampled_frames" ]] && sampled_frames=0
+    # Fail CLOSED on out-of-range scores: the parse regex already rejects
+    # NaN/Inf literals and exponent forms, but a huge digit string still
+    # overflows printf to inf, and 150 is a number yet not a VMAF score.
+    # The range check also bounds the fixed-decimal metric line below.
+    local score_max='100'
+    [[ "$effective" == 'ssim' ]] && score_max='1'
+    if (( $(echo "$score < 0 || $score > $score_max" | bc -l) )); then
+        echo "quality_gate: $effective score '$score' is outside the valid range 0-$score_max (non-finite or out-of-range; failing closed)"
+        echo 'ENCODE_STEP_FAILED quality_gate'; exit 1
+    fi
     if (( sampled_frames <= 0 )); then
         echo 'quality_gate: comparison produced no sampled frames (check that source and encode are playable video)'
         echo 'ENCODE_STEP_FAILED quality_gate'; exit 1

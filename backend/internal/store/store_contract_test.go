@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -898,24 +899,34 @@ func TestTranslateDatetimeNow(t *testing.T) {
 }
 
 // TestMigratePGFresh proves migratePG creates the full schema on an empty PG
-// database. This is the fresh-PG proof: drop+recreate encode_test, then open
-// (which runs migratePG), then verify core tables exist and a basic insert
-// works. Env-gated like the contract suite.
+// database. This is the fresh-PG proof: drop+recreate a DEDICATED database
+// (encode_migrate_fresh_test), then open (which runs migratePG), then verify
+// core tables exist and a basic insert works. Env-gated like the contract suite.
+// The dedicated DB matters: `go test ./...` runs packages in PARALLEL, and
+// dropping the shared encode_test here raced other packages' PG connections
+// (CI flake: TestBackupRestorePGRoundTrip hit "database does not exist").
 func TestMigratePGFresh(t *testing.T) {
 	dsn := os.Getenv("ENCODE_TEST_PG_DSN")
 	if dsn == "" {
 		t.Skip("ENCODE_TEST_PG_DSN not set; skipping fresh-PG migration test")
 	}
-	// Drop and recreate the test database via the maintenance connection.
-	if err := dropAndRecreateTestDB(dsn); err != nil {
+	freshDSN, err := dedicatedFreshDSN(dsn)
+	if err != nil {
+		t.Fatalf("derive fresh DSN: %v", err)
+	}
+	// Drop and recreate the DEDICATED database via the maintenance connection.
+	if err := dropAndRecreateTestDB(freshDSN); err != nil {
 		t.Fatalf("drop+recreate: %v", err)
 	}
 	// Open runs migratePG against the empty database.
-	s, err := Open(dsn)
+	s, err := Open(freshDSN)
 	if err != nil {
 		t.Fatalf("open fresh pg: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		s.Close()
+		_ = dropTestDB(freshDSN) // no stray DB accumulates on the test cluster
+	})
 
 	ctx := context.Background()
 	// Verify a basic insert works (proves the schema is fully created).
@@ -943,7 +954,7 @@ func TestMigratePGFresh(t *testing.T) {
 	}
 }
 
-// dropAndRecreateTestDB drops and recreates the encode_test database via a
+// dropAndRecreateTestDB drops and recreates the database named in the DSN via a
 // maintenance connection to the default database. It parses the database name
 // from the DSN and connects to the "postgres" maintenance database to issue
 // the DROP+CREATE. The error from DROP (if the DB doesn't exist yet) is
@@ -965,5 +976,50 @@ func dropAndRecreateTestDB(dsn string) error {
 	if _, err := maintDB.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, dbName)); err != nil {
 		return fmt.Errorf("create database: %w", err)
 	}
+	return nil
+}
+
+// dedicatedFreshDSN derives a DSN pointing at encode_migrate_fresh_test on the
+// same server/user as dsn, so TestMigratePGFresh's destructive drop+recreate
+// never touches the shared encode_test database that other packages use
+// concurrently (`go test ./...` runs packages in parallel).
+func dedicatedFreshDSN(dsn string) (string, error) {
+	_, maintDSN, err := parseTestDBName(dsn)
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.Index(maintDSN, "://")
+	if scheme < 0 {
+		return "", fmt.Errorf("not a postgres DSN: %q", maintDSN)
+	}
+	rest := maintDSN[scheme+3:]
+	slash := strings.Index(rest, "/")
+	if slash < 0 {
+		return "", fmt.Errorf("no database path in DSN: %q", maintDSN)
+	}
+	pathStart := scheme + 3 + slash
+	// parseTestDBName always builds the maintenance DSN with the "postgres"
+	// database; swap that path segment for the dedicated name, keeping query.
+	const freshDB = "encode_migrate_fresh_test"
+	pathEnd := pathStart + len("/postgres")
+	if len(maintDSN) < pathEnd || maintDSN[pathStart:pathEnd] != "/postgres" {
+		return "", fmt.Errorf("unexpected maintenance path in %q", maintDSN)
+	}
+	return maintDSN[:pathStart] + "/" + freshDB + maintDSN[pathEnd:], nil
+}
+
+// dropTestDB drops the database named in dsn via a maintenance connection
+// (errors tolerated) — TestMigratePGFresh cleanup, so no stray DB accumulates.
+func dropTestDB(dsn string) error {
+	dbName, maintDSN, err := parseTestDBName(dsn)
+	if err != nil {
+		return err
+	}
+	maintDB, err := sql.Open("pgx", maintDSN)
+	if err != nil {
+		return err
+	}
+	defer maintDB.Close()
+	_, _ = maintDB.ExecContext(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbName))
 	return nil
 }

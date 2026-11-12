@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 )
 
 // QBit is a bounded qBittorrent WebAPI v2 client (first-class provider).
@@ -36,7 +37,8 @@ func NewQBit(baseURL, username, password string, log *slog.Logger) (*QBit, error
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, fmt.Errorf("qbittorrent: invalid URL %q", baseURL)
+		// Never echo the raw URL: it can carry userinfo credentials (Q4).
+		return nil, fmt.Errorf("qbittorrent: invalid URL %q", notify.RedactURL(baseURL))
 	}
 	if log == nil {
 		log = slog.Default()
@@ -204,14 +206,15 @@ func (q *QBit) Completed(ctx context.Context, category string) ([]Torrent, error
 		fq.Set("hash", t.Hash)
 		fb, err := q.get(ctx, "/api/v2/torrents/files", fq)
 		if err != nil {
+			// Transport errors embed the full request URL — redact (Q4).
 			q.log.Warn("ingest: torrent files fetch failed; skipping this poll",
-				"provider", model.IngestProviderQBit, "hash", t.Hash, "err", err)
+				"provider", model.IngestProviderQBit, "hash", t.Hash, "err", notify.RedactURL(err.Error()))
 			continue
 		}
 		var files []qbitFile
 		if err := json.Unmarshal(fb, &files); err != nil {
 			q.log.Warn("ingest: torrent files decode failed; skipping this poll",
-				"provider", model.IngestProviderQBit, "hash", t.Hash, "err", err)
+				"provider", model.IngestProviderQBit, "hash", t.Hash, "err", notify.RedactURL(err.Error()))
 			continue
 		}
 		tt := Torrent{Hash: t.Hash, Name: t.Name, Category: t.Category, SavePath: t.SavePath}

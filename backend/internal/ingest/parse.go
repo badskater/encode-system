@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // maxSeriesNameLen caps a parsed/mapped series folder name. Folder names
@@ -23,15 +24,26 @@ import (
 // break filesystem limits downstream.
 const maxSeriesNameLen = 200
 
+// maxReleaseNameRunes caps the raw release name BEFORE any parsing work
+// (Q1). Torrent names arrive from an untrusted client and the HTTP body
+// cap (32 MiB) is far above any sane name; an oversized name is refused
+// as unparseable instead of being processed. The cap also bounds the
+// bracket-strip and regex work to a trivial worst case.
+const maxReleaseNameRunes = 1024
+
 // videoExtensions are the file extensions staged as encode sources. They
 // mirror scanner.SourceExtensions (the scanner's source detection) — kept
 // as a local list so the ingest package does not import the scanner just
-// for four strings; the two MUST stay in sync (a contract test pins it).
+// for four strings; the two MUST stay in sync (contract_test.go pins it
+// in both directions).
 var videoExtensions = []string{".m2ts", ".ts", ".mkv", ".mp4"}
 
 // IsVideoFile reports whether name carries a source-video extension
-// (case-insensitive). Only these files are staged; samples, NFOs and
-// other extras stay in the download directory.
+// (case-insensitive). Only these files are staged; NFOs and other extras
+// stay in the download directory. Samples are excluded separately by
+// Stage (a 'sample' directory segment or a basename starting with
+// 'sample') — staging one lets the scanner's alphabetical source
+// fallback pick it over the episode.
 func IsVideoFile(name string) bool {
 	ext := strings.ToLower(path.Ext(name))
 	for _, e := range videoExtensions {
@@ -80,13 +92,20 @@ var (
 	// bare trailing number: "Title 03".
 	bareEpRe = regexp.MustCompile(`^(.*?)\s+(\d{1,3})$`)
 	// multiEpisodeTail detects a second episode right after the first
-	// ("S01E01E02", "S01E01-02", "S01E01 - E02") — a pack, not a single
-	// episode; conservative parsing refuses it.
-	multiEpisodeTail = regexp.MustCompile(`(?i)^[-.\s]*E\d{1,3}|^[-.\s]*-\s*\d{1,3}`)
+	// ("S01E01E02", "S01E01-02", "S01E01 - E02", "S01E01 02",
+	// "S01E01.02" — dots normalize to spaces before matching) — a pack,
+	// not a single episode; conservative parsing refuses it. The bare
+	// number form requires the digit run to END at a space or the end of
+	// the tail so resolution/year tags ("1080p", "2024") are not mistaken
+	// for a second episode.
+	multiEpisodeTail = regexp.MustCompile(`(?i)^[-.\s]*(?:E\d{1,3}|-\s*\d{1,3}|\d{1,3}(?:\s|$))`)
 	// leadingBracket / trailingBracket strip fansub tags and CRC/quality
-	// brackets: "[Group] Title - 01 [1080p][ABCD1234]".
-	leadingBracketRe  = regexp.MustCompile(`^\s*\[[^\]]*\]\s*`)
-	trailingBracketRe = regexp.MustCompile(`\s*\[[^\]]*\]\s*$`)
+	// brackets: "[Group] Title - 01 [1080p][ABCD1234]". The + quantifiers
+	// strip ALL consecutive leading/trailing brackets in ONE pass each —
+	// the old strip-until-stable loop was O(n²) on bracket-heavy names
+	// (Q1: a 60KB name took ~25s and hung the poll).
+	leadingBracketRe  = regexp.MustCompile(`^\s*(?:\[[^\]]*\]\s*)+`)
+	trailingBracketRe = regexp.MustCompile(`(?:\s*\[[^\]]*\])+\s*$`)
 )
 
 // ParseRelease extracts a series name and episode number from a torrent
@@ -106,20 +125,22 @@ var (
 // Multi-episode packs (S01E01E02, S01E01-02) are refused likewise.
 // Episode 0 and episodes above 999 are refused.
 func ParseRelease(name string) (series string, episode int, ok bool) {
+	// Bound the input FIRST (Q1): an oversized name is unparseable by
+	// definition — refuse before any regex/strip work so a hostile name
+	// can never hang the poll loop or block SIGTERM drain.
+	if utf8.RuneCountInString(name) > maxReleaseNameRunes {
+		return "", 0, false
+	}
 	s := strings.TrimSpace(name)
 	// Strip a known video extension (torrent names sometimes carry it).
 	if ext := strings.ToLower(path.Ext(s)); IsVideoFile("x" + ext) {
 		s = strings.TrimSuffix(s, path.Ext(s))
 	}
-	// Strip leading [Group] and trailing [tags] brackets.
-	for {
-		trimmed := leadingBracketRe.ReplaceAllString(s, "")
-		trimmed = trailingBracketRe.ReplaceAllString(trimmed, "")
-		if trimmed == s {
-			break
-		}
-		s = trimmed
-	}
+	// Strip leading [Group] and trailing [tags] brackets in ONE pass
+	// each (the + quantifiers consume all consecutive brackets; a second
+	// application could never strip more, so no loop is needed).
+	s = leadingBracketRe.ReplaceAllString(s, "")
+	s = trailingBracketRe.ReplaceAllString(s, "")
 	// Dots and underscores are release-name separators.
 	s = strings.NewReplacer(".", " ", "_", " ").Replace(s)
 	s = collapseSpaces(s)
@@ -155,8 +176,12 @@ func ParseRelease(name string) (series string, episode int, ok bool) {
 		season, _ := strconv.Atoi(s[m[2]:m[3]])
 		ep, _ := strconv.Atoi(s[m[4]:m[5]])
 		head := strings.TrimSpace(s[:m[0]])
+		tail := strings.TrimSpace(s[m[1]:])
 		if season != 1 || !validEpisode(ep) || !cleanSeries(&head) {
 			return "", 0, false
+		}
+		if multiEpisodeTail.MatchString(tail) {
+			return "", 0, false // double-episode pack ("01x03 04")
 		}
 		return head, ep, true
 	}

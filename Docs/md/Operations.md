@@ -938,7 +938,14 @@ mock-server regression tests.
 
 1. Ingestion copies the torrent's video files (`.mkv/.mp4/.ts/.m2ts`)
    from the download share into `scripts_root/<Series>/Ep NN/`
-   (temp-file + rename per file; existing files are skipped).
+   (temp-file + rename per file; existing files are skipped). Samples
+   are never staged (a `sample` directory segment or a basename starting
+   with `sample`, case-insensitive) — the scanner's alphabetical source
+   fallback would otherwise pick the sample over the episode. Files in
+   subdirectories keep a distinct flattened name prefixed with their
+   parent dirs (`cd1/a.mkv` → `cd1_a.mkv`), so multi-CD releases do not
+   overwrite each other. Single-file torrents (the file sits directly at
+   the client's download root) are staged from the root as well.
 2. **An operator authors the `.avs`/`.vpy` filter script** in that episode
    folder. Ingestion never writes scripts and never creates jobs.
 3. The scanner picks the episode up on its next cycle (source + script
@@ -946,10 +953,12 @@ mock-server regression tests.
 
 Release names are parsed conservatively (`Show.S01E01`, `01x01`,
 `[Group] Show - 01 [1080p]`, bare `Show 01`). Anything ambiguous —
-multi-season (`S02E01`), multi-episode packs (`S01E01E02`), years,
-resolutions, traversal — is **skipped and logged, never guessed**. A
-category→series map (Settings card, JSON object) overrides the parsed
-series name; the episode is still parsed from the name.
+multi-season (`S02E01`), multi-episode packs (`S01E01E02`, `S01E01-02`,
+`S01E01 02`, `Show 01x03 04`), years, resolutions, traversal — is
+**skipped and logged, never guessed**. Names longer than 1024 runes are
+refused outright (the parser is bounded; a hostile name can never hang
+the poll). A category→series map (Settings card, JSON object) overrides
+the parsed series name; the episode is still parsed from the name.
 
 ### Operate
 
@@ -963,15 +972,26 @@ series name; the episode is still parsed from the name.
 - Cadence: default 60 s. HA (Postgres): the loop runs under advisory lock
   **1008** — only the leader replica polls; failover behaves like the
   other singleton loops (see HA runbook).
+- Per-poll cap: one poll processes at most **500 torrents**; the rest are
+  deferred to the next poll (the ledger makes progress incremental) and
+  the truncation is logged as `per-poll torrent cap reached`. A client
+  with thousands of completed torrents therefore ingests in batches
+  instead of one unbounded marathon.
+- Skip-log cooldown: an unparseable or failing torrent is re-listed by
+  the client on every poll; its skip is logged at full level **once per
+  hour per torrent hash**, then at debug only (in-memory, reset on
+  restart). This keeps a permanently-bad torrent from flooding the log.
 - Dedupe: the `ingest_ledger` table records `(provider, torrent_hash)` →
   staged path. A torrent is staged exactly once; the ledger survives
   restarts. To re-stage a torrent, delete its ledger row (and the staged
   files) — there is no UI for this yet.
 - Observability: structured logs (`ingest staged`, per-torrent warnings),
-  audit event `ingest.staged` (actor `controller`), and an operational
-  alert through the configured notification channels (Discord/webhook/
-  ntfy/email) reminding the operator to author the filter script. With no
-  channel configured, logs + audit only.
+  audit events `ingest.staged` (actor `controller`) and `ingest.duplicate`
+  (a release whose files were ALL already staged by another torrent —
+  ledger row recorded, no success alert), and an operational alert through
+  the configured notification channels (Discord/webhook/ntfy/email)
+  reminding the operator to author the filter script. With no channel
+  configured, logs + audit only.
 
 ### Diagnosis
 
@@ -985,13 +1005,23 @@ series name; the episode is still parsed from the name.
 | `rutorrent rpc: HTTP 401/403` | Web-server auth in front of ruTorrent rejects the Basic credentials; digest-only auth is not supported (experimental limitation). |
 | Torrent completed but never staged | Check the category filter / map keys (ruTorrent matches the LABEL, `d.custom1`), and that the torrent is actually complete (`d.get_complete`, fallback `left_bytes=0`). |
 | Same torrent staged twice after a DB restore | The ledger restored from an older snapshot lost the row; staging skips existing files, so the re-stage is harmless. |
+| `per-poll torrent cap reached` | More than 500 completed torrents are waiting; the remainder ingest on subsequent polls. Normal after a large backlog — no action needed unless it persists with a growing backlog. |
+| `ingest.duplicate` audit, no alert | Another release already staged every file of this episode (same series+episode, same base names). The ledger row dedupes the torrent; nothing new was staged, so no success alert fires. |
 
 ### Safety notes
 
 - Torrent file names are untrusted: absolute paths, `..` traversal and
   symlink escapes out of the torrent directory are refused; a symlinked
-  torrent directory resolving outside `download_root` is refused too;
-  destinations are flattened to base names inside the episode folder.
+  torrent directory resolving outside `download_root` is refused too.
+  Containment is re-verified AFTER opening each source against the
+  opened file's final path (Linux `/proc/self/fd`, Windows
+  `GetFinalPathNameByHandle`), so a path swap between check and open
+  cannot leak foreign files. Destinations are flattened inside the
+  episode folder (parent-dir-prefixed when the source has depth).
+- Client URLs must not embed credentials (`user:pass@host` is rejected
+  at save time — use the username/password fields); every ingest error
+  log renders URLs through the shared redactor, so transport errors
+  never leak URL-embedded credentials.
 - Every HTTP exchange is bounded (30 s client timeout + poll context);
   one bad torrent or category never stops the batch or the loop.
 - Disabling ingestion (`enabled=false`) makes every tick a no-op; the

@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 )
 
 // Ledger is the dedupe surface the poll loop needs (kept narrow for
@@ -49,6 +51,13 @@ type StagedEvent struct {
 // DefaultPollInterval is the cadence when poll_interval_seconds is 0.
 const DefaultPollInterval = 60 * time.Second
 
+// MaxTorrentsPerPoll bounds one poll cycle's fanout (Q11): a client with
+// thousands of completed torrents must not turn one tick into an
+// unbounded staging marathon. Torrents beyond the cap are deferred to
+// the next poll (the ledger makes progress incremental) and the
+// truncation is logged as a warning.
+const MaxTorrentsPerPoll = 500
+
 // Poll bounds mirror validateIngest so a hand-edited DB row cannot push
 // the cadence outside the sane range even if it bypassed the API.
 const (
@@ -74,6 +83,9 @@ func RunLoop(ctx context.Context, log *slog.Logger, ledger Ledger, cfg LiveConfi
 	}
 	var tick *time.Ticker
 	var curInterval time.Duration
+	// One skip-log tracker for the loop's lifetime (Q12): the cooldown
+	// must span polls, not reset every tick.
+	skips := newSkipTracker()
 	defer func() {
 		if tick != nil {
 			tick.Stop()
@@ -93,7 +105,7 @@ func RunLoop(ctx context.Context, log *slog.Logger, ledger Ledger, cfg LiveConfi
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			PollOnce(ctx, log, ledger, c, factory, onStaged)
+			pollOnce(ctx, log, ledger, c, factory, onStaged, skips)
 		}
 	}
 }
@@ -109,8 +121,15 @@ func pollInterval(seconds int) time.Duration {
 }
 
 // PollOnce performs one ingestion pass. Exported so tests (and a future
-// manual-trigger endpoint) can run a cycle without the ticker.
+// manual-trigger endpoint) can run a cycle without the ticker. Each call
+// gets a fresh skip-log tracker; RunLoop carries one across ticks so the
+// cooldown (Q12) spans polls.
 func PollOnce(ctx context.Context, log *slog.Logger, ledger Ledger, c Config, factory ClientFactory, onStaged func(StagedEvent)) {
+	pollOnce(ctx, log, ledger, c, factory, onStaged, newSkipTracker())
+}
+
+// pollOnce is the poll body with an explicit skip-log tracker.
+func pollOnce(ctx context.Context, log *slog.Logger, ledger Ledger, c Config, factory ClientFactory, onStaged func(StagedEvent), skips *skipTracker) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -122,25 +141,38 @@ func PollOnce(ctx context.Context, log *slog.Logger, ledger Ledger, c Config, fa
 		log.Warn("ingest: scripts_root not configured; skipping poll")
 		return
 	}
+	skips.purge(time.Now()) // bound the cooldown map (Q12)
 	client, err := factory(in)
 	if err != nil {
-		log.Warn("ingest: client construction failed", "provider", in.Provider, "err", err)
+		// Construction errors can echo the configured URL (credentials
+		// included) — render through RedactURL (Q4).
+		log.Warn("ingest: client construction failed", "provider", in.Provider, "err", notify.RedactURL(err.Error()))
 		return
 	}
+	processed := 0
 	for _, category := range pollCategories(in) {
 		if ctx.Err() != nil {
 			return
 		}
 		torrents, err := client.Completed(ctx, category)
 		if err != nil {
-			log.Warn("ingest: completed-list failed", "provider", in.Provider, "category", category, "err", err)
+			// Transport errors embed the full request URL — redact (Q4).
+			log.Warn("ingest: completed-list failed", "provider", in.Provider, "category", category, "err", notify.RedactURL(err.Error()))
 			continue // next category / next tick
 		}
 		for _, t := range torrents {
 			if ctx.Err() != nil {
 				return
 			}
-			stageTorrent(ctx, log, ledger, in, c.ScriptsRoot, t, onStaged)
+			if processed >= MaxTorrentsPerPoll {
+				// Per-poll fanout cap (Q11): defer the rest to the next
+				// poll (the ledger makes progress incremental).
+				log.Warn("ingest: per-poll torrent cap reached; remaining torrents deferred to the next poll",
+					"provider", in.Provider, "cap", MaxTorrentsPerPoll)
+				return
+			}
+			processed++
+			stageTorrent(ctx, log, ledger, in, c.ScriptsRoot, t, onStaged, skips)
 		}
 	}
 }
@@ -164,8 +196,10 @@ func pollCategories(in model.IngestSettings) []string {
 }
 
 // stageTorrent processes ONE torrent with full error isolation: every
-// failure logs and returns, never propagates to the batch.
-func stageTorrent(ctx context.Context, log *slog.Logger, ledger Ledger, in model.IngestSettings, scriptsRoot string, t Torrent, onStaged func(StagedEvent)) {
+// failure logs and returns, never propagates to the batch. Repeated
+// skips of the same hash log at full level once per cooldown window
+// (Q12); repeats drop to debug.
+func stageTorrent(ctx context.Context, log *slog.Logger, ledger Ledger, in model.IngestSettings, scriptsRoot string, t Torrent, onStaged func(StagedEvent), skips *skipTracker) {
 	seen, err := ledger.IngestSeen(ctx, in.Provider, t.Hash)
 	if err != nil {
 		log.Warn("ingest: ledger check failed", "provider", in.Provider, "hash", t.Hash, "err", err)
@@ -176,19 +210,30 @@ func stageTorrent(ctx context.Context, log *slog.Logger, ledger Ledger, in model
 	}
 	series, episode, ok := resolveSeriesEpisode(in, t)
 	if !ok {
-		log.Info("ingest: release name unparseable; skipped (never guessed)",
-			"provider", in.Provider, "hash", t.Hash, "name", t.Name, "category", t.Category)
+		if skips.allow(t.Hash, time.Now()) {
+			log.Info("ingest: release name unparseable; skipped (never guessed)",
+				"provider", in.Provider, "hash", t.Hash, "name", t.Name, "category", t.Category)
+		} else {
+			log.Debug("ingest: release name unparseable; skipped (log cooldown)",
+				"provider", in.Provider, "hash", t.Hash, "name", t.Name, "category", t.Category)
+		}
 		return
 	}
 	destDir := filepath.Join(scriptsRoot, series, EpisodeDirName(episode))
 	staged, err := Stage(ctx, in.DownloadRoot, t, destDir)
 	if err != nil {
-		log.Warn("ingest: staging failed", "provider", in.Provider, "hash", t.Hash,
-			"name", t.Name, "series", series, "episode", episode, "err", err)
+		if skips.allow(t.Hash, time.Now()) {
+			log.Warn("ingest: staging failed", "provider", in.Provider, "hash", t.Hash,
+				"name", t.Name, "series", series, "episode", episode, "err", notify.RedactURL(err.Error()))
+		} else {
+			log.Debug("ingest: staging failed (log cooldown)", "provider", in.Provider, "hash", t.Hash,
+				"name", t.Name, "series", series, "episode", episode, "err", notify.RedactURL(err.Error()))
+		}
 		return
 	}
 	relPath := filepath.Join(series, EpisodeDirName(episode))
-	if _, err := ledger.RecordIngest(ctx, in.Provider, t.Hash, t.Name, series, fmt.Sprintf("%02d", episode), relPath); err != nil {
+	inserted, err := ledger.RecordIngest(ctx, in.Provider, t.Hash, t.Name, series, fmt.Sprintf("%02d", episode), relPath)
+	if err != nil {
 		// Files are staged but the ledger write failed: the next poll
 		// re-runs staging (existing-file skip makes it idempotent) and
 		// retries the record. Never report the event twice.
@@ -196,8 +241,27 @@ func stageTorrent(ctx context.Context, log *slog.Logger, ledger Ledger, in model
 			"provider", in.Provider, "hash", t.Hash, "err", err)
 		return
 	}
-	log.Info("ingest staged", "provider", in.Provider, "hash", t.Hash, "name", t.Name,
-		"series", series, "episode", episode, "staged_path", relPath, "files", len(staged))
+	if !inserted {
+		// Another poller recorded this torrent first (HA lock-loss
+		// window): the ledger deduped the row — suppress the duplicate
+		// event so the operator gets exactly one alert (Q6).
+		log.Debug("ingest: torrent already recorded by another poller; duplicate event suppressed",
+			"provider", in.Provider, "hash", t.Hash)
+		return
+	}
+	if len(staged) == 0 {
+		// Cross-torrent same-episode collision (Q9): every file was
+		// already present (another release staged this episode first).
+		// The ledger row stays (dedupe), but this is NOT a success —
+		// the event carries zero files so the API layer audits a
+		// duplicate and sends no alert.
+		log.Info("ingest: duplicate release — all files already present",
+			"provider", in.Provider, "hash", t.Hash, "name", t.Name,
+			"series", series, "episode", episode, "staged_path", relPath)
+	} else {
+		log.Info("ingest staged", "provider", in.Provider, "hash", t.Hash, "name", t.Name,
+			"series", series, "episode", episode, "staged_path", relPath, "files", len(staged))
+	}
 	if onStaged != nil {
 		onStaged(StagedEvent{
 			Provider:   in.Provider,
@@ -227,4 +291,47 @@ func resolveSeriesEpisode(in model.IngestSettings, t Torrent) (series string, ep
 		return "", 0, false
 	}
 	return parsedSeries, ep, true
+}
+
+// skipLogCooldown bounds how often a repeatedly-skipped torrent may log
+// at full level (Q12): an unparseable or failing torrent is re-listed by
+// the client on EVERY poll, and logging each skip produced ~8640
+// lines/day/torrent. One full-level log per hour per hash is enough to
+// diagnose; the repeats drop to debug.
+const skipLogCooldown = time.Hour
+
+// skipTracker is the per-hash in-memory skip-log cooldown. It lives for
+// the lifetime of the poll loop (RunLoop owns one); it is deliberately
+// NOT persisted — a restart may re-log once, which is harmless.
+type skipTracker struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func newSkipTracker() *skipTracker {
+	return &skipTracker{last: make(map[string]time.Time)}
+}
+
+// allow reports whether hash's skip should log at full level now: the
+// first skip in a cooldown window logs, repeats inside the window do not.
+func (s *skipTracker) allow(hash string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.last[hash]; ok && now.Sub(t) < skipLogCooldown {
+		return false
+	}
+	s.last[hash] = now
+	return true
+}
+
+// purge drops expired entries so the map stays bounded by the torrents
+// skipped within the last cooldown window (called once per poll).
+func (s *skipTracker) purge(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h, t := range s.last {
+		if now.Sub(t) >= skipLogCooldown {
+			delete(s.last, h)
+		}
+	}
 }

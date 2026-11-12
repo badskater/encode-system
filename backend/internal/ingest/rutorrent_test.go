@@ -1,10 +1,14 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -252,5 +256,88 @@ func TestRuTorrentInvalidURL(t *testing.T) {
 		if _, err := NewRuTorrent(u, "", "", nil); err == nil {
 			t.Fatalf("NewRuTorrent(%q) must fail", u)
 		}
+	}
+}
+
+// TestRuSingleFileStagesEndToEnd pins Q5 (ruTorrent side): is_multi_file=0
+// → savePath = Dir(basePath) = the download ROOT; the file sits at
+// downloadRoot/<filename> and must stage end to end (mock → Stage).
+func TestRuSingleFileStagesEndToEnd(t *testing.T) {
+	f := newFakeRuTorrent(t)
+	f.torrents["h1"] = rtRow("Movie.2024.1080p", "", "/downloads/movie.mkv", false, true)
+	f.filesByHash["h1"] = [][]any{{"movie.mkv", "1", "1", 5, "1"}}
+	c := f.client(t)
+	got, err := c.Completed(context.Background(), "")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("list: %v %d", err, len(got))
+	}
+	if got[0].SavePath != "/downloads" {
+		t.Fatalf("single-file savePath must be the parent dir, got %q", got[0].SavePath)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "movie.mkv"), []byte("movie"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	staged, err := Stage(context.Background(), root, got[0], dest)
+	if err != nil {
+		t.Fatalf("single-file torrent must stage under the flat mount: %v", err)
+	}
+	if len(staged) != 1 || staged[0] != "movie.mkv" {
+		t.Fatalf("staged=%v", staged)
+	}
+	b, _ := os.ReadFile(filepath.Join(dest, "movie.mkv"))
+	if string(b) != "movie" {
+		t.Fatalf("content=%q", b)
+	}
+}
+
+// TestRuFilesFetchErrorRedacted pins Q4 (client log site): a transport
+// failure on the per-torrent file list embeds the FULL request URL — the
+// skip-log must render it through notify.RedactURL.
+func TestRuFilesFetchErrorRedacted(t *testing.T) {
+	secret := "leak-" + "canary-99"
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.FormValue("mode") == "fls" {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("hijack unsupported")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			conn.Close() // transport failure mid-exchange
+			return
+		}
+		row := rtRow("Show S01E01", "", "/d/Show", true, true)
+		json.NewEncoder(w).Encode(map[string]any{"t": map[string]any{"h1": row}})
+	}))
+	defer srv.Close()
+	credURL := strings.Replace(srv.URL, "http://", "http://probeuser:"+secret+"@", 1)
+	c, err := NewRuTorrent(credURL, "", "", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Completed(context.Background(), "")
+	if err != nil {
+		t.Fatalf("list must survive the per-torrent failure: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("failed torrent must be skipped: %v", got)
+	}
+	if !strings.Contains(buf.String(), "torrent files fetch failed") {
+		t.Fatalf("expected skip log: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatal("files-fetch error leaked the URL password into the log")
+	}
+	if strings.Contains(buf.String(), "probeuser") {
+		t.Fatal("files-fetch error leaked the URL username into the log (userinfo must be dropped)")
 	}
 }

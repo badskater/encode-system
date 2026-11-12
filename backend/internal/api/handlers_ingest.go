@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/ingest"
@@ -62,6 +63,12 @@ func validateIngest(in *model.IngestSettings) error {
 		return errSettings("ingest.provider must be qbittorrent or rutorrent when ingestion is enabled")
 	}
 	if in.URL == "" || !isHTTPURL(in.URL) {
+		// Name the userinfo rule explicitly when that is the violation
+		// (Q4): credentials ride in ingest.username/ingest.password, and
+		// a URL that carries them leaks into transport-error strings.
+		if u, err := url.Parse(in.URL); err == nil && u.User != nil {
+			return errSettings("ingest.url must not embed credentials (user:pass@host) — use ingest.username and ingest.password instead")
+		}
 		return errSettings("ingest.url must be an http(s) URL when ingestion is enabled (e.g. http://192.168.1.10:8080)")
 	}
 	if in.DownloadRoot == "" {

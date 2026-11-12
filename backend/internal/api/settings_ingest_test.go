@@ -511,3 +511,109 @@ func TestIngestDefaultClientFactory(t *testing.T) {
 		t.Fatal("unknown provider must error")
 	}
 }
+
+// TestIngestUserinfoURLRejected pins Q4 (validation side): a client URL
+// with embedded userinfo is refused at save time with an error naming
+// the rule — credentials belong in ingest.username/ingest.password, and
+// a URL that carries them leaks into transport-error strings.
+func TestIngestUserinfoURLRejected(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	b := ingestBlock(t.TempDir())
+	b["url"] = "http://probeuser:" + "leak-" + "canary-99@127.0.0.1:8080"
+	status, body := putSettingsWithIngest(t, e, ts.URL, b)
+	if status != 400 {
+		t.Fatalf("userinfo URL must be refused: %d %s", status, body)
+	}
+	if !strings.Contains(string(body), "must not embed credentials") {
+		t.Fatalf("error must name the rule: %s", body)
+	}
+}
+
+// TestChannelURLUserinfoRejected pins the shared isHTTPURL userinfo
+// refusal for the webhook/ntfy channels (Q4: credentials never ride in a
+// URL that transport errors can echo into logs).
+func TestChannelURLUserinfoRejected(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	for _, key := range []string{"generic_webhook_url", "ntfy_topic_url"} {
+		resp, body := doJSON(t, "GET", ts.URL+"/api/settings", adminTok, nil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("GET settings: %d %s", resp.StatusCode, body)
+		}
+		var put map[string]any
+		if err := json.Unmarshal(body, &put); err != nil {
+			t.Fatal(err)
+		}
+		put[key] = "http://probeuser:" + "leak-" + "canary-99@example.com/hook"
+		resp2, body2 := doJSON(t, "PUT", ts.URL+"/api/settings", adminTok, put)
+		if resp2.StatusCode != 400 {
+			t.Fatalf("%s userinfo must be refused: %d %s", key, resp2.StatusCode, body2)
+		}
+		if !strings.Contains(string(body2), "credentials") {
+			t.Fatalf("%s error must name the rule: %s", key, body2)
+		}
+	}
+}
+
+// TestIngestDuplicateStagedNoAlert pins Q9 (API side): a torrent that
+// stages ZERO files (the same episode was already staged by another
+// release) still gets its ledger row (dedupe), but the audit records
+// ingest.duplicate and NO success alert fires.
+func TestIngestDuplicateStagedNoAlert(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	dlRoot := t.TempDir()
+	for _, d := range []struct{ dir, content string }{{"rel1", "RELEASE-1"}, {"rel2", "RELEASE-2"}} {
+		dir := filepath.Join(dlRoot, d.dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "a.mkv"), []byte(d.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := e.server.defaultsSettings()
+	st.Ingest = model.IngestSettings{
+		Enabled: true, Provider: model.IngestProviderQBit,
+		URL: "http://127.0.0.1:8080", DownloadRoot: dlRoot,
+	}
+	if err := e.server.Store.SaveSettings(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingNotifier{}
+	e.server.Notifier = rec
+	fake := &fakeIngestClient{torrents: []ingest.Torrent{
+		{Hash: "h1", Name: "Show.S01E01.1080p", SavePath: "/d/rel1", Files: []ingest.File{{Name: "a.mkv"}}},
+		{Hash: "h2", Name: "Show.S01E01.720p", SavePath: "/d/rel2", Files: []ingest.File{{Name: "a.mkv"}}},
+	}}
+	e.server.IngestClient = func(model.IngestSettings) (ingest.Client, error) { return fake, nil }
+	cfg := e.server.ingestLiveConfig(ctx)
+	ingest.PollOnce(ctx, e.server.Log, e.server.Store, cfg, e.server.ingestClientFactory(), e.server.onIngestStaged)
+
+	if rec.alerts() != 1 {
+		t.Fatalf("exactly one success alert (the duplicate must not alert): %d", rec.alerts())
+	}
+	events, err := e.server.Store.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var staged, duplicate bool
+	for _, ev := range events {
+		if ev.Action == "ingest.staged" && strings.Contains(ev.Object, "h1") {
+			staged = true
+		}
+		if ev.Action == "ingest.duplicate" && strings.Contains(ev.Object, "h2") {
+			duplicate = true
+		}
+	}
+	if !staged || !duplicate {
+		t.Fatalf("audit must record ingest.staged(h1) + ingest.duplicate(h2): %+v", events)
+	}
+	for _, h := range []string{"h1", "h2"} {
+		seen, _ := e.server.Store.IngestSeen(ctx, "qbittorrent", h)
+		if !seen {
+			t.Fatalf("ledger must record %s (dedupe)", h)
+		}
+	}
+}

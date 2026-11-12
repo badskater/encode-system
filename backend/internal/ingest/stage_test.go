@@ -31,6 +31,8 @@ func seedTorrent(t *testing.T, torrentName string, files map[string]string) stri
 
 // TestStageCopiesVideoFilesOnly proves staging copies source videos,
 // flattens subdirectory paths to base names, and leaves extras behind.
+// Samples are EXCLUDED (Q3): staging one lets the scanner's alphabetical
+// fallback pick it over the episode.
 func TestStageCopiesVideoFilesOnly(t *testing.T) {
 	root := seedTorrent(t, "Show.S01E01", map[string]string{
 		"show.s01e01.mkv":   "video-data",
@@ -52,8 +54,8 @@ func TestStageCopiesVideoFilesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(staged) != 2 {
-		t.Fatalf("expected 2 video files staged, got %v", staged)
+	if len(staged) != 1 || staged[0] != "show.s01e01.mkv" {
+		t.Fatalf("expected only the episode staged (sample excluded), got %v", staged)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "show.s01e01.mkv"))
 	if err != nil || string(got) != "video-data" {
@@ -61,6 +63,9 @@ func TestStageCopiesVideoFilesOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "extra.srt")); !os.IsNotExist(err) {
 		t.Fatal("non-video file must not be staged")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "sample.mkv")); !os.IsNotExist(err) {
+		t.Fatal("sample must not be staged")
 	}
 	// No temp residue.
 	entries, _ := os.ReadDir(dest)
@@ -270,6 +275,167 @@ func TestStageEmptySavePath(t *testing.T) {
 		tor := Torrent{Hash: "h", SavePath: sp, Files: []File{{Name: "a.mkv"}}}
 		if _, err := Stage(context.Background(), t.TempDir(), tor, t.TempDir()); err == nil {
 			t.Fatalf("save path %q must be refused", sp)
+		}
+	}
+}
+
+// TestStageTOCTOUSwapRig reproduces the reviewer's containment race (Q2):
+// a goroutine swaps a RESOLVED path component (real dir → symlink outside
+// download_root) between the pre-open EvalSymlinks check and os.Open.
+// Post-open verification of the OPENED file's final path must hold the
+// boundary: 400 iterations, ZERO leaks of outside content. A swap AFTER
+// open holds the original inode and is safe.
+func TestStageTOCTOUSwapRig(t *testing.T) {
+	root := t.TempDir()    // download_root
+	outside := t.TempDir() // attacker-controlled tree OUTSIDE root
+	if err := os.WriteFile(filepath.Join(outside, "a.mkv"), []byte("SECRET-OUTSIDE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	show := filepath.Join(root, "Show")
+	real := filepath.Join(show, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "a.mkv"), []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink support probe (the rig is meaningless without it).
+	probe := filepath.Join(t.TempDir(), "probe-link")
+	if err := os.Symlink(outside, probe); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		bak := real + ".bak"
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if os.Rename(real, bak) == nil {
+				if os.Symlink(outside, real) == nil {
+					os.Remove(real)
+				}
+				os.Rename(bak, real)
+			}
+		}
+	}()
+
+	tor := Torrent{Hash: "h", SavePath: "/d/Show", Files: []File{{Name: "real/a.mkv"}}}
+	leaked := 0
+	for i := 0; i < 400; i++ {
+		dest := filepath.Join(t.TempDir(), "ep")
+		staged, err := Stage(context.Background(), root, tor, dest)
+		if err != nil {
+			continue // refused swap window — correct outcome
+		}
+		if len(staged) != 1 {
+			t.Fatalf("iteration %d: staged=%v", i, staged)
+		}
+		b, err := os.ReadFile(filepath.Join(dest, staged[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "video" {
+			leaked++
+		}
+	}
+	if leaked > 0 {
+		t.Fatalf("TOCTOU: %d/400 iterations leaked OUTSIDE content into the episode folder", leaked)
+	}
+}
+
+// TestStageSampleExclusion pins Q3: samples are never staged — a 'sample'
+// directory segment (any case) or a basename starting with 'sample' (any
+// case) is skipped, so the scanner's alphabetical source fallback can
+// never pick a sample over the episode.
+func TestStageSampleExclusion(t *testing.T) {
+	root := seedTorrent(t, "Show.S01E01", map[string]string{
+		"episode.mkv":        "episode",
+		"sample/sample.mkv":  "sample-dir",
+		"Sample.mkv":         "sample-base",
+		"sample-show.mkv":    "sample-prefix",
+		"SAMPLE/Sample2.mkv": "sample-case",
+		"subs/extra.srt":     "subtitle",
+	})
+	dest := t.TempDir()
+	tor := Torrent{Hash: "h", Name: "Show.S01E01", SavePath: "/d/Show.S01E01", Files: []File{
+		{Name: "episode.mkv"}, {Name: "sample/sample.mkv"}, {Name: "Sample.mkv"},
+		{Name: "sample-show.mkv"}, {Name: "SAMPLE/Sample2.mkv"}, {Name: "subs/extra.srt"},
+	}}
+	staged, err := Stage(context.Background(), root, tor, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 1 || staged[0] != "episode.mkv" {
+		t.Fatalf("only the episode must stage, got %v", staged)
+	}
+	entries, _ := os.ReadDir(dest)
+	if len(entries) != 1 {
+		t.Fatalf("dest must hold exactly the episode: %v", entries)
+	}
+}
+
+// TestStageSingleFileAtRoot pins Q5: a single-file torrent saves its file
+// DIRECTLY at the client save root (qBit save_path=root; ruTorrent
+// savePath=Dir(basePath)). The basename mapping must fall back to
+// downloadRoot/<filename> instead of looking for a nonexistent
+// downloadRoot/<root-basename> directory.
+func TestStageSingleFileAtRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "movie.mkv"), []byte("movie"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	tor := Torrent{Hash: "h", Name: "Movie.2024.1080p", SavePath: "/downloads",
+		Files: []File{{Name: "movie.mkv", Size: 5}}}
+	staged, err := Stage(context.Background(), root, tor, dest)
+	if err != nil {
+		t.Fatalf("single-file torrent must stage under the flat mount: %v", err)
+	}
+	if len(staged) != 1 || staged[0] != "movie.mkv" {
+		t.Fatalf("staged=%v", staged)
+	}
+	b, _ := os.ReadFile(filepath.Join(dest, "movie.mkv"))
+	if string(b) != "movie" {
+		t.Fatalf("content=%q", b)
+	}
+	// Negative control: the file is NOT at the root → clear mount error.
+	tor2 := Torrent{Hash: "h2", SavePath: "/downloads", Files: []File{{Name: "absent.mkv"}}}
+	if _, err := Stage(context.Background(), root, tor2, t.TempDir()); err == nil {
+		t.Fatal("missing single-file source must error")
+	}
+}
+
+// TestStageMultiCDDistinctNames pins Q10: flattening must not silently
+// drop same-named files from different subdirectories (multi-CD
+// releases). When the relative path has depth, the destination base name
+// is prefixed with its parent directories (cd1_a.mkv, cd2_a.mkv).
+func TestStageMultiCDDistinctNames(t *testing.T) {
+	root := seedTorrent(t, "Show", map[string]string{
+		"cd1/a.mkv":       "CD1",
+		"cd2/a.mkv":       "CD2",
+		"disc3/sub/b.mkv": "DEEP",
+	})
+	dest := t.TempDir()
+	tor := Torrent{Hash: "h", SavePath: "/d/Show", Files: []File{
+		{Name: "cd1/a.mkv"}, {Name: "cd2/a.mkv"}, {Name: "disc3/sub/b.mkv"},
+	}}
+	staged, err := Stage(context.Background(), root, tor, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"cd1_a.mkv": "CD1", "cd2_a.mkv": "CD2", "disc3_sub_b.mkv": "DEEP"}
+	if len(staged) != len(want) {
+		t.Fatalf("staged=%v want %v", staged, want)
+	}
+	for name, content := range want {
+		b, err := os.ReadFile(filepath.Join(dest, name))
+		if err != nil || string(b) != content {
+			t.Fatalf("%s: %q err=%v", name, b, err)
 		}
 	}
 }

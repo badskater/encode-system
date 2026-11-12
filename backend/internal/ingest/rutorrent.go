@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/badskater/encode-system/backend/internal/model"
+	"github.com/badskater/encode-system/backend/internal/notify"
 )
 
 // RuTorrent is a BEST-EFFORT, EXPERIMENTAL client for the ruTorrent
@@ -44,7 +45,8 @@ func NewRuTorrent(baseURL, username, password string, log *slog.Logger) (*RuTorr
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, fmt.Errorf("rutorrent: invalid URL %q", baseURL)
+		// Never echo the raw URL: it can carry userinfo credentials (Q4).
+		return nil, fmt.Errorf("rutorrent: invalid URL %q", notify.RedactURL(baseURL))
 	}
 	if log == nil {
 		log = slog.Default()
@@ -151,8 +153,9 @@ func (r *RuTorrent) Completed(ctx context.Context, category string) ([]Torrent, 
 		}
 		files, err := r.files(ctx, hash)
 		if err != nil {
+			// Transport errors embed the full request URL — redact (Q4).
 			r.log.Warn("ingest: torrent files fetch failed; skipping this poll",
-				"provider", model.IngestProviderRuTorrent, "hash", hash, "err", err)
+				"provider", model.IngestProviderRuTorrent, "hash", hash, "err", notify.RedactURL(err.Error()))
 			continue
 		}
 		out = append(out, Torrent{

@@ -32,14 +32,17 @@ var embeddedURLRe = regexp.MustCompile("https?://[^\\s\"'`<>\\[\\]()]+")
 // It handles BOTH shapes: a bare URL, and URLs EMBEDDED in a larger error
 // string (url.Parse of the whole message yields an empty Scheme, so each
 // embedded http(s) substring is redacted in place — P4 review Q3: the old
-// whole-string parse failed open on exactly that shape). Unparseable input
-// with no embedded URL is truncated at the first '?' so a raw query can
-// never survive. Exported because the API layer reuses it to mask
+// whole-string parse failed open on exactly that shape). A message
+// PREFIXED with a single-token scheme-like label ("qbittorrent: … Post
+// \"http://…\"") parses as an OPAQUE URL — that is not a bare URL either,
+// so it also falls through to embedded redaction (P11 Q4). Unparseable
+// input with no embedded URL is truncated at the first '?' so a raw query
+// can never survive. Exported because the API layer reuses it to mask
 // credential-bearing settings URLs for non-admin readers.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
-	if err == nil && u.Scheme != "" {
-		return redactParsedURL(u) // raw IS an absolute URL
+	if err == nil && u.Scheme != "" && u.Opaque == "" {
+		return redactParsedURL(u) // raw IS an absolute hierarchical URL
 	}
 	if embeddedURLRe.MatchString(raw) {
 		return embeddedURLRe.ReplaceAllStringFunc(raw, func(m string) string {

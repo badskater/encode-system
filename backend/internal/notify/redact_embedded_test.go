@@ -66,3 +66,32 @@ func TestRedactURLEmbeddedMultipleAndBare(t *testing.T) {
 		t.Fatalf("embedded Discord path token leaked: %q", got)
 	}
 }
+
+// TestRedactURLSchemePrefixedWrapper pins the P11 Q4 gap: an error message
+// prefixed with a single-token scheme-like label ("qbittorrent: …") parses
+// as an OPAQUE URL (scheme "qbittorrent", opaque rest), so the whole-string
+// branch used to return it with the embedded credential URL intact. The
+// embedded http(s) substring must be redacted regardless of the wrapper.
+func TestRedactURLSchemePrefixedWrapper(t *testing.T) {
+	user := "probe" + "user"
+	pass := "wrap" + "ped-s3cret-55"
+	query := "ha" + "sh-query-66"
+	in := `qbittorrent: /api/v2/torrents/files: Post "http://` + user + `:` + pass + `@127.0.0.1:9/api/v2/torrents/files?hash=` + query + `": EOF`
+	got := RedactURL(in)
+	for _, secret := range []string{user, pass, query} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("scheme-prefixed wrapper leaked %q: %q", secret, got)
+		}
+	}
+	// Diagnostic text and the URL skeleton survive.
+	for _, keep := range []string{"qbittorrent: /api/v2/torrents/files", "127.0.0.1:9", "EOF", "REDACTED"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("redaction lost diagnostic text %q: %q", keep, got)
+		}
+	}
+	// A bare opaque URL without an embedded http(s) URL passes through
+	// (legacy behavior — nothing credential-bearing to mask).
+	if got := RedactURL("mailto:ops@example.com"); got != "mailto:ops@example.com" {
+		t.Fatalf("opaque non-URL changed: %q", got)
+	}
+}

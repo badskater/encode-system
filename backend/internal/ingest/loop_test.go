@@ -1,12 +1,19 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/store"
@@ -283,5 +290,236 @@ func TestPollIntervalBounds(t *testing.T) {
 		if got := pollInterval(tc.seconds).String(); got != tc.want {
 			t.Errorf("pollInterval(%d) = %s, want %s", tc.seconds, got, tc.want)
 		}
+	}
+}
+
+// barrierLedger forces both pollers past the seen-check before either
+// records — the HA lock-loss window the reviewer's probe reproduced.
+type barrierLedger struct {
+	Ledger
+	barrier chan struct{}
+	once    sync.Once
+}
+
+func (l *barrierLedger) IngestSeen(ctx context.Context, p, h string) (bool, error) {
+	l.once.Do(func() { close(l.barrier) })
+	<-l.barrier
+	return l.Ledger.IngestSeen(ctx, p, h)
+}
+
+// TestPollLockLossSingleAlert pins Q6: when two pollers race the same
+// unseen torrent (lock-loss window), the ledger dedupes the row and ONLY
+// the inserter fires the staged event — exactly one alert, never two.
+func TestPollLockLossSingleAlert(t *testing.T) {
+	f := newLoopFixture(t)
+	tor := f.seedDownload(t, "h1", "Show.S01E01", "", "Show.S01E01")
+	f.client.byCat[""] = []Torrent{tor}
+	led := &barrierLedger{Ledger: f.st, barrier: make(chan struct{})}
+	var mu sync.Mutex
+	events := 0
+	on := func(StagedEvent) { mu.Lock(); events++; mu.Unlock() }
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			PollOnce(context.Background(), nil, led, f.config(), f.factory, on)
+		}()
+	}
+	wg.Wait()
+	if events != 1 {
+		t.Fatalf("lock-loss race must fire exactly 1 alert, got %d", events)
+	}
+	seen, _ := f.st.IngestSeen(context.Background(), model.IngestProviderQBit, "h1")
+	if !seen {
+		t.Fatal("ledger row must exist")
+	}
+}
+
+// TestPollSameEpisodeCollisionHonest pins Q9 (loop side): two different
+// torrents parsing to the same series+episode with the same base file
+// name — the second stages ZERO files (existing-skip) but still gets a
+// ledger row (dedupe). Its event must carry Files=[] so the API layer
+// audits a duplicate instead of alerting a false success.
+func TestPollSameEpisodeCollisionHonest(t *testing.T) {
+	f := newLoopFixture(t)
+	for _, d := range []struct{ dir, content string }{{"rel1", "RELEASE-1"}, {"rel2", "RELEASE-2"}} {
+		dir := filepath.Join(f.root, d.dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "a.mkv"), []byte(d.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t1 := Torrent{Hash: "h1", Name: "Show.S01E01.1080p", SavePath: "/d/rel1", Files: []File{{Name: "a.mkv"}}}
+	t2 := Torrent{Hash: "h2", Name: "Show.S01E01.720p", SavePath: "/d/rel2", Files: []File{{Name: "a.mkv"}}}
+	f.client.byCat[""] = []Torrent{t1, t2}
+	f.poll(t)
+	if len(f.events) != 2 {
+		t.Fatalf("both torrents report events (staged + duplicate), got %d", len(f.events))
+	}
+	if len(f.events[0].Files) != 1 || len(f.events[1].Files) != 0 {
+		t.Fatalf("second torrent must report ZERO staged files: %+v", f.events)
+	}
+	for _, h := range []string{"h1", "h2"} {
+		seen, _ := f.st.IngestSeen(context.Background(), model.IngestProviderQBit, h)
+		if !seen {
+			t.Fatalf("ledger must dedupe %s", h)
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(f.scripts, "Show", "Ep 01", "a.mkv"))
+	if string(b) != "RELEASE-1" {
+		t.Fatalf("first release wins (existing-skip), got %q", b)
+	}
+}
+
+// countingLedger counts seen-checks (one per torrent the poll processes).
+type countingLedger struct {
+	Ledger
+	seen atomic.Int64
+}
+
+func (l *countingLedger) IngestSeen(ctx context.Context, p, h string) (bool, error) {
+	l.seen.Add(1)
+	return l.Ledger.IngestSeen(ctx, p, h)
+}
+
+// TestPollPerPollCap pins Q11: one poll processes at most
+// MaxTorrentsPerPoll torrents; the rest are deferred to the next poll
+// with a warning (unbounded-fanout guard).
+func TestPollPerPollCap(t *testing.T) {
+	f := newLoopFixture(t)
+	tors := make([]Torrent, MaxTorrentsPerPoll+1)
+	for i := range tors {
+		tors[i] = Torrent{Hash: fmt.Sprintf("h%04d", i), Name: "Ambiguous.Release.1080p", SavePath: "/d/x"}
+	}
+	f.client.byCat[""] = tors
+	led := &countingLedger{Ledger: f.st}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	PollOnce(context.Background(), log, led, f.config(), f.factory, f.onStaged)
+	if got := led.seen.Load(); got != int64(MaxTorrentsPerPoll) {
+		t.Fatalf("poll must process exactly %d torrents, got %d", MaxTorrentsPerPoll, got)
+	}
+	if !strings.Contains(buf.String(), "per-poll torrent cap") {
+		t.Fatalf("truncation must warn: %s", buf.String())
+	}
+}
+
+// TestPollSkipCooldown pins Q12: repeated skips of the same torrent log
+// at full level ONCE per cooldown window; later skips log at debug only
+// (the ~8640-lines/day/torrent spam fix). The tracker persists across
+// polls in RunLoop; pollOnce is the internal entry that carries it.
+func TestPollSkipCooldown(t *testing.T) {
+	f := newLoopFixture(t)
+	bad := f.seedDownload(t, "bad", "Totally.Ambiguous.Release.1080p", "", "bad")
+	missing := Torrent{Hash: "missing", Name: "Missing.Show.S01E01", SavePath: "/d/absent", Files: []File{{Name: "a.mkv"}}}
+	f.client.byCat[""] = []Torrent{bad, missing}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	skips := newSkipTracker()
+	for i := 0; i < 3; i++ {
+		pollOnce(context.Background(), log, f.st, f.config(), f.factory, f.onStaged, skips)
+	}
+	count := func(level, sub string) int {
+		n := 0
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if line == "" {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatal(err)
+			}
+			if rec["level"] == level && strings.Contains(rec["msg"].(string), sub) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count("INFO", "unparseable"); n != 1 {
+		t.Fatalf("unparseable skip must log INFO once per cooldown, got %d", n)
+	}
+	if n := count("DEBUG", "unparseable"); n != 2 {
+		t.Fatalf("repeat unparseable skips must log DEBUG, got %d", n)
+	}
+	if n := count("WARN", "staging failed"); n != 1 {
+		t.Fatalf("staging failure must log WARN once per cooldown, got %d", n)
+	}
+	if n := count("DEBUG", "staging failed"); n != 2 {
+		t.Fatalf("repeat staging failures must log DEBUG, got %d", n)
+	}
+}
+
+// TestSkipTrackerCooldownWindow pins the tracker's TTL semantics with a
+// fake clock: allow once, suppress inside the window, allow after it,
+// and purge drops expired entries.
+func TestSkipTrackerCooldownWindow(t *testing.T) {
+	s := newSkipTracker()
+	now := time.Now()
+	if !s.allow("h", now) {
+		t.Fatal("first skip must log")
+	}
+	if s.allow("h", now.Add(skipLogCooldown-time.Minute)) {
+		t.Fatal("inside cooldown must suppress")
+	}
+	if !s.allow("h", now.Add(skipLogCooldown)) {
+		t.Fatal("after cooldown must log again")
+	}
+	s.purge(now.Add(2 * skipLogCooldown))
+	if len(s.last) != 0 {
+		t.Fatalf("purge must drop expired entries: %v", s.last)
+	}
+}
+
+// TestPollErrorLogsRedactCredentials pins Q4 (loop side): a dial error
+// from a credential-bearing client URL must never reach the log with the
+// secret — every ingest error-log path renders through notify.RedactURL.
+// Covers the completed-list failure and the client-construction failure.
+func TestPollErrorLogsRedactCredentials(t *testing.T) {
+	secret := "leak-" + "canary-99"
+	// Grab a port that refuses connections instantly.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	credURL := "http://probeuser:" + secret + "@" + addr
+
+	f := newLoopFixture(t)
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	// Dial error on the completed list (real client, refused port).
+	factory := func(model.IngestSettings) (Client, error) {
+		return NewQBit(credURL, "u", "p", nil)
+	}
+	PollOnce(context.Background(), log, f.st, f.config(), factory, f.onStaged)
+	if !strings.Contains(buf.String(), "completed-list failed") {
+		t.Fatalf("expected completed-list failure log: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatal("dial error leaked the URL password into the log")
+	}
+	if strings.Contains(buf.String(), "probeuser") {
+		t.Fatal("dial error leaked the URL username into the log (userinfo must be dropped)")
+	}
+
+	// Construction failure embedding the credential URL.
+	buf.Reset()
+	badFactory := func(model.IngestSettings) (Client, error) {
+		return nil, fmt.Errorf("bad client URL %q", credURL)
+	}
+	PollOnce(context.Background(), log, f.st, f.config(), badFactory, f.onStaged)
+	if !strings.Contains(buf.String(), "client construction failed") {
+		t.Fatalf("expected construction failure log: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatal("construction error leaked the URL password into the log")
+	}
+	if strings.Contains(buf.String(), "probeuser") {
+		t.Fatal("construction error leaked the URL username into the log")
 	}
 }

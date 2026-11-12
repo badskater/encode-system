@@ -61,8 +61,22 @@ func (s *Server) ingestClientFactory() ingest.ClientFactory {
 // channel is configured. The alert tells the operator the NEXT manual
 // step: author the .avs/.vpy filter script so the scanner can queue the
 // encode — ingestion stages sources only, it never creates jobs.
+//
+// A torrent that staged ZERO files (Q9: another release already staged
+// this episode) is audited as ingest.duplicate and gets NO success
+// alert — the ledger row still dedupes it, but nothing new happened.
 func (s *Server) onIngestStaged(ev ingest.StagedEvent) {
 	ctx := context.Background()
+	if len(ev.Files) == 0 {
+		s.auditSystem(ctx, "ingest.duplicate", "ingest:"+ev.Provider+":"+ev.Hash, map[string]any{
+			"name":        ev.Name,
+			"series":      ev.Series,
+			"episode":     ev.Episode,
+			"staged_path": ev.StagedPath,
+			"files":       0,
+		})
+		return
+	}
 	s.auditSystem(ctx, "ingest.staged", "ingest:"+ev.Provider+":"+ev.Hash, map[string]any{
 		"name":        ev.Name,
 		"series":      ev.Series,

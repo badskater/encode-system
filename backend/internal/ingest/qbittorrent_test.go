@@ -1,11 +1,15 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -319,5 +323,90 @@ func TestQBitInvalidURL(t *testing.T) {
 		if _, err := NewQBit(u, "", "", nil); err == nil {
 			t.Fatalf("NewQBit(%q) must fail", u)
 		}
+	}
+}
+
+// TestQBitSingleFileStagesEndToEnd pins Q5 (qBittorrent side): a
+// single-file torrent reports save_path = the download ROOT; under the
+// documented flat mount the file sits at downloadRoot/<filename> and
+// must stage end to end (mock client → Stage).
+func TestQBitSingleFileStagesEndToEnd(t *testing.T) {
+	f := newFakeQBit(t)
+	f.torrents = []qbitTorrent{{Hash: "h1", Name: "Movie.2024.1080p", SavePath: "/downloads"}}
+	f.filesByHash["h1"] = []qbitFile{{Name: "movie.mkv", Size: 5}}
+	q := f.client(t)
+	got, err := q.Completed(context.Background(), "")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("list: %v %d", err, len(got))
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "movie.mkv"), []byte("movie"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	staged, err := Stage(context.Background(), root, got[0], dest)
+	if err != nil {
+		t.Fatalf("single-file torrent must stage under the flat mount: %v", err)
+	}
+	if len(staged) != 1 || staged[0] != "movie.mkv" {
+		t.Fatalf("staged=%v", staged)
+	}
+	b, _ := os.ReadFile(filepath.Join(dest, "movie.mkv"))
+	if string(b) != "movie" {
+		t.Fatalf("content=%q", b)
+	}
+}
+
+// TestQBitFilesFetchErrorRedacted pins Q4 (client log site): a transport
+// failure on the per-torrent files call embeds the FULL request URL
+// (url.Error) — the client's skip-log must render it through
+// notify.RedactURL so URL-embedded credentials never reach the log.
+func TestQBitFilesFetchErrorRedacted(t *testing.T) {
+	secret := "leak-" + "canary-99"
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "SID", Value: "s", Path: "/"})
+		fmt.Fprint(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"hash":"h1","name":"Show S01E01","save_path":"/d/x"}]`)
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("hijack unsupported")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Close() // transport failure mid-exchange
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	credURL := strings.Replace(srv.URL, "http://", "http://probeuser:"+secret+"@", 1)
+	q, err := NewQBit(credURL, "", "", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Completed(context.Background(), "")
+	if err != nil {
+		t.Fatalf("list must survive the per-torrent failure: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("failed torrent must be skipped: %v", got)
+	}
+	if !strings.Contains(buf.String(), "torrent files fetch failed") {
+		t.Fatalf("expected skip log: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatal("files-fetch error leaked the URL password into the log")
+	}
+	if strings.Contains(buf.String(), "probeuser") {
+		t.Fatal("files-fetch error leaked the URL username into the log (userinfo must be dropped)")
 	}
 }

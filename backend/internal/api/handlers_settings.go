@@ -457,11 +457,11 @@ func validateSettings(st *model.Settings) error {
 	// them, so a typo or a non-HTTP scheme is caught at save time.
 	st.GenericWebhookURL = strings.TrimSpace(st.GenericWebhookURL)
 	if st.GenericWebhookURL != "" && !isHTTPURL(st.GenericWebhookURL) {
-		return errSettings("generic_webhook_url must be an http(s) URL or blank")
+		return errSettings("generic_webhook_url must be an http(s) URL without embedded credentials (user:pass@) or blank")
 	}
 	st.NtfyTopicURL = strings.TrimSpace(st.NtfyTopicURL)
 	if st.NtfyTopicURL != "" && !isHTTPURL(st.NtfyTopicURL) {
-		return errSettings("ntfy_topic_url must be an http(s) URL (e.g. https://ntfy.sh/mytopic) or blank")
+		return errSettings("ntfy_topic_url must be an http(s) URL without embedded credentials (user:pass@) (e.g. https://ntfy.sh/mytopic) or blank")
 	}
 	// SMTP email channel: enabled when host+from+to are all set. Port 0
 	// defaults to 587 at send time; anything else must be a real port.
@@ -714,11 +714,14 @@ type settingsErr string
 func (e settingsErr) Error() string { return string(e) }
 func errSettings(msg string) error  { return settingsErr(msg) }
 
-// isHTTPURL reports whether raw is an absolute http(s) URL with a host —
-// the shared bound for the generic webhook and ntfy topic settings.
+// isHTTPURL reports whether raw is an absolute http(s) URL with a host
+// and NO embedded userinfo — the shared bound for the generic webhook,
+// ntfy topic and ingestion client settings. Credentials belong in the
+// dedicated username/password fields, never in the URL: transport
+// errors quote the full URL and would leak them into logs (Q4).
 func isHTTPURL(raw string) bool {
 	u, err := url.Parse(raw)
-	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
+	return err == nil && u.Host != "" && u.User == nil && (u.Scheme == "http" || u.Scheme == "https")
 }
 
 // isWindowsPath accepts C:\... and C:/... (separator after the drive

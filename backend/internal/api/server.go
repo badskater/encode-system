@@ -522,6 +522,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/series", s.withAnyUser(s.handleListSeries))
 	mux.HandleFunc("POST /api/series", s.withAdmin(s.handleCreateSeries))
 	mux.HandleFunc("PATCH /api/series/{id}", s.withAdmin(s.handlePatchSeries))
+	mux.HandleFunc("DELETE /api/series/{id}", s.withAdmin(s.handleDeleteSeries))
 
 	mux.HandleFunc("GET /api/step-templates", s.withAnyUser(s.handleListStepTemplates))
 	mux.HandleFunc("POST /api/step-templates", s.withAdmin(s.handleCreateStepTemplate))

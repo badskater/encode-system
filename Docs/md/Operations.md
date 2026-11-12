@@ -39,6 +39,7 @@
 | Alert + hold jobs on low disk | Settings → Disk alert threshold GB: below it the node posts a Discord alert and soft-drains (no new jobs) until it recovers. 0 = off. |
 | Manage storage sources | UI → Settings → **Storage shares**: add/edit NFS/SMB/S3 sources per role (scripts/release). Passwords are write-only (never shown again). An enabled S3 scripts share switches the scanner to bucket listing — no mounts needed anywhere. |
 | Scaffold a new series' folders | UI → Series → **Create series** (name, episode count, optional tag + flow): builds `Ep 01…NN` on the scripts share and the `[Group] … - Raws [Tag]` release folder. Re-run with a higher count to extend. |
+| Delete a series (keep history) | UI → Series → **Delete** (admin; the confirm dialog shows the series' done/total progress and job count) or `DELETE /api/series/{id}`. Removes the registry row ONLY — jobs, history, stats and files are untouched. See [Delete a series](#delete-a-series-registry-cleanup) for the scanner re-registration caveat. |
 | Override a series' quality tag | UI → Series → Tag column (click to edit; blank = global tag from Settings). |
 | Encode a 4K/HDR series | Flow builder: use `hdr_probe` → `encode_4k` (reads hdr.json, bt2020/PQ for HDR10); author `2160.avs/.vpy` in the episode folder (outranks 1080 scripts). |
 | Auto-select the audio track by language | Flow builder: use the `audio_lang` step (language priority, default `jpn,eng`); the mux step tags the track from audio.json. |
@@ -83,6 +84,34 @@
 | Gate encode quality | Default flows include `quality_gate` after `verify_output` (sampled VMAF vs source, SSIM fallback); see the quality gate section below for tuning. |
 | Add subs/fonts/chapters to a finished encode | Queue the `default-subs` flow as a separate job on the same episode dir after the encode flow; see the subtitles/fonts/chapters section below. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
+
+### Delete a series (registry cleanup)
+
+`DELETE /api/series/{id}` (admin-only; UI: Series page → **Delete**, with a
+confirm dialog showing the series' done/total progress and job count)
+removes the series **registry row only**:
+
+- **Jobs and history survive.** Jobs store the series name as plain text
+  (no foreign key), so every job keeps its series/episode data, stays
+  listable and filterable on the Jobs page, and keeps counting in
+  `/api/stats` and the per-series progress queries.
+- **No file operations.** Episode folders, sources, filter scripts and
+  finished outputs on the scripts/release shares are never touched.
+- **Scanner re-registration.** If the series folder still exists on the
+  scripts share (or S3 scripts bucket) and contains *ready* episodes
+  (source + filter script past the 2-minute stability gate), the next scan
+  re-registers the series automatically — a fresh row, enabled, default
+  flow. Existing jobs still dedupe, so no duplicate encodes are queued.
+  Scaffold-only/empty folders produce no candidates and do **not**
+  re-register. **Remove or rename the folder on the share to make the
+  deletion stick.**
+- Responses: `204` on success, `404` for an unknown id, `403` for viewer
+  sessions and read-scope tokens. Audited as `series.delete` (actor +
+  series name/id).
+
+Use it to clean up stale registry rows (renamed/removed shows, accidental
+registrations). To stop a series from queueing without deleting anything,
+use **Pause** or the enable toggle instead.
 
 ## Quality gate (VMAF/SSIM)
 

@@ -13,6 +13,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -394,6 +395,68 @@ func storeContract(t *testing.T, openFn func(t *testing.T) *Store) {
 	// The stall counter derives from failed rows with the stall prefix.
 	if n, err := s.CountStalledJobs(ctx); err != nil || n != 1 {
 		t.Fatalf("CountStalledJobs = %d err=%v, want 1", n, err)
+	}
+
+	// --- Series delete: registry row only, job history preserved ---
+	delSr, err := s.UpsertSeriesByName(ctx, "ContractDeleteShow")
+	if err != nil {
+		t.Fatalf("upsert delete-show: %v", err)
+	}
+	delJob, err := s.CreateJob(ctx, &model.Job{
+		Series: "ContractDeleteShow", Episode: "01", EpisodeDir: "ContractDeleteShow/Ep 01",
+		ScriptType: "vpy", FlowID: flow.ID,
+	})
+	if err != nil {
+		t.Fatalf("create delete-show job: %v", err)
+	}
+	if err := s.FinishJob(ctx, delJob.ID, model.JobDone, 0, "", nil, ""); err != nil {
+		t.Fatalf("finish delete-show job: %v", err)
+	}
+	progressBefore, err := s.SeriesProgressCounts(ctx)
+	if err != nil {
+		t.Fatalf("progress before delete: %v", err)
+	}
+	if err := s.DeleteSeries(ctx, delSr.ID); err != nil {
+		t.Fatalf("delete series: %v", err)
+	}
+	if _, err := s.GetSeries(ctx, delSr.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetSeries after delete: err=%v, want sql.ErrNoRows", err)
+	}
+	// Deleting an unknown id is a not-found error, not a silent success.
+	if err := s.DeleteSeries(ctx, delSr.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("repeat DeleteSeries: err=%v, want sql.ErrNoRows", err)
+	}
+	// The job survives with its denormalized series name and status.
+	gotDelJob, err := s.GetJob(ctx, delJob.ID)
+	if err != nil {
+		t.Fatalf("job lost after series delete: %v", err)
+	}
+	if gotDelJob.Series != "ContractDeleteShow" || gotDelJob.Status != model.JobDone {
+		t.Fatalf("job mutated after series delete: %+v", gotDelJob)
+	}
+	exists, err := s.JobExistsForEpisode(ctx, "ContractDeleteShow/Ep 01")
+	if err != nil || !exists {
+		t.Fatalf("episode dedupe key lost: exists=%v err=%v", exists, err)
+	}
+	// Progress counts still derive from the surviving job rows.
+	progressAfter, err := s.SeriesProgressCounts(ctx)
+	if err != nil {
+		t.Fatalf("progress after delete: %v", err)
+	}
+	if progressBefore["ContractDeleteShow"] != progressAfter["ContractDeleteShow"] {
+		t.Fatalf("progress changed by series delete: %+v → %+v",
+			progressBefore["ContractDeleteShow"], progressAfter["ContractDeleteShow"])
+	}
+	// Re-upsert (what the scanner does on the next scan) creates a FRESH row.
+	reSr, err := s.UpsertSeriesByName(ctx, "ContractDeleteShow")
+	if err != nil {
+		t.Fatalf("re-upsert after delete: %v", err)
+	}
+	if reSr.ID == delSr.ID {
+		t.Fatalf("re-upsert reused deleted id %d", delSr.ID)
+	}
+	if !reSr.Enabled {
+		t.Fatalf("re-upserted series must be enabled: %+v", reSr)
 	}
 }
 

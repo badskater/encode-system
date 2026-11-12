@@ -378,6 +378,10 @@ export const api = {
     request<CreateSeriesResponse>('POST', '/api/series', body),
   patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean; node_group?: string; webhook_url?: string }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
+  // deleteSeries removes the series REGISTRY ROW only (admin). Jobs,
+  // history and files on the shares survive; the scanner re-registers the
+  // series on the next scan if its folder still has ready episodes.
+  deleteSeries: (id: number) => request<void>('DELETE', `/api/series/${id}`),
 
   stepTemplates: () => request<StepTemplate[]>('GET', '/api/step-templates'),
   createStepTemplate: (t: Omit<StepTemplate, 'id' | 'builtin' | 'created_at' | 'updated_at'>) =>

@@ -429,9 +429,12 @@ func (s *Store) MigrateSettingsKey(ctx context.Context, key string, value string
 
 // UpsertSeriesByName returns the series row for name, creating it enabled
 // with no flow override when first seen. Existing rows are returned as-is.
+// ON CONFLICT(name) DO NOTHING is the dual-backend idiom (same as
+// InsertStepTemplateIfAbsent): SQLite's INSERT OR IGNORE is a syntax error
+// on Postgres, which broke scanner series registration in PG mode.
 func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Series, error) {
 	if _, err := s.qExec(ctx,
-		`INSERT OR IGNORE INTO series (name) VALUES (?)`, name); err != nil {
+		`INSERT INTO series (name) VALUES (?) ON CONFLICT(name) DO NOTHING`, name); err != nil {
 		return nil, fmt.Errorf("upsert series: %w", err)
 	}
 	return s.SeriesByName(ctx, name)
@@ -557,6 +560,25 @@ func (s *Store) SetSeriesNodeGroup(ctx context.Context, id int64, group string) 
 	_, err := s.qExec(ctx,
 		`UPDATE series SET node_group=?, updated_at=datetime('now') WHERE id=?`, group, id)
 	return err
+}
+
+// DeleteSeries removes ONLY the series registry row. Jobs are untouched:
+// jobs.series is a denormalized TEXT name (no FK to series.id), so job
+// history, stats and the per-episode dedupe keys all survive the delete.
+// No filesystem side effects — episode folders, sources and outputs on the
+// shares are never touched. Note the scanner re-registers the series on the
+// next scan if its folder still yields ready episodes (scanOnce upserts by
+// name), so this is registry cleanup, not a permanent removal while the
+// folder stays active. Returns sql.ErrNoRows when id is unknown.
+func (s *Store) DeleteSeries(ctx context.Context, id int64) error {
+	res, err := s.qExec(ctx, `DELETE FROM series WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // ---------- Series progress (Phase F1) ----------

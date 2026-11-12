@@ -344,6 +344,19 @@ raising the count), never duplicates. Names are validated against the
 Windows-reserved characters before any filesystem touch; episode folders pad
 to three digits for 100+ episode shows (`Ep 001`).
 
+### Delete series (registry cleanup)
+
+`DELETE /api/series/{id}` (admin-only, `204`; `404` unknown id; UI: Series
+page → **Delete** with a confirm dialog showing the series' progress counts)
+removes the series **registry row only**. Jobs reference the series by
+denormalized name (`jobs.series` TEXT, no FK), so job history, stats and
+progress counts survive untouched, and no file operations are performed on
+the shares. The scanner re-registers the series on the next scan if its
+folder still yields ready episodes (fresh row, enabled, default flow;
+existing jobs still dedupe) — remove/rename the folder to make the deletion
+stick. Audited as `series.delete`. See Operations.md → "Delete a series
+(registry cleanup)" for the operator runbook.
+
 ## Storage shares
 
 `GET|POST /api/shares`, `PUT|DELETE /api/shares/{id}` — one row per

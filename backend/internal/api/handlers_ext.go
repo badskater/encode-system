@@ -222,6 +222,44 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sr)
 }
 
+// handleDeleteSeries serves DELETE /api/series/{id} (admin-only). It removes
+// the series REGISTRY ROW ONLY — registry cleanup, not a destructive media
+// operation:
+//
+//   - Jobs/history survive: jobs.series is a denormalized name (no FK to
+//     series.id), so every job keeps its series/episode data, stays
+//     listable/filterable and keeps counting in stats and progress queries.
+//   - No file operations whatsoever: episode folders, sources and outputs on
+//     the shares are never touched.
+//   - Scanner interaction: if the series folder still exists on the scripts
+//     share AND contains ready episodes (source + filter script past the
+//     stability gate), the next scan re-registers the series — a fresh row,
+//     enabled, default flow (scanner.scanOnce upserts by name for every
+//     candidate). Scaffold-only/empty folders yield no candidates and do NOT
+//     re-register. Remove or rename the folder on the share to make the
+//     deletion stick.
+//
+// Audited as series.delete; 404 for unknown ids, 204 on success.
+func (s *Server) handleDeleteSeries(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad series id")
+		return
+	}
+	ctx := r.Context()
+	sr, err := s.Store.GetSeries(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "series not found")
+		return
+	}
+	if err := s.Store.DeleteSeries(ctx, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete series")
+		return
+	}
+	s.audit(r, "series.delete", auditObject("series", id), map[string]any{"name": sr.Name})
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ---------- Flow default / export / import ----------
 
 // handleSetDefaultFlow marks one flow as THE default (all others cleared).

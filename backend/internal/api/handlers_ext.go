@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -253,6 +255,13 @@ func (s *Server) handleDeleteSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.DeleteSeries(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Concurrent delete: another request removed the row between
+			// our GetSeries and this DELETE. The series is gone — 404,
+			// not 500.
+			writeErr(w, http.StatusNotFound, "series not found")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "delete series")
 		return
 	}

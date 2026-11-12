@@ -238,3 +238,49 @@ func TestDeleteSeriesPreservesHistory(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteSeriesAdminTokenAuditActor pins that a series deleted with an
+// admin-scope API token is audited under "api-token:<name>" (not the admin
+// session username), with the series name in the detail.
+func TestDeleteSeriesAdminTokenAuditActor(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+
+	sr, err := e.server.Store.UpsertSeriesByName(ctxBg(), "TokenShow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokBody := doJSON(t, "POST", ts.URL+"/api/tokens", adminTok, map[string]any{"name": "radarr", "scope": "admin"})
+	var created map[string]any
+	if err := json.Unmarshal(tokBody, &created); err != nil {
+		t.Fatal(err)
+	}
+	tok := created["token"].(string)
+
+	resp, out := doJSON(t, "DELETE", ts.URL+"/api/series/"+itoa(sr.ID), tok, nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("admin-token DELETE = %d, want 204 (%s)", resp.StatusCode, out)
+	}
+
+	_, auditBody := doJSON(t, "GET", ts.URL+"/api/audit?limit=50", adminTok, nil)
+	var events []model.AuditEvent
+	if err := json.Unmarshal(auditBody, &events); err != nil {
+		t.Fatal(err)
+	}
+	var found *model.AuditEvent
+	for i := range events {
+		if events[i].Action == "series.delete" && events[i].Object == "series:"+itoa(sr.ID) {
+			found = &events[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("audit missing series.delete for series:%d: %s", sr.ID, auditBody)
+	}
+	if found.Actor != "api-token:radarr" {
+		t.Fatalf("audit actor = %q, want api-token:radarr", found.Actor)
+	}
+	if !strings.Contains(found.Detail, "TokenShow") {
+		t.Fatalf("audit detail missing series name: %q", found.Detail)
+	}
+}

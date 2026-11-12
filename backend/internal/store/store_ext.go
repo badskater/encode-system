@@ -575,7 +575,13 @@ func (s *Store) DeleteSeries(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	// Check the RowsAffected error like AssignJob does: a driver failure
+	// here must surface as itself, not be masked into a spurious ErrNoRows.
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return sql.ErrNoRows
 	}
 	return nil

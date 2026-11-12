@@ -95,6 +95,13 @@ removes the series **registry row only**:
   (no foreign key), so every job keeps its series/episode data, stays
   listable and filterable on the Jobs page, and keeps counting in
   `/api/stats` and the per-series progress queries.
+- **Per-series overrides are lost for NEW jobs.** The flow override, quality
+  tag override and mute (`notify=false`) live on the registry row: jobs
+  queued after the delete fall back to the default flow, the global Settings
+  tag and normal notifications. Already-queued jobs keep their denormalized
+  `flow_id` and finish cleanly on that flow. If the scanner re-registers the
+  series (below), the fresh row starts with DEFAULT settings — re-apply any
+  overrides after deleting.
 - **No file operations.** Episode folders, sources, filter scripts and
   finished outputs on the scripts/release shares are never touched.
 - **Scanner re-registration.** If the series folder still exists on the

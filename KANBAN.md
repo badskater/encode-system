@@ -22,6 +22,11 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 ## Release v1.23.0 (pending tag)
 
+> Known follow-up (post-release): bash `crc32_rename` uses POSIX `cksum`
+> (reflected polynomial) while the PS dialect uses IEEE CRC-32 — tags differ
+> for the same file (vector 377A6011 vs CBF43926). Pre-existing parity nuance,
+> flagged in code; needs a tooling decision (align both on one algorithm).
+
 - Scope: the resilience batch P1–P11 below — job/step timeouts + stall
   watchdog, opt-in observability assets, notification channels (webhook /
   ntfy / email), offsite backups (S3 + SFTP), quality_gate (VMAF/SSIM),

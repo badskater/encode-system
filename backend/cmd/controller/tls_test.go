@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -38,6 +39,13 @@ type testPKI struct {
 
 func newTestPKI(t *testing.T) *testPKI {
 	t.Helper()
+	return newTestPKIWithServerValidity(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+}
+
+// newTestPKIWithServerValidity is newTestPKI with a custom validity window on
+// the SERVER cert (the CA stays valid) — for boot-time expiry-warning tests.
+func newTestPKIWithServerValidity(t *testing.T, srvNotBefore, srvNotAfter time.Time) *testPKI {
+	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -66,8 +74,8 @@ func newTestPKI(t *testing.T) *testPKI {
 	srvTpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: "encode-controller"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotBefore:    srvNotBefore,
+		NotAfter:     srvNotAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{"localhost"},
@@ -150,7 +158,7 @@ func buildTestMux(t *testing.T) http.Handler {
 // contract: no env → nil config, and the same mux serves plain HTTP exactly
 // as before (httptest regression over the real API).
 func TestResolveTLSConfigNeitherSetKeepsPlainHTTPDefault(t *testing.T) {
-	cfg, err := resolveTLSConfig("", "")
+	cfg, err := resolveTLSConfig("", "", discardLog())
 	if err != nil || cfg != nil {
 		t.Fatalf("neither set: want (nil, nil), got (%v, %v)", cfg, err)
 	}
@@ -187,7 +195,7 @@ func TestResolveTLSConfigPartialFailsFast(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg, err := resolveTLSConfig(c.cert, c.key)
+			cfg, err := resolveTLSConfig(c.cert, c.key, discardLog())
 			if err == nil {
 				t.Fatalf("partial config must fail fast, got config %v", cfg)
 			}
@@ -230,7 +238,7 @@ func TestResolveTLSConfigLoadErrors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg, err := resolveTLSConfig(c.cert, c.key)
+			cfg, err := resolveTLSConfig(c.cert, c.key, discardLog())
 			if err == nil {
 				t.Fatalf("bad keypair must fail fast, got config %v", cfg)
 			}
@@ -253,7 +261,7 @@ func TestResolveTLSConfigLoadErrors(t *testing.T) {
 func TestControllerServesAPIOverTLS(t *testing.T) {
 	pki := newTestPKI(t)
 	certPath, keyPath := pki.writeServerPEM(t)
-	tlsCfg, err := resolveTLSConfig(certPath, keyPath)
+	tlsCfg, err := resolveTLSConfig(certPath, keyPath, discardLog())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,11 +311,91 @@ func TestControllerServesAPIOverTLS(t *testing.T) {
 		t.Fatal("client without the CA must be rejected, got a successful response")
 	}
 
-	// TLS 1.1-only client: refused by the MinVersion floor.
+	// TLS 1.1-only client: refused by the MinVersion floor. MinVersion is
+	// REQUIRED here, not cosmetic: since Go 1.18 the client default minimum
+	// is TLS 1.2, so a MaxVersion-only config fails locally ("no supported
+	// versions satisfy MinVersion and MaxVersion") BEFORE any ClientHello —
+	// the test would pass even with the server floor deleted. Pinning
+	// MinVersion to 1.0 makes the client genuinely offer ≤1.1 on the wire.
 	oldClient := &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pki.pool(t), MaxVersion: tls.VersionTLS11},
+		TLSClientConfig: &tls.Config{RootCAs: pki.pool(t), MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11},
 	}, Timeout: 5 * time.Second}
 	if _, err := oldClient.Get(base + "/api/health"); err == nil {
 		t.Fatal("TLS 1.1 client must be refused (MinVersion 1.2)")
+	}
+}
+
+// discardLog drops log output — for call sites that only care about the
+// returned config/error, not the warnings.
+func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// TestResolveTLSConfigValidCertNoWarning: a cert inside its validity window
+// must not produce any boot warning.
+func TestResolveTLSConfigValidCertNoWarning(t *testing.T) {
+	pki := newTestPKI(t)
+	certPath, keyPath := pki.writeServerPEM(t)
+	var buf bytes.Buffer
+	cfg, err := resolveTLSConfig(certPath, keyPath, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil || cfg == nil {
+		t.Fatalf("valid keypair must load cleanly: cfg=%v err=%v", cfg, err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("valid cert must not warn, got: %q", buf.String())
+	}
+}
+
+// TestResolveTLSConfigInvalidValidityWarnsButStarts pins the boot-warning
+// contract: an expired or not-yet-valid cert logs a WARNING (naming the path
+// and NotAfter) but does NOT fail startup — the operator may be mid-rotation.
+// The server still comes up and presents the cert: a trusting client fails at
+// x509 VALIDITY (not connection refused), proving the TLS listener is serving.
+func TestResolveTLSConfigInvalidValidityWarnsButStarts(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+		wantWarn  string
+	}{
+		{"expired", now.Add(-48 * time.Hour), now.Add(-24 * time.Hour), "EXPIRED"},
+		{"not_yet_valid", now.Add(24 * time.Hour), now.Add(48 * time.Hour), "NOT YET VALID"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pki := newTestPKIWithServerValidity(t, c.notBefore, c.notAfter)
+			certPath, keyPath := pki.writeServerPEM(t)
+			var buf bytes.Buffer
+			cfg, err := resolveTLSConfig(certPath, keyPath, slog.New(slog.NewTextHandler(&buf, nil)))
+			if err != nil {
+				t.Fatalf("validity problems must warn, not fail startup: %v", err)
+			}
+			if cfg == nil {
+				t.Fatal("want a usable TLS config despite the validity warning")
+			}
+			out := buf.String()
+			if !strings.Contains(out, c.wantWarn) || !strings.Contains(out, certPath) || !strings.Contains(out, "not_after") {
+				t.Fatalf("warning must name the problem, cert path and NotAfter; got: %q", out)
+			}
+			// Server still starts: serve the REAL mux over TLS with the
+			// loaded config; the client's failure must be x509 validity,
+			// not a dead listener.
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			httpSrv := &http.Server{Handler: buildTestMux(t), TLSConfig: cfg, ReadHeaderTimeout: 10 * time.Second}
+			go func() { _ = httpSrv.ServeTLS(ln, "", "") }()
+			defer httpSrv.Close()
+			client := &http.Client{Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{RootCAs: pki.pool(t)},
+			}, Timeout: 5 * time.Second}
+			_, err = client.Get("https://" + ln.Addr().String() + "/api/health")
+			if err == nil {
+				t.Fatal("client must reject a cert outside its validity window")
+			}
+			if !strings.Contains(err.Error(), "x509") || !strings.Contains(err.Error(), "valid") {
+				t.Fatalf("want an x509 validity error (server up), got: %v", err)
+			}
+		})
 	}
 }

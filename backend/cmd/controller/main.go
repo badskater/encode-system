@@ -74,7 +74,7 @@ func main() {
 	// touched; neither keeps the plain-HTTP default byte-identical. Cert
 	// load errors (missing/unreadable/mismatched files) also fail fast with
 	// the offending paths. See Docs/md/Deployment.md §Native HTTPS.
-	tlsCfg, err := resolveTLSConfig(os.Getenv("ENCODE_TLS_CERT"), os.Getenv("ENCODE_TLS_KEY"))
+	tlsCfg, err := resolveTLSConfig(os.Getenv("ENCODE_TLS_CERT"), os.Getenv("ENCODE_TLS_KEY"), log)
 	if err != nil {
 		log.Error("tls config", "err", err)
 		os.Exit(1)

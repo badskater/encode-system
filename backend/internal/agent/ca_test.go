@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -266,7 +268,7 @@ func TestLoadAgentCAPoolAppendsToSystemRoots(t *testing.T) {
 	systemCertPool = func() (*x509.CertPool, error) { return standIn, nil }
 	t.Cleanup(func() { systemCertPool = orig })
 
-	pool, err := loadAgentCAPool(custom.writeCAFile(t))
+	pool, err := loadAgentCAPool(custom.writeCAFile(t), testLog())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +285,7 @@ func TestLoadAgentCAPoolSystemPoolError(t *testing.T) {
 	orig := systemCertPool
 	systemCertPool = func() (*x509.CertPool, error) { return nil, io.ErrUnexpectedEOF }
 	t.Cleanup(func() { systemCertPool = orig })
-	if _, err := loadAgentCAPool(pki.writeCAFile(t)); err == nil {
+	if _, err := loadAgentCAPool(pki.writeCAFile(t), testLog()); err == nil {
 		t.Fatal("system pool failure must propagate")
 	}
 }
@@ -293,7 +295,7 @@ func TestLoadAgentCAPoolSystemPoolError(t *testing.T) {
 // farm cert verifies against the combined pool.
 func TestLoadAgentCAPoolRealSystemRoots(t *testing.T) {
 	pki := newTestPKI(t)
-	pool, err := loadAgentCAPool(pki.writeCAFile(t))
+	pool, err := loadAgentCAPool(pki.writeCAFile(t), testLog())
 	if err != nil {
 		t.Fatalf("real system pool + append: %v", err)
 	}
@@ -324,5 +326,87 @@ func TestAgentHTTPUpdateGateUnchangedWithCA(t *testing.T) {
 	t.Setenv("ENCODE_AGENT_ALLOW_HTTP_UPDATES", "1")
 	if err := a.getAuth(context.Background(), "/api/agent/download/agent", &buf); err != nil {
 		t.Fatalf("opt-in must still allow plain-HTTP downloads: %v", err)
+	}
+}
+
+// writeLeafAnchorFile writes the PKI's SERVER (leaf, non-CA) cert as the
+// ENCODE_AGENT_CA_CERT file — the misconfiguration the warning targets.
+func writeLeafAnchorFile(t *testing.T, pki *testPKI) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "leaf-anchor.crt")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pki.serverDER}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadAgentCAPoolLeafAnchorWarnsButLoads: a leaf (non-CA) trust anchor is
+// accepted by Go (de-facto pinning) — it must LOAD and verify the exact leaf,
+// but produce a rotation warning naming the file.
+func TestLoadAgentCAPoolLeafAnchorWarnsButLoads(t *testing.T) {
+	pki := newTestPKI(t)
+	var buf bytes.Buffer
+	pool, err := loadAgentCAPool(writeLeafAnchorFile(t, pki), slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatalf("leaf anchor must still load (pinning is legitimate): %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "leaf certificate") || !strings.Contains(out, "rotation") {
+		t.Fatalf("want leaf-anchor rotation warning, got: %q", out)
+	}
+	verifyLeaf(t, pool, pki.serverDER, true) // the pinned leaf itself verifies
+}
+
+// TestLoadAgentCAPoolCAAnchorNoWarning: the documented configuration (the CA
+// cert) must not produce any warning.
+func TestLoadAgentCAPoolCAAnchorNoWarning(t *testing.T) {
+	pki := newTestPKI(t)
+	var buf bytes.Buffer
+	if _, err := loadAgentCAPool(pki.writeCAFile(t), slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("CA anchor must not warn, got: %q", buf.String())
+	}
+}
+
+// TestLoadAgentCAPoolMixedPEMWarnsOnlyForLeaf: a CA+leaf bundle (e.g. an
+// operator appending the wrong file) warns exactly once — for the leaf.
+func TestLoadAgentCAPoolMixedPEMWarnsOnlyForLeaf(t *testing.T) {
+	pki := newTestPKI(t)
+	mixed := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pki.caCert.Raw}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pki.serverDER})...)
+	path := filepath.Join(t.TempDir(), "mixed.pem")
+	if err := os.WriteFile(path, mixed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := loadAgentCAPool(path, slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(buf.String(), "leaf certificate"); n != 1 {
+		t.Fatalf("want exactly 1 leaf warning for CA+leaf bundle, got %d: %q", n, buf.String())
+	}
+}
+
+// TestAgentCALeafAnchorStillWorks is the end-to-end half: with a leaf anchor
+// the agent starts (warning logged) and a REAL heartbeat over TLS succeeds —
+// Go pins the exact cert, so the misconfiguration works until rotation.
+func TestAgentCALeafAnchorStillWorks(t *testing.T) {
+	pki := newTestPKI(t)
+	t.Setenv("ENCODE_AGENT_CA_CERT", writeLeafAnchorFile(t, pki))
+	base := startTLSServer(t, pki, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	}))
+	var buf bytes.Buffer
+	a, err := New(agentCfg(base, t.TempDir()), "1.0.0", slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatalf("leaf anchor must not block startup: %v", err)
+	}
+	if err := a.heartbeat(context.Background()); err != nil {
+		t.Fatalf("leaf-pinned heartbeat must still work: %v", err)
+	}
+	if !strings.Contains(buf.String(), "leaf certificate") {
+		t.Fatalf("want leaf-anchor warning at startup, got: %q", buf.String())
 	}
 }

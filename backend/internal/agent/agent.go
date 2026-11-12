@@ -100,7 +100,7 @@ func New(cfg Config, version string, log *slog.Logger) (*Agent, error) {
 	// points at a PEM file appended to the system pool for EVERY controller-
 	// facing request (heartbeat + update downloads share this one client).
 	// Resolved before any side effect so a broken trust config fails fast.
-	client, err := newControllerClient(os.Getenv("ENCODE_AGENT_CA_CERT"))
+	client, err := newControllerClient(os.Getenv("ENCODE_AGENT_CA_CERT"), log)
 	if err != nil {
 		return nil, err
 	}

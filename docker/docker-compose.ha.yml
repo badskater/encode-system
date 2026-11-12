@@ -116,6 +116,11 @@ services:
       # Service: same name on both replicas → Traefik v3 LB coalescing.
       # server.port points at the controller's in-container 8080.
       traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
+      # Backend scheme: http by default (Traefik terminates TLS at the edge).
+      # With native TLS on the replicas (ENCODE_TLS_CERT/KEY set) ALSO set
+      # ENCODE_TRAEFIK_SCHEME=https in .env — otherwise Traefik speaks plain
+      # HTTP to a TLS listener and every request 502s.
+      traefik.http.services.encode-controller-svc.loadBalancer.server.scheme: ${ENCODE_TRAEFIK_SCHEME:-http}
     healthcheck:
       # Plain HTTP by default; with native TLS set ENCODE_HEALTHCHECK_URL=
       # https://localhost:8080/api/health (+ ENCODE_HEALTHCHECK_FLAGS=
@@ -173,6 +178,9 @@ services:
       traefik.http.routers.encode-controller.service: encode-controller-svc
       traefik.http.routers.encode-controller.middlewares: ${ENCODE_AUTH_MIDDLEWARE:-}
       traefik.http.services.encode-controller-svc.loadBalancer.server.port: "8080"
+      # Same env-gated backend scheme as controller-1 (https when the
+      # replicas run native TLS; see the comment there).
+      traefik.http.services.encode-controller-svc.loadBalancer.server.scheme: ${ENCODE_TRAEFIK_SCHEME:-http}
     healthcheck:
       # Plain HTTP by default; with native TLS set ENCODE_HEALTHCHECK_URL=
       # https://localhost:8080/api/health (+ ENCODE_HEALTHCHECK_FLAGS=

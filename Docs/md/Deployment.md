@@ -441,16 +441,24 @@ mounts. To enable:
    `ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health` and (self-signed
    CA only) `ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate`. The flag
    relaxes ONLY the container's local probe — agents still verify via
-   `ENCODE_AGENT_CA_CERT`.
+   `ENCODE_AGENT_CA_CERT`. If you verify the probe WITH the CA instead
+   (no `--no-check-certificate`), the URL must use a SAN-covered name/IP:
+   the recipe's SANs are `DNS:encode.lan` + `IP:<CTRL_IP>`, NOT `localhost`,
+   so `--ca-cert` + `https://localhost:8080` fails hostname verification
+   (and a public CA can never cover `localhost`) — use e.g.
+   `ENCODE_HEALTHCHECK_URL=https://<CTRL_IP>:8080/api/health`, or keep
+   `--no-check-certificate` for the loopback probe.
 4. `docker compose -f docker-compose.runtime.yml up -d` (recreates the
    container). `install.sh` detects the TLS vars and health-probes over
    https automatically.
 
 HA note: with Traefik terminating TLS at the edge, native TLS is usually
 left unset (Traefik→replica stays HTTP on the internal network). Set it only
-when the replicas themselves must serve HTTPS. The recipe below applies
-unchanged — both replicas mount the same `./tls/` files, so the single
-ownership step covers both.
+when the replicas themselves must serve HTTPS — and then ALSO set
+`ENCODE_TRAEFIK_SCHEME=https` in `.env`: Traefik's backend scheme defaults to
+`http`, and plain HTTP against a TLS listener 502s every request. The recipe
+below applies unchanged — both replicas mount the same `./tls/` files, so the
+single ownership step covers both.
 
 ### Self-signed CA recipe (LAN farms)
 
@@ -558,9 +566,12 @@ no crash) until they are switched; jobs are held by the drain.
    `http-updates.conf` drop-in on Linux nodes) — TLS makes it unnecessary.
    Publish an agent update once to confirm the download path works over TLS.
 
-**Rollback**: remove BOTH `ENCODE_TLS_*` vars from `.env`, recreate the
-controller (plain HTTP returns), and point nodes' `controller_url` back to
-`http://`. The CA env can stay on nodes — it is inert for plain HTTP.
+**Rollback**: remove BOTH `ENCODE_TLS_*` vars AND the healthcheck override
+(`ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS`) from `.env`, recreate
+the controller (plain HTTP returns), and point nodes' `controller_url` back to
+`http://`. A leftover `https://` healthcheck probe against a plain-HTTP
+controller fails (wget exit 4) and the container stays permanently unhealthy.
+The CA env can stay on nodes — it is inert for plain HTTP.
 
 **Publicly trusted certs**: skip the CA recipe — use a cert from your normal
 issuer (or Let's Encrypt via the Traefik HA path). Agents need no

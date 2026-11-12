@@ -38,7 +38,7 @@
 #                    (native controller TLS). Appended to the system trust pool
 #                    for every controller request; passed to the service via a
 #                    systemd drop-in. Not needed for http:// controllers.
-#                    The path must not contain $, quotes, backticks,
+#                    The path must not contain $, %, quotes, backticks,
 #                    backslashes or newlines (systemd drop-in limitation —
 #                    the installer rejects them). Spaces are fine.
 set -euo pipefail
@@ -289,15 +289,16 @@ fi
 # on a broken path, so catch it here with a clear installer error instead.
 if [ -n "${ENCODE_AGENT_CA_CERT:-}" ]; then
     # The path is interpolated into a systemd Environment= drop-in below.
-    # systemd expands $VAR/${VAR} and processes backslash escapes inside the
-    # quoted value, and a literal quote or newline breaks the assignment —
-    # a mangled drop-in silently points the agent at the wrong (or no) file.
-    # Reject those characters at install time instead; a plain path like
-    # /etc/encode-agent/encode-ca.crt is the supported form (spaces are OK,
-    # systemd quotes the assignment).
+    # systemd expands $VAR/${VAR}, performs %-specifier expansion (%h, %t,
+    # ... — a literal % in a path like /path/100%20ca/ca.crt gets mangled),
+    # and processes backslash escapes inside the quoted value; a literal
+    # quote or newline breaks the assignment — a mangled drop-in silently
+    # points the agent at the wrong (or no) file. Reject those characters at
+    # install time instead; a plain path like /etc/encode-agent/encode-ca.crt
+    # is the supported form (spaces are OK, systemd quotes the assignment).
     case "$ENCODE_AGENT_CA_CERT" in
-        *'$'*|*'"'*|*"'"*|*'`'*|*'\'*|*$'\n'*)
-            die "ENCODE_AGENT_CA_CERT path must not contain \$, quotes, backticks, backslashes or newlines (cannot be carried in a systemd drop-in): $ENCODE_AGENT_CA_CERT — copy the CA to a plain path, e.g. /etc/encode-agent/encode-ca.crt"
+        *'$'*|*'%'*|*'"'*|*"'"*|*'`'*|*'\'*|*$'\n'*)
+            die "ENCODE_AGENT_CA_CERT path must not contain \$, %, quotes, backticks, backslashes or newlines (cannot be carried in a systemd drop-in): $ENCODE_AGENT_CA_CERT — copy the CA to a plain path, e.g. /etc/encode-agent/encode-ca.crt"
             ;;
     esac
     [ -r "$ENCODE_AGENT_CA_CERT" ] || die "ENCODE_AGENT_CA_CERT is not readable: $ENCODE_AGENT_CA_CERT"

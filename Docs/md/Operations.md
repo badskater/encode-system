@@ -782,6 +782,13 @@ covers verification, rotation and failure diagnosis. With TLS enabled,
 `ENCODE_AGENT_ALLOW_HTTP_UPDATES` is unnecessary (the opt-in only gates
 plain-HTTP downloads); remove it after cutover.
 
+Cipher suites: the controller leaves `CipherSuites` unset, so Go's defaults
+apply — PFS-preferred (ECDHE AES-GCM / ChaCha20-Poly1305; TLS 1.3 suites
+always provide PFS). The ECDHE-RSA CBC suite is still accepted on TLS 1.2 for
+older-client compatibility, but static RSA key exchange (plain CBC-RSA /
+GCM-RSA) is disabled by default since Go 1.22. There is no operator knob for
+this.
+
 ### Verify
 
 ```bash
@@ -828,6 +835,8 @@ proves the download path trusts the cert too.
 | Controller exits: `load TLS keypair …` | Missing/unreadable/mismatched cert or key files | Check the compose mounts exist and container paths match the env values; cert and key must be a matching PEM pair. |
 | Controller exits: `load TLS keypair … permission denied` | Host-side ownership: bind mounts keep host ownership, and the container runs as `encode` (uid 100, gid 101) — a root-owned 0600 key is unreadable inside | On the host: `ls -n /opt/encode-system/tls/` — `controller.key` must show owner `100` and mode `-rw-------`. Fix: `chown 100:101 /opt/encode-system/tls/controller.crt /opt/encode-system/tls/controller.key && chmod 600 /opt/encode-system/tls/controller.key`, then `docker compose -f docker-compose.runtime.yml restart controller`. |
 | Container `unhealthy` after enabling TLS | Healthcheck still probes plain HTTP | Set `ENCODE_HEALTHCHECK_URL=https://localhost:8080/api/health` (+ `ENCODE_HEALTHCHECK_FLAGS=--no-check-certificate` for self-signed) in `.env`, recreate. |
+| Controller boot log: `TLS certificate is EXPIRED …` / `NOT YET VALID …` (warning — it still starts) | Loaded cert is outside its validity window; every agent handshake will fail | Replace the cert (rotation above) and restart. Warning-only by design so a mid-rotation boot still comes up. |
+| Agent log: `trust anchor is a leaf certificate …` | `ENCODE_AGENT_CA_CERT` points at the server (leaf) cert instead of the CA — works today, breaks at the next rotation | Point it at `ca.crt` and restart the agent. |
 | Agent log: `x509: certificate signed by unknown authority` | `ENCODE_AGENT_CA_CERT` unset, wrong file, or not the CA that signed the controller cert | Point it at the correct `ca.crt` (PEM); restart the agent. Machine env on Windows needs an agent restart to take effect. |
 | Agent log: `x509: certificate is valid for X, not Y` | SAN mismatch — cert lacks the IP/hostname in `controller_url` | Re-sign with the right `subjectAltName` (IP SAN for IP URLs); replace controller cert, restart controller. |
 | Agent refuses to start: `ENCODE_AGENT_CA_CERT: cannot read …` / `contains no valid PEM certificates` | Broken path or non-PEM file — fail-fast by design | Fix the path/file; on Linux check the `ca-cert.conf` drop-in, on Windows the machine env var. |
@@ -838,9 +847,12 @@ proves the download path trusts the cert too.
 
 Controller first (drain or idle window → TLS env + mounts + healthcheck →
 recreate → verify with `curl --cacert`), then node-by-node (CA file + env +
-`https://` URL + restart). Rollback = remove both `ENCODE_TLS_*` vars,
-recreate, point nodes back to `http://` (the CA env is inert on plain HTTP).
-Full step-by-step: `Docs/md/Deployment.md` §Switching an existing farm.
+`https://` URL + restart). Rollback = remove both `ENCODE_TLS_*` vars AND the
+healthcheck override (`ENCODE_HEALTHCHECK_URL`/`ENCODE_HEALTHCHECK_FLAGS` — a
+leftover https probe against plain HTTP exits 4 and stays permanently
+unhealthy), recreate, point nodes back to `http://` (the CA env is inert on
+plain HTTP). Full step-by-step: `Docs/md/Deployment.md` §Switching an existing
+farm.
 
 ## Known failure modes
 

@@ -124,6 +124,25 @@ func Default4kCPUFlow() *model.Flow {
 	}
 }
 
+// DefaultSubsFlow is the SEPARATE post-encode extras pipeline (P6): it
+// extracts subtitles, fonts and chapters from the episode's source and
+// muxes them into the already-encoded output MKV. It runs as its OWN job
+// AFTER the encode flow completes (the operator queues it against the same
+// episode dir; nothing chains it into the encode defaults automatically).
+// Seeded name-guarded on fresh installs only, exactly like the encode
+// defaults — existing flows are never modified.
+func DefaultSubsFlow() *model.Flow {
+	return &model.Flow{
+		Name: "default-subs",
+		Steps: []model.Step{
+			{Type: model.StepType("subtitle_extract")},
+			{Type: model.StepType("font_extract")},
+			{Type: model.StepType("chapter_extract")},
+			{Type: model.StepType("mux_extras")},
+		},
+	}
+}
+
 // psQuote renders a PowerShell single-quoted string literal, escaping embedded
 // single quotes by doubling them. All rendered values pass through here, which
 // keeps generated scripts injection-safe for arbitrary series names.

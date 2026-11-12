@@ -486,3 +486,117 @@ describe('FlowBuilder quality_gate params', () => {
     expect((screen.getByLabelText('Compare every Nth frame (1 = all)') as HTMLInputElement).value).toBe('6');
   });
 });
+
+// P6 extras builtins: like quality_gate, these surface through the generic
+// ParamDef-driven rendering — no bespoke UI. The fixtures mirror the REAL
+// template params from backend/internal/flow/builtin_steps_subs.go: the
+// three extraction steps declare NO params; mux_extras declares the single
+// optional `output` param.
+describe('FlowBuilder extras builtins (P6)', () => {
+  function extrasTemplates(): StepTemplate[] {
+    const mk = (key: string, label: string, params: StepTemplate['params'] = []): StepTemplate => ({
+      id: 0,
+      key,
+      label,
+      description: `${label} step`,
+      params,
+      powershell: '',
+      builtin: true,
+      created_at: '',
+      updated_at: '',
+    });
+    return [
+      mk('subtitle_extract', 'Subtitle extract'),
+      mk('font_extract', 'Font extract'),
+      mk('chapter_extract', 'Chapter extract'),
+      mk('mux_extras', 'Mux extras (subs/fonts/chapters)', [
+        {
+          key: 'output',
+          label: 'Encoded output filename (blank: auto-discover)',
+          placeholder: 'Series - 01 [1080p].mkv',
+        },
+      ]),
+    ];
+  }
+
+  it('shows all four extras builtins in the palette; extraction steps carry no params', () => {
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={vi.fn()} onCancel={() => {}} />,
+    );
+    fireEvent.click(screen.getByText('Subtitle extract'));
+    fireEvent.click(screen.getByText('Font extract'));
+    fireEvent.click(screen.getByText('Chapter extract'));
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+
+    // Only mux_extras renders a param input (the extraction steps have none).
+    expect(screen.getByLabelText('Encoded output filename (blank: auto-discover)')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Source name')).not.toBeInTheDocument();
+    const output = screen.getByLabelText('Encoded output filename (blank: auto-discover)') as HTMLInputElement;
+    expect(output.value).toBe('');
+    expect(output.placeholder).toBe('Series - 01 [1080p].mkv');
+  });
+
+  it('round-trips a default-subs flow with an explicit mux_extras output through onSave', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={onSave} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'my-subs-flow' },
+    });
+    fireEvent.click(screen.getByText('Subtitle extract'));
+    fireEvent.click(screen.getByText('Font extract'));
+    fireEvent.click(screen.getByText('Chapter extract'));
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+    fireEvent.change(screen.getByLabelText('Encoded output filename (blank: auto-discover)'), {
+      target: { value: 'Custom Encode.mkv' },
+    });
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [name, steps] = onSave.mock.calls[0];
+    expect(name).toBe('my-subs-flow');
+    expect(steps).toEqual([
+      { type: 'subtitle_extract', params: {} },
+      { type: 'font_extract', params: {} },
+      { type: 'chapter_extract', params: {} },
+      { type: 'mux_extras', params: { output: 'Custom Encode.mkv' } },
+    ]);
+  });
+
+  it('strips a blank mux_extras output so the script auto-discovers the encoded MKV', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <FlowBuilder initial={null} templates={extrasTemplates()} onSave={onSave} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('flow name (e.g. 1080p-opus)'), {
+      target: { value: 'auto-discover' },
+    });
+    fireEvent.click(screen.getByText('Mux extras (subs/fonts/chapters)'));
+
+    fireEvent.click(screen.getByText('Create flow'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, steps] = onSave.mock.calls[0];
+    expect(steps).toEqual([{ type: 'mux_extras', params: {} }]);
+  });
+
+  it('renders a stored mux_extras output param when editing an existing flow', () => {
+    const flow: Flow = {
+      id: 1,
+      name: 'existing-subs',
+      steps: [
+        { type: 'subtitle_extract' },
+        { type: 'mux_extras', params: { output: 'Series - 01 [1080p].mkv' } },
+      ],
+      is_default: false,
+      created_at: '',
+      updated_at: '',
+    };
+    render(
+      <FlowBuilder initial={flow} templates={extrasTemplates()} onSave={vi.fn()} onCancel={() => {}} />,
+    );
+    expect(
+      (screen.getByLabelText('Encoded output filename (blank: auto-discover)') as HTMLInputElement).value,
+    ).toBe('Series - 01 [1080p].mkv');
+  });
+});

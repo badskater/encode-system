@@ -151,21 +151,25 @@ var refusedTemplates = map[string]string{
 // Refused templates (dgindex, keyframes) are excluded — they error before
 // producing a body.
 var builtinLinuxToolMap = map[string]string{
-	"source_rename":  "mv",        // bash mv replaces Rename-Item
-	"media_probe":    "mediainfo", // MediaInfo CLI (lowercase binary name on Linux)
-	"hdr_probe":      "mediainfo", // MediaInfo CLI
-	"audio":          "opusenc",   // opusenc is the encoder (ffmpeg decode-only)
-	"audio_branch":   "opusenc",   // opusenc + mediainfo + ffmpeg decode
-	"audio_lang":     "opusenc",   // opusenc + mediainfo + ffmpeg decode
-	"flac_audio":     "flac",      // flac encoder (ffmpeg decode-only)
-	"encode":         "x265",      // x265 encoder (vspipe pipes in)
-	"encode_4k":      "x265",      // x265 encoder (vspipe pipes in)
-	"mux":            "mkvmerge",  // mkvmerge (same binary on Linux)
-	"verify_output":  "mkvmerge",  // mkvmerge -J (same binary)
-	"quality_gate":   "ffmpeg",    // ffmpeg libvmaf/ssim comparison (same binary)
-	"crc32_rename":   "cksum",     // POSIX cksum (CRC32) or python fallback
-	"release_copy":   "cp",        // bash cp replaces Copy-Item
-	"discord_notify": "curl",      // curl replaces WebClient
+	"source_rename":    "mv",         // bash mv replaces Rename-Item
+	"media_probe":      "mediainfo",  // MediaInfo CLI (lowercase binary name on Linux)
+	"hdr_probe":        "mediainfo",  // MediaInfo CLI
+	"audio":            "opusenc",    // opusenc is the encoder (ffmpeg decode-only)
+	"audio_branch":     "opusenc",    // opusenc + mediainfo + ffmpeg decode
+	"audio_lang":       "opusenc",    // opusenc + mediainfo + ffmpeg decode
+	"flac_audio":       "flac",       // flac encoder (ffmpeg decode-only)
+	"encode":           "x265",       // x265 encoder (vspipe pipes in)
+	"encode_4k":        "x265",       // x265 encoder (vspipe pipes in)
+	"mux":              "mkvmerge",   // mkvmerge (same binary on Linux)
+	"verify_output":    "mkvmerge",   // mkvmerge -J (same binary)
+	"quality_gate":     "ffmpeg",     // ffmpeg libvmaf/ssim comparison (same binary)
+	"subtitle_extract": "mkvextract", // mkvmerge -J identify + mkvextract tracks
+	"font_extract":     "mkvextract", // mkvmerge -J identify + mkvextract attachments
+	"chapter_extract":  "mkvextract", // mkvmerge -J identify + mkvextract chapters
+	"mux_extras":       "mkvmerge",   // mkvmerge merges extras into the encoded MKV
+	"crc32_rename":     "cksum",      // POSIX cksum (CRC32) or python fallback
+	"release_copy":     "cp",         // bash cp replaces Copy-Item
+	"discord_notify":   "curl",       // curl replaces WebClient
 }
 
 // TestBuiltinBashAllTemplatesResolveOrRefuse: every built-in template must

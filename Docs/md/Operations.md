@@ -81,6 +81,7 @@
 | Alert on node online/offline | UI → Settings → **Node status alerts** toggle (`settings.notify_node_status`, default off). Fires alerts on real online↔offline transitions (30s loop, leader-gated on HA) to every configured channel. Requires at least one notification channel (Discord webhook, generic webhook, ntfy topic or SMTP email). |
 | Verify muxed output integrity | Default flows include `verify_output` after mux (tracks + duration); add it to custom flows from the step list. |
 | Gate encode quality | Default flows include `quality_gate` after `verify_output` (sampled VMAF vs source, SSIM fallback); see the quality gate section below for tuning. |
+| Add subs/fonts/chapters to a finished encode | Queue the `default-subs` flow as a separate job on the same episode dir after the encode flow; see the subtitles/fonts/chapters section below. |
 | Track a series' completion | UI → Series → Progress column (done/total bar, failed/active counts). |
 
 ## Quality gate (VMAF/SSIM)
@@ -150,6 +151,69 @@ looks like the source.
   structural-loss floor, not a perceptual target — prefer VMAF when the
   node's ffmpeg has libvmaf. The gate runs before `release_copy`, so a
   rejected encode never reaches the release folder.
+
+## Subtitles, fonts & chapters (default-subs)
+
+`default-subs` is a SEPARATE post-encode flow (P6). It extracts subtitle
+tracks, font attachments and chapters from the episode's source and muxes
+them into the already-encoded output MKV. It is seeded on fresh installs
+only (name-guarded, like every factory flow — existing installs get the
+four builtins in the step palette but no flow changes) and it never
+becomes the default flow.
+
+- **How to run it**: after the encode flow finishes for an episode, create
+  a NEW job on the SAME series/episode dir with flow `default-subs`
+  (UI → Jobs → new job, or `POST /api/jobs` with the flow id). Nothing
+  chains it into the encode defaults automatically — the encode flow's
+  output is left untouched until you queue this. The source media
+  (`src.*`) must still be present in the episode dir.
+- **Steps** (in order): `subtitle_extract` → `font_extract` →
+  `chapter_extract` → `mux_extras`. Each is also usable standalone in
+  custom flows.
+- **Tool requirements**: MKVToolNix on the node — Windows:
+  `mkvmerge.exe` + `mkvextract.exe` in the bin dir (`C:\bin`); Linux:
+  `mkvmerge`/`mkvextract` on PATH (package `mkvtoolnix`) plus `jq` for the
+  bash ports. Missing tools fail the step with an error naming the tool
+  and the package.
+- **What gets extracted**: ALL subtitle tracks (every language/signs
+  track — fansub releases keep them all), written as
+  `subs_<trackid>_<lang>.<ext>` (extension from the codec: SRT/ASS/SSA/
+  WebVTT/PGS `.sup`/VobSub `.sub`+`.idx`; unknown codecs extract raw as
+  `.sub`). Font attachments are detected by MIME type
+  (`application/x-truetype-font`, `application/vnd.ms-opentype`, `font/*`,
+  …) or by `.ttf`/`.otf`/`.woff`/`.ttc` extension, written under `fonts/`.
+  Chapters are extracted as Matroska XML (`chapters.xml`). Track
+  language, name and default/forced flags are preserved in `subs.json`
+  and re-applied when muxing.
+- **Graceful skips**: a source with no subtitle tracks / no font
+  attachments / no chapters is NOT a failure — the step logs the skip and
+  succeeds. Manifests (`subs.json`, `fonts.json`) are always rewritten
+  (empty when nothing was found) so re-runs reflect the current source.
+  When NOTHING was extracted, `mux_extras` succeeds without touching the
+  output (no mkvmerge invocation — the log says "output unchanged").
+- **Output discovery**: `mux_extras` finds the encoded MKV in the episode
+  dir: the optional `output` param (explicit filename) first, else the
+  standard release-named MKV (`<Series> - <Ep> [<Tag>].mkv` — exactly what
+  `mux` writes and `release_copy` reads), else the newest non-source MKV
+  (covers outputs renamed by `crc32_rename`). Every candidate is checked
+  against the source by FILE IDENTITY (symlink/hardlink aware) — the
+  source is never modified; an `output` param pointing at the source is a
+  loud error. No encoded output found → loud tool error (run the encode
+  flow first).
+- **Atomic replace + idempotency**: mkvmerge writes
+  `.mux_extras.tmp.mkv` in the episode dir, the result is verified
+  non-empty, then renamed over the encoded output — a failed mux never
+  corrupts it. The encoded input is read with
+  `--no-subtitles --no-chapters --no-attachments`, so re-running the flow
+  REPLACES the extras instead of duplicating them.
+- **Release copy**: `default-subs` modifies the episode-dir MKV only. The
+  release folder copy made by the encode flow is NOT refreshed
+  automatically — append a `release_copy` step to the flow (or copy
+  manually) if the release should carry the extras too.
+- **Failure classes**: missing tools / missing source / mkvmerge or
+  mkvextract crash / missing extracted files / missing encoded output are
+  tool errors with distinct messages; "nothing to extract" is always a
+  success.
 
 ## Notification channels
 

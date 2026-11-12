@@ -205,17 +205,21 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
   (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
   render error; `Write-Output` is the one translated cmdlet (→ `echo`).
-- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 15
-  of 17 built-in templates carry bash-native sources
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 19
+  of 21 built-in templates carry bash-native sources
   (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
   `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
-  `encode_4k`, `mux`, `verify_output`, `quality_gate`, `crc32_rename`,
+  `encode_4k`, `mux`, `verify_output`, `quality_gate`, `subtitle_extract`,
+  `font_extract`, `chapter_extract`, `mux_extras`, `crc32_rename`,
   `release_copy`, `discord_notify`. Tool mappings: `vspipe -c y4m | x265`
   (video, args mirrored verbatim from the PS template — ffmpeg never
   video-encodes), `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac`
   (audio), `ffmpeg` libvmaf/ssim comparison (`quality_gate` — measurement,
   not encoding), `mkvmerge`/`mediainfo`/`jq` verify (`bc` required —
-  `verify_output` and `quality_gate` fail-fast if absent), `cksum` CRC32,
+  `verify_output` and `quality_gate` fail-fast if absent),
+  `mkvmerge -J` + `mkvextract` tracks/attachments/chapters (the P6
+  extraction steps; `jq` required) and `mkvmerge` extras muxing
+  (`mux_extras`), `cksum` CRC32,
   `sha256sum` hashing, `curl` notify.
   2 templates are refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
   Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
@@ -224,7 +228,8 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
-  `verify_output`, `quality_gate`, `crc32_rename`, `release_copy`,
+  `verify_output`, `quality_gate`, `subtitle_extract`, `font_extract`,
+  `chapter_extract`, `mux_extras`, `crc32_rename`, `release_copy`,
   `keyframes`, `discord_notify`.
 - **Discord notification step**: `discord_notify` posts an episode-progress
   message to a Discord webhook when the flow reaches it (e.g. after mux or
@@ -495,6 +500,32 @@ controller re-caps `log_full` at 1 MiB defensively.
   — metrics_json is float-only). Score < threshold fails the step; tool
   errors (ffmpeg missing/crash, unparseable score, missing inputs) fail
   with distinct messages. Tuning: Docs/md/Operations.md § Quality gate.
+- **`default-subs` flow (P6)** — a SEPARATE post-encode pipeline seeded
+  name-guarded on fresh installs (existing flows are never modified; it
+  never becomes the default flag). Steps: `subtitle_extract` →
+  `font_extract` → `chapter_extract` → `mux_extras`. The operator queues
+  it as its OWN job against the same episode dir AFTER the encode flow
+  finishes — nothing chains it into the encode defaults automatically.
+  The extraction steps read the source (`Find-SourceFile`) with
+  `mkvmerge -J` + `mkvextract` and write episode-dir artifacts:
+  `subs_<id>_<lang>.<ext>` + `subs.json` (language/name/default/forced
+  flags per track), `fonts/<id>_<name>` + `fonts.json` (font MIME types
+  or .ttf/.otf/.woff/.ttc attachments), `chapters.xml` (Matroska XML).
+  Nothing found is a graceful skip (success, logged); manifests are
+  always rewritten so re-runs reflect the current source. `mux_extras`
+  locates the encoded output (optional `output` param → the standard
+  release-named MKV → newest non-source MKV, every candidate checked
+  against the source by FILE IDENTITY — Test-SameFile / `-ef`), merges
+  the extras with `mkvmerge` (encoded input first with
+  `--no-subtitles --no-chapters --no-attachments` so re-runs replace
+  instead of duplicating; per-sub language/name/flag options; global
+  `--chapters`/`--attach-file`), and atomically replaces the output
+  (`.mux_extras.tmp.mkv` temp + rename). No extras at all → success
+  without touching the output; missing encoded output → loud tool error.
+  Requires MKVToolNix on the node (Windows: `mkvmerge.exe`/`mkvextract.exe`
+  in BinDir; Linux: PATH). The release copy is NOT refreshed automatically
+  — re-run `release_copy` (add it to the flow) or copy manually.
+  Runbook: Docs/md/Operations.md § Subtitles, fonts & chapters.
 
 ## Queue control, storage & admin features (2026-09 feature set)
 

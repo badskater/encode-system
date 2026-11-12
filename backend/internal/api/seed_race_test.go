@@ -60,13 +60,13 @@ func TestSeedDefaultFlowConcurrentBoot(t *testing.T) {
 		for _, f := range flows {
 			counts[f.Name]++
 		}
-		for _, name := range []string{"default-1080", "default-4k", "default-4k-cpu"} {
+		for _, name := range []string{"default-1080", "default-4k", "default-4k-cpu", "default-subs"} {
 			if counts[name] != 1 {
 				t.Errorf("iter %d: flow %q seeded %d times, want exactly 1", iter, name, counts[name])
 			}
 		}
-		if len(flows) != 3 {
-			t.Errorf("iter %d: %d flows after concurrent seed, want 3", iter, len(flows))
+		if len(flows) != 4 {
+			t.Errorf("iter %d: %d flows after concurrent seed, want 4", iter, len(flows))
 		}
 		st.Close()
 	}

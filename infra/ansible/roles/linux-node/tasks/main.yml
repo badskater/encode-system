@@ -31,6 +31,37 @@
     state: present
   when: ansible_os_family | default("Debian") == "RedHat"
 
+# ------------------------------------------------- VapourSynth scxvid plugin
+# The keyframes builtin (scene-change detection, P7) runs on Linux through
+# the vapoursynth-scxvid VapourSynth plugin: the rendered .vpy imports
+# scxvid and vspipe writes the xvid first-pass log — the same artifact
+# format the Windows SCXvid step produces. The pip wheel bundles xvidcore
+# and installs the plugin under site-packages/vapoursynth/plugins/, where
+# VapourSynth (R55+) auto-loads it; no system xvid library is needed.
+# Requires the node's VapourSynth Python >= 3.12 (wheel Requires-Python).
+- name: Install pip for the VapourSynth scxvid plugin (apt)
+  ansible.builtin.apt:
+    name: python3-pip
+    state: present
+  when: ansible_os_family | default("Debian") == "Debian"
+
+- name: Install pip for the VapourSynth scxvid plugin (dnf)
+  ansible.builtin.dnf:
+    name: python3-pip
+    state: present
+  when: ansible_os_family | default("RedHat") == "RedHat"
+
+# break_system_packages: PEP 668 distros (Debian 12+) mark the system
+# Python externally-managed. The plugin MUST land in the same Python
+# vspipe uses (a venv's site-packages is not auto-loaded), so system-wide
+# pip install is the intended path on these dedicated encode nodes.
+- name: Install VapourSynth scxvid plugin (keyframes step)
+  ansible.builtin.pip:
+    name: vapoursynth-scxvid
+    state: present
+    executable: pip3
+    break_system_packages: true
+
 # --------------------------------------------------- agent user + directories
 - name: Create agent service user
   ansible.builtin.user:

@@ -75,6 +75,7 @@ var builtinBashSources = map[string]string{
 	"mux_extras":       bashSourceMuxExtras,
 	"crc32_rename":     bashSourceCrc32Rename,
 	"release_copy":     bashSourceReleaseCopy,
+	"keyframes":        bashSourceKeyframes,
 	"discord_notify":   bashSourceDiscordNotify,
 }
 
@@ -82,8 +83,7 @@ var builtinBashSources = map[string]string{
 // equivalent. Each value is the human-readable reason included in the render
 // error so an operator reading the job log understands the platform mismatch.
 var builtinBashRefused = map[string]string{
-	"dgindex":   "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
-	"keyframes": "scene-change keyframe detection: the PS template uses SCXvid.exe (Windows .NET); a faithful Linux equivalent requires scxvid-standalone or a VapourSynth SCXvid plugin, neither of which is wired into this change. The previous bash body was a fake (every-240th-frame, NOT scene-change detection) — shipping a fake is worse than refusing. Add a real Linux SCXvid path before re-enabling.",
+	"dgindex": "DGIndexNV requires an Nvidia GPU and is Windows-only; Linux nodes use VapourSynth source filters (no .dgi index needed). Use the default-4k-cpu flow which omits the dgindex step.",
 }
 
 // findSourceFileBash mirrors the EncodeLib Find-SourceFile helper: locate the
@@ -980,12 +980,122 @@ const bashSourceReleaseCopy = `release_copy () {
     echo 'ENCODE_STEP release_copy 100'
 }`
 
-// bashSourceKeyframes was REMOVED (GAP 2): the inline Python emitted every
-// 240th frame, NOT scene-change detection — a fake. The PS template uses
-// SCXvid.exe (Windows .NET) for real scene-change detection. Rather than
-// ship a fake, `keyframes` is now refused in builtinBashRefused with a clear
-// error. A faithful Linux SCXvid path (scxvid-standalone / VapourSynth
-// plugin) can re-enable it in a future change.
+// bashSourceKeyframes: real scene-change detection on Linux via the
+// vapoursynth-scxvid plugin (pip install vapoursynth-scxvid), replacing the
+// old fake every-240th-frame body that was refused in GAP 2.
+//
+// PARITY CONTRACT (verified against the Windows template + upstream sources):
+//   - Windows feeds SCXvid.exe the RELEASE MKV downscaled to 640x360 yuv420p
+//     (ffmpeg scale=640:360 -pix_fmt yuv420p). The .vpy mirrors that input:
+//     same release MKV, resize.Bicubic to 640x360, format YUV420P8 (scxvid
+//     requires constant-format YUV420P8; Bicubic matches ffmpeg's default
+//     scaler family).
+//   - SCXvid.exe (the soyokaze/SCXvid-standalone port of the Avisynth
+//     plugin) writes an XviD FIRST-PASS STATS LOG as its output file — that
+//     log IS the "<Series> - <Episode> Keyframes.txt" artifact (Aegisub
+//     opens it directly). vapoursynth-scxvid uses the same xvidcore
+//     xvid_plugin_2pass1 with identical encoder settings, so its `log`
+//     output is the same artifact format — no conversion/parser needed.
+//   - use_slices=True mirrors SCXvid-standalone, which sets
+//     num_slices = num_threads (threaded WITH slices); the encoder flag
+//     sets (vop/motion/quant/max_key_interval) are identical upstream.
+//   - The log is written to a unique temp file NEXT TO the final artifact
+//     and renamed on success: a failed run never leaves a partial
+//     Keyframes.txt that the freshness skip would treat as valid on retry
+//     (an improvement over the Windows direct-write, same success output).
+//   - Source loading: L-SMASH Works (lsmas.LWLibavSource) with an FFMS2
+//     fallback — the same CPU source-filter family the Linux encode path
+//     documents for .vpy scripts. Paths reach the .vpy through env vars
+//     (ENCODE_KF_SOURCE/ENCODE_KF_LOG), so the heredoc stays fully quoted
+//     and no path ever needs Python-literal escaping.
+//   - vspipe runs the WHOLE clip to a null sink (scxvid seeking is slow —
+//     it processes from frame 0; the log is only complete after the last
+//     frame). Markers, skip/stale logic and error texts mirror the PS body.
+const bashSourceKeyframes = `keyframes () {
+    echo 'ENCODE_STEP keyframes 0'
+    local vspipe
+    vspipe=$(command -v vspipe 2>/dev/null || true)
+    [[ -z "$vspipe" ]] && vspipe="$BinDir/vspipe"
+    if ! [[ -x "$vspipe" ]]; then
+        echo "VapourSynth (vspipe) not found - install VapourSynth and the scxvid plugin: pip install vapoursynth-scxvid"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    local dest_dir="$ReleaseDir/$ReleaseFolder"
+    local mkv="$dest_dir/$OutputName"
+    local kf="$dest_dir/$Series - $Episode Keyframes.txt"
+    if ! [[ -e "$mkv" ]]; then
+        echo "release MKV not found: $mkv"; echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    if [[ -e "$kf" ]] && [[ "$kf" -nt "$mkv" ]]; then
+        echo 'keyframes file exists and is newer than the MKV, skipping'
+        echo 'ENCODE_STEP keyframes 100'
+        return 0
+    fi
+    if [[ -e "$kf" ]]; then
+        echo 'keyframes file is stale (older than MKV), regenerating'
+        rm -f -- "$kf"
+    fi
+    echo '[keyframes] vspipe -> scxvid (xvid first-pass log)'
+    # Unique work dir (episode side) for the generated script + vspipe
+    # stderr; unique log temp NEXT TO the artifact so the final rename is
+    # atomic on the release filesystem.
+    local tmpd log
+    tmpd=$(mktemp -d "$EpisodeDir/.keyframes.XXXXXX")
+    log=$(mktemp "$dest_dir/.scxvid.XXXXXX")
+    export ENCODE_KF_SOURCE="$mkv"
+    export ENCODE_KF_LOG="$log"
+    cat > "$tmpd/script.vpy" <<'VPY'
+import os
+import vapoursynth as vs
+import scxvid
+
+core = vs.core
+source = os.environ["ENCODE_KF_SOURCE"]
+log = os.environ["ENCODE_KF_LOG"]
+
+# Release MKV in, same as the Windows path. L-SMASH Works first, FFMS2
+# fallback (the CPU source-filter family the Linux encode path uses).
+try:
+    clip = core.lsmas.LWLibavSource(source=source)
+except (AttributeError, vs.Error):
+    clip = core.ffms2.Source(source=source)
+
+# Windows contract: scale=640:360, yuv420p (8-bit 4:2:0). scxvid requires
+# constant-format YUV420P8; convert 10-bit sources here.
+clip = core.resize.Bicubic(clip, width=640, height=360, format=vs.YUV420P8)
+
+# use_slices=True mirrors SCXvid-standalone (num_slices = num_threads).
+# The log is the xvid first-pass stats file = the Keyframes.txt artifact.
+clip = scxvid.Scxvid(clip, log=log, use_slices=True)
+clip.set_output()
+VPY
+    # Whole clip to a null sink: scxvid must see every frame in order for
+    # the log to be complete. stderr (progress/errors) is echoed with a
+    # prefix, mirroring how the PS body echoes SCXvid output.
+    local rc=0
+    "$vspipe" -c y4m "$tmpd/script.vpy" - > /dev/null 2> "$tmpd/vspipe.log" || rc=$?
+    unset ENCODE_KF_SOURCE ENCODE_KF_LOG
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        if [[ "$line" =~ [^[:space:]] ]]; then
+            echo "[vspipe] $line"
+        fi
+    done < "$tmpd/vspipe.log"
+    rm -rf -- "$tmpd"
+    if (( rc != 0 )); then
+        rm -f -- "$log"
+        echo "vspipe exited with code $rc - scene-change detection failed (VapourSynth + scxvid plugin required: pip install vapoursynth-scxvid)"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    if ! [[ -s "$log" ]]; then
+        echo "scxvid finished but the keyframes log was not created"
+        rm -f -- "$log"
+        echo 'ENCODE_STEP_FAILED keyframes'; exit 1
+    fi
+    mv -f -- "$log" "$kf"
+    echo 'ENCODE_STEP keyframes 100'
+}`
 
 // bashSourceDiscordNotify: PS uses System.Net.WebClient to POST JSON to a
 // Discord webhook. bash uses curl -fsS with the same JSON payload shape

@@ -13,6 +13,41 @@ Mirror of the session task list. Move cards through columns as work lands.
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
 
+## Done (Linux keyframes via vapoursynth-scxvid, 2026-11-12)
+
+- `keyframes` builtin ported to Linux (P7, `internal/flow/builtin_steps_linux.go`):
+  real scene-change detection via the `vapoursynth-scxvid` pip plugin —
+  the GAP 2 refusal is lifted (`dgindex` remains the only refused
+  template). The bash body renders a `.vpy` that loads the RELEASE MKV
+  (lsmas `LWLibavSource`, ffms2 fallback), resizes to 640x360 YUV420P8
+  (the Windows `scale=640:360 -pix_fmt yuv420p` contract) and calls
+  `scxvid.Scxvid(clip, log=…, use_slices=True)`; `vspipe -c y4m` runs the
+  whole clip to a null sink. Paths flow through env vars
+  (`ENCODE_KF_SOURCE`/`ENCODE_KF_LOG`) so the heredoc stays quoted.
+- Parity decisions (verified against upstream sources): the Keyframes.txt
+  artifact IS an xvid first-pass stats log on both platforms —
+  SCXvid-standalone and vapoursynth-scxvid both use xvidcore
+  `xvid_plugin_2pass1` with identical encoder settings, so no
+  parser/conversion exists or is needed. `use_slices=True` mirrors
+  SCXvid-standalone's `num_slices = num_threads`. Linux publishes the log
+  via unique temp + atomic rename (a failed run never leaves a partial
+  file the freshness skip would trust); empty-log runs fail closed (`-s`).
+- Provisioning (`infra/ansible/roles/linux-node`): `python3-pip` (apt/dnf)
+  + `ansible.builtin.pip: vapoursynth-scxvid` (`break_system_packages` for
+  PEP 668 distros — the plugin must land in the Python vspipe uses).
+  Wheel bundles xvidcore; requires Python ≥ 3.12. Syntax-check green
+  (site.yml, linux-node.yml, provision.yml).
+- Tests: render contracts (`.vpy` content, vspipe shape, artifact/skip/
+  stale/error texts), stub-exec e2e with a contract-validating vspipe stub
+  writing a real-format xvid log fixture — cross-dialect BYTE parity
+  proven under real pwsh (Windows SCXvid.exe stub, same fixture), plus
+  missing-vspipe / missing-plugin / vspipe-failure / no-log / missing-MKV /
+  header-only-log edges. Refusal pins inverted
+  (`TestBashKeyframesPortedToLinux`, `TestBashKeyframesInBuiltinSources`);
+  generic marker/tool-map/no-PS-cmdlet parity suites stay green.
+- Docs: README, Architecture, Deployment, Operations (new Keyframes
+  section), REPO_CONVENTIONS updated — Linux gap closed for keyframes.
+
 ## Done (Usability batch, 2026-11)
 
 - `POST /api/scan` (admin, `handlers_scan.go`): manual scanner trigger —

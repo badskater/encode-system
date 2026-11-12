@@ -4,7 +4,7 @@
 
 - Queue-driven encode farm: detect new episode material on storage shares, run jobs on a fleet of nodes, monitor everything from one web UI.
 - Storage is pluggable: **NFS**, **SMB**, or **S3-compatible object storage** (MinIO, Ceph RGW, AWS). S3 needs no mounts anywhere — the controller lists the bucket and agents stage episodes per job.
-- Windows Server 2025 nodes with Nvidia GPUs; encode tooling unchanged (DGIndexNV, x265 fork, mkvmerge), audio migrated from FLAC/eac3to-only to Opus (eac3to → WAV → opusenc). Linux nodes (CPU, no GPU) run a VapourSynth-first path: `.vpy` source filter piped through `vspipe -c y4m` into the same x265 fork, audio decoded with ffmpeg (decode-only) → `opusenc`/`flac`. `dgindex` and `keyframes` are refused on Linux (DGIndexNV is Windows/Nvidia-only; no faithful SCXvid Linux port yet).
+- Windows Server 2025 nodes with Nvidia GPUs; encode tooling unchanged (DGIndexNV, x265 fork, mkvmerge), audio migrated from FLAC/eac3to-only to Opus (eac3to → WAV → opusenc). Linux nodes (CPU, no GPU) run a VapourSynth-first path: `.vpy` source filter piped through `vspipe -c y4m` into the same x265 fork, audio decoded with ffmpeg (decode-only) → `opusenc`/`flac`. `dgindex` is refused on Linux (DGIndexNV is Windows/Nvidia-only); `keyframes` is ported via the `vapoursynth-scxvid` plugin (same xvid first-pass log artifact as the Windows SCXvid step).
 - NFRs: single source of truth (controller DB), bounded concurrency per node, node reboot after 10 tasks, agent auto-update without touching each box, structured logs with job IDs, audit trail for admin mutations.
 
 ## System overview
@@ -221,9 +221,16 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   extraction steps; `jq` required) and `mkvmerge` extras muxing
   (`mux_extras`), `cksum` CRC32,
   `sha256sum` hashing, `curl` notify.
-  2 templates are refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
+  1 template is refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
   Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
-  index needed) and `keyframes` (no faithful SCXvid Linux equivalent yet).
+  index needed). `keyframes` is ported (P7): a generated `.vpy` loads the
+  release MKV (lsmas, ffms2 fallback), resizes to 640x360 YUV420P8 (the
+  Windows `scale=640:360 -pix_fmt yuv420p` contract) and runs
+  `scxvid.Scxvid(clip, log=…, use_slices=True)` via `vspipe` to a null
+  sink; the xvid first-pass log is published as the Keyframes.txt artifact
+  (same format the Windows SCXvid-standalone writes — `use_slices=True`
+  mirrors its `num_slices = num_threads`). Requires `pip install
+  vapoursynth-scxvid` (provisioned by the linux-node ansible role).
 
 - **Built-in templates** (seeded at boot, editable, not deletable):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
@@ -277,7 +284,7 @@ Functions:
 - `Invoke-VideoEncode` — `x265_x64.exe` with the flow's parameter set and the episode's `.avs`/`.vpy` as input.
 - `Invoke-Mux` — `mkvmerge` with the repo's standard track flags (jpn, default video, no chapters/global tags).
 - `Invoke-ReleaseCopy` — copy the finished MKV into the `ReleaseFolders/[group] Series - Raws [tag]/` pattern.
-- `Invoke-Keyframes` — `ffmpeg` writes a downscaled temp y4m, `SCXvid` reads it into the keyframes file; skipped if it already exists.
+- `Invoke-Keyframes` — `ffmpeg` writes a downscaled temp y4m (640x360, yuv420p), `SCXvid` reads it and writes the xvid first-pass log as `<Series> - NN Keyframes.txt`; skipped if the file already exists and is newer than the MKV. Linux parity: the bash port runs the same detection through `vapoursynth-scxvid` (`.vpy` + `vspipe`), publishing the identical log format.
 
 All steps write structured progress lines (`ENCODE_STEP <name> <pct>`) that the agent parses into heartbeat progress.
 

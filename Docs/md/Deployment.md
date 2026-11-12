@@ -9,7 +9,7 @@
   - `C:\bin` populated with encode tools (DGIndexNV, x265_x64, mkvmerge, ffmpeg, eac3to, opusenc, SCXvid) — Ansible copies from a staging dir, or publish a bin zip from the UI.
   - The shares mounted at `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` (nfs/smb only).
 - Linux nodes (CPU, no GPU required) with:
-  - Toolchain on `PATH`: `bash`, VapourSynth (`vspipe`), `x265`, `ffmpeg` (decode-only), `opusenc`, `flac`, `mkvmerge` (mkvtoolnix), `mediainfo`, `jq`, `bc`, coreutils (`cksum`/`sha256sum`), `curl`. `dgindex` and `keyframes` steps are refused on Linux (no GPU/DGIndexNV, no faithful SCXvid port) — use a flow that omits them (e.g. a VapourSynth-first `default-4k-cpu` flow).
+  - Toolchain on `PATH`: `bash`, VapourSynth (`vspipe`), `x265`, `ffmpeg` (decode-only), `opusenc`, `flac`, `mkvmerge` (mkvtoolnix), `mediainfo`, `jq`, `bc`, coreutils (`cksum`/`sha256sum`), `curl`. `dgindex` is refused on Linux (no GPU/DGIndexNV) — use a flow that omits it (e.g. a VapourSynth-first `default-4k-cpu` flow). `keyframes` works on Linux: it needs the `vapoursynth-scxvid` pip package (Python ≥ 3.12, the Python VapourSynth uses) plus a source filter (`lsmas` or `ffms2`) and the `resize` (zimg) plugin; the linux-node ansible role installs the pip package automatically.
   - `cifs-utils` + `nfs-common` (Debian) or `nfs-utils` (RHEL) for share mounts; S3 needs nothing.
   - systemd (recommended — the agent ships a `encode-agent.service` unit with `Restart=always`) or run the agent as a bare foreground loop.
 - Ansible control node with `pywinrm` (or SSH) reachability to the Windows hosts — or use the controller's built-in Web UI provisioning (no workstation needed).

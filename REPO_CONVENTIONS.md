@@ -36,7 +36,7 @@ Distributed anime encoding farm. Terminology used everywhere:
   profile 8.1 with `--dolby-vision-rpu` (needs dovi_tool.exe in C:\bin).
 - Mux: `mkvmerge` with the standard track language/default flags from the
   legacy batch script; audio language comes from `audio.json` when present.
-- Keyframes: `ffmpeg` → y4m pipe → `SCXvid` → `<Series> - NN Keyframes.txt`, only when the flow includes the keyframes step.
+- Keyframes: `ffmpeg` → y4m pipe → `SCXvid` → `<Series> - NN Keyframes.txt`, only when the flow includes the keyframes step. The artifact is an xvid first-pass stats log; on Linux the same file is produced by `vapoursynth-scxvid` via `vspipe` (log-format parity, no conversion).
 - Binaries live in `C:\bin` on nodes (moved from `E:\Encodes\bin`). Encode
   working dirs: `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` — both
   NFS shares mounted by the Windows NFS client. Series folders are created

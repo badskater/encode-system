@@ -249,6 +249,47 @@ becomes the default flow.
   tool errors with distinct messages; "nothing to extract" is always a
   success.
 
+## Keyframes (scene-change detection)
+
+The `keyframes` step writes `<Series> - <Episode> Keyframes.txt` into the
+release folder — an **xvid first-pass stats log** (header comments + one
+`type quant kblks mblks ublks length hlength` line per frame; `i` lines are
+the scene-change keyframes). Aegisub opens it directly via
+Video → Open Keyframes. Both dialects produce the same artifact format:
+
+- **Windows**: `ffmpeg` downscales the release MKV to a temp y4m
+  (`scale=640:360`, `yuv420p`), `SCXvid.exe` (SCXvid-standalone) reads it on
+  stdin and writes the log.
+- **Linux**: a generated `.vpy` loads the release MKV (lsmas
+  `LWLibavSource`, ffms2 fallback), resizes to 640x360 YUV420P8 and runs
+  `scxvid.Scxvid(clip, log=…, use_slices=True)`; `vspipe -c y4m` processes
+  the whole clip to a null sink so the log is complete. The plugin comes
+  from the `vapoursynth-scxvid` pip package (xvidcore bundled in the
+  wheel); the linux-node ansible role installs it. `use_slices=True`
+  mirrors SCXvid-standalone's `num_slices = num_threads`; the encoder
+  settings are identical upstream, so detection matches given the same
+  pixels (resampler differences between ffmpeg and zimg can cause minor
+  deltas at threshold boundaries).
+
+Operational notes:
+
+- **Requirements (Linux)**: VapourSynth (`vspipe`, Python ≥ 3.12),
+  `vapoursynth-scxvid` (`pip install vapoursynth-scxvid`), a source filter
+  (`lsmas` or `ffms2`) and the `resize` (zimg) plugin. Missing
+  vspipe/plugin fails the step with an actionable message naming the pip
+  package — it never falls back to fake detection.
+- **Skip/regenerate**: an existing Keyframes.txt newer than the release
+  MKV skips the step; an older one is regenerated. Linux writes the log to
+  a unique temp file next to the artifact and renames it on success, so a
+  failed run never leaves a partial file that the skip check would treat
+  as fresh on retry.
+- **Input is the RELEASE MKV**, not the raw source — run the step after
+  `release_copy` (as the default flows do). Without the release MKV the
+  step fails with `release MKV not found`.
+- **Runtime**: detection encodes every frame with xvid at 640x360 — expect
+  minutes per episode, not seconds. Seeking is not used (the plugin
+  processes from frame 0); the whole clip runs in one vspipe pass.
+
 ## Notification channels
 
 Discord stays the default transport (unchanged). Three additive channels ship

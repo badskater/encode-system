@@ -448,14 +448,16 @@ mounts. To enable:
 
 HA note: with Traefik terminating TLS at the edge, native TLS is usually
 left unset (Traefik→replica stays HTTP on the internal network). Set it only
-when the replicas themselves must serve HTTPS.
+when the replicas themselves must serve HTTPS. The recipe below applies
+unchanged — both replicas mount the same `./tls/` files, so the single
+ownership step covers both.
 
 ### Self-signed CA recipe (LAN farms)
 
-Run on the controller host (or any trusted machine), then copy the files as
-noted. Adjust the two variables to YOUR farm — the SANs must cover every
-name/IP agents will dial (an `https://<ip>:8080` URL needs the **IP SAN**;
-no DNS lookup happens):
+Run as root on the controller host (or any trusted machine — the ownership
+step needs root), then copy the files as noted. Adjust the two variables to
+YOUR farm — the SANs must cover every name/IP agents will dial (an
+`https://<ip>:8080` URL needs the **IP SAN**; no DNS lookup happens):
 
 ```bash
 CTRL_IP=172.24.92.232          # the address agents use in controller_url
@@ -477,11 +479,22 @@ openssl req -new -key controller.key -subj "/CN=encode-controller" \
 cat > san.cnf <<EOF
 subjectAltName = DNS:${CTRL_DNS}, IP:${CTRL_IP}
 extendedKeyUsage = serverAuth
+keyUsage = digitalSignature, keyEncipherment
 EOF
 openssl x509 -req -in controller.csr -CA ca.crt -CAkey ca.key \
   -CAcreateserial -days 825 -sha256 -extfile san.cnf -out controller.crt
 
+# 4. Permissions + ownership for the container. Both controller images run
+#    as `encode` = uid 100, gid 101 (docker/Dockerfile on Alpine,
+#    docker/Dockerfile.runtime on Debian; verify with
+#    `docker compose -f docker-compose.runtime.yml exec controller id`).
+#    Bind mounts keep HOST ownership: a root-owned 0600 key is unreadable
+#    inside the container and the controller exits at boot with
+#    "load TLS keypair … permission denied". Own the two mounted files as
+#    the container user. ca.key never enters the container — keep it
+#    root-owned and backed up offline.
 chmod 600 ca.key controller.key
+chown 100:101 controller.crt controller.key
 # Sanity: the SANs must list the IP/hostname agents will use.
 openssl x509 -in controller.crt -noout -text | grep -A1 "Subject Alternative Name"
 ```
@@ -489,7 +502,9 @@ openssl x509 -in controller.crt -noout -text | grep -A1 "Subject Alternative Nam
 Controller placement (compose deploy): `controller.crt`/`controller.key` go
 to `/opt/encode-system/tls/` (mounted per the wiring above); set the `.env`
 vars; recreate. Bare-binary deploy: point `ENCODE_TLS_CERT`/`ENCODE_TLS_KEY`
-at the files directly and restart the process.
+at the files directly and restart the process — the key must be readable by
+the user the process runs as (the recipe's `chown` covers the uid-100
+container case).
 
 Agent placement — copy **`ca.crt` only** (never `ca.key`) to each node:
 

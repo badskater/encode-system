@@ -244,6 +244,7 @@ func TestSettingsSecretsNotInAudit(t *testing.T) {
 
 	tok := "nt" + "fy-audit-tok"
 	pw := "sm" + "tp-audit-pw"
+	ingestPW := "qb" + "it-audit-pw"
 	m := settingsMap(t, ts.URL)
 	m["ntfy_topic_url"] = "https://ntfy.sh/audit"
 	m["ntfy_token"] = tok
@@ -251,6 +252,17 @@ func TestSettingsSecretsNotInAudit(t *testing.T) {
 	m["smtp_from"] = "a@example.com"
 	m["smtp_to"] = "b@example.com"
 	m["smtp_password"] = pw
+	// P11: the ingest block carries a write-only password too — its
+	// value must never reach the audit detail, and its change boolean
+	// must (the detail cap must not truncate the flags).
+	m["ingest"] = map[string]any{
+		"enabled":       true,
+		"provider":      "qbittorrent",
+		"url":           "http://127.0.0.1:8080",
+		"username":      "audit-" + "user",
+		"password":      ingestPW,
+		"download_root": "/mnt/downloads",
+	}
 	if resp, _ := doJSON(t, "PUT", ts.URL+"/api/settings", adminTok, m); resp.StatusCode != 200 {
 		t.Fatalf("put: %d", resp.StatusCode)
 	}
@@ -265,11 +277,14 @@ func TestSettingsSecretsNotInAudit(t *testing.T) {
 			continue
 		}
 		found = true
-		if strings.Contains(ev.Detail, tok) || strings.Contains(ev.Detail, pw) {
+		if strings.Contains(ev.Detail, tok) || strings.Contains(ev.Detail, pw) ||
+			strings.Contains(ev.Detail, ingestPW) || strings.Contains(ev.Detail, "audit-"+"user") ||
+			strings.Contains(ev.Detail, "127.0.0.1:8080") {
 			t.Fatalf("audit detail leaked a secret: %s", ev.Detail)
 		}
-		if !strings.Contains(ev.Detail, "ntfy_token_changed") || !strings.Contains(ev.Detail, "smtp_password_changed") {
-			t.Errorf("audit detail must record secret-change booleans: %s", ev.Detail)
+		if !strings.Contains(ev.Detail, "ntfy_token_changed") || !strings.Contains(ev.Detail, "smtp_password_changed") ||
+			!strings.Contains(ev.Detail, "ingest_password_changed") || !strings.Contains(ev.Detail, "ingest_enabled") {
+			t.Errorf("audit detail must record secret-change booleans (incl. ingest): %s", ev.Detail)
 		}
 	}
 	if !found {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/badskater/encode-system/backend/internal/auth"
 	"github.com/badskater/encode-system/backend/internal/flow"
+	"github.com/badskater/encode-system/backend/internal/ingest"
 	"github.com/badskater/encode-system/backend/internal/model"
 	"github.com/badskater/encode-system/backend/internal/notify"
 	"github.com/badskater/encode-system/backend/internal/offsite"
@@ -103,6 +104,12 @@ type Server struct {
 	// (offsite.BuildDestinations from live settings). Same seam pattern as
 	// Notifier/MailSender.
 	OffsiteDestinations func(st *model.Settings) ([]offsite.Destination, []offsite.Result)
+	// IngestClient, when non-nil, overrides download-client construction
+	// for the experimental ingestion loop (P11). Tests inject a fake to
+	// assert poll/stage/audit behavior without a real BitTorrent client;
+	// production leaves this nil (qBittorrent/ruTorrent from live
+	// settings). Same seam pattern as Notifier/MailSender.
+	IngestClient func(in model.IngestSettings) (ingest.Client, error)
 	// digest holds buffered job-outcome events when settings.NotifyDigest is
 	// ON. A ticker started by StartDigestLoop flushes it hourly, posting one
 	// summary instead of per-job alerts. Built in New (never nil — the buffer

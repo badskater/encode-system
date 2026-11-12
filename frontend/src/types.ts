@@ -159,21 +159,26 @@ export interface Settings {
   // Offsite backups (P4): S3 + SFTP destinations for DB snapshots. The
   // block's secrets are write-only (has_* flags on GET); see BackupOffsite.
   backup_offsite?: BackupOffsite;
+  // Experimental download ingestion (P11): stage completed torrents'
+  // source files into the scripts share. OFF by default; see Ingest.
+  ingest?: Ingest;
   updated_at?: string;
 }
 
 // SettingsSave is the PUT /api/settings payload: the settings blob plus the
 // write-only secrets (which never appear on GET). An empty/omitted secret
 // keeps the stored value (the shares pattern). The has_* output flags are
-// GET-only and must not be sent back. An OMITTED backup_offsite block keeps
-// the stored block wholesale; a present block replaces non-secret fields.
+// GET-only and must not be sent back. An OMITTED backup_offsite or ingest
+// block keeps the stored block wholesale; a present block replaces
+// non-secret fields.
 export type SettingsSave = Omit<
   Settings,
-  'has_ntfy_token' | 'has_smtp_password' | 'backup_offsite'
+  'has_ntfy_token' | 'has_smtp_password' | 'backup_offsite' | 'ingest'
 > & {
   ntfy_token?: string;
   smtp_password?: string;
   backup_offsite?: BackupOffsiteSave;
+  ingest?: IngestSave;
 };
 
 // ProvisionRun: one controller-driven Ansible provisioning attempt.
@@ -259,6 +264,32 @@ export interface BackupOffsiteSave {
   sftp?: OffsiteSFTPSave;
   keep_n?: number;
   include_shares_key?: boolean;
+}
+
+// Experimental download ingestion (P11). OFF by default. The controller
+// polls a BitTorrent client for completed downloads and stages their
+// source video files into the scripts share (<series>/<episode>/); filter
+// scripts (.avs/.vpy) stay hand-authored and the scanner queues jobs once
+// both are present. The password is WRITE-ONLY: GET returns has_password,
+// never the value; send it via SettingsSave.ingest (blank keeps stored).
+export interface Ingest {
+  enabled?: boolean;
+  provider?: 'qbittorrent' | 'rutorrent' | '';
+  url?: string; // client web base URL
+  username?: string; // optional (auth-bypassed clients need none)
+  category?: string; // optional category/label filter
+  // Category → series folder name overrides (JSON object). The episode
+  // number is still parsed from the release name — never guessed.
+  category_map?: Record<string, string>;
+  poll_interval_seconds?: number; // 0 = default 60; range 10-3600
+  // Controller-visible mount of the client's download directory (the
+  // directory that directly contains the completed torrent folders).
+  download_root?: string;
+  has_password?: boolean; // GET only
+}
+// Save shape: the write-only password in, has_password out.
+export interface IngestSave extends Omit<Ingest, 'has_password'> {
+  password?: string;
 }
 
 // ShareKind is the transport backing a share mount.

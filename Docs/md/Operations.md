@@ -918,6 +918,75 @@ curl -sI http://<controller>:8080/api/auth/oidc/login
 | User gets viewer instead of admin | Groups claim not emitted by the provider, wrong claim name (`ENCODE_OIDC_GROUPS_CLAIM`), group name mismatch (exact match), or `ENCODE_OIDC_ADMIN_GROUP` unset (no mapping → existing roles kept, new users viewer). Inspect the ID token's claims at the provider side. |
 | SSO user cannot log in locally | By design: provisioned accounts have no local password. Set one via user management if hybrid access is wanted. |
 
+## Download ingestion (experimental, off by default)
+
+P11 adds optional download ingestion: the controller polls a BitTorrent
+client for **completed** downloads and stages their source video files
+into the scripts share. It is **OFF by default** and **experimental** —
+qBittorrent (WebAPI v2) is the first-class provider; ruTorrent (httprpc
+plugin) is best-effort.
+
+### Workflow (sources only — scripts stay hand-authored)
+
+1. Ingestion copies the torrent's video files (`.mkv/.mp4/.ts/.m2ts`)
+   from the download share into `scripts_root/<Series>/Ep NN/`
+   (temp-file + rename per file; existing files are skipped).
+2. **An operator authors the `.avs`/`.vpy` filter script** in that episode
+   folder. Ingestion never writes scripts and never creates jobs.
+3. The scanner picks the episode up on its next cycle (source + script
+   present, source mtime stable ≥2 min) and queues the encode as usual.
+
+Release names are parsed conservatively (`Show.S01E01`, `01x01`,
+`[Group] Show - 01 [1080p]`, bare `Show 01`). Anything ambiguous —
+multi-season (`S02E01`), multi-episode packs (`S01E01E02`), years,
+resolutions, traversal — is **skipped and logged, never guessed**. A
+category→series map (Settings card, JSON object) overrides the parsed
+series name; the episode is still parsed from the name.
+
+### Operate
+
+- Enable/configure: Settings page → **Download ingestion (EXPERIMENTAL)**
+  card, or `PUT /api/settings` with the `ingest` block (`enabled`,
+  `provider`, `url`, `username`, `password` write-only, `category`,
+  `category_map`, `poll_interval_seconds` 0/10-3600, `download_root`).
+  Changes apply on the next poll — no restart. Blank password on save
+  keeps the stored one; the value is AES-GCM encrypted at rest and never
+  returned by the API (`has_password` flags presence).
+- Cadence: default 60 s. HA (Postgres): the loop runs under advisory lock
+  **1008** — only the leader replica polls; failover behaves like the
+  other singleton loops (see HA runbook).
+- Dedupe: the `ingest_ledger` table records `(provider, torrent_hash)` →
+  staged path. A torrent is staged exactly once; the ledger survives
+  restarts. To re-stage a torrent, delete its ledger row (and the staged
+  files) — there is no UI for this yet.
+- Observability: structured logs (`ingest staged`, per-torrent warnings),
+  audit event `ingest.staged` (actor `controller`), and an operational
+  alert through the configured notification channels (Discord/webhook/
+  ntfy/email) reminding the operator to author the filter script. With no
+  channel configured, logs + audit only.
+
+### Diagnosis
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `directory … not visible under download_root` | The client's download directory is not mounted into the controller at `download_root`, or the torrent saves into a per-category subfolder. Mount the directory that DIRECTLY contains the torrent folders (see Deployment.md). |
+| `release name unparseable; skipped` | The name carries no safe episode signal (or is multi-season/a pack). Rename the torrent or stage manually; the parser never guesses. |
+| `qbittorrent login: authentication failed` | Wrong credentials, or the WebUI user differs from the configured one. Password is write-only — re-type it on the Settings card. |
+| `qbittorrent … 403` repeating | Session expiry is retried once automatically; persistent 403 = IP ban (qBittorrent bans after repeated failed logins) or auth required with no username configured. |
+| `rutorrent rpc: HTTP 401/403` | Web-server auth in front of ruTorrent rejects the Basic credentials; digest-only auth is not supported (experimental limitation). |
+| Torrent completed but never staged | Check the category filter / map keys (ruTorrent matches the LABEL, `d.custom1`), and that the torrent is actually complete (`d.get_complete`, fallback `left_bytes=0`). |
+| Same torrent staged twice after a DB restore | The ledger restored from an older snapshot lost the row; staging skips existing files, so the re-stage is harmless. |
+
+### Safety notes
+
+- Torrent file names are untrusted: absolute paths, `..` traversal and
+  symlink escapes out of the torrent directory are refused; destinations
+  are flattened to base names inside the episode folder.
+- Every HTTP exchange is bounded (30 s client timeout + poll context);
+  one bad torrent or category never stops the batch or the loop.
+- Disabling ingestion (`enabled=false`) makes every tick a no-op; the
+  ledger and staged files are left untouched.
+
 ## Known failure modes
 
 - **Share mount dropped on a Windows node** (NFS/SMB): jobs fail at source read; remount via the Ansible play (`ansible-playbook site.yml --tags nfs-client`) or the provisioning "mount shares" option. On Linux: `mount -a` or `systemctl restart mnt-*.automount` (the CIFS/NFS mounts use `x-systemd.automount` so they auto-remount on first access; check the 0600 credential files at `/etc/encode-agent/cifs-*.cred` if a mount refuses).

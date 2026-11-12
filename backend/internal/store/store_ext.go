@@ -136,6 +136,9 @@ type settingsBlob struct {
 	OffsiteS3SecretKey    string `json:"offsite_s3_secret_key,omitempty"`
 	OffsiteSFTPPassword   string `json:"offsite_sftp_password,omitempty"`
 	OffsiteSFTPPrivateKey string `json:"offsite_sftp_private_key,omitempty"`
+	// IngestPassword (P11) is the download-client credential — same
+	// write-only/encrypted pattern as the secrets above.
+	IngestPassword string `json:"ingest_password,omitempty"`
 }
 
 // GetSettings loads the persisted settings row. Returns nil (not an error)
@@ -160,6 +163,7 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 		OffsiteS3SecretKey    string `json:"offsite_s3_secret_key"`
 		OffsiteSFTPPassword   string `json:"offsite_sftp_password"`
 		OffsiteSFTPPrivateKey string `json:"offsite_sftp_private_key"`
+		IngestPassword        string `json:"ingest_password"`
 	}
 	if err := json.Unmarshal([]byte(js), &blob); err != nil {
 		return nil, fmt.Errorf("unmarshal settings: %w", err)
@@ -190,6 +194,11 @@ func (s *Store) GetSettings(ctx context.Context) (*model.Settings, error) {
 	st.BackupOffsite.S3.SecretKey = s3sk
 	st.BackupOffsite.SFTP.Password = sftpPW
 	st.BackupOffsite.SFTP.PrivateKey = sftpKey
+	ingestPW, err := s.decryptSharePassword(blob.IngestPassword)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt settings ingest_password: %w", err)
+	}
+	st.Ingest.Password = ingestPW
 	// include_shares_key defaults to TRUE. A bool cannot distinguish
 	// "absent" from "false" after unmarshal, so probe the raw blob: rows
 	// written before the field existed (or before backup_offsite existed
@@ -374,9 +383,14 @@ func (s *Store) SaveSettings(ctx context.Context, st *model.Settings) error {
 	if err != nil {
 		return fmt.Errorf("encrypt settings offsite_sftp_private_key: %w", err)
 	}
+	ingestPW, err := s.encryptSharePassword(st.Ingest.Password)
+	if err != nil {
+		return fmt.Errorf("encrypt settings ingest_password: %w", err)
+	}
 	b, err := json.Marshal(settingsBlob{
 		Settings: st, NtfyToken: tok, SMTPPassword: pw,
 		OffsiteS3SecretKey: s3sk, OffsiteSFTPPassword: sftpPW, OffsiteSFTPPrivateKey: sftpKey,
+		IngestPassword: ingestPW,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)

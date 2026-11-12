@@ -729,6 +729,93 @@ and the SSO button disappear, local login is untouched. Already-provisioned
 accounts and their sessions remain (sessions expire on the normal TTL);
 delete the accounts via user management if you want them gone.
 
+## Download ingestion (experimental, off by default)
+
+P11 can poll a BitTorrent client for completed downloads and stage their
+source video files into the scripts share, where the scanner picks them
+up once an operator authors the `.avs`/`.vpy` filter script. The feature
+is **OFF by default** and **experimental**; nothing changes on upgrade
+until it is explicitly enabled on the Settings page. See Operations.md
+§Download ingestion for the workflow, observability and diagnosis.
+
+### Mount requirement (read first)
+
+Ingestion copies files — it does not download them. The controller must
+see the client's completed downloads on a local path:
+
+- `ingest.download_root` is the **controller-visible** directory that
+  corresponds to the client's download root — the directory that
+  **directly contains the completed torrent folders**.
+- The client must save completed torrents **directly under that root**
+  (flat layout). Per-category subfolders are not resolved: the controller
+  maps a torrent to `download_root/<basename of the client save path>`
+  and verifies it exists before staging (missing = skip + log).
+- Example: qBittorrent saves to `/downloads/complete` on the download
+  host; the controller container mounts that same directory at
+  `/mnt/downloads` → set `download_root: /mnt/downloads`. A torrent saved
+  as `/downloads/complete/Show.S01E01` is read from
+  `/mnt/downloads/Show.S01E01`.
+
+Compose wiring (controller service):
+
+```yaml
+volumes:
+  - /srv/downloads/complete:/mnt/downloads:ro
+```
+
+A read-only mount is sufficient (ingestion only reads the download side;
+writes go to the scripts share). The scripts share must already be
+mounted at `scripts_root` as for normal scanning.
+
+### qBittorrent setup (first-class)
+
+1. Enable the Web UI (Tools → Options → Web UI) and note its port.
+2. Either create a user for the controller, or whitelist the controller's
+   IP ("Bypass authentication for clients on localhost" / IP whitelist)
+   and leave the ingest username empty.
+3. (Optional) Create a category (e.g. `anime`) and set the ingest
+   `category` filter or the category→series map. Completed torrents in
+   that category are polled via `torrents/info?filter=completed`.
+4. Settings page → Download ingestion: provider `qbittorrent`, URL
+   `http://<host>:<port>`, credentials, download root. Save.
+
+Sessions use the cookie login (`/api/v2/auth/login`); an expired session
+(403) is re-logged-in once automatically. Repeated failed logins can get
+the controller IP banned by qBittorrent — fix credentials, then unban.
+
+### ruTorrent setup (best-effort, experimental)
+
+1. Enable the **httprpc** plugin (it ships with ruTorrent; the client
+   calls `plugins/httprpc/action.php`).
+2. Put HTTP **Basic** auth in front of ruTorrent (or leave it open on a
+   trusted LAN); digest-only auth is not supported.
+3. Use ruTorrent **labels** as categories (the client matches
+   `d.custom1`); the category filter/map works on labels.
+4. Settings page: provider `rutorrent`, URL = the ruTorrent web root
+   (e.g. `http://host/rutorrent`), credentials, download root.
+
+Limitations (documented, not bugs to file): completion is read from the
+appended `d.get_complete` command (fallback `left_bytes=0` on builds that
+drop it); single-file torrents resolve their save dir as the parent of
+`d.get_base_path`; only Basic auth; no per-torrent retry tuning. Prefer
+qBittorrent for production use.
+
+### Enable / disable / rollback
+
+- Enable: Settings card (admin) or `PUT /api/settings` with the `ingest`
+  block. The password is write-only (blank keeps the stored one) and
+  AES-GCM encrypted with the shares key — back up the key file alongside
+  the DB as usual.
+- Disable: uncheck "Enable download ingestion" and save. Every poll tick
+  becomes a no-op; staged files and the `ingest_ledger` table are left
+  untouched. No restart needed.
+- Rollback: the feature is additive (settings JSON blob + one new table).
+  Older binaries ignore the `ingest` settings key; the `ingest_ledger`
+  table is harmless to leave in place. On Postgres the table is created
+  by `CREATE TABLE IF NOT EXISTS` on every open (fresh and upgrade).
+- HA: the poll loop holds advisory lock **1008**; only the leader replica
+  polls. No additional configuration is required.
+
 ## Post-deploy validation
 
 See `Docs/md/FirstNodeDeploy.md` §6 for the full smoke procedure. Short form:

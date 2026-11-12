@@ -538,7 +538,7 @@ func TestContractPostgres(t *testing.T) {
 		tables := []string{
 			"node_metrics", "audit_events", "pairing_codes", "provision_runs",
 			"sessions", "users", "api_tokens", "shares", "settings",
-			"step_templates", "series", "jobs", "flows", "nodes",
+			"step_templates", "series", "jobs", "flows", "nodes", "ingest_ledger",
 		}
 		ctx := context.Background()
 		for _, tbl := range tables {

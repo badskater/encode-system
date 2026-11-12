@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type {
   Settings, SettingsSave, UpdateCheck, UpdateManifest,
   OffsiteS3, OffsiteSFTP, OffsiteS3Save, OffsiteSFTPSave,
+  Ingest, IngestSave,
 } from '../types';
 import { timeAgo } from '../components/helpers';
 import { useIsAdmin } from '../hooks/useRole';
@@ -154,6 +155,59 @@ function validateOffsite(s: Settings): string | null {
   return null;
 }
 
+// validateIngest mirrors the server's ingest bounds (P11, experimental)
+// so a typo is caught before the PUT. The category map lives in a JSON
+// textarea: it must parse to a plain string→string object with safe
+// folder names. Disabled ingestion needs only shape-valid fields.
+// Returns an error message or null when valid.
+function validateIngest(s: Settings, mapText: string): string | null {
+  const ing = s.ingest;
+  if (!ing) return null;
+  const interval = ing.poll_interval_seconds ?? 0;
+  if (interval !== 0 && (!Number.isInteger(interval) || interval < 10 || interval > 3600)) {
+    return 'Ingest poll interval must be 0 (default 60) or 10-3600 seconds';
+  }
+  // Parse the category map even when disabled — the stored value must
+  // always be sane (server parity).
+  const trimmed = mapText.trim();
+  if (trimmed) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return 'Category map must be valid JSON (an object like {"anime": "Show Name"})';
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return 'Category map must be a JSON object mapping category → series name';
+    }
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!k.trim() || typeof v !== 'string' || !v.trim()) {
+        return 'Category map keys and values must be non-empty strings';
+      }
+      if (/[/\\]|\.\./.test(k) || /[/\\]|\.\./.test(v)) {
+        return 'Category map entries must be plain names (no slashes or ..)';
+      }
+    }
+  }
+  if (!ing.enabled) return null;
+  if (ing.provider !== 'qbittorrent' && ing.provider !== 'rutorrent') {
+    return 'Ingest provider must be qBittorrent or ruTorrent when enabled';
+  }
+  const url = (ing.url ?? '').trim();
+  if (!url || !isHttpUrl(url)) {
+    return 'Ingest client URL must be an http(s) URL when enabled';
+  }
+  const root = (ing.download_root ?? '').trim();
+  if (!root) return 'Download root is required when ingestion is enabled';
+  if (!root.startsWith('/') || root.startsWith('//')) {
+    return 'Download root must be an absolute Unix path (e.g. /mnt/downloads)';
+  }
+  if (root.split('/').some((seg) => seg === '..')) {
+    return 'Download root must not contain .. segments';
+  }
+  return null;
+}
+
 // SettingsPage edits the fleet's runtime configuration from the UI:
 //  - NFS shares (documentation-grade: which exports, where they mount)
 //  - Controller roots (scan + release dirs inside the container)
@@ -201,6 +255,11 @@ export default function SettingsPage() {
   const [offsiteS3Secret, setOffsiteS3Secret] = useState('');
   const [offsiteSFTPPassword, setOffsiteSFTPPassword] = useState('');
   const [offsiteSFTPKey, setOffsiteSFTPKey] = useState('');
+  // Write-only ingest client password (P11): same keep-semantics.
+  const [ingestPassword, setIngestPassword] = useState('');
+  // Category→series map editor: a JSON textarea. The text is the source
+  // of truth while editing; save() parses it into settings.ingest.
+  const [categoryMapText, setCategoryMapText] = useState('{}');
   const isAdmin = useIsAdmin();
   // Refs to the file inputs: a successful publish clears the STATE but the
   // uncontrolled <input type=file> would still show the picked file name —
@@ -214,7 +273,11 @@ export default function SettingsPage() {
     // failure (e.g. nothing published yet) must not make the settings form
     // unusable.
     try {
-      setSettings(await api.settings());
+      const loaded = await api.settings();
+      setSettings(loaded);
+      // Seed the category-map textarea from the stored block (pretty-
+      // printed so the operator can edit it directly).
+      setCategoryMapText(JSON.stringify(loaded.ingest?.category_map ?? {}, null, 2));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -293,6 +356,11 @@ export default function SettingsPage() {
       backup_offsite: { ...(s.backup_offsite ?? {}), sftp: { ...(s.backup_offsite?.sftp ?? {}), ...patch } },
     } : s));
   }
+  // Nested ingest setter (P11): merge into settings.ingest without
+  // disturbing the write-only has_password flag.
+  function setIngest(patch: Partial<Ingest>) {
+    setSettings((s) => (s ? { ...s, ingest: { ...(s.ingest ?? {}), ...patch } } : s));
+  }
 
   async function save() {
     if (!settings) return;
@@ -306,6 +374,19 @@ export default function SettingsPage() {
     const invalidOffsite = validateOffsite(settings);
     if (invalidOffsite) {
       setError(invalidOffsite);
+      return;
+    }
+    const invalidIngest = validateIngest(settings, categoryMapText);
+    if (invalidIngest) {
+      setError(invalidIngest);
+      return;
+    }
+    // Enabled ingestion with a username needs a credential: either one
+    // already stored (has_password) or one typed now. Mirrors the
+    // server's post-merge check.
+    if (settings.ingest?.enabled && (settings.ingest.username ?? '').trim() &&
+        !settings.ingest.has_password && !ingestPassword) {
+      setError('Ingest password is required when a username is set (blank keeps the stored one; none is stored)');
       return;
     }
     // Enabled offsite destinations need a credential: either one already
@@ -383,6 +464,26 @@ export default function SettingsPage() {
           include_shares_key: o.include_shares_key ?? true,
         };
       }
+      // Ingest block (P11): strip the GET-only has_password flag, parse
+      // the category-map textarea (validated above), clamp the cadence,
+      // attach the typed write-only password (blank = keep stored).
+      if (toSave.ingest) {
+        const ing = toSave.ingest;
+        const ingestSave: IngestSave = {
+          enabled: ing.enabled,
+          provider: ing.provider,
+          url: ing.url,
+          username: ing.username,
+          category: ing.category,
+          category_map: categoryMapText.trim()
+            ? JSON.parse(categoryMapText) as Record<string, string>
+            : {},
+          poll_interval_seconds: clampInt(ing.poll_interval_seconds ?? 0, 0, 3600),
+          download_root: ing.download_root,
+        };
+        if (ingestPassword) ingestSave.password = ingestPassword;
+        payload.ingest = ingestSave;
+      }
       const saved = await api.saveSettings(payload);
       setSettings(saved);
       // Secrets were consumed: clear the inputs so the next save keeps them.
@@ -391,6 +492,7 @@ export default function SettingsPage() {
       setOffsiteS3Secret('');
       setOffsiteSFTPPassword('');
       setOffsiteSFTPKey('');
+      setIngestPassword('');
       setNotice('Settings saved. Scanner and new jobs pick them up on the next cycle — no restart needed.');
     } catch (e) {
       setError(e instanceof Error ? e.message.replace(/^\d+:\s*/, '') : String(e));
@@ -993,6 +1095,97 @@ export default function SettingsPage() {
         )}
         {settings.updated_at && (
           <span className="muted" style={{ marginLeft: 12 }}>last saved {timeAgo(settings.updated_at)}</span>
+        )}
+      </div>
+
+      {/* Experimental download ingestion (P11): OFF by default. Stages
+          completed torrents' source files into the scripts share; filter
+          scripts stay hand-authored (the scanner queues jobs once both
+          are present). Same save() flow as every other settings card —
+          PUT is a full replace, never a second independent saver. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>
+          Download ingestion{' '}
+          <span className="badge" style={{ background: '#9e6a03', color: '#fff', fontSize: 11, verticalAlign: 'middle' }}>
+            EXPERIMENTAL
+          </span>
+        </h3>
+        <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+          Off by default. When enabled, the controller polls the download client for completed
+          torrents and copies their source video files into the scripts share
+          (&lt;series&gt;/Ep NN/). It stages SOURCES only — author the .avs/.vpy filter script in
+          the episode folder afterwards; the scanner then queues the encode. Release names that
+          cannot be parsed safely are skipped, never guessed.
+        </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            aria-label="Enable download ingestion"
+            checked={!!settings.ingest?.enabled}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ enabled: e.target.checked })}
+          />
+          <span>Enable download ingestion</span>
+        </label>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Provider</span>
+          <select
+            aria-label="Ingest provider"
+            style={{ width: '100%' }}
+            value={settings.ingest?.provider ?? ''}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ provider: e.target.value as Ingest['provider'] })}
+          >
+            <option value="">— select —</option>
+            <option value="qbittorrent">qBittorrent (WebAPI v2)</option>
+            <option value="rutorrent">ruTorrent (httprpc, best-effort)</option>
+          </select>
+          <span className="muted" style={{ fontSize: 12 }}>
+            qBittorrent is the first-class provider; ruTorrent support is experimental.
+          </span>
+        </label>
+        {offField('Client URL', 'Web base URL of the client (e.g. http://192.168.1.10:8080).', settings.ingest?.url, (v) => setIngest({ url: v }), 'http://192.168.1.10:8080')}
+        {offField('Client username', 'Optional — leave empty for auth-bypassed clients (e.g. qBittorrent localhost whitelist).', settings.ingest?.username, (v) => setIngest({ username: v }), 'admin')}
+        {secretField(
+          'Client password',
+          'Write-only. Blank keeps the stored password.',
+          ingestPassword, setIngestPassword, !!settings.ingest?.has_password, 'client password',
+        )}
+        {offField('Category filter', 'Optional — only this client category/label is ingested. Empty = all (or the mapped categories below).', settings.ingest?.category, (v) => setIngest({ category: v }), 'anime')}
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Category → series map (JSON)</span>
+          <textarea
+            aria-label="Category to series map (JSON)"
+            rows={4}
+            style={{ width: '100%', fontFamily: 'var(--font-mono, monospace)' }}
+            value={categoryMapText}
+            disabled={!isAdmin}
+            onChange={(e) => setCategoryMapText(e.target.value)}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Maps a client category to the series folder name, overriding the parsed name
+            (the episode is still parsed from the release name). Example: {'{"anime": "Show Name"}'}
+          </span>
+        </label>
+        <label style={{ display: 'block', marginBottom: 12 }}>
+          <span style={{ display: 'block', marginBottom: 2 }}>Poll interval (seconds)</span>
+          <input
+            type="number"
+            aria-label="Ingest poll interval"
+            style={{ width: '100%' }}
+            min={0}
+            max={3600}
+            value={settings.ingest?.poll_interval_seconds ?? 0}
+            disabled={!isAdmin}
+            onChange={(e) => setIngest({ poll_interval_seconds: Number(e.target.value) })}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>0 = default 60s; otherwise 10-3600.</span>
+        </label>
+        {offField('Download root (controller-visible)', 'MOUNT REQUIREMENT: the client\'s download directory must be mounted into the controller container at this path. It must directly contain the completed torrent folders.', settings.ingest?.download_root, (v) => setIngest({ download_root: v }), '/mnt/downloads')}
+        {isAdmin && (
+        <button className="btn primary" disabled={saving} onClick={save}>
+          {saving ? 'Saving…' : 'Save settings'}
+        </button>
         )}
       </div>
 

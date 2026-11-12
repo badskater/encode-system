@@ -314,6 +314,15 @@ func main() {
 	// stalled jobs. Bound to the same ctx so SIGTERM stops it cleanly.
 	srv.StartStallWatchdogLoop(ctx)
 
+	// Experimental download ingestion (P11, OFF by default): polls the
+	// configured BitTorrent client (qBittorrent first-class, ruTorrent
+	// best-effort) for completed downloads and stages their source video
+	// files into the scripts share. Filter scripts stay hand-authored —
+	// the scanner queues jobs once source + script are both present.
+	// HA: wrapped in RunLoopSupervisor (LockKeyIngest=1008) so only one
+	// replica polls. Bound to the same ctx so SIGTERM stops it cleanly.
+	srv.StartIngestLoop(ctx)
+
 	// DB backup scheduler: periodic snapshots under <dataDir>/backups (SQLite
 	// VACUUM INTO or PG logical dump), keeps the newest 24 scheduled ones;
 	// manual snapshots are never auto-pruned. Enabled/interval live-adjustable

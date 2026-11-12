@@ -271,6 +271,12 @@ type Settings struct {
 	// generations to KeepN. Upload failures never fail the local backup.
 	BackupOffsite BackupOffsite `json:"backup_offsite"`
 
+	// Ingest configures EXPERIMENTAL download ingestion (P11): poll a
+	// BitTorrent client for completed downloads and stage their source
+	// files into the scripts share for hand-authored filter scripts.
+	// OFF by default; see IngestSettings.
+	Ingest IngestSettings `json:"ingest"`
+
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
@@ -333,6 +339,60 @@ type BackupOffsiteSFTP struct {
 	// enforced with ssh.FixedHostKey on every dial.
 	HostKey string `json:"host_key"`
 }
+
+// IngestSettings configures EXPERIMENTAL download ingestion (P11): the
+// controller polls a BitTorrent client for completed downloads and stages
+// their source video files into the scripts share (<series>/<episode>/),
+// where the scanner picks them up once an operator authors the .avs/.vpy
+// filter script. Ingestion stages SOURCES only — it never creates jobs.
+//
+// OFF by default (Enabled=false is the zero value old settings rows
+// unmarshal to). Password is WRITE-ONLY over the API (json:"-", masked as
+// has_password inside ingest), AES-GCM encrypted at rest with the shares
+// key — the same pattern as NtfyToken/SMTPPassword.
+type IngestSettings struct {
+	Enabled bool `json:"enabled"`
+	// Provider selects the client: "qbittorrent" (WebAPI v2, first-class)
+	// or "rutorrent" (httprpc plugin, best-effort/experimental). Required
+	// when Enabled.
+	Provider string `json:"provider"`
+	// URL is the client's web base URL (e.g. http://192.168.1.10:8080 for
+	// qBittorrent, http://host/rutorrent for ruTorrent). Required when
+	// Enabled; stored with any trailing slash trimmed.
+	URL string `json:"url"`
+	// Username is optional: qBittorrent with auth bypassed for localhost
+	// needs none; ruTorrent behind web-server auth uses HTTP Basic. When
+	// set, a password is required (checked post-merge at save time).
+	Username string `json:"username"`
+	// Password is WRITE-ONLY over the API, AES-GCM encrypted at rest.
+	Password string `json:"-"`
+	// Category restricts polling to one client category (qBittorrent
+	// category / ruTorrent label). Empty = consider all completed
+	// downloads, or — when CategoryMap is non-empty — only the categories
+	// named in the map.
+	Category string `json:"category"`
+	// CategoryMap maps client category → series folder name. A mapped
+	// category overrides the series name parsed from the release name
+	// (the episode number is still parsed from the name — never guessed).
+	CategoryMap map[string]string `json:"category_map"`
+	// PollIntervalSeconds is the poll cadence. 0 = default (60s);
+	// validated 0 or 10-3600.
+	PollIntervalSeconds int `json:"poll_interval_seconds"`
+	// DownloadRoot is the CONTROLLER-visible directory that corresponds to
+	// the client's download root — the directory that directly contains the
+	// completed torrent folders. The controller resolves each torrent as
+	// DownloadRoot/<basename of the client save path> and verifies it
+	// exists before staging (missing = skip + log, never guess). MOUNT
+	// REQUIREMENT: the client's download directory must be mounted into
+	// the controller container at this path (see Docs/md/Deployment.md).
+	DownloadRoot string `json:"download_root"`
+}
+
+// Ingest provider constants.
+const (
+	IngestProviderQBit      = "qbittorrent"
+	IngestProviderRuTorrent = "rutorrent"
+)
 
 // Session is an issued management session (token stored hashed at rest).
 type Session struct {

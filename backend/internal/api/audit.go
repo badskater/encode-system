@@ -36,15 +36,20 @@ func (s *Server) auditSystem(ctx context.Context, action, object string, detail 
 }
 
 // writeAudit is the shared audit write path for request-scoped and
-// system-scoped events. Detail is marshaled leniently and capped at 512
-// bytes — audit rows are forensic breadcrumbs, not data dumps.
+// system-scoped events. Detail is marshaled leniently and capped at 1024
+// bytes — audit rows are forensic breadcrumbs, not data dumps. (The cap
+// was 512 until P11: the settings.update detail carries ~25 secret-free
+// booleans, and the ingest fields pushed the secret-change flags past
+// 512 — truncation silently dropped smtp_password_changed, which the
+// no-secrets-in-audit contract test pins. 1024 keeps every flag with
+// headroom while staying bounded.)
 func (s *Server) writeAudit(ctx context.Context, actor, action, object string, detail any) {
 	detailStr := ""
 	if detail != nil {
 		if b, err := json.Marshal(detail); err == nil {
 			detailStr = string(b)
-			if len(detailStr) > 512 {
-				detailStr = detailStr[:512] + "…"
+			if len(detailStr) > 1024 {
+				detailStr = detailStr[:1024] + "…"
 			}
 		}
 	}

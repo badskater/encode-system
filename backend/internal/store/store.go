@@ -175,6 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_hash);
 	if err := s.ensureSharesTable(context.Background()); err != nil {
 		return fmt.Errorf("migrate shares: %w", err)
 	}
+	if err := s.ensureIngestLedger(context.Background()); err != nil {
+		return fmt.Errorf("migrate ingest ledger: %w", err)
+	}
 	if err := s.migrateAuth(context.Background()); err != nil {
 		return err
 	}

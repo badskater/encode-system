@@ -220,6 +220,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS ingest_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  provider TEXT NOT NULL,
+  torrent_hash TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  series TEXT NOT NULL DEFAULT '',
+  episode TEXT NOT NULL DEFAULT '',
+  staged_path TEXT NOT NULL,
+  staged_at TEXT NOT NULL DEFAULT %s,
+  UNIQUE(provider, torrent_hash)
+);
 `
 
 // migratePG creates the full Postgres schema from scratch. Unlike the SQLite

@@ -33,6 +33,20 @@ type settingsReq struct {
 	// write-only secrets (the model's json:"-" drops them). nil = the PUT
 	// omitted the block entirely → the stored block is kept as-is.
 	BackupOffsite *offsiteReq `json:"backup_offsite,omitempty"`
+	// Ingest shadows the nested ingestion block (P11) for its write-only
+	// password. nil = the PUT omitted the block → the stored block is
+	// kept as-is (same keep-semantics as backup_offsite).
+	Ingest *ingestReq `json:"ingest,omitempty"`
+}
+
+// ingestReq mirrors the FULL ingest block for decoding (the shadow is
+// the sole decode target under DisallowUnknownFields): model fields plus
+// the write-only password. has_password is a GET-only echo, accepted and
+// ignored so a verbatim GET→PUT round-trip keeps working.
+type ingestReq struct {
+	model.IngestSettings
+	Password    string `json:"password"`
+	HasPassword bool   `json:"has_password"` // output-only echo, ignored
 }
 
 // offsiteReq mirrors the FULL backup_offsite block for decoding: the
@@ -90,6 +104,13 @@ type offsiteOut struct {
 	HasS3AccessKey    bool `json:"has_s3_access_key"`
 }
 
+// ingestOut is the API-facing ingest block: model fields (password is
+// json:"-" on the model) plus the has_password presence flag.
+type ingestOut struct {
+	model.IngestSettings
+	HasPassword bool `json:"has_password"`
+}
+
 // MarshalJSON implements the mask: embed Settings' fields (secrets already
 // json:"-" on the model) and add the has_* flags. backup_offsite is
 // re-marshaled through offsiteOut so its nested secrets get flags too.
@@ -105,12 +126,16 @@ func (o settingsOut) MarshalJSON() ([]byte, error) {
 		HasNtfyToken    bool       `json:"has_ntfy_token"`
 		HasSMTPPassword bool       `json:"has_smtp_password"`
 		BackupOffsite   offsiteOut `json:"backup_offsite"`
+		Ingest          ingestOut  `json:"ingest"`
 	}{alias(*o.Settings), o.HasNtfyToken, o.HasSMTPPassword, offsiteOut{
 		BackupOffsite:     off,
 		HasS3SecretKey:    off.S3.SecretKey != "",
 		HasSFTPPassword:   off.SFTP.Password != "",
 		HasSFTPPrivateKey: off.SFTP.PrivateKey != "",
 		HasS3AccessKey:    hasAccessKey,
+	}, ingestOut{
+		IngestSettings: o.Settings.Ingest,
+		HasPassword:    o.Settings.Ingest.Password != "",
 	}})
 }
 
@@ -194,6 +219,9 @@ func maskSettingsForNonAdmin(st *model.Settings) *model.Settings {
 	cp.NtfyTopicURL = notify.RedactURL(cp.NtfyTopicURL)
 	cp.GenericWebhookURL = notify.RedactURL(cp.GenericWebhookURL)
 	cp.BackupOffsite.S3.AccessKey = ""
+	// The ingestion client URL can carry query credentials the same way
+	// the channel URLs can; mask its query values for non-admin readers.
+	cp.Ingest.URL = notify.RedactURL(cp.Ingest.URL)
 	return &cp
 }
 
@@ -223,6 +251,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		st.BackupOffsite.S3.SecretKey = req.BackupOffsite.S3.SecretKey
 		st.BackupOffsite.SFTP.Password = req.BackupOffsite.SFTP.Password
 		st.BackupOffsite.SFTP.PrivateKey = req.BackupOffsite.SFTP.PrivateKey
+	}
+	// Ingest secret arrives in the nested shadow (the model's json:"-"
+	// drops it). An absent block keeps the stored one wholesale — see
+	// the keep-merge below.
+	if req.Ingest != nil {
+		st.Ingest = req.Ingest.IngestSettings
+		st.Ingest.Password = req.Ingest.Password
 	}
 	if err := validateSettings(&st); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -268,6 +303,15 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			st.BackupOffsite.SFTP.PrivateKey = prev.BackupOffsite.SFTP.PrivateKey
 		}
 	}
+	// Ingest keep-semantics (P11): an OMITTED ingest block keeps the
+	// stored block wholesale (a partial PUT from automation that predates
+	// P11 must not wipe ingestion config). A PRESENT block replaces the
+	// non-secret fields; a blank password keeps its stored value.
+	if req.Ingest == nil {
+		st.Ingest = prev.Ingest
+	} else if st.Ingest.Password == "" {
+		st.Ingest.Password = prev.Ingest.Password
+	}
 	// G4: a configured SMTP user with no password AFTER the keep-merge
 	// would silently send unauthenticated — refuse it. (Checked post-merge
 	// so a stored password keeps the configuration valid when the PUT
@@ -288,6 +332,15 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if st.BackupOffsite.SFTP.Enabled && st.BackupOffsite.SFTP.Password == "" && st.BackupOffsite.SFTP.PrivateKey == "" {
 		writeErr(w, http.StatusBadRequest,
 			"backup_offsite.sftp needs a password or private_key when enabled (blank values keep the stored ones; none are stored)")
+		return
+	}
+	// Same post-merge rule for ingestion: a configured username with no
+	// password AFTER the keep-merge would fail every client login —
+	// refuse at save time. (No username at all is legal: qBittorrent with
+	// localhost auth bypass, or ruTorrent without web-server auth.)
+	if st.Ingest.Enabled && st.Ingest.Username != "" && st.Ingest.Password == "" {
+		writeErr(w, http.StatusBadRequest,
+			"ingest.password is required when ingest.username is set (a blank password keeps the stored one; none is stored)")
 		return
 	}
 	if err := s.Store.SaveSettings(r.Context(), &st); err != nil {
@@ -323,6 +376,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		"offsite_s3_secret_changed":  req.BackupOffsite != nil && req.BackupOffsite.S3.SecretKey != "",
 		"offsite_sftp_pw_changed":    req.BackupOffsite != nil && req.BackupOffsite.SFTP.Password != "",
 		"offsite_sftp_key_changed":   req.BackupOffsite != nil && req.BackupOffsite.SFTP.PrivateKey != "",
+		// Ingestion (P11): operational knobs + booleans only — the client
+		// URL, username and password never land in the audit table.
+		"ingest_enabled":          st.Ingest.Enabled,
+		"ingest_provider":         st.Ingest.Provider,
+		"ingest_password_changed": req.Ingest != nil && req.Ingest.Password != "",
 	})
 	writeJSON(w, http.StatusOK, maskSettings(s.currentSettings(r.Context())))
 }
@@ -468,6 +526,9 @@ func validateSettings(st *model.Settings) error {
 		return errSettings("scripts_root/release_root must be absolute Unix paths (e.g. /data/scripts)")
 	}
 	if err := validateBackupOffsite(&st.BackupOffsite); err != nil {
+		return err
+	}
+	if err := validateIngest(&st.Ingest); err != nil {
 		return err
 	}
 	return nil

@@ -876,3 +876,177 @@ describe('Settings offsite backups card', () => {
     expect(saveSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('Settings experimental ingestion card (P11)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings());
+    vi.spyOn(api, 'manifest').mockResolvedValue(manifest);
+  });
+
+  // The ingest card renders the LAST "Save settings" button on the page
+  // (all cards share the same save() — PUT is a full replace).
+  async function ingestSaveButton() {
+    const buttons = await screen.findAllByRole('button', { name: /save settings/i });
+    return buttons[buttons.length - 1];
+  }
+
+  // Fake credential assembled at runtime (redaction-safe).
+  const ingestPw = 'qbit' + '-pw-1';
+
+  async function enableIngestBase() {
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.change(screen.getByLabelText('Client URL'), { target: { value: 'http://192.168.1.10:8080' } });
+    fireEvent.change(screen.getByLabelText('Download root (controller-visible)'), { target: { value: '/mnt/downloads' } });
+  }
+
+  it('renders the experimental badge and defaults to off', async () => {
+    render(<SettingsPage />);
+    expect(await screen.findByText('EXPERIMENTAL')).toBeInTheDocument();
+    const toggle = (await screen.findByLabelText('Enable download ingestion')) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('blocks save when enabled without a client URL (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/client URL must be an http/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks save when enabled without a download root', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText('Enable download ingestion'));
+    fireEvent.change(screen.getByLabelText('Ingest provider'), { target: { value: 'qbittorrent' } });
+    fireEvent.change(screen.getByLabelText('Client URL'), { target: { value: 'http://192.168.1.10:8080' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/Download root is required/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid JSON category map before the PUT', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), { target: { value: '{not json' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/Category map must be valid JSON/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-object category map (array)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), { target: { value: '["anime"]' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/must be a JSON object/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects traversal in category map values (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), {
+      target: { value: '{"anime": "../evil"}' },
+    });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/no slashes or \.\./i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the ingest block with the typed password, then clears it', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({
+      ingest: { enabled: true, provider: 'qbittorrent', has_password: true },
+    }));
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.change(screen.getByLabelText('Client password'), { target: { value: ingestPw } });
+    fireEvent.change(screen.getByLabelText('Category to series map (JSON)'), {
+      target: { value: '{"anime": "Mapped Show"}' },
+    });
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    const sent = saveSpy.mock.calls[0][0];
+    expect(sent.ingest).toMatchObject({
+      enabled: true,
+      provider: 'qbittorrent',
+      url: 'http://192.168.1.10:8080',
+      username: 'qbit-user',
+      password: ingestPw,
+      category_map: { anime: 'Mapped Show' },
+      download_root: '/mnt/downloads',
+    });
+    expect((sent.ingest as Record<string, unknown>).has_password).toBeUndefined();
+    // Password input cleared after save (next save keeps the stored one).
+    await waitFor(() =>
+      expect((screen.getByLabelText('Client password') as HTMLInputElement).value).toBe(''));
+  });
+
+  it('omits the password on a second save (blank keeps stored)', async () => {
+    // The saved response mirrors what a real server returns: the FULL
+    // ingest block (the form re-binds to it, so it must stay valid).
+    const saveSpy = vi.spyOn(api, 'saveSettings').mockResolvedValue(baseSettings({
+      ingest: {
+        enabled: true, provider: 'qbittorrent', url: 'http://192.168.1.10:8080',
+        username: 'qbit-user', download_root: '/mnt/downloads', has_password: true,
+      },
+    }));
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.change(screen.getByLabelText('Client password'), { target: { value: ingestPw } });
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+    // Second save without typing a password: the payload must not carry one.
+    fireEvent.click(await ingestSaveButton());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(2));
+    expect(saveSpy.mock.calls[1][0].ingest!.password).toBeUndefined();
+  });
+
+  it('shows the saved placeholder when has_password is set (write-only UX)', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      ingest: { enabled: true, provider: 'qbittorrent', has_password: true },
+    }));
+    render(<SettingsPage />);
+    const pw = (await screen.findByLabelText('Client password')) as HTMLInputElement;
+    expect(pw.value).toBe('');
+    expect(pw.placeholder).toMatch(/saved.*leave blank to keep/i);
+  });
+
+  it('prefills the category map textarea from the stored block', async () => {
+    vi.spyOn(api, 'settings').mockResolvedValue(baseSettings({
+      ingest: { category_map: { anime: 'Stored Show' } },
+    }));
+    render(<SettingsPage />);
+    const ta = (await screen.findByLabelText('Category to series map (JSON)')) as HTMLTextAreaElement;
+    await waitFor(() => expect(JSON.parse(ta.value)).toEqual({ anime: 'Stored Show' }));
+  });
+
+  it('blocks save when a username is set without any password (mirrors server post-merge)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Client username'), { target: { value: 'qbit-user' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/password is required when a username is set/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects an out-of-range poll interval (mirrors server)', async () => {
+    const saveSpy = vi.spyOn(api, 'saveSettings');
+    render(<SettingsPage />);
+    await enableIngestBase();
+    fireEvent.change(screen.getByLabelText('Ingest poll interval'), { target: { value: '5' } });
+    fireEvent.click(await ingestSaveButton());
+    expect(await screen.findByText(/poll interval must be 0/i)).toBeInTheDocument();
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+});

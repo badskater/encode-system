@@ -278,19 +278,24 @@ if [ "$USE_POSTGRES" = "1" ]; then
             log "running pgimport: SQLite → Postgres (dry-run first)"
             # Dry-run validates counts before any write; a failure here stops
             # the install rather than importing a half-read source.
+            # --entrypoint /app/pgimport is REQUIRED: both controller images
+            # set ENTRYPOINT ["/app/controller"]. Without the override,
+            # `compose run ... controller /app/pgimport ...` hands pgimport to
+            # the controller as argv, which boots a rogue server against the
+            # empty PG instead of importing (and never exits).
             SHARE_KEY_ENV="$(grep -E '^ENCODE_SHARES_KEY_FILE=' .env 2>/dev/null | cut -d= -f2 || true)"; SHARE_KEY_ENV="${SHARE_KEY_ENV:-/data/encode.db.shares-key}"
-            compose -f docker-compose.runtime.yml run --rm \
+            compose -f docker-compose.runtime.yml run --rm --entrypoint /app/pgimport \
                 -v "${STATE_VOL}":/data \
                 -e PGPASSWORD="${PG_PASS}" \
                 -e ENCODE_SHARES_KEY_FILE="${SHARE_KEY_ENV}" \
-                controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" -dry-run \
+                controller -sqlite /data/encode.db -pg "${PG_DSN_HOST}" -dry-run \
                 || die "pgimport dry-run failed — refusing to migrate a source that does not validate"
             # Real import (target was confirmed empty, no -force needed).
-            compose -f docker-compose.runtime.yml run --rm \
+            compose -f docker-compose.runtime.yml run --rm --entrypoint /app/pgimport \
                 -v "${STATE_VOL}":/data \
                 -e PGPASSWORD="${PG_PASS}" \
                 -e ENCODE_SHARES_KEY_FILE="${SHARE_KEY_ENV}" \
-                controller /app/pgimport -sqlite /data/encode.db -pg "${PG_DSN_HOST}" \
+                controller -sqlite /data/encode.db -pg "${PG_DSN_HOST}" \
                 || die "pgimport failed — SQLite DB not migrated; controller will boot against an empty PG"
             log "SQLite → Postgres migration complete"
             # Shares key: the SQLite controller kept its AES-GCM key at

@@ -12,15 +12,19 @@ Mirror of the session task list. Move cards through columns as work lands.
 
 - GPU-path validation on a real Nvidia node (test VMs have no GPU: DGIndexNV
   and KNLMeansCL/OpenCL filters untestable there)
-- P12 release prep (v1.23.0): docs sync + GOOS=windows `internal/flow` build
-  fix + DeleteShare RowsAffected idiom landed; remaining: chunked full-diff
-  review, squash PR #49 → main, tag v1.23.0, release-asset verification.
-- P13 farm rollout: the farm controller (172.24.92.232) STAYS ON v1.19.3
-  until P13 — upgrade to v1.23.0 + SQLite→Postgres cutover (validated
-  runbook in the fleet-ops skill) + native TLS cutover are one scheduled
-  operation, not yet executed.
 
-## Release v1.23.0 (pending tag)
+## Release v1.23.0 + v1.23.1 (shipped)
+
+> v1.23.1 (installer-only patch, PR #51): `install.sh --postgres` now runs
+> pgimport via `--entrypoint /app/pgimport` — both images set ENTRYPOINT
+> ["/app/controller"], so the old argv form booted a rogue controller
+> instead of importing. Adds `docker/install_pgimport_test.sh` regression
+> guard + a `shell-scripts` CI job. Controller/agent binaries unchanged.
+>
+> P13 farm rollout COMPLETE (2026-11-13): controller (232) upgraded
+> v1.19.3 → v1.23.0, SQLite → Postgres (15 tables / 19,911 rows, counts
+> verified), native HTTPS (self-signed CA, IP SAN). Both Windows agents on
+> v1.23.0 heartbeating over TLS; update manifest publishes 1.23.0.
 
 > Known follow-up (post-release): bash `crc32_rename` uses POSIX `cksum`
 > (reflected polynomial) while the PS dialect uses IEEE CRC-32 — tags differ
@@ -37,9 +41,9 @@ Mirror of the session task list. Move cards through columns as work lands.
   CI green + full-diff review → tag v1.23.0 → release workflow builds
   controller + windows/linux agents + pgimport + encodectl + SPA + deploy
   bundle + GHCR image.
-- Farm note: production (232) runs v1.19.3 on the release pipeline
-  (docker-compose.runtime.yml, SQLite). It is NOT upgraded by this release
-  entry — the upgrade + PG cutover + TLS is P13, operator-scheduled.
+- Farm note: production (232) upgraded to v1.23.0 on the release pipeline
+  (docker-compose.runtime.yml, Postgres, native HTTPS) via P13 — see the
+  rollout note above. Both agents on v1.23.0 over TLS.
 - Gates at prep time: gofmt clean, go vet, full `go test ./... -count=1`
   (1,095 backend tests), PG store+api+pgimport suites green on a scratch
   16.4 cluster, linux controller + windows agent builds, and

@@ -134,3 +134,17 @@ jobs:
           name: ui-dist
           path: frontend/dist/
           if-no-files-found: error
+
+  shell-scripts:
+    name: Shell scripts (install)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax check (bash -n)
+        run: |
+          bash -n docker/install.sh
+          bash -n docker/install-agent.sh
+
+      - name: pgimport entrypoint regression
+        run: bash docker/install_pgimport_test.sh

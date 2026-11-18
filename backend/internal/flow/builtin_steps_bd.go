@@ -83,7 +83,7 @@ func bdMergeTemplate() *model.StepTemplate {
             throw "no Blu-ray playlist (*.mpls) found in $($Job.EpisodeDir) (expected BDMV/PLAYLIST or a loose .mpls beside the .m2ts)"
         }
         if ($pls.Count -gt 1) {
-            $names = ($pls | ForEach-Object { $_.Name }) -join ', '
+            $names = (($pls | ForEach-Object { $_.Name -replace '[\r\n]', ' ' }) -join ', ')
             throw "multiple playlists in $($Job.EpisodeDir) ($names) - set the playlist parameter"
         }
         $mplsRel = $prefix + $pls[0].Name
@@ -92,7 +92,7 @@ func bdMergeTemplate() *model.StepTemplate {
     if ($mpls -match '[\r\n"]') {
         throw "playlist path contains quotes or newlines (cannot be meta-quoted): $($mpls -replace '[\r\n]', ' ')"
     }
-    Write-Output "[bd_merge] playlist: $mplsRel"
+    Write-Output "[bd_merge] playlist: $($mplsRel -replace '[\r\n]', ' ')"
 
     # --- Detection listing: tracks + chapter marks ---
     # EAP relaxed for the native call (PS 5.1 wraps stderr as ErrorRecords;
@@ -225,7 +225,7 @@ func bdSplitTemplate() *model.StepTemplate {
             throw "no Blu-ray playlist (*.mpls) found in $($Job.EpisodeDir) (expected BDMV/PLAYLIST or a loose .mpls beside the .m2ts)"
         }
         if ($pls.Count -gt 1) {
-            $names = ($pls | ForEach-Object { $_.Name }) -join ', '
+            $names = (($pls | ForEach-Object { $_.Name -replace '[\r\n]', ' ' }) -join ', ')
             throw "multiple playlists in $($Job.EpisodeDir) ($names) - set the playlist parameter"
         }
         $mplsRel = $prefix + $pls[0].Name
@@ -234,7 +234,7 @@ func bdSplitTemplate() *model.StepTemplate {
     if ($mpls -match '[\r\n"]') {
         throw "playlist path contains quotes or newlines (cannot be meta-quoted): $($mpls -replace '[\r\n]', ' ')"
     }
-    Write-Output "[bd_split] playlist: $mplsRel (mode=$mode)"
+    Write-Output "[bd_split] playlist: $($mplsRel -replace '[\r\n]', ' ') (mode=$mode)"
 
     # --- Detection listing: tracks + chapter marks ---
     $prevEAP = $ErrorActionPreference

@@ -55,15 +55,17 @@ const bashSourceBdMerge = `bd_merge () {
         fi
         local -a pls=()
         local f
-        while IFS= read -r f; do
+        # Null-delimited discovery: a filename containing a newline must
+        # not split into two candidates (or forge log lines).
+        while IFS= read -r -d '' f; do
             [[ -n "$f" ]] && pls+=("$f")
-        done < <(find "$search_dir" -maxdepth 1 -type f -iname '*.mpls' -printf '%f\n' 2>/dev/null | sort)
+        done < <(find "$search_dir" -maxdepth 1 -type f -iname '*.mpls' -printf '%f\0' 2>/dev/null | sort -z)
         if (( ${#pls[@]} == 0 )); then
             echo "bd_merge: no Blu-ray playlist (*.mpls) found in $EpisodeDir (expected BDMV/PLAYLIST or a loose .mpls beside the .m2ts)"
             echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
         fi
         if (( ${#pls[@]} > 1 )); then
-            echo "bd_merge: multiple playlists in $EpisodeDir (${pls[*]}) - set the playlist parameter"
+            echo "bd_merge: multiple playlists in $EpisodeDir ($(printf '%s ' "${pls[@]}" | tr '\r\n' '  '))- set the playlist parameter"
             echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
         fi
         mpls_rel="$prefix${pls[0]}"
@@ -73,7 +75,7 @@ const bashSourceBdMerge = `bd_merge () {
         echo "bd_merge: playlist path contains quotes or newlines (cannot be meta-quoted)"
         echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
     fi
-    echo "[bd_merge] playlist: $mpls_rel"
+    echo "[bd_merge] playlist: $(printf '%s' "$mpls_rel" | tr '\r\n' '  ')"
 
     # --- Detection listing: tracks + chapter marks ---
     local det
@@ -108,9 +110,12 @@ const bashSourceBdMerge = `bd_merge () {
                 ;;
             Marks:*)
                 local marks_str="${line#Marks:}"
-                # Intentional word splitting: marks are whitespace-separated
-                # and each token is validated below before use.
-                for m in $marks_str; do
+                # read -ra splits on IFS WITHOUT glob expansion (a bare
+                # "for m in $marks_str" would pathname-expand hostile
+                # tokens before validation). Each token is validated.
+                local -a mark_toks=()
+                read -ra mark_toks <<< "$marks_str"
+                for m in "${mark_toks[@]}"; do
                     if [[ ! "$m" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$ ]]; then
                         echo "bd_merge: tsMuxeR listing: invalid chapter mark '$m'"
                         echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
@@ -136,7 +141,10 @@ const bashSourceBdMerge = `bd_merge () {
         for i in "${!ids[@]}"; do
             printf '%s, "%s", track=%s\n' "${codecs[$i]}" "$mpls" "${ids[$i]}"
         done
-    } > "$meta"
+    } > "$meta" || {
+        echo 'bd_merge: failed to write the meta file'
+        echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
+    }
     echo 'ENCODE_STEP bd_merge 60'
     rm -f "$out"
     "${tsrun[@]}" "$meta" "$out" 2>&1 | sed 's/^/[tsMuxeR] /' || {
@@ -180,7 +188,10 @@ const bashSourceBdMerge = `bd_merge () {
             done
             echo '  </EditionEntry>'
             echo '</Chapters>'
-        } > "$chxml"
+        } > "$chxml" || {
+            echo 'bd_merge: failed to write chapters.xml'
+            echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
+        }
         echo "[bd_merge] wrote chapters.xml (${#marks[@]} chapters)"
     fi
     echo 'ENCODE_STEP bd_merge 100'
@@ -229,15 +240,17 @@ const bashSourceBdSplit = `bd_split () {
         fi
         local -a pls=()
         local f
-        while IFS= read -r f; do
+        # Null-delimited discovery: a filename containing a newline must
+        # not split into two candidates (or forge log lines).
+        while IFS= read -r -d '' f; do
             [[ -n "$f" ]] && pls+=("$f")
-        done < <(find "$search_dir" -maxdepth 1 -type f -iname '*.mpls' -printf '%f\n' 2>/dev/null | sort)
+        done < <(find "$search_dir" -maxdepth 1 -type f -iname '*.mpls' -printf '%f\0' 2>/dev/null | sort -z)
         if (( ${#pls[@]} == 0 )); then
             echo "bd_split: no Blu-ray playlist (*.mpls) found in $EpisodeDir (expected BDMV/PLAYLIST or a loose .mpls beside the .m2ts)"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
         if (( ${#pls[@]} > 1 )); then
-            echo "bd_split: multiple playlists in $EpisodeDir (${pls[*]}) - set the playlist parameter"
+            echo "bd_split: multiple playlists in $EpisodeDir ($(printf '%s ' "${pls[@]}" | tr '\r\n' '  '))- set the playlist parameter"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
         mpls_rel="$prefix${pls[0]}"
@@ -247,7 +260,7 @@ const bashSourceBdSplit = `bd_split () {
         echo "bd_split: playlist path contains quotes or newlines (cannot be meta-quoted)"
         echo 'ENCODE_STEP_FAILED bd_split'; exit 1
     fi
-    echo "[bd_split] playlist: $mpls_rel (mode=$mode)"
+    echo "[bd_split] playlist: $(printf '%s' "$mpls_rel" | tr '\r\n' '  ') (mode=$mode)"
 
     # --- Detection listing: tracks + chapter marks ---
     local det
@@ -329,7 +342,10 @@ const bashSourceBdSplit = `bd_split () {
         out="$EpisodeDir/bd-split.m2ts"
         # Clean stale artifacts so a re-run with fewer chapters never leaves
         # orphan parts behind (mux_extras would pick up stale chapters.xml).
-        find "$EpisodeDir" -maxdepth 1 -type f \( -name 'chapter-[0-9][0-9].m2ts' -o -name 'chapter-[0-9][0-9].xml' -o -name 'bd-split.split.*.m2ts' -o -name 'chapters.xml' \) -delete
+        find "$EpisodeDir" -maxdepth 1 -type f \( -name 'chapter-[0-9][0-9].m2ts' -o -name 'chapter-[0-9][0-9].xml' -o -name 'bd-split.split.*.m2ts' -o -name 'chapters.xml' \) -delete || {
+            echo 'bd_split: failed to clean stale split artifacts'
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        }
     else
         # Keep chapters range_a..range_b: cut from mark[range_a-1] up to the
         # START of the next chapter after the range (or the source end).
@@ -343,7 +359,10 @@ const bashSourceBdSplit = `bd_split () {
     for i in "${!ids[@]}"; do
         meta_lines+=("$(printf '%s, "%s", track=%s' "${codecs[$i]}" "$mpls" "${ids[$i]}")")
     done
-    printf '%s\n' "${meta_lines[@]}" > "$meta"
+    printf '%s\n' "${meta_lines[@]}" > "$meta" || {
+        echo 'bd_split: failed to write the meta file'
+        echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+    }
     echo 'ENCODE_STEP bd_split 60'
     "${tsrun[@]}" "$meta" "$out" 2>&1 | sed 's/^/[tsMuxeR] /' || {
         echo 'bd_split: tsMuxeR mux failed'
@@ -386,7 +405,10 @@ const bashSourceBdSplit = `bd_split () {
             done
             echo '  </EditionEntry>'
             echo '</Chapters>'
-        } > "$EpisodeDir/chapters.xml"
+        } > "$EpisodeDir/chapters.xml" || {
+            echo 'bd_split: failed to write chapters.xml'
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        }
         echo "[bd_split] kept chapters $range_a-$range_b -> src.m2ts + chapters.xml"
         echo 'ENCODE_STEP bd_split 100'
         return 0
@@ -412,7 +434,18 @@ const bashSourceBdSplit = `bd_split () {
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
         nn=$(printf '%02d' "$n")
-        mv -f "$part" "$EpisodeDir/chapter-$nn.m2ts"
+        mv -f "$part" "$EpisodeDir/chapter-$nn.m2ts" || {
+            echo "bd_split: failed to rename split part $part"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        }
+        # Post-condition: a stale DIRECTORY at the target name would make
+        # mv move the part INSIDE it and still exit 0 — require a regular
+        # file at the artifact path (parity: PS Rename-Item throws on an
+        # existing target).
+        if [[ ! -f "$EpisodeDir/chapter-$nn.m2ts" ]]; then
+            echo "bd_split: chapter-$nn.m2ts is not a regular file after rename (stale directory at target?)"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        fi
         # Each part is exactly one chapter: a single mark at 0, original
         # chapter number kept in the display name.
         {
@@ -428,7 +461,10 @@ const bashSourceBdSplit = `bd_split () {
             echo '    </ChapterAtom>'
             echo '  </EditionEntry>'
             echo '</Chapters>'
-        } > "$EpisodeDir/chapter-$nn.xml"
+        } > "$EpisodeDir/chapter-$nn.xml" || {
+            echo "bd_split: failed to write chapter-$nn.xml"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        }
     done
     echo "[bd_split] wrote ${#marks[@]} chapter files (chapter-01.m2ts .. chapter-$(printf '%02d' "${#marks[@]}").m2ts)"
     echo 'ENCODE_STEP bd_split 100'

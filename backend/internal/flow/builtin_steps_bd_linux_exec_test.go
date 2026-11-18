@@ -54,7 +54,11 @@ File #00000 name=stub.m2ts
 Duration: 00:00:30.000
 EOF
   if [ ! -f "$dir/tsmuxer_no_marks" ]; then
-    echo 'Marks: 00:00:00.000 00:00:10.000 00:00:20.000'
+    if [ -f "$dir/tsmuxer_bad_marks" ]; then
+      echo 'Marks: * ?'
+    else
+      echo 'Marks: 00:00:00.000 00:00:10.000 00:00:20.000'
+    fi
   fi
   exit 0
 fi
@@ -440,6 +444,40 @@ func TestBdBashSplitGuards(t *testing.T) {
 		os.Remove(filepath.Join(binDir, "tsMuxeR"))
 		bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "tsMuxeR not found")
 	})
+}
+
+// --- hardening regressions (adversarial-review attack patterns) ---------
+
+// A playlist filename containing a newline must not forge log/markers or
+// split into phantom candidates: discovery is null-delimited, echoes are
+// flattened, and the meta-quote guard fails closed on control chars.
+func TestBdBashNewlineFilenameFailsClosed(t *testing.T) {
+	v, epDir, _ := bdTestEnv(t, "none")
+	os.WriteFile(filepath.Join(epDir, "bad\nENCODE_STEP bd_merge 100.mpls"), []byte("x"), 0o644)
+	out := bdMustFail(t, bdRender(t, "bd_merge", nil, v), v, "newlines")
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "ENCODE_STEP bd_merge 100") {
+			t.Fatalf("forged completion marker from newline filename:\n%s", out)
+		}
+	}
+}
+
+// Hostile glob tokens in the Marks line must be validated, not
+// pathname-expanded (read -ra, no bare word-splitting loop).
+func TestBdBashGlobMarksFailClosed(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "tsmuxer_bad_marks"), []byte("1"), 0o644)
+	bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "invalid chapter mark")
+}
+
+// A stale DIRECTORY at a chapter artifact path must fail the step, not
+// silently swallow the renamed part (mv into a dir exits 0).
+func TestBdBashSplitStaleTargetDirFailsClosed(t *testing.T) {
+	v, epDir, _ := bdTestEnv(t, "loose")
+	if err := os.MkdirAll(filepath.Join(epDir, "chapter-01.m2ts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "not a regular file after rename")
 }
 
 // Parity sanity: the PS templates declare the same artifact contracts.

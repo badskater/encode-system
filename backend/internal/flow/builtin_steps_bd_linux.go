@@ -440,8 +440,8 @@ const bashSourceBdSplit = `bd_split () {
         }
         # Post-condition: a stale DIRECTORY at the target name would make
         # mv move the part INSIDE it and still exit 0 — require a regular
-        # file at the artifact path (parity: PS Rename-Item throws on an
-        # existing target).
+        # file at the artifact path (the PS dialect's rename cmdlet throws
+        # on an existing target, so this keeps fail-closed parity).
         if [[ ! -f "$EpisodeDir/chapter-$nn.m2ts" ]]; then
             echo "bd_split: chapter-$nn.m2ts is not a regular file after rename (stale directory at target?)"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1

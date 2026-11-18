@@ -244,6 +244,20 @@ func TestBackupRestorePGRoundTrip(t *testing.T) {
 		t.Skip("ENCODE_TEST_PG_DSN not set; skipping PG restore test")
 	}
 
+	// Dedicated per-test database (same pattern as backup_pg_test.go).
+	// Using the store package's encode_test directly races its TestMain:
+	// go test runs packages in parallel, so this package can connect
+	// BEFORE store's TestMain creates the database (CI flake: "database
+	// encode_test does not exist"). Deriving our own removes the ordering
+	// dependency entirely.
+	const restoreTestDB = "encode_restore_test"
+	_, maintDSN, err := parseBackupTestDSN(dsn)
+	if err != nil {
+		t.Fatalf("parse test DSN: %v", err)
+	}
+	dropAndCreateBackupTestDB(t, restoreTestDB, maintDSN)
+	dsn = swapDBName(dsn, restoreTestDB)
+
 	dir := t.TempDir()
 	st, err := store.Open(dsn)
 	if err != nil {

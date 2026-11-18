@@ -130,17 +130,40 @@ func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (
 	if source == "" {
 		source = mkvFallback
 	}
+	// Blu-ray disc layout fallback: no flat media file, but a BDMV folder
+	// with playlists AND streams. The bd_merge/bd_split steps resolve the
+	// actual playlist at runtime; SourceFile reports the first (sorted)
+	// playlist for display. A flat source always wins over the disc layout.
+	var bdmvNewest time.Time
+	if source == "" && script != "" {
+		pl, newest, ok, err := bdmvSource(fsys, dir)
+		if err != nil {
+			return Candidate{}, false, err
+		}
+		if ok {
+			source = pl
+			bdmvNewest = newest
+		}
+	}
 	if source == "" || script == "" {
 		return Candidate{}, false, nil
 	}
 	// Stability gate: a source still being copied over NFS has a fresh mtime.
 	if minStableAge > 0 {
-		info, err := fs.Stat(fsys, path.Join(dir, source))
-		if err != nil {
-			return Candidate{}, false, err
-		}
-		if time.Since(info.ModTime()) < minStableAge {
-			return Candidate{}, false, nil
+		if !bdmvNewest.IsZero() {
+			// Disc layout: the newest playlist/stream mtime represents the
+			// copy progress (the big stream files land last).
+			if time.Since(bdmvNewest) < minStableAge {
+				return Candidate{}, false, nil
+			}
+		} else {
+			info, err := fs.Stat(fsys, path.Join(dir, source))
+			if err != nil {
+				return Candidate{}, false, err
+			}
+			if time.Since(info.ModTime()) < minStableAge {
+				return Candidate{}, false, nil
+			}
 		}
 	}
 	return Candidate{
@@ -159,4 +182,71 @@ func isSourceExt(ext string) bool {
 		}
 	}
 	return false
+}
+
+// bdmvSource detects a Blu-ray disc layout inside an episode folder:
+// BDMV/PLAYLIST/*.mpls plus BDMV/STREAM/*.m2ts (spec-uppercase directories,
+// case-insensitive extensions). Returns the first sorted playlist's path
+// relative to the episode dir and the newest mtime across all playlist and
+// stream files (the stability signal — a disc mid-copy has fresh streams).
+// A missing BDMV folder is not an error: ok=false lets the caller skip.
+func bdmvSource(fsys fs.FS, dir string) (string, time.Time, bool, error) {
+	plEntries, err := fs.ReadDir(fsys, path.Join(dir, "BDMV", "PLAYLIST"))
+	if err != nil {
+		return "", time.Time{}, false, nil
+	}
+	stEntries, err := fs.ReadDir(fsys, path.Join(dir, "BDMV", "STREAM"))
+	if err != nil {
+		return "", time.Time{}, false, nil
+	}
+	var playlists, streams []string
+	for _, e := range plEntries {
+		if !e.IsDir() && strings.EqualFold(path.Ext(e.Name()), ".mpls") {
+			playlists = append(playlists, e.Name())
+		}
+	}
+	for _, e := range stEntries {
+		if !e.IsDir() && strings.EqualFold(path.Ext(e.Name()), ".m2ts") {
+			streams = append(streams, e.Name())
+		}
+	}
+	if len(playlists) == 0 || len(streams) == 0 {
+		return "", time.Time{}, false, nil
+	}
+	sort.Strings(playlists)
+	sort.Strings(streams)
+	var newest time.Time
+	for _, rel := range append(
+		[]string{path.Join("BDMV", "PLAYLIST", playlists[0])},
+		streamFiles(streams)...,
+	) {
+		info, err := fs.Stat(fsys, path.Join(dir, rel))
+		if err != nil {
+			return "", time.Time{}, false, err
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	// All playlists matter for the stability signal too (a fresh playlist
+	// rewrite means the disc is still being authored/copied).
+	for _, pl := range playlists[1:] {
+		info, err := fs.Stat(fsys, path.Join(dir, "BDMV", "PLAYLIST", pl))
+		if err != nil {
+			return "", time.Time{}, false, err
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	return path.Join("BDMV", "PLAYLIST", playlists[0]), newest, true, nil
+}
+
+// streamFiles maps stream base names to their BDMV/STREAM relative paths.
+func streamFiles(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, path.Join("BDMV", "STREAM", n))
+	}
+	return out
 }

@@ -28,34 +28,70 @@ func ScanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableA
 	}
 
 	// Group objects by their depth-2 directory ("series/episode").
+	// BDMV subtree keys (series/episode/BDMV/PLAYLIST|STREAM/…) are deeper
+	// than the flat layout rule, but they are evidence of a disc-layout
+	// episode — collect them per episode dir instead of dropping them.
 	byDir := map[string][]s3Entry{}
+	bdmvByDir := map[string][]s3Entry{}
 	for _, o := range objs {
 		dir, name := path.Split(o.Key)
 		trimmed := strings.TrimSuffix(dir, "/")
 		// Depth-2 keys are "series/episode/file": the dir part holds exactly
 		// one slash. Root/top-level files and deeper nesting are ignored,
 		// mirroring the filesystem scan's depth rule.
-		if name == "" || strings.Count(trimmed, "/") != 1 {
+		if name == "" {
 			continue
 		}
-		key := trimmed
-		byDir[key] = append(byDir[key], s3Entry{name: name, obj: o})
+		if strings.Count(trimmed, "/") == 1 {
+			byDir[trimmed] = append(byDir[trimmed], s3Entry{name: name, obj: o})
+			continue
+		}
+		if rel, epDir, ok := bdmvKey(o.Key); ok {
+			bdmvByDir[epDir] = append(bdmvByDir[epDir], s3Entry{name: rel, obj: o})
+		}
 	}
 
-	dirs := make([]string, 0, len(byDir))
+	dirs := make([]string, 0, len(byDir)+len(bdmvByDir))
+	seen := map[string]bool{}
 	for d := range byDir {
 		dirs = append(dirs, d)
+		seen[d] = true
+	}
+	for d := range bdmvByDir {
+		if !seen[d] {
+			dirs = append(dirs, d)
+		}
 	}
 	sort.Strings(dirs)
 
 	var out []Candidate
 	for _, d := range dirs {
-		c, ok := inspectS3Episode(d, byDir[d], minStableAge, time.Now())
+		c, ok := inspectS3Episode(d, byDir[d], bdmvByDir[d], minStableAge, time.Now())
 		if ok {
 			out = append(out, c)
 		}
 	}
 	return out, nil
+}
+
+// bdmvKey recognizes a Blu-ray playlist/stream object key inside an episode
+// prefix: <series>/<episode>/BDMV/PLAYLIST/<name>.mpls or
+// <series>/<episode>/BDMV/STREAM/<name>.m2ts (spec-uppercase directories,
+// case-insensitive extensions — parity with the filesystem bdmvSource).
+// Returns the path relative to the episode dir and the depth-2 episode dir.
+func bdmvKey(key string) (rel, epDir string, ok bool) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 5 || parts[2] != "BDMV" {
+		return "", "", false
+	}
+	ext := strings.ToLower(path.Ext(parts[4]))
+	switch {
+	case parts[3] == "PLAYLIST" && ext == ".mpls":
+	case parts[3] == "STREAM" && ext == ".m2ts":
+	default:
+		return "", "", false
+	}
+	return strings.Join(parts[2:], "/"), parts[0] + "/" + parts[1], true
 }
 
 // s3Entry is one object in an episode directory listing.
@@ -65,8 +101,10 @@ type s3Entry struct {
 }
 
 // inspectS3Episode applies the same source/script selection and stability
-// rules as inspectEpisode to one episode's object listing.
-func inspectS3Episode(epDir string, entries []s3Entry, minStableAge time.Duration, now time.Time) (Candidate, bool) {
+// rules as inspectEpisode to one episode's object listing. bdmvEntries
+// carries the disc-layout evidence (BDMV/PLAYLIST + BDMV/STREAM objects)
+// used when no flat source exists — parity with the filesystem fallback.
+func inspectS3Episode(epDir string, entries, bdmvEntries []s3Entry, minStableAge time.Duration, now time.Time) (Candidate, bool) {
 	var source, script string
 	var mkvFallback string
 	var sourceMtime time.Time
@@ -98,6 +136,29 @@ func inspectS3Episode(epDir string, entries []s3Entry, minStableAge time.Duratio
 	}
 	if source == "" {
 		source = mkvFallback
+	}
+	// Disc-layout fallback (parity with inspectEpisode): playlists AND
+	// streams must both be present; the newest BDMV object is the
+	// stability signal.
+	if source == "" && len(bdmvEntries) > 0 {
+		var playlists []string
+		hasStream := false
+		var newest time.Time
+		for _, e := range bdmvEntries {
+			if strings.HasPrefix(e.name, "BDMV/PLAYLIST/") {
+				playlists = append(playlists, e.name)
+			} else if strings.HasPrefix(e.name, "BDMV/STREAM/") {
+				hasStream = true
+			}
+			if e.obj.LastModified.After(newest) {
+				newest = e.obj.LastModified
+			}
+		}
+		if len(playlists) > 0 && hasStream {
+			sort.Strings(playlists)
+			source = playlists[0]
+			sourceMtime = newest
+		}
 	}
 	if source == "" || script == "" {
 		return Candidate{}, false

@@ -44,6 +44,8 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		releaseCopyTemplate(),
 		keyframesTemplate(),
 		discordNotifyTemplate(),
+		bdMergeTemplate(),
+		bdSplitTemplate(),
 	}
 }
 

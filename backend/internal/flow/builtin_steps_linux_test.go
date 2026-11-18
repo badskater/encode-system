@@ -170,6 +170,8 @@ var builtinLinuxToolMap = map[string]string{
 	"release_copy":     "cp",         // bash cp replaces Copy-Item
 	"keyframes":        "vspipe",     // vspipe runs the scxvid .vpy (vapoursynth-scxvid)
 	"discord_notify":   "curl",       // curl replaces WebClient
+	"bd_merge":         "tsMuxeR",    // tsMuxeR remuxes the playlist to one m2ts
+	"bd_split":         "tsMuxeR",    // tsMuxeR splits the playlist at chapter marks
 }
 
 // TestBuiltinBashAllTemplatesResolveOrRefuse: every built-in template must

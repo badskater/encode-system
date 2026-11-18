@@ -31,6 +31,32 @@
     state: present
   when: ansible_os_family | default("Debian") == "RedHat"
 
+# ------------------------------------------------- tsMuxeR runtime libraries
+# The bd_merge/bd_split builtins remux Blu-ray playlists with tsMuxeR
+# (bin package). The CLI links libfreetype/libpng/libbrotli (subtitle font
+# rendering) — the upstream AppImage does NOT bundle them. Install the
+# system libraries here; on minimal hosts the bin package may instead ship
+# a tsMuxeR-lib/ directory beside the binary, which the steps prepend to
+# LD_LIBRARY_PATH automatically. Package names are Debian 13 (t64 transition);
+# on older Debian use libpng16-16, on RHEL-family freetype/libpng/brotli.
+- name: Install tsMuxeR runtime libraries (apt)
+  ansible.builtin.apt:
+    name:
+      - libfreetype6
+      - libpng16-16t64
+      - libbrotli1
+    state: present
+  when: ansible_os_family | default("Debian") == "Debian"
+
+- name: Install tsMuxeR runtime libraries (dnf)
+  ansible.builtin.dnf:
+    name:
+      - freetype
+      - libpng
+      - brotli
+    state: present
+  when: ansible_os_family | default("Debian") == "RedHat"
+
 # ------------------------------------------------- VapourSynth scxvid plugin
 # The keyframes builtin (scene-change detection, P7) runs on Linux through
 # the vapoursynth-scxvid VapourSynth plugin: the rendered .vpy imports

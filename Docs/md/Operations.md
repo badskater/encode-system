@@ -387,15 +387,25 @@ DTS-HD MA / LPCM) works on it unchanged. Verified against tsMuxeR **v3.1.0**.
   encode flow; `mux_extras` picks up the `chapters.xml` sidecar. For
   OP/ED trimming or one episode out of a multi-episode playlist use
   `bd_split` with `mode=range`, `range=N-M` (1-based chapters; a range
-  ending at the last chapter cuts to the source end). `mode=chapters`
-  (default) writes `chapter-NN.m2ts` + `chapter-NN.xml` per chapter — to
-  encode one part, move `chapter-NN.m2ts` into a fresh episode dir as the
-  source and rename its sidecar to `chapters.xml`.
+  ending at the last chapter cuts to the source end). Range mode requires
+  **ffprobe** (Windows: `ffprobe.exe` in the bin dir; Linux: `ffprobe` on
+  PATH or in the bin dir — ships with ffmpeg) and cuts with
+  `--cut-pictures=inside`: the output starts at the first key picture AT
+  OR AFTER the first kept mark — no previous-chapter pre-roll. Compliant
+  BDs place entry marks on key pictures, so the cut is exact there; an
+  off-keyframe mark loses up to one GOP at the head, and the sidecar is
+  rebased against the MEASURED first video PTS (never nominal mark math).
+  `mode=chapters` (default) writes `chapter-NN.m2ts` + `chapter-NN.xml`
+  per chapter; a playlist whose first mark is non-zero additionally gets
+  `chapter-00` (the pre-chapter segment 0 → first mark). To encode one
+  part, move `chapter-NN.m2ts` into a fresh episode dir as the source and
+  rename its sidecar to `chapters.xml`.
 - **Artifacts**: `src.m2ts` / `chapter-NN.m2ts`, `chapters.xml` /
   `chapter-NN.xml` (Matroska XML), `bd-merge.meta` / `bd-split.meta` (kept
-  for debugging). Re-runs clean stale chapter/split artifacts and always
-  remux (no fresh-skip). A playlist without marks: merge succeeds without
-  chapters; split fails loudly.
+  for debugging). Re-runs clean stale chapter/split artifacts in EVERY
+  mode (a chapters→range/merge switch leaves no orphans; >99-chapter
+  names included) and always remux (no fresh-skip). A playlist without
+  marks: merge succeeds without chapters; split fails loudly.
 - **Failure classes**: missing tsMuxeR / missing or ambiguous playlist /
   unsafe `playlist` param (traversal, absolute, quotes, control chars) /
   detection or mux non-zero exit / missing or undersized outputs / split

@@ -56,9 +56,25 @@ EOF
   if [ ! -f "$dir/tsmuxer_no_marks" ]; then
     if [ -f "$dir/tsmuxer_bad_marks" ]; then
       echo 'Marks: * ?'
+    elif [ -f "$dir/tsmuxer_glob_marks" ]; then
+      echo 'Marks: 00:00:1?.000'
+    elif [ -f "$dir/tsmuxer_first_mark_nonzero" ]; then
+      echo 'Marks: 00:00:05.000 00:00:10.000 00:00:20.000'
+    elif [ -f "$dir/tsmuxer_marks_100" ]; then
+      m='Marks:'
+      i=0
+      while [ "$i" -lt 100 ]; do
+        m="$m $(printf '%02d:%02d:%02d.000' $((i / 3600)) $((i % 3600 / 60)) $((i % 60)))"
+        i=$((i + 1))
+      done
+      echo "$m"
     else
       echo 'Marks: 00:00:00.000 00:00:10.000 00:00:20.000'
     fi
+  fi
+  if [ -f "$dir/tsmuxer_multiclip" ]; then
+    echo 'File #00001 name=stub2.m2ts'
+    echo 'Duration: 00:00:30.000'
   fi
   exit 0
 fi
@@ -67,8 +83,16 @@ if [ -f "$dir/tsmuxer_mux_fail" ]; then
   echo "stub: mux failure" >&2
   exit 1
 fi
+# Syntax fidelity (real tsMuxeR rejects the space form): --cut-pictures
+# must carry =cover or =inside; a bare flag fails the mux.
+if grep -q -- '--cut-pictures' "$meta" && ! grep -qE -- '--cut-pictures=(cover|inside)' "$meta"; then
+  echo "stub: --cut-pictures takes cover or inside, not \"\"" >&2
+  exit 1
+fi
 if grep -q -- '--split-chapters' "$meta"; then
   count=3
+  [ -f "$dir/tsmuxer_first_mark_nonzero" ] && count=4
+  [ -f "$dir/tsmuxer_marks_100" ] && count=100
   [ -f "$dir/tsmuxer_part_count" ] && count=$(cat "$dir/tsmuxer_part_count")
   base="${out%.*}"
   p=1
@@ -80,6 +104,16 @@ else
   head -c 256 /dev/zero > "$out"
 fi
 echo "tsMuxeR stub: muxed $out"
+`
+
+// bdFfprobeStub serves the range-mode rebase query: first video PTS of
+// the cut output. Default 610.0 = pinned 600s base + 10.0s keyframe
+// (keyframe-aligned cut at mark 00:00:10.000). Sidecar ffprobe_pts
+// overrides the value (off-keyframe probes).
+const bdFfprobeStub = `#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$@" > "$dir/ffprobe_args.txt"
+if [ -f "$dir/ffprobe_pts" ]; then cat "$dir/ffprobe_pts"; else echo '610.000000'; fi
 `
 
 // bdTestEnv builds an episode tree + a stub bin dir. layout controls the
@@ -118,6 +152,9 @@ func bdTestEnv(t *testing.T, layout string) (Vars, string, string) {
 	if err := os.WriteFile(filepath.Join(binDir, "tsMuxeR"), []byte(bdStubBody), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(binDir, "ffprobe"), []byte(bdFfprobeStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	v := Vars{BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: filepath.Join(root, "release"), Group: "TestGroup", Tag: "1080p"}
 	return v, epDir, binDir
 }
@@ -135,15 +172,25 @@ func bdRender(t *testing.T, key string, params map[string]string, v Vars) string
 }
 
 // bdRun executes the rendered script with ONLY coreutils on PATH (the
-// tsMuxeR stub lives in BinDir — exercising the BinDir resolution path,
-// not command -v). Returns combined output + exit error.
+// tsMuxeR/ffprobe stubs live in BinDir — exercising the BinDir resolution
+// path, not command -v) in a fresh empty working directory. Returns
+// combined output + exit error.
 func bdRun(t *testing.T, script string, v Vars) (string, error) {
+	t.Helper()
+	return bdRunInDir(t, script, v, t.TempDir())
+}
+
+// bdRunInDir is bdRun with a controlled cwd — glob-expansion probes plant
+// mark-shaped filenames there (a bare word-splitting Marks loop would
+// pathname-expand against the process cwd).
+func bdRunInDir(t *testing.T, script string, v Vars, cwd string) (string, error) {
 	t.Helper()
 	scriptPath := filepath.Join(t.TempDir(), "bd.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("bash", scriptPath)
+	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "PATH=/usr/bin:/bin:/usr/local/bin")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -378,8 +425,8 @@ func TestBdBashSplitRangeArtifacts(t *testing.T) {
 	bdMustRun(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v)
 
 	meta := bdRead(t, filepath.Join(epDir, "bd-split.meta"))
-	if !strings.Contains(meta, "MUXOPT --cut-start=00:00:10.000 --cut-end=00:00:20.000") {
-		t.Errorf("range 2-2 must cut from mark 2 to mark 3 start:\n%s", meta)
+	if !strings.Contains(meta, "MUXOPT --cut-start=00:00:10.000 --cut-pictures=inside --start-time=27000000 --cut-end=00:00:20.000") {
+		t.Errorf("range 2-2 must cut inside from mark 2 to mark 3 start with pinned base:\n%s", meta)
 	}
 	if _, err := os.Stat(filepath.Join(epDir, "src.m2ts")); err != nil {
 		t.Errorf("range mode must produce src.m2ts: %v", err)
@@ -437,7 +484,7 @@ func TestBdBashSplitGuards(t *testing.T) {
 	t.Run("part count mismatch", func(t *testing.T) {
 		v, _, binDir := bdTestEnv(t, "loose")
 		os.WriteFile(filepath.Join(binDir, "tsmuxer_part_count"), []byte("2"), 0o644)
-		bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "split parts but the playlist has")
+		bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "split parts but expected")
 	})
 	t.Run("missing tool", func(t *testing.T) {
 		v, _, binDir := bdTestEnv(t, "loose")
@@ -463,11 +510,66 @@ func TestBdBashNewlineFilenameFailsClosed(t *testing.T) {
 }
 
 // Hostile glob tokens in the Marks line must be validated, not
-// pathname-expanded (read -ra, no bare word-splitting loop).
+// pathname-expanded. NON-VACUOUS: the cwd contains a mark-shaped file, so
+// a bare word-splitting loop would expand '00:00:1?.000' into a VALID
+// mark and complete — the test only passes with read -ra in place.
+// Both dialects' steps must fail closed identically (parity).
 func TestBdBashGlobMarksFailClosed(t *testing.T) {
-	v, _, binDir := bdTestEnv(t, "loose")
-	os.WriteFile(filepath.Join(binDir, "tsmuxer_bad_marks"), []byte("1"), 0o644)
-	bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "invalid chapter mark")
+	for _, key := range []string{"bd_merge", "bd_split"} {
+		t.Run(key, func(t *testing.T) {
+			v, _, binDir := bdTestEnv(t, "loose")
+			os.WriteFile(filepath.Join(binDir, "tsmuxer_glob_marks"), []byte("1"), 0o644)
+			cwd := t.TempDir()
+			// The expansion target: a legal filename that IS a valid mark.
+			os.WriteFile(filepath.Join(cwd, "00:00:15.000"), []byte("x"), 0o644)
+			script := bdRender(t, key, nil, v)
+			out, err := bdRunInDir(t, script, v, cwd)
+			if err == nil {
+				t.Fatalf("%s: glob token expanded into a valid mark (defense missing):\n%s", key, out)
+			}
+			if !strings.Contains(out, "invalid chapter mark") {
+				t.Fatalf("%s: expected mark validation failure:\n%s", key, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "ENCODE_STEP "+key+" 100") {
+					t.Fatalf("%s: forged completion marker:\n%s", key, out)
+				}
+			}
+		})
+	}
+}
+
+// A newline in the untrusted range/mode params must not forge line-start
+// progress markers through the error echo (agent live tracker parses
+// ^ENCODE_STEP unanchored at the end).
+func TestBdBashParamMarkerForgeryFailsClosed(t *testing.T) {
+	for _, tc := range []struct{ name, param, value string }{
+		{"range", "range", "x\nENCODE_STEP bd_split 100"},
+		{"range cross-step", "range", "x\nENCODE_STEP encode 100"},
+		{"mode", "mode", "x\nENCODE_STEP bd_split 100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, _, _ := bdTestEnv(t, "loose")
+			params := map[string]string{tc.param: tc.value}
+			if tc.param == "range" {
+				params["mode"] = "range"
+			}
+			out := bdMustFail(t, bdRender(t, "bd_split", params, v), v, "ENCODE_STEP_FAILED")
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "ENCODE_STEP bd_split 100") || strings.HasPrefix(line, "ENCODE_STEP encode 100") {
+					t.Fatalf("forged marker from %s param:\n%s", tc.param, out)
+				}
+			}
+		})
+	}
+}
+
+// bash arithmetic wraps mod 2^64: an uncapped digit string would validate
+// 2^64+2 as chapter 2. The {1,9} cap must reject it (PS [int] overflow
+// parity).
+func TestBdBashRangeOverflowFailsClosed(t *testing.T) {
+	v, _, _ := bdTestEnv(t, "loose")
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "18446744073709551618"}, v), v, "range must be N or N-M")
 }
 
 // A stale DIRECTORY at a chapter artifact path must fail the step, not
@@ -478,6 +580,94 @@ func TestBdBashSplitStaleTargetDirFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	bdMustFail(t, bdRender(t, "bd_split", nil, v), v, "not a regular file after rename")
+}
+
+// First mark non-zero → tsMuxeR emits N+1 parts (pre-chapter segment
+// 0 -> first mark). It must map to chapter-00, not fail the count check.
+func TestBdBashSplitNonZeroFirstMark(t *testing.T) {
+	v, epDir, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "tsmuxer_first_mark_nonzero"), []byte("1"), 0o644)
+	bdMustRun(t, bdRender(t, "bd_split", nil, v), v)
+	for _, nn := range []string{"00", "01", "02", "03"} {
+		if _, err := os.Stat(filepath.Join(epDir, "chapter-"+nn+".m2ts")); err != nil {
+			t.Errorf("chapter-%s.m2ts missing: %v", nn, err)
+		}
+		xml := bdRead(t, filepath.Join(epDir, "chapter-"+nn+".xml"))
+		if !strings.Contains(xml, "<ChapterString>Chapter "+nn+"</ChapterString>") {
+			t.Errorf("chapter-%s.xml name wrong:\n%s", nn, xml)
+		}
+	}
+}
+
+// >99 chapters: %02d is MINIMUM width — cleanup must match 3-digit names
+// and the rename must produce chapter-100 (not collide with stale files).
+func TestBdBashSplitHundredChapters(t *testing.T) {
+	v, epDir, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "tsmuxer_marks_100"), []byte("1"), 0o644)
+	// Stale artifacts beyond the 2-digit pattern.
+	os.WriteFile(filepath.Join(epDir, "chapter-100.m2ts"), []byte("stale"), 0o644)
+	os.WriteFile(filepath.Join(epDir, "chapter-101.m2ts"), []byte("stale"), 0o644)
+	os.WriteFile(filepath.Join(epDir, "chapter-101.xml"), []byte("stale"), 0o644)
+	bdMustRun(t, bdRender(t, "bd_split", nil, v), v)
+	if _, err := os.Stat(filepath.Join(epDir, "chapter-100.m2ts")); err != nil {
+		t.Fatalf("chapter-100.m2ts missing: %v", err)
+	}
+	if b := bdRead(t, filepath.Join(epDir, "chapter-100.m2ts")); len(b) != 256 {
+		t.Errorf("chapter-100.m2ts must be the fresh part, not the stale file (%d bytes)", len(b))
+	}
+	if _, err := os.Stat(filepath.Join(epDir, "chapter-101.m2ts")); !os.IsNotExist(err) {
+		t.Errorf("stale chapter-101.m2ts not cleaned")
+	}
+	if _, err := os.Stat(filepath.Join(epDir, "chapter-101.xml")); !os.IsNotExist(err) {
+		t.Errorf("stale chapter-101.xml not cleaned")
+	}
+}
+
+// Mode switches must not leave orphans: chapters→range, chapters→merge.
+func TestBdBashModeSwitchCleansStaleChapters(t *testing.T) {
+	for _, next := range []struct {
+		key    string
+		params map[string]string
+	}{{"bd_split", map[string]string{"mode": "range", "range": "2-2"}}, {"bd_merge", nil}} {
+		t.Run(next.key, func(t *testing.T) {
+			v, epDir, _ := bdTestEnv(t, "loose")
+			bdMustRun(t, bdRender(t, "bd_split", nil, v), v)
+			bdMustRun(t, bdRender(t, next.key, next.params, v), v)
+			entries, _ := os.ReadDir(epDir)
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), "chapter-") || strings.HasPrefix(e.Name(), "bd-split.split.") {
+					t.Errorf("stale split artifact survived switch to %s: %s", next.key, e.Name())
+				}
+			}
+		})
+	}
+}
+
+// Range mode requires ffprobe for the measured rebase — fail fast with an
+// actionable message when it is absent.
+func TestBdBashRangeRequiresFfprobe(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	os.Remove(filepath.Join(binDir, "ffprobe"))
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v, "requires ffprobe")
+}
+
+// Multi-clip playlist listing (two File # entries): tracks are listed
+// once per stream, meta must carry exactly one line per track referencing
+// the playlist (tsMuxeR expands PlayItems internally).
+func TestBdBashMergeMultiClipListing(t *testing.T) {
+	v, epDir, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "tsmuxer_multiclip"), []byte("1"), 0o644)
+	bdMustRun(t, bdRender(t, "bd_merge", nil, v), v)
+	meta := bdRead(t, filepath.Join(epDir, "bd-merge.meta"))
+	lines := strings.Split(strings.TrimSpace(meta), "\n")
+	if len(lines) != 3 { // MUXOPT + 2 tracks
+		t.Fatalf("multi-clip listing must not duplicate track lines:\n%s", meta)
+	}
+	for _, l := range lines[1:] {
+		if !strings.Contains(l, "00000.mpls\", track=") {
+			t.Errorf("track line must reference the playlist: %s", l)
+		}
+	}
 }
 
 // Parity sanity: the PS templates declare the same artifact contracts.

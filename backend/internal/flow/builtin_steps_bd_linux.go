@@ -146,6 +146,12 @@ const bashSourceBdMerge = `bd_merge () {
         echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
     }
     echo 'ENCODE_STEP bd_merge 60'
+    # Clean stale split artifacts from a previous bd_split run in this dir
+    # (mode-switch orphan guard — parity with bd_split's own cleanup).
+    find "$EpisodeDir" -maxdepth 1 -type f \( -name 'chapter-[0-9]*.m2ts' -o -name 'chapter-[0-9]*.xml' -o -name 'bd-split.split.*.m2ts' \) -delete || {
+        echo 'bd_merge: failed to clean stale split artifacts'
+        echo 'ENCODE_STEP_FAILED bd_merge'; exit 1
+    }
     rm -f "$out"
     "${tsrun[@]}" "$meta" "$out" 2>&1 | sed 's/^/[tsMuxeR] /' || {
         echo 'bd_merge: tsMuxeR mux failed'
@@ -213,7 +219,7 @@ const bashSourceBdSplit = `bd_split () {
     local mode="${mode:-chapters}"
     mode=$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     if [[ "$mode" != 'chapters' && "$mode" != 'range' ]]; then
-        echo "bd_split: mode must be 'chapters' or 'range' (got '$mode')"
+        echo "bd_split: mode must be 'chapters' or 'range' (got '$(printf '%s' "$mode" | tr '\r\n' '  ')')"
         echo 'ENCODE_STEP_FAILED bd_split'; exit 1
     fi
 
@@ -295,7 +301,12 @@ const bashSourceBdSplit = `bd_split () {
                 ;;
             Marks:*)
                 local marks_str="${line#Marks:}"
-                for m in $marks_str; do
+                # read -ra splits on IFS WITHOUT glob expansion (a bare
+                # "for m in $marks_str" would pathname-expand hostile
+                # tokens before validation). Each token is validated.
+                local -a mark_toks=()
+                read -ra mark_toks <<< "$marks_str"
+                for m in "${mark_toks[@]}"; do
                     if [[ ! "$m" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$ ]]; then
                         echo "bd_split: tsMuxeR listing: invalid chapter mark '$m'"
                         echo 'ENCODE_STEP_FAILED bd_split'; exit 1
@@ -315,12 +326,16 @@ const bashSourceBdSplit = `bd_split () {
     fi
 
     # --- Range validation (1-based chapter numbers, inclusive) ---
+    # Digit cap BEFORE arithmetic: bash wraps mod 2^64, so an uncapped
+    # [0-9]+ would validate 2^64+2 as chapter 2 (the PS dialect's integer
+    # cast throws on overflow — the cap keeps both dialects identical).
+    # 9 digits is far above any real chapter count.
     local range_a=1 range_b=${#marks[@]}
     if [[ "$mode" == 'range' ]]; then
         local r="${range:-}"
         r=$(printf '%s' "$r" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        if [[ ! "$r" =~ ^([0-9]+)(-([0-9]+))?$ ]]; then
-            echo "bd_split: range must be N or N-M chapter numbers (got '$r')"
+        if [[ ! "$r" =~ ^([0-9]{1,9})(-([0-9]{1,9}))?$ ]]; then
+            echo "bd_split: range must be N or N-M chapter numbers (got '$(printf '%s' "$r" | tr '\r\n' '  ')')"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
         range_a=$((10#${BASH_REMATCH[1]}))
@@ -330,9 +345,25 @@ const bashSourceBdSplit = `bd_split () {
             echo "bd_split: range $range_a-$range_b is outside the playlist's 1-${#marks[@]} chapters"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
+        # Range mode rebases chapters against the MEASURED output start —
+        # ffprobe is required (fail fast, before the remux).
+        local ffprobe
+        ffprobe=$(command -v ffprobe 2>/dev/null || true)
+        [[ -z "$ffprobe" ]] && ffprobe="$BinDir/ffprobe"
+        if ! [[ -x "$ffprobe" ]]; then
+            echo "bd_split: range mode requires ffprobe for exact chapter rebasing (install the ffmpeg package or add ffprobe to $BinDir)"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        fi
     fi
     echo "[bd_split] ${#ids[@]} track(s), ${#marks[@]} chapter mark(s)"
     echo 'ENCODE_STEP bd_split 30'
+
+    # --- Clean stale artifacts (ALL modes: a mode switch must not leave
+    # orphans from a previous run; patterns cover >99-chapter names) ---
+    find "$EpisodeDir" -maxdepth 1 -type f \( -name 'chapter-[0-9]*.m2ts' -o -name 'chapter-[0-9]*.xml' -o -name 'bd-split.split.*.m2ts' -o -name 'chapters.xml' \) -delete || {
+        echo 'bd_split: failed to clean stale split artifacts'
+        echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+    }
 
     # --- Meta file ---
     local meta="$EpisodeDir/bd-split.meta" out=''
@@ -340,16 +371,14 @@ const bashSourceBdSplit = `bd_split () {
     if [[ "$mode" == 'chapters' ]]; then
         meta_lines+=('MUXOPT --split-chapters')
         out="$EpisodeDir/bd-split.m2ts"
-        # Clean stale artifacts so a re-run with fewer chapters never leaves
-        # orphan parts behind (mux_extras would pick up stale chapters.xml).
-        find "$EpisodeDir" -maxdepth 1 -type f \( -name 'chapter-[0-9][0-9].m2ts' -o -name 'chapter-[0-9][0-9].xml' -o -name 'bd-split.split.*.m2ts' -o -name 'chapters.xml' \) -delete || {
-            echo 'bd_split: failed to clean stale split artifacts'
-            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
-        }
     else
-        # Keep chapters range_a..range_b: cut from mark[range_a-1] up to the
-        # START of the next chapter after the range (or the source end).
-        local muxopt="MUXOPT --cut-start=${marks[$((range_a - 1))]}"
+        # Keep chapters range_a..range_b. --cut-pictures inside starts at
+        # the first key picture AT OR AFTER the cut — no previous-chapter
+        # pre-roll (compliant BDs place entry marks on key pictures, so
+        # the cut is exact there). --start-time pins the mux base to 600s
+        # so the ffprobe rebase below recovers the source-relative content
+        # start from the first video PTS.
+        local muxopt="MUXOPT --cut-start=${marks[$((range_a - 1))]} --cut-pictures=inside --start-time=27000000"
         if (( range_b < ${#marks[@]} )); then muxopt+=" --cut-end=${marks[$range_b]}"; fi
         meta_lines+=("$muxopt")
         out="$EpisodeDir/src.m2ts"
@@ -380,11 +409,27 @@ const bashSourceBdSplit = `bd_split () {
             echo 'bd_split: src.m2ts is smaller than one 192-byte source packet - mux produced no data'
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
-        # Rebased chapters.xml for the kept range (times relative to the
-        # range start; original chapter numbers kept in the names).
-        local h m s z start_ms
-        IFS=':.' read -r h m s z <<< "${marks[$((range_a - 1))]}"
-        start_ms=$(( (10#$h * 3600 + 10#$m * 60 + 10#$s) * 1000 + 10#$z ))
+        # Exact rebase against the MEASURED output start: tsMuxeR keeps
+        # source-relative PTS offset by the pinned 600s mux base, so the
+        # first video PTS minus 600 is the source time of the first kept
+        # picture (the key picture at/after the cut mark). Nominal mark
+        # math would silently shift every chapter by the keyframe snap.
+        local first_pts
+        if ! first_pts=$("$ffprobe" -v error -select_streams v:0 -show_entries packet=pts_time -of default=noprint_wrappers=1:nokey=1 -read_intervals '%+#1' "$out"); then
+            echo 'bd_split: ffprobe failed on the cut output'
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        fi
+        first_pts=$(printf '%s' "$first_pts" | head -n1 | tr -d '[:space:]')
+        if [[ ! "$first_pts" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "bd_split: ffprobe returned no usable first video PTS ('$(printf '%s' "$first_pts" | tr '\r\n' '  ')')"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        fi
+        local start_ms
+        start_ms=$(awk -v p="$first_pts" 'BEGIN{printf "%d", (p - 600) * 1000 + 0.5}')
+        if (( start_ms < 0 )); then
+            echo "bd_split: cut output starts before the pinned mux base (first PTS $first_pts) - unexpected tsMuxeR timing"
+            echo 'ENCODE_STEP_FAILED bd_split'; exit 1
+        fi
         {
             echo '<?xml version="1.0" encoding="UTF-8"?>'
             echo '<Chapters>'
@@ -394,6 +439,9 @@ const bashSourceBdSplit = `bd_split () {
                 IFS=':.' read -r h m s z <<< "${marks[$i]}"
                 ms=$(( (10#$h * 3600 + 10#$m * 60 + 10#$s) * 1000 + 10#$z ))
                 rel=$((ms - start_ms))
+                # The first kept mark can predate the key picture the cut
+                # actually starts at (off-keyframe mark): clamp to 0.
+                if (( rel < 0 )); then rel=0; fi
                 echo '    <ChapterAtom>'
                 printf '      <ChapterTimeStart>%02d:%02d:%02d.%09d</ChapterTimeStart>\n' \
                     $((rel / 3600000)) $((rel % 3600000 / 60000)) $((rel % 60000 / 1000)) $((rel % 1000 * 1000000))
@@ -415,15 +463,22 @@ const bashSourceBdSplit = `bd_split () {
     fi
 
     # --- chapters mode: rename split parts to chapter-NN.m2ts + sidecars ---
+    # A playlist whose FIRST mark is non-zero gets an extra pre-chapter
+    # segment (0 -> first mark) from --split-chapters: N marks -> N+1
+    # parts (verified against real tsMuxeR 3.1.0). It maps to chapter-00.
+    local pre_part=0
+    if [[ "${marks[0]}" != '00:00:00.000' ]]; then pre_part=1; fi
+    local expected_parts=$(( ${#marks[@]} + pre_part ))
     local part_count
     part_count=$(find "$EpisodeDir" -maxdepth 1 -type f -name 'bd-split.split.*.m2ts' | wc -l)
-    if (( part_count != ${#marks[@]} )); then
-        echo "bd_split: tsMuxeR produced $part_count split parts but the playlist has ${#marks[@]} chapters"
+    if (( part_count != expected_parts )); then
+        echo "bd_split: tsMuxeR produced $part_count split parts but expected $expected_parts (${#marks[@]} chapters, pre-chapter segment: $pre_part)"
         echo 'ENCODE_STEP_FAILED bd_split'; exit 1
     fi
-    local n nn part size
-    for ((n = 1; n <= ${#marks[@]}; n++)); do
-        part="$EpisodeDir/bd-split.split.$n.m2ts"
+    local p cn nn part size
+    for ((p = 1; p <= expected_parts; p++)); do
+        cn=$((p - pre_part))
+        part="$EpisodeDir/bd-split.split.$p.m2ts"
         if [[ ! -f "$part" ]]; then
             echo "bd_split: tsMuxeR split part missing: $part"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
@@ -433,7 +488,7 @@ const bashSourceBdSplit = `bd_split () {
             echo "bd_split: split part $part is smaller than one 192-byte source packet"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
-        nn=$(printf '%02d' "$n")
+        nn=$(printf '%02d' "$cn")
         mv -f "$part" "$EpisodeDir/chapter-$nn.m2ts" || {
             echo "bd_split: failed to rename split part $part"
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
@@ -447,7 +502,8 @@ const bashSourceBdSplit = `bd_split () {
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         fi
         # Each part is exactly one chapter: a single mark at 0, original
-        # chapter number kept in the display name.
+        # chapter number kept in the display name (chapter-00 = the
+        # pre-chapter segment when the first mark is non-zero).
         {
             echo '<?xml version="1.0" encoding="UTF-8"?>'
             echo '<Chapters>'
@@ -466,6 +522,6 @@ const bashSourceBdSplit = `bd_split () {
             echo 'ENCODE_STEP_FAILED bd_split'; exit 1
         }
     done
-    echo "[bd_split] wrote ${#marks[@]} chapter files (chapter-01.m2ts .. chapter-$(printf '%02d' "${#marks[@]}").m2ts)"
+    echo "[bd_split] wrote $expected_parts chapter files (chapter-$(printf '%02d' "$((1 - pre_part))").m2ts .. chapter-$(printf '%02d' "${#marks[@]}").m2ts)"
     echo 'ENCODE_STEP bd_split 100'
 }`

@@ -259,12 +259,16 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   and mux. `bd_merge` → `src.m2ts` + `chapters.xml` (Matroska XML sidecar
   from the marks — M2TS cannot hold chapters; `mux_extras` consumes the
   sidecar). `bd_split` → `mode=chapters`: `chapter-NN.m2ts` per mark
-  (`--split-chapters`, keyframe-aligned) + per-part `chapter-NN.xml`;
+  (`--split-chapters`, keyframe-aligned; a non-zero first mark adds a
+  `chapter-00` pre-chapter segment) + per-part `chapter-NN.xml`;
   `mode=range` + `range=N-M`: kept chapters as `src.m2ts`
-  (`--cut-start`/`--cut-end` at mark times) with rebased `chapters.xml`.
+  (`--cut-start`/`--cut-end` at mark times, `--cut-pictures=inside` — no
+  previous-chapter pre-roll) with `chapters.xml` rebased against the
+  MEASURED first video PTS (ffprobe required in range mode).
   Meta files (`bd-merge.meta`/`bd-split.meta`) are kept for debugging;
-  stale artifacts are cleaned on re-run; no fresh-skip (remux is cheap and
-  must reflect current params). The scanner recognizes disc-layout
+  stale artifacts are cleaned in every mode on re-run; no fresh-skip
+  (remux is cheap and must reflect current params). The scanner
+  recognizes disc-layout
   episodes: `BDMV/PLAYLIST/*.mpls` + `BDMV/STREAM/*.m2ts` with no flat
   media file become candidates (fs `bdmvSource` + S3 `bdmvKey` parity;
   flat sources keep priority; stability gate on the newest BDMV file).

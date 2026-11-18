@@ -49,7 +49,7 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 
 ### Controller (`backend/cmd/controller`)
 
-- **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
+- **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. A Blu-ray disc layout also qualifies: `BDMV/PLAYLIST/*.mpls` **and** `BDMV/STREAM/*.m2ts` with no flat media file (the `bd_merge`/`bd_split` steps resolve the playlist at runtime; `SourceFile` reports the first sorted playlist; the stability gate uses the newest playlist/stream mtime — S3: `LastModified`). Flat sources keep priority over the disc layout. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
 - **Queue** persists jobs in SQLite (default) or Postgres (`ENCODE_DATABASE_URL`; see the dialect layer below). Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained script — PowerShell (`.ps1`) for Windows nodes or bash (`.sh`) for Linux nodes, selected at dispatch time via `DialectForPlatform(node.Platform)`. PowerShell scripts call functions from `EncodeLib.ps1` (dot-sourced by the preamble); bash scripts are self-contained (the shared `find_source_file` helper is emitted into every render). For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
@@ -209,13 +209,13 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
   (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
   render error; `Write-Output` is the one translated cmdlet (→ `echo`).
-- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 20
-  of 21 built-in templates carry bash-native sources
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 22
+  of 23 built-in templates carry bash-native sources
   (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
   `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
   `encode_4k`, `mux`, `verify_output`, `quality_gate`, `subtitle_extract`,
   `font_extract`, `chapter_extract`, `mux_extras`, `crc32_rename`,
-  `release_copy`, `keyframes`, `discord_notify`. Tool mappings: `vspipe -c y4m | x265`
+  `release_copy`, `keyframes`, `discord_notify`, `bd_merge`, `bd_split`. Tool mappings: `vspipe -c y4m | x265`
   (video, args mirrored verbatim from the PS template — ffmpeg never
   video-encodes), `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac`
   (audio), `ffmpeg` libvmaf/ssim comparison (`quality_gate` — measurement,
@@ -224,7 +224,10 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `mkvmerge -J` + `mkvextract` tracks/attachments/chapters (the P6
   extraction steps; `jq` required) and `mkvmerge` extras muxing
   (`mux_extras`), `cksum` CRC32,
-  `sha256sum` hashing, `curl` notify.
+  `sha256sum` hashing, `curl` notify, `tsMuxeR` Blu-ray playlist remux
+  (`bd_merge`/`bd_split` — `command -v tsMuxeR` then `$BinDir/tsMuxeR`,
+  with an optional `$BinDir/tsMuxeR-lib/` bundled-libs directory prepended
+  to `LD_LIBRARY_PATH` for tsMuxeR invocations only).
   1 template is refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
   Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
   index needed). `keyframes` is ported (P7): a generated `.vpy` loads the
@@ -236,13 +239,35 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   mirrors its `num_slices = num_threads`). Requires `pip install
   vapoursynth-scxvid` (provisioned by the linux-node ansible role).
 
-- **Built-in templates** (**21**, seeded at boot, editable, not deletable —
+- **Built-in templates** (**23**, seeded at boot, editable, not deletable —
   `flow.BuiltinStepTemplates()`):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
   `verify_output`, `quality_gate`, `subtitle_extract`, `font_extract`,
   `chapter_extract`, `mux_extras`, `crc32_rename`, `release_copy`,
-  `keyframes`, `discord_notify`.
+  `keyframes`, `discord_notify`, `bd_merge`, `bd_split`.
+- **Blu-ray playlist pipeline** (`internal/flow/builtin_steps_bd.go` +
+  `_linux.go`): `bd_merge` and `bd_split` remux Blu-ray playlists (MPLS)
+  with **tsMuxeR** (teaching-droid/tsMuxer fork, v3.1.0 verified; lossless,
+  output stays **M2TS** so the eac3to audio chain reads BD-native
+  TrueHD/DTS-HD/LPCM unchanged). The steps resolve a playlist (param >
+  `BDMV/PLAYLIST/*.mpls` > flat `*.mpls`, single-candidate rule), parse
+  tsMuxeR's detection listing (Track ID/Stream ID pairs + `Marks:` chapter
+  line, shape-validated), generate a `.meta` whose track lines reference
+  the playlist (tsMuxeR expands it per PlayItem, trimmed to IN/OUT via its
+  `--playlist-clips played` default — raw-clip black padding never leaks),
+  and mux. `bd_merge` → `src.m2ts` + `chapters.xml` (Matroska XML sidecar
+  from the marks — M2TS cannot hold chapters; `mux_extras` consumes the
+  sidecar). `bd_split` → `mode=chapters`: `chapter-NN.m2ts` per mark
+  (`--split-chapters`, keyframe-aligned) + per-part `chapter-NN.xml`;
+  `mode=range` + `range=N-M`: kept chapters as `src.m2ts`
+  (`--cut-start`/`--cut-end` at mark times) with rebased `chapters.xml`.
+  Meta files (`bd-merge.meta`/`bd-split.meta`) are kept for debugging;
+  stale artifacts are cleaned on re-run; no fresh-skip (remux is cheap and
+  must reflect current params). The scanner recognizes disc-layout
+  episodes: `BDMV/PLAYLIST/*.mpls` + `BDMV/STREAM/*.m2ts` with no flat
+  media file become candidates (fs `bdmvSource` + S3 `bdmvKey` parity;
+  flat sources keep priority; stability gate on the newest BDMV file).
 - **Discord notification step**: `discord_notify` posts an episode-progress
   message to a Discord webhook when the flow reaches it (e.g. after mux or
   release copy). Webhook resolution: flow param first, then the controller's

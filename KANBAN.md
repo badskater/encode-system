@@ -52,6 +52,30 @@ Mirror of the session task list. Move cards through columns as work lands.
   Linux-only by build tag, matching the agent-never-imports-flow design).
   Frontend: 311 vitest tests / 25 files, lint/tsc/build green.
 
+## Done (BD playlist steps — MPLS → M2TS split/merge, 2026-11-18)
+
+- Scope: `bd_merge` / `bd_split` builtins (PS + bash parity) remux Blu-ray
+  playlists losslessly with tsMuxeR (teaching-droid/tsMuxer v3.1.0,
+  Apache-2.0); output stays M2TS for the eac3to audio chain. Merge →
+  `src.m2ts` + `chapters.xml` sidecar; split → `chapter-NN.m2ts` per mark
+  or `range=N-M` trim with rebased chapters. Scanner recognizes BDMV
+  episode layouts (fs + S3 parity, stability gate on newest BDMV file).
+  linux-node role installs tsMuxeR's freetype/libpng/brotli runtime libs;
+  bin package may ship a `tsMuxeR-lib/` bundled-libs layout.
+- Delivery: branch `feat/bd-playlist-steps` → PR #60. Verification: 12
+  scanner unit tests; dedicated bash exec suite (artifacts, guards,
+  layouts, bundled-libs env scoping); contract stub in the all-templates
+  harness; gated REAL-BINARY Linux E2E (synthetic disc authored in-test,
+  rendered scripts executed, ffprobe durations + clean decode) PASSED on
+  the dev host; full backend suite green; GOOS=windows cross-build OK;
+  ansible --syntax-check exit 0.
+- Docs: Architecture (scanner + BD pipeline + 23 builtins), Operations
+  (bd runbook: bin-package tsMuxeR procedure, flow composition, failure
+  classes, real-binary test recipe).
+- Pending: CI + adversarial review → squash merge → release tag → farm
+  upgrade + bin package publish (win+linux tsMuxeR) + live Windows-node
+  smoke with the synthetic fixture.
+
 ## Done (Resilience batch P1–P11, 2026-11)
 
 - **P1 — job/step timeouts + stall watchdog** (09e8efc, spec fix ea2589a,

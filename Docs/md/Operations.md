@@ -353,6 +353,80 @@ Operational notes:
   or 0 to disable the watchdog. A too-low threshold fails healthy Windows
   keyframes runs and burns retries. Linux nodes are unaffected.
 
+## Blu-ray playlist steps (bd_merge / bd_split)
+
+Lossless MPLS-driven M2TS split/merge with **tsMuxeR** (teaching-droid/tsMuxer
+fork, Apache-2.0). Output stays M2TS — the eac3to audio chain (TrueHD /
+DTS-HD MA / LPCM) works on it unchanged. Verified against tsMuxeR **v3.1.0**.
+
+- **Tool requirements**: `tsMuxeR.exe` in the Windows bin dir; on Linux
+  `tsMuxeR` on PATH or in the bin dir. The CLI links
+  `libfreetype`/`libpng`/`libbrotli` (the upstream AppImage does NOT bundle
+  them): the linux-node ansible role installs them (`libfreetype6`,
+  `libpng16-16t64`, `libbrotli1` on Debian 13; `freetype`/`libpng`/`brotli`
+  on RHEL-family). Alternatively ship a `tsMuxeR-lib/` directory beside the
+  binary in the bin package — the steps prepend it to `LD_LIBRARY_PATH`
+  for tsMuxeR invocations only.
+- **Adding tsMuxeR to the bin package**: download ONLY from
+  `github.com/teaching-droid/tsMuxer/releases` (other sites are unrelated to
+  the project) and verify the published `.sha256`. Windows: unzip
+  `tsMuxeR-<ver>-windows-x64.zip` (self-contained CLI + DLLs) into the bin
+  folder. Linux: the `linux-x64.zip` CLI (or the AppImage's
+  `usr/bin/tsMuxeR` via `--appimage-extract`, no FUSE needed) as `tsMuxeR`,
+  plus the three libraries above in `tsMuxeR-lib/` if the node lacks system
+  packages. Re-zip the bin folder and publish (Settings → Push to nodes,
+  version bump). Drain mode first if jobs are running.
+- **Input layouts** (episode dir): full `BDMV/` folder, or loose
+  `00001.mpls` + `00001.m2ts` (+ `.clpi` if present). The scanner enqueues
+  BDMV episodes automatically (playlists + streams + filter script, no flat
+  media file). Playlist resolution: `playlist` param > `BDMV/PLAYLIST` >
+  flat `*.mpls`; several playlists without a param is a loud error naming
+  the candidates.
+- **Flow composition**: put `bd_merge` FIRST (it produces `src.m2ts`; the
+  following `source_rename` is then a no-op) and continue with the normal
+  encode flow; `mux_extras` picks up the `chapters.xml` sidecar. For
+  OP/ED trimming or one episode out of a multi-episode playlist use
+  `bd_split` with `mode=range`, `range=N-M` (1-based chapters; a range
+  ending at the last chapter cuts to the source end). Range mode requires
+  **ffprobe** (Windows: `ffprobe.exe` in the bin dir; Linux: `ffprobe` on
+  PATH or in the bin dir — ships with ffmpeg) and cuts with
+  `--cut-pictures=inside`: the output starts at the first key picture AT
+  OR AFTER the first kept mark — no previous-chapter pre-roll. Compliant
+  BDs place entry marks on key pictures, so the cut is exact there; an
+  off-keyframe mark loses up to one GOP at the head, and the sidecar is
+  rebased against the MEASURED first video PTS (never nominal mark math).
+  Range mode refuses degenerate cuts loudly: a mid-source range whose
+  measured duration deviates >1.5s from the requested span (tsMuxeR
+  ignores a cut-end at/before the snapped start), or a to-end range where
+  every kept chapter collapses to 00:00:00 (marks closer than one GOP).
+  `mode=chapters` (default) writes `chapter-NN.m2ts` + `chapter-NN.xml`
+  per chapter; a playlist whose first mark is non-zero additionally gets
+  `chapter-00` (the pre-chapter segment 0 → first mark). To encode one
+  part, move `chapter-NN.m2ts` into a fresh episode dir as the source and
+  rename its sidecar to `chapters.xml`.
+- **Artifacts**: `src.m2ts` / `chapter-NN.m2ts`, `chapters.xml` /
+  `chapter-NN.xml` (Matroska XML), `bd-merge.meta` / `bd-split.meta` (kept
+  for debugging). Re-runs clean stale chapter/split artifacts in EVERY
+  mode (a chapters→range/merge switch leaves no orphans; >99-chapter
+  names included) and always remux (no fresh-skip). A playlist without
+  marks: merge succeeds without chapters; split fails loudly.
+- **Failure classes**: missing tsMuxeR / missing or ambiguous playlist /
+  unsafe `playlist` param (traversal, absolute, quotes, control chars) /
+  detection or mux non-zero exit / missing or undersized outputs / split
+  part-count mismatch — all fail the step with `ENCODE_STEP_FAILED` and a
+  message naming the cause. tsMuxeR's `--report=<file>` can be added to a
+  meta run manually for upstream bug reports.
+- **Real-binary regression test** (Linux, gated): authors a synthetic disc
+  (ffmpeg 1s-GOP test source → tsMuxeR `--blu-ray --custom-chapters`) and
+  executes the rendered job scripts, asserting durations + clean decode:
+
+  ```bash
+  ENCODE_TEST_TSMUXER_BIN=/path/tsMuxeR \
+  ENCODE_TEST_TSMUXER_LIB=/path/libs \
+  ENCODE_TEST_FFMPEG=/path/ffmpeg ENCODE_TEST_FFPROBE=/path/ffprobe \
+  go test ./internal/flow/ -run TestBdRealBinary -v
+  ```
+
 ## Notification channels
 
 Discord stays the default transport (unchanged). Three additive channels ship

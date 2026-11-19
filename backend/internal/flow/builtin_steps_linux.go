@@ -77,6 +77,8 @@ var builtinBashSources = map[string]string{
 	"release_copy":     bashSourceReleaseCopy,
 	"keyframes":        bashSourceKeyframes,
 	"discord_notify":   bashSourceDiscordNotify,
+	"bd_merge":         bashSourceBdMerge,
+	"bd_split":         bashSourceBdSplit,
 }
 
 // builtinBashRefused lists built-in templates that genuinely have no Linux

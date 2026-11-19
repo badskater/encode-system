@@ -264,6 +264,47 @@ for a in "$@"; do
 done
 echo "dovi_tool stub: ok"
 `,
+
+		// tsMuxeR: dual mode (bd_merge/bd_split).
+		// 1 arg (playlist): detection listing — Track ID/Stream ID pairs +
+		// Marks line, the exact shape the steps parse (3 chapters).
+		// 2 args (meta, out): mux — create the output; with --split-chapters
+		// in the meta, create out.split.N.m2ts parts instead (no base file,
+		// matching real tsMuxeR). Outputs are >= 192 bytes (source-packet
+		// size guard).
+		"tsMuxeR": `#!/usr/bin/env bash
+if [ "$#" -eq 1 ]; then
+  cat << 'EOF'
+tsMuxeR version 3.1.0 (stub). github.com/teaching-droid/tsMuxer
+Track ID:    4113
+Stream type: H.264
+Stream ID:   V_MPEG4/ISO/AVC
+Stream info: stub
+Stream lang: und
+
+Track ID:    4352
+Stream type: AC3
+Stream ID:   A_AC3
+Stream info: stub
+Stream lang: und
+
+File #00000 name=stub.m2ts
+Duration: 00:00:30.000
+Marks: 00:00:00.000 00:00:10.000 00:00:20.000
+EOF
+  exit 0
+fi
+meta="$1"; out="$2"
+if grep -q -- '--split-chapters' "$meta"; then
+  base="${out%.*}"
+  for part in 1 2 3; do
+    head -c 256 /dev/zero > "$base.split.$part.m2ts"
+  done
+else
+  head -c 256 /dev/zero > "$out"
+fi
+echo "tsMuxeR stub: muxed $out"
+`,
 	}
 
 	for name, body := range stubs {
@@ -293,6 +334,9 @@ func execTestEnv(t *testing.T, binDir string) (Vars, string) {
 	os.MkdirAll(epDir, 0o755)
 	os.WriteFile(filepath.Join(epDir, "src.m2ts"), []byte("fake-source-data"), 0o644)
 	os.WriteFile(filepath.Join(epDir, "1080.vpy"), []byte("# stub vpy"), 0o644)
+	// Loose Blu-ray playlist for bd_merge/bd_split (auto-discovery finds
+	// exactly one .mpls; the tsMuxeR stub serves the detection listing).
+	os.WriteFile(filepath.Join(epDir, "00000.mpls"), []byte("fake-mpls"), 0o644)
 	// Pre-create the hevc and audio files so mux/verify can find them.
 	os.WriteFile(filepath.Join(epDir, "1080.hevc"), []byte("fake-hevc"), 0o644)
 	os.WriteFile(filepath.Join(epDir, "audio.opus"), []byte("fake-audio"), 0o644)

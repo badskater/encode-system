@@ -395,6 +395,10 @@ DTS-HD MA / LPCM) works on it unchanged. Verified against tsMuxeR **v3.1.0**.
   BDs place entry marks on key pictures, so the cut is exact there; an
   off-keyframe mark loses up to one GOP at the head, and the sidecar is
   rebased against the MEASURED first video PTS (never nominal mark math).
+  Range mode refuses degenerate cuts loudly: a mid-source range whose
+  measured duration deviates >1.5s from the requested span (tsMuxeR
+  ignores a cut-end at/before the snapped start), or a to-end range where
+  every kept chapter collapses to 00:00:00 (marks closer than one GOP).
   `mode=chapters` (default) writes `chapter-NN.m2ts` + `chapter-NN.xml`
   per chapter; a playlist whose first mark is non-zero additionally gets
   `chapter-00` (the pre-chapter segment 0 → first mark). To encode one

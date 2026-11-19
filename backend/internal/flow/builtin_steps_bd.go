@@ -322,6 +322,11 @@ func bdSplitTemplate() *model.StepTemplate {
     if ($mode -eq 'chapters') {
         $metaLines += 'MUXOPT --split-chapters'
         $out = Join-Path $Job.EpisodeDir 'bd-split.m2ts'
+        # chapters mode does not produce src.m2ts: a stale range/merge
+        # output would otherwise survive and win Find-SourceFile's src.*
+        # preference in a downstream encode (re-review A7).
+        $staleSrc = Join-Path $Job.EpisodeDir 'src.m2ts'
+        if (Test-Path -LiteralPath $staleSrc) { Remove-Item -LiteralPath $staleSrc -Force }
     } else {
         # Keep chapters rangeA..rangeB. --cut-pictures inside starts at
         # the first key picture AT OR AFTER the cut — no previous-chapter
@@ -359,21 +364,59 @@ func bdSplitTemplate() *model.StepTemplate {
         try { $fp = & $ffprobe '-v' 'error' '-select_streams' 'v:0' '-show_entries' 'packet=pts_time' '-of' 'default=noprint_wrappers=1:nokey=1' '-read_intervals' '%+#1' $out 2>&1 } finally { $ErrorActionPreference = $prevEAP }
         if ($LASTEXITCODE -ne 0) { throw "bd_split: ffprobe failed on the cut output (exit $LASTEXITCODE)" }
         $firstPts = (@($fp) | ForEach-Object { "$_" } | Select-Object -First 1).Trim()
-        if ($firstPts -notmatch '^[0-9]+(\.[0-9]+)?$') {
+        # Digit cap (33-bit m2ts PTS tops out ~95443s) — parity with the
+        # bash guard against overflow fail-open numerics.
+        if ($firstPts -notmatch '^[0-9]{1,6}(\.[0-9]+)?$') {
             throw "bd_split: ffprobe returned no usable first video PTS ('$($firstPts -replace '[\r\n]', ' ')')"
         }
-        $startMs = [int][math]::Round(([double]$firstPts - 600) * 1000)
-        if ($startMs -lt 0) {
+        # Pre-base guard BEFORE rounding (bash parity: rounding first
+        # would truncate a small negative offset to 0 and accept it).
+        if ([double]$firstPts -lt 600) {
             throw "bd_split: cut output starts before the pinned mux base (first PTS $firstPts) - unexpected tsMuxeR timing"
         }
-        $xml = @('<?xml version="1.0" encoding="UTF-8"?>', '<Chapters>', '  <EditionEntry>')
+        # [math]::Round defaults to ToEven — the bash port uses awk %.0f
+        # (also half-to-even) so identical PTS values rebase identically.
+        $startMs = [int][math]::Round(([double]$firstPts - 600) * 1000)
+        # Sub-GOP sanity (mid-source ranges): tsMuxeR IGNORES a cut-end at
+        # or before the snapped start and muxes to the source end — the
+        # measured duration must match the requested range within 1.5s.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $fd = & $ffprobe '-v' 'error' '-show_entries' 'format=duration' '-of' 'default=noprint_wrappers=1:nokey=1' $out 2>&1 } finally { $ErrorActionPreference = $prevEAP }
+        if ($LASTEXITCODE -ne 0) { throw "bd_split: ffprobe duration query failed on the cut output (exit $LASTEXITCODE)" }
+        $durStr = (@($fd) | ForEach-Object { "$_" } | Select-Object -First 1).Trim()
+        if ($durStr -notmatch '^[0-9]{1,6}(\.[0-9]+)?$') {
+            throw "bd_split: ffprobe returned no usable duration ('$($durStr -replace '[\r\n]', ' ')')"
+        }
+        $durMs = [int][math]::Round([double]$durStr * 1000)
+        if ($rangeB -lt $marks.Count) {
+            $endParts = $marks[$rangeB] -split '[:.]'
+            $endMs = ([int]$endParts[0] * 3600 + [int]$endParts[1] * 60 + [int]$endParts[2]) * 1000 + [int]$endParts[3]
+            $expectedMs = $endMs - $startMs
+            if ([math]::Abs($durMs - $expectedMs) -gt 1500) {
+                throw "bd_split: cut duration ${durMs}ms does not match the requested range (${expectedMs}ms expected, tolerance 1500ms) - chapter marks closer than one GOP?"
+            }
+        }
+        # Precompute rebased times; refuse a to-end range where EVERY kept
+        # chapter collapses to 0 (marks closer than one GOP, cut snapped
+        # past all of them) instead of publishing a silently wrong sidecar.
+        $rels = @(); $collapsed = 0
         for ($i = $rangeA - 1; $i -lt $rangeB; $i++) {
             $mp = $marks[$i] -split '[:.]'
             $ms = ([int]$mp[0] * 3600 + [int]$mp[1] * 60 + [int]$mp[2]) * 1000 + [int]$mp[3]
             $rel = $ms - $startMs
             # The first kept mark can predate the key picture the cut
-            # actually starts at (off-keyframe mark): clamp to 0.
-            if ($rel -lt 0) { $rel = 0 }
+            # actually starts at (off-keyframe mark): clamp to 0. A mark
+            # landing exactly at 0 counts toward the collapse guard too.
+            if ($rel -le 0) { $rel = 0; $collapsed++ }
+            $rels += $rel
+        }
+        if ($rangeB -ge $marks.Count -and $rels.Count -gt 1 -and $collapsed -eq $rels.Count) {
+            throw 'bd_split: every kept chapter collapsed to 00:00:00 (marks closer than one GOP) - refusing to publish a wrong range'
+        }
+        $xml = @('<?xml version="1.0" encoding="UTF-8"?>', '<Chapters>', '  <EditionEntry>')
+        for ($j = 0; $j -lt $rels.Count; $j++) {
+            $rel = $rels[$j]
             $rh = [math]::Floor($rel / 3600000)
             $rm = [math]::Floor(($rel % 3600000) / 60000)
             $rs = [math]::Floor(($rel % 60000) / 1000)
@@ -381,7 +424,7 @@ func bdSplitTemplate() *model.StepTemplate {
             $xml += '    <ChapterAtom>'
             $xml += ('      <ChapterTimeStart>{0:D2}:{1:D2}:{2:D2}.{3:D9}</ChapterTimeStart>' -f $rh, $rm, $rs, $rf)
             $xml += '      <ChapterDisplay>'
-            $xml += ('        <ChapterString>Chapter {0:D2}</ChapterString>' -f ($i + 1))
+            $xml += ('        <ChapterString>Chapter {0:D2}</ChapterString>' -f ($rangeA + $j))
             $xml += '        <ChapterLanguage>eng</ChapterLanguage>'
             $xml += '      </ChapterDisplay>'
             $xml += '    </ChapterAtom>'
@@ -401,7 +444,8 @@ func bdSplitTemplate() *model.StepTemplate {
     $prePart = 0
     if ($marks[0] -ne '00:00:00.000') { $prePart = 1 }
     $expectedParts = $marks.Count + $prePart
-    $partCount = @(Get-ChildItem -LiteralPath $Job.EpisodeDir -File -Filter 'bd-split.split.*.m2ts').Count
+    $partCount = @(Get-ChildItem -LiteralPath $Job.EpisodeDir -File |
+        Where-Object { $_.Name -match '^bd-split\.split\.[0-9]+\.m2ts$' }).Count
     if ($partCount -ne $expectedParts) {
         throw "tsMuxeR produced $partCount split parts but expected $expectedParts ($($marks.Count) chapters, pre-chapter segment: $prePart)"
     }

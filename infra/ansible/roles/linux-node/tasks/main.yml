@@ -37,33 +37,19 @@
 # rendering) — the upstream AppImage does NOT bundle them. Install the
 # system libraries here; on minimal hosts the bin package may instead ship
 # a tsMuxeR-lib/ directory beside the binary, which the steps prepend to
-# LD_LIBRARY_PATH automatically. libpng's package name changed in the
-# 64-bit time_t transition: libpng16-16t64 on Debian 13+/Ubuntu 24.04+,
-# libpng16-16 on older releases (a bookworm node with backported Python
-# 3.12 passes the scxvid gate below but needs the legacy name HERE).
-- name: Install tsMuxeR runtime libraries (apt, t64 naming)
-  ansible.builtin.apt:
-    name:
-      - libfreetype6
-      - libpng16-16t64
-      - libbrotli1
-    state: present
-  when: >-
-    ansible_os_family | default("Debian") == "Debian" and
-    ((ansible_distribution == "Debian" and ansible_distribution_major_version | int >= 13) or
-     (ansible_distribution == "Ubuntu" and ansible_distribution_major_version | int >= 24))
-
-- name: Install tsMuxeR runtime libraries (apt, legacy naming)
+# LD_LIBRARY_PATH automatically. libpng16-16 is the LEGACY name on purpose:
+# the t64 transition package libpng16-16t64 (Debian 13+/Ubuntu 24.04+)
+# Provides: libpng16-16 (verified against trixie control data), so apt
+# resolves it on legacy AND t64 releases — including rolling/derivative
+# distros where a version-conditional name switch misroutes.
+- name: Install tsMuxeR runtime libraries (apt)
   ansible.builtin.apt:
     name:
       - libfreetype6
       - libpng16-16
       - libbrotli1
     state: present
-  when: >-
-    ansible_os_family | default("Debian") == "Debian" and
-    not ((ansible_distribution == "Debian" and ansible_distribution_major_version | int >= 13) or
-         (ansible_distribution == "Ubuntu" and ansible_distribution_major_version | int >= 24))
+  when: ansible_os_family | default("Debian") == "Debian"
 
 - name: Install tsMuxeR runtime libraries (dnf)
   ansible.builtin.dnf:

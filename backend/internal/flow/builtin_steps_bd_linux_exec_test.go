@@ -106,14 +106,19 @@ fi
 echo "tsMuxeR stub: muxed $out"
 `
 
-// bdFfprobeStub serves the range-mode rebase query: first video PTS of
-// the cut output. Default 610.0 = pinned 600s base + 10.0s keyframe
-// (keyframe-aligned cut at mark 00:00:10.000). Sidecar ffprobe_pts
-// overrides the value (off-keyframe probes).
+// bdFfprobeStub serves the range-mode rebase queries. Packet-pts query:
+// default 610.0 = pinned 600s base + 10.0s keyframe (keyframe-aligned cut
+// at mark 00:00:10.000); sidecar ffprobe_pts overrides. Duration query:
+// default 10.0s (matches range 2-2); sidecar ffprobe_dur overrides.
 const bdFfprobeStub = `#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 printf '%s\n' "$@" > "$dir/ffprobe_args.txt"
-if [ -f "$dir/ffprobe_pts" ]; then cat "$dir/ffprobe_pts"; else echo '610.000000'; fi
+case "$*" in
+  *format=duration*)
+    if [ -f "$dir/ffprobe_dur" ]; then cat "$dir/ffprobe_dur"; else echo '10.000000'; fi ;;
+  *)
+    if [ -f "$dir/ffprobe_pts" ]; then cat "$dir/ffprobe_pts"; else echo '610.000000'; fi ;;
+esac
 `
 
 // bdTestEnv builds an episode tree + a stub bin dir. layout controls the
@@ -668,6 +673,76 @@ func TestBdBashMergeMultiClipListing(t *testing.T) {
 			t.Errorf("track line must reference the playlist: %s", l)
 		}
 	}
+}
+
+// --- re-review round 2 regressions --------------------------------------
+
+// range->chapters must remove the stale range src.m2ts (find_source_file
+// prefers src.*, so a downstream encode would pick the wrong source).
+func TestBdBashRangeToChaptersCleansStaleSrc(t *testing.T) {
+	v, epDir, _ := bdTestEnv(t, "loose")
+	bdMustRun(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v)
+	if _, err := os.Stat(filepath.Join(epDir, "src.m2ts")); err != nil {
+		t.Fatalf("range mode must produce src.m2ts: %v", err)
+	}
+	bdMustRun(t, bdRender(t, "bd_split", nil, v), v)
+	if _, err := os.Stat(filepath.Join(epDir, "src.m2ts")); !os.IsNotExist(err) {
+		t.Errorf("stale range src.m2ts survived switch to chapters mode")
+	}
+	if _, err := os.Stat(filepath.Join(epDir, "chapter-01.m2ts")); err != nil {
+		t.Errorf("chapters mode must still produce parts: %v", err)
+	}
+}
+
+// Cleanup must match the PS numeric-only contract: user files whose names
+// merely START like artifacts (chapter-1abc.m2ts, bd-split.split.abc.m2ts)
+// must survive on Linux exactly as they do on Windows.
+func TestBdBashCleanupSparesNonArtifactNames(t *testing.T) {
+	v, epDir, _ := bdTestEnv(t, "loose")
+	for _, n := range []string{"chapter-1abc.m2ts", "chapter-12x.xml", "bd-split.split.abc.m2ts"} {
+		os.WriteFile(filepath.Join(epDir, n), []byte("user-file"), 0o644)
+	}
+	bdMustRun(t, bdRender(t, "bd_split", nil, v), v)
+	for _, n := range []string{"chapter-1abc.m2ts", "chapter-12x.xml", "bd-split.split.abc.m2ts"} {
+		if _, err := os.Stat(filepath.Join(epDir, n)); err != nil {
+			t.Errorf("cleanup deleted non-artifact user file %s", n)
+		}
+	}
+}
+
+// Uncapped PTS overflowed awk %d into exponent notation and failed OPEN
+// (script exit 0 + truncated sidecar). The digit cap must fail closed.
+func TestBdBashHugePtsFailsClosed(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "ffprobe_pts"), []byte("99999999999999999999.0\n"), 0o644)
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v, "no usable first video PTS")
+}
+
+// A below-base PTS must fail BEFORE rounding (awk truncates -0.5 to 0,
+// which would silently accept nominal unrebased times).
+func TestBdBashBelowBasePtsFailsClosed(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	os.WriteFile(filepath.Join(binDir, "ffprobe_pts"), []byte("599.999000\n"), 0o644)
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v, "before the pinned mux base")
+}
+
+// Sub-GOP mid-source range: tsMuxeR ignores cut-end <= snapped start and
+// muxes to the source end — the duration guard must refuse it.
+func TestBdBashSubGopDurationGuard(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	// Cut snapped to 11s; requested range 2-2 expects 20-11=9s; the
+	// engine (wrongly) produced 29.5s -> guard fires.
+	os.WriteFile(filepath.Join(binDir, "ffprobe_pts"), []byte("611.000000\n"), 0o644)
+	os.WriteFile(filepath.Join(binDir, "ffprobe_dur"), []byte("29.500000\n"), 0o644)
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-2"}, v), v, "does not match the requested range")
+}
+
+// Sub-GOP to-end range: every kept chapter collapses to 0 — refuse.
+func TestBdBashCollapsedChaptersGuard(t *testing.T) {
+	v, _, binDir := bdTestEnv(t, "loose")
+	// Cut snapped to 21s, past BOTH kept marks (10s, 20s).
+	os.WriteFile(filepath.Join(binDir, "ffprobe_pts"), []byte("621.000000\n"), 0o644)
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-3"}, v), v, "collapsed to 00:00:00")
 }
 
 // Parity sanity: the PS templates declare the same artifact contracts.

@@ -235,6 +235,16 @@ func TestBdRealBinaryLinuxEndToEnd(t *testing.T) {
 	if n := strings.Count(metaOut, "track=4113"); n != 1 {
 		t.Errorf("multi-clip listing must not duplicate track lines (got %d):\n%s", n, metaOut)
 	}
+
+	// --- Sub-GOP marks: range mode must REFUSE, not publish wrong cuts ---
+	// Marks 0/0.5/1.0 are closer than one GOP: the inside cut snaps to
+	// key picture 1.0, tsMuxeR ignores cut-end <= start, and both kept
+	// chapters would collapse to 00:00:00. The collapse guard fails loud.
+	os.WriteFile(meta, []byte("MUXOPT --blu-ray --custom-chapters=\"00:00:00.000;00:00:00.500;00:00:01.000\"\n"+
+		"V_MPEG4/ISO/AVC, \"test.mp4\", track=1\n"+
+		"A_AC3, \"test.mp4\", track=2\n"), 0o644)
+	run(t, work, authorEnv, filepath.Join(binDir, "tsMuxeR"), meta, epDir)
+	bdMustFail(t, bdRender(t, "bd_split", map[string]string{"mode": "range", "range": "2-3"}, v), v, "collapsed to 00:00:00")
 }
 
 // patchMPLSFirstMark shifts the first PlayList mark's timestamp by the

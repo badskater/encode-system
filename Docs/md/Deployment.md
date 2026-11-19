@@ -48,6 +48,18 @@ project (guard reads `ENCODE_CONTAINER_NAME` from `.env`).
 > `ENCODE_COMPOSE_PROJECT` for install.sh) and `ENCODE_CONTAINER_NAME` when
 > running anything but the single production deploy.
 
+> **Gotcha (TLS deploys):** install.sh replaces `docker-compose.runtime.yml`
+> with the bundle's stock copy, which ships the `./tls/controller.crt` /
+> `./tls/controller.key` mounts COMMENTED OUT. On a native-TLS deploy
+> (uncommented at cutover) the upgraded controller crash-loops with
+> `open /tls/controller.crt: no such file or directory` and the install
+> health check fails. Fix: re-uncomment the two mount lines in
+> `$ENCODE_HOME/docker-compose.runtime.yml`, then
+> `COMPOSE_PROJECT_NAME=encode-system docker compose -f
+> docker-compose.runtime.yml --profile postgres up -d` (the `--profile
+> postgres` keeps the DB container in the compose scope). The `tls/` files
+> and `.env` survive the upgrade untouched. Verified live on v1.24.0.
+
 Windows nodes install with one elevated PowerShell command using a pairing
 code from UI → Nodes:
 

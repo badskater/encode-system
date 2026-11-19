@@ -72,9 +72,20 @@ Mirror of the session task list. Move cards through columns as work lands.
 - Docs: Architecture (scanner + BD pipeline + 23 builtins), Operations
   (bd runbook: bin-package tsMuxeR procedure, flow composition, failure
   classes, real-binary test recipe).
-- Pending: CI + adversarial review → squash merge → release tag → farm
-  upgrade + bin package publish (win+linux tsMuxeR) + live Windows-node
-  smoke with the synthetic fixture.
+- Delivery: PR #60 squash-merged (3aa4ef7), released **v1.24.0** (10 assets
+  verified). Two adversarial-review rounds (real-binary + mutation probes):
+  all findings fixed and re-verified — measured range rebase
+  (--cut-pictures=inside + pinned 600s base + ffprobe), fail-closed numeric
+  guards, numeric-only cleanup parity, sub-GOP refusal guards, stale
+  src.m2ts removal, libpng Provides-based apt naming. CI green incl. the
+  PG restore-test race fix (own encode_restore_test DB).
+- Live verification (farm 172.24.92.232, upgraded 1.23.2 → 1.24.0):
+  Windows node job 27 `bd_merge` DONE (tsMuxeR 3.1.0 via bin v5, src.m2ts
+  8.16 MB + 3-chapter sidecar verified); Linux node job 28 `bd_split`
+  chapters mode DONE (real agent dispatch → rendered bash → tsMuxeR with
+  bundled tsMuxeR-lib; 3 parts ≈10.02 s each, zero decode errors, per-part
+  sidecars). Upgrade pitfall found + fixed live: install.sh overwrites the
+  customized compose — TLS mounts must be re-uncommented (see Operations).
 
 ## Done (Resilience batch P1–P11, 2026-11)
 

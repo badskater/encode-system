@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import SeriesPage from './Series';
 import { api } from '../api/client';
 import { RoleContext } from '../hooks/useRole';
-import type { Series } from '../types';
+import type { Series, SeriesTemplate } from '../types';
 
 // usePolling resolves fn() immediately on mount; mocking the api methods is
 // enough to drive the page render without waiting for real timers.
@@ -23,6 +23,9 @@ function seriesFixture(overrides: Partial<Series> = {}): Series {
 
 function mockEmpty() {
   vi.spyOn(api, 'flows').mockResolvedValue([]);
+  // The filter-script editor lists templates when it opens; keep the
+  // endpoint mocked everywhere so no test hits an unmocked method.
+  vi.spyOn(api, 'seriesTemplates').mockResolvedValue({ templates: [] });
   // api.settings is typed as the merged Settings interface; provide a full
   // fixture so TypeScript is satisfied across both declared shapes.
   vi.spyOn(api, 'settings').mockResolvedValue({
@@ -380,6 +383,195 @@ describe('Series page webhook channel cell', () => {
     fireEvent.change(input2, { target: { value: 'http://evil.example/hook' } });
     fireEvent.keyDown(input2, { key: 'Enter', code: 'Enter' });
     expect(patchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Series page filter-script cell', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function templateFixture(name: string): SeriesTemplate {
+    return { name, size: 123, mtime: '2026-11-20T21:00:00Z' };
+  }
+
+  it('shows the assigned template name on the series row', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ script_type: 'vpy', script_template: '1080.vpy' }),
+    ]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+    expect(screen.getByText('Filter script')).toBeInTheDocument();
+    expect(screen.getByText('1080.vpy')).toBeInTheDocument();
+  });
+
+  it('shows a dash when no script is assigned', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('Show A')).toBeInTheDocument());
+    expect(screen.getByText('—')).toBeInTheDocument();
+  });
+
+  it('lists template names from seriesTemplates when the editor opens', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ script_type: 'vpy', script_template: '1080.vpy' }),
+    ]);
+    mockEmpty();
+    const tplSpy = vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy'), templateFixture('2160.vpy')],
+    });
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('1080.vpy')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('1080.vpy'));
+
+    const picker = await screen.findByLabelText('Filter script template');
+    expect(tplSpy).toHaveBeenCalledWith(1);
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '2160.vpy' })).toBeInTheDocument(),
+    );
+    expect(screen.getByRole('option', { name: '1080.vpy' })).toBeInTheDocument();
+    expect((picker as HTMLSelectElement).value).toBe('1080.vpy');
+  });
+
+  it('refreshes the template list when the type changes', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    const tplSpy = vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy'), templateFixture('1080.avs')],
+    });
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('—')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('—'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    // One fetch when the editor opens…
+    await waitFor(() => expect(tplSpy).toHaveBeenCalledTimes(1));
+    // …and one per type change.
+    fireEvent.change(typeSelect, { target: { value: 'vpy' } });
+    await waitFor(() => expect(tplSpy).toHaveBeenCalledTimes(2));
+    fireEvent.change(typeSelect, { target: { value: 'avs' } });
+    await waitFor(() => expect(tplSpy).toHaveBeenCalledTimes(3));
+    expect(tplSpy).toHaveBeenLastCalledWith(1);
+    // Switching type clears the stale template choice (extension mismatch).
+    const picker = screen.getByLabelText('Filter script template') as HTMLSelectElement;
+    expect(picker.value).toBe('');
+  });
+
+  it('PATCHes script_type and script_template together on save', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy')],
+    });
+    const patchSpy = vi
+      .spyOn(api, 'patchSeries')
+      .mockResolvedValue(seriesFixture({ script_type: 'vpy', script_template: '1080.vpy' }));
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('—')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('—'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    fireEvent.change(typeSelect, { target: { value: 'vpy' } });
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '1080.vpy' })).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByLabelText('Filter script template'), {
+      target: { value: '1080.vpy' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, {
+        script_type: 'vpy',
+        script_template: '1080.vpy',
+      }),
+    );
+  });
+
+  it('PATCHes both fields empty when None is chosen', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([
+      seriesFixture({ script_type: 'vpy', script_template: '1080.vpy' }),
+    ]);
+    mockEmpty();
+    vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy')],
+    });
+    const patchSpy = vi.spyOn(api, 'patchSeries').mockResolvedValue(seriesFixture());
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('1080.vpy')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('1080.vpy'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    fireEvent.change(typeSelect, { target: { value: '' } });
+    // None hides the template picker entirely.
+    expect(screen.queryByLabelText('Filter script template')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(patchSpy).toHaveBeenCalledWith(1, { script_type: '', script_template: '' }),
+    );
+  });
+
+  it('disables Save until a template is picked for a chosen type', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy')],
+    });
+    const patchSpy = vi.spyOn(api, 'patchSeries').mockResolvedValue(seriesFixture());
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('—')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('—'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    fireEvent.change(typeSelect, { target: { value: 'vpy' } });
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '1080.vpy' })).toBeInTheDocument(),
+    );
+    // Half assignment (type without template) must not be sendable.
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Filter script template'), {
+      target: { value: '1080.vpy' },
+    });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    expect(patchSpy).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a 400 error message from the PATCH inline and keeps the editor open', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy')],
+    });
+    vi.spyOn(api, 'patchSeries').mockRejectedValue(
+      new Error('400: template "1080.vpy" not found under _templates/Show A/'),
+    );
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('—')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('—'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    fireEvent.change(typeSelect, { target: { value: 'vpy' } });
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '1080.vpy' })).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByLabelText('Filter script template'), {
+      target: { value: '1080.vpy' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText('400: template "1080.vpy" not found under _templates/Show A/'),
+      ).toBeInTheDocument(),
+    );
+    // Editor stays open so the operator can fix the assignment.
+    expect(screen.getByLabelText('Filter script type')).toBeInTheDocument();
   });
 });
 

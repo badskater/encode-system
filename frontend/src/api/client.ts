@@ -3,7 +3,7 @@
 // localStorage and send as a Bearer credential (same wire format as before,
 // but now per-session, revocable, and sliding-expiry server-side).
 
-import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, Settings, SettingsSave, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
+import type { APIToken, AuditEvent, BackupInfo, BackupStatus, Share, CreateSeriesResponse, Flow, FlowExport, Job, JobETA, JobLogStreamEvent, JobStatus, Node, NodeMetricSample, PairingCode, ProvisionRun, Series, SeriesTemplate, Settings, SettingsSave, Stats, StepTemplate, UpdateCheck, UpdateManifest, User } from '../types';
 
 const TOKEN_KEY = 'encode-session-token';
 
@@ -392,10 +392,18 @@ export const api = {
   importFlow: (payload: FlowExport) => request<Flow>('POST', '/api/flows/import', payload),
 
   series: () => request<Series[]>('GET', '/api/series'),
-  createSeries: (body: { name: string; episodes: number; tag?: string; flow_id?: number }) =>
+  createSeries: (body: { name: string; episodes: number; tag?: string; flow_id?: number; script_type?: string; script_template?: string }) =>
     request<CreateSeriesResponse>('POST', '/api/series', body),
-  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean; node_group?: string; webhook_url?: string }) =>
+  // patchSeries updates per-series settings. script_type/script_template
+  // must travel TOGETHER (both '' clears the assignment) — the server
+  // rejects half assignments with 400.
+  patchSeries: (id: number, body: { flow_id?: number; enabled?: boolean; tag?: string; notify?: boolean; paused?: boolean; node_group?: string; webhook_url?: string; script_type?: string; script_template?: string }) =>
     request<Series>('PATCH', `/api/series/${id}`, body),
+  // seriesTemplates lists the filter-script templates available for a
+  // series (_templates/<Series>/ on the scripts share), sorted by name.
+  // Empty list when the directory is absent; 404 for an unknown series.
+  seriesTemplates: (id: number) =>
+    request<{ templates: SeriesTemplate[] }>('GET', `/api/series/${id}/templates`),
   // deleteSeries removes the series REGISTRY ROW only (admin). Jobs,
   // history and files on the shares survive; the scanner re-registers the
   // series on the next scan if its folder still has ready episodes.

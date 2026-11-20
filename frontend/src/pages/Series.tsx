@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api/client';
-import type { Flow, Series } from '../types';
+import type { Flow, Series, SeriesTemplate } from '../types';
 import { usePolling } from '../hooks/usePolling';
 import CreateSeriesDialog from '../components/CreateSeriesDialog';
 import DeleteSeriesDialog from '../components/DeleteSeriesDialog';
@@ -59,6 +59,16 @@ export default function SeriesPage() {
     } catch (e) {
       setActionError(String(e));
     }
+  }
+
+  // changeScript assigns (or clears) the series' filter-script template.
+  // Both fields always travel together — the server rejects half
+  // assignments with 400. Errors propagate to ScriptCell, which keeps the
+  // editor open and shows the message inline (like DeleteSeriesDialog).
+  async function changeScript(sr: Series, scriptType: string, scriptTemplate: string) {
+    await api.patchSeries(sr.id, { script_type: scriptType, script_template: scriptTemplate });
+    setActionError(null);
+    refresh();
   }
 
 
@@ -134,6 +144,7 @@ export default function SeriesPage() {
             <th>Paused</th>
             <th>Notify</th>
             <th>Channel</th>
+            <th>Filter script</th>
             {isAdmin && <th>Actions</th>}
           </tr>
         </thead>
@@ -237,6 +248,12 @@ export default function SeriesPage() {
                   onSave={(u) => changeWebhook(sr, u)}
                 />
               </td>
+              <td>
+                <ScriptCell
+                  series={sr}
+                  onSave={(t, tpl) => changeScript(sr, t, tpl)}
+                />
+              </td>
               {isAdmin && (
                 <td>
                   <button
@@ -254,7 +271,7 @@ export default function SeriesPage() {
           ))}
           {(series ?? []).length === 0 && (
             <tr>
-              <td colSpan={isAdmin ? 11 : 10} className="muted">
+              <td colSpan={isAdmin ? 12 : 11} className="muted">
                 No series yet — use Create series, or drop a series folder into
                 the scripts share and the scanner will register it.
               </td>
@@ -431,5 +448,142 @@ function WebhookCell({ url, onSave }: { url: string; onSave: (u: string) => void
         }
       }}
     />
+  );
+}
+
+// ScriptCell shows the series' filter-script assignment (the template file
+// name, or "—" when unassigned) and expands to a type + template picker on
+// click, mirroring the TagCell/WebhookCell click-to-edit pattern. Templates
+// come from GET /api/series/{id}/templates and are re-fetched when the
+// editor opens or the type changes. Save always sends script_type and
+// script_template TOGETHER (both '' for None) — the server rejects half
+// assignments, so Save stays disabled until a template is picked. A failed
+// save keeps the editor open and shows the server's error inline (like
+// DeleteSeriesDialog).
+function ScriptCell({
+  series,
+  onSave,
+}: {
+  series: Series;
+  onSave: (scriptType: string, scriptTemplate: string) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [scriptType, setScriptType] = useState(series.script_type ?? '');
+  const [template, setTemplate] = useState(series.script_template ?? '');
+  const [templates, setTemplates] = useState<SeriesTemplate[]>([]);
+  const [loadError, setLoadError] = useState('');
+  const [saveError, setSaveError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // loadTemplates refreshes the picker from the scripts share; a listing
+  // failure degrades to an empty picker with a visible reason.
+  async function loadTemplates() {
+    try {
+      const res = await api.seriesTemplates(series.id);
+      setTemplates(res.templates);
+      setLoadError('');
+    } catch (e) {
+      setTemplates([]);
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function save() {
+    if (busy) return; // double-click guard
+    setBusy(true);
+    setSaveError('');
+    try {
+      await onSave(scriptType, scriptType === '' ? '' : template);
+      setEditing(false);
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!editing) {
+    return (
+      <span
+        className="muted"
+        style={{ cursor: 'pointer' }}
+        title={
+          series.script_template
+            ? `Filter script: ${series.script_template} — click to change`
+            : 'No filter script assigned — click to pick a template'
+        }
+        onClick={() => {
+          setScriptType(series.script_type ?? '');
+          setTemplate(series.script_template ?? '');
+          setSaveError('');
+          setEditing(true);
+          loadTemplates();
+        }}
+      >
+        {series.script_template || <em>—</em>}
+      </span>
+    );
+  }
+
+  // Keep the current assignment selectable even if its file vanished from
+  // the share since it was assigned (re-saving it surfaces the 400 inline).
+  const names = templates.map((t) => t.name);
+  if (template && !names.includes(template)) names.unshift(template);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <select
+        aria-label="Filter script type"
+        value={scriptType}
+        onChange={(e) => {
+          const v = e.target.value;
+          setScriptType(v);
+          setTemplate(''); // extension changes with the type — re-pick
+          if (v !== '') loadTemplates();
+        }}
+      >
+        <option value="">None</option>
+        <option value="vpy">VapourSynth (.vpy)</option>
+        <option value="avs">AviSynth (.avs)</option>
+      </select>
+      {scriptType !== '' && (
+        <select
+          aria-label="Filter script template"
+          value={template}
+          onChange={(e) => setTemplate(e.target.value)}
+        >
+          <option value="">Choose template…</option>
+          {names.map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+      )}
+      {loadError && <div className="error-box">{loadError}</div>}
+      {scriptType !== '' && !loadError && names.length === 0 && (
+        <span className="muted" style={{ fontSize: 12 }}>
+          No templates in _templates/{series.name}/ yet.
+        </span>
+      )}
+      {saveError && <div className="error-box">{saveError}</div>}
+      <div style={{ display: 'flex', gap: 4 }}>
+        <button
+          className="btn primary"
+          style={{ padding: '2px 10px', fontSize: 12 }}
+          disabled={busy || (scriptType !== '' && template === '')}
+          onClick={save}
+        >
+          {busy ? 'Saving…' : 'Save'}
+        </button>
+        <button
+          className="btn"
+          style={{ padding: '2px 10px', fontSize: 12 }}
+          onClick={() => setEditing(false)}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }

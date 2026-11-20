@@ -107,54 +107,105 @@ const bashSourceZoneBuild = `zone_build () {
     # 2. Chapter-name matches: zone spans the whole named chapter.
     if [[ -f "$chapters" ]]; then
         local ch_rows
-        # Normalize compact XML to one tag per line first (greedy sub()
-        # would otherwise keep only the LAST atom on a multi-atom line).
-        ch_rows=$(sed 's/></>\n</g' "$chapters" | awk '
-            /<ChapterAtom>/ { inatom = 1; ts = ""; name = ""; grabname = 0 }
+        # Strip XML comments (PS [xml] ignores them; a comment containing
+        # chapter markup would otherwise create phantom zones), then
+        # normalize compact XML to one tag per line (greedy sub() would
+        # keep only the LAST atom on a multi-atom line).
+        ch_rows=$(awk 'BEGIN{RS="<!--"} {if (NR>1) {p=index($0,"-->"); if (p==0) exit 1; $0=substr($0,p+3)} printf "%s",$0}' "$chapters" | sed 's/></>\n</g' | awk '
+            function hex2dec(h,   i, c, v) {
+                v = 0; h = tolower(h)
+                for (i = 1; i <= length(h); i++) {
+                    c = index("0123456789abcdef", substr(h, i, 1)) - 1
+                    if (c < 0) return -1
+                    v = v * 16 + c
+                }
+                return v
+            }
+            function utf8(c) {
+                # mawk sprintf %c is BYTE-oriented: emit the UTF-8 bytes
+                # explicitly so legal entities (é, emoji) stay valid UTF-8.
+                if (c <= 0) return " "
+                if (c <= 127) return sprintf("%c", c)
+                if (c <= 2047) return sprintf("%c%c", 192 + int(c/64), 128 + (c%64))
+                if (c <= 65535) return sprintf("%c%c%c", 224 + int(c/4096), 128 + (int(c/64)%64), 128 + (c%64))
+                return sprintf("%c%c%c%c", 240 + int(c/262144), 128 + (int(c/4096)%64), 128 + (int(c/64)%64), 128 + (c%64))
+            }
+            function sanitize(s,   i, ch, out) {
+                out = ""
+                for (i = 1; i <= length(s); i++) {
+                    ch = substr(s, i, 1)
+                    if (ch ~ /[[:cntrl:]]/) out = out " "
+                    else out = out ch
+                }
+                sub(/^ +/, "", out); sub(/ +$/, "", out)
+                return out
+            }
+            function decode(s,   out, rest, ent, code) {
+                # SINGLE pass over the ORIGINAL string: decoded output is
+                # never re-scanned (no double-unescape: &#38;#79; -> &#79;).
+                out = ""; rest = s
+                while (match(rest, /&(#([0-9]+|[xX][0-9a-fA-F]+)|amp|lt|gt|quot|apos);/)) {
+                    out = out substr(rest, 1, RSTART-1)
+                    ent = substr(rest, RSTART, RLENGTH)
+                    if (ent == "&amp;") out = out "&"
+                    else if (ent == "&lt;") out = out "<"
+                    else if (ent == "&gt;") out = out ">"
+                    else if (ent == "&quot;") out = out "\""
+                    else if (ent == "&apos;") out = out "\047"
+                    else {
+                        code = substr(ent, 3, length(ent)-3)
+                        if (code ~ /^[xX]/) code = hex2dec(substr(code, 2))
+                        else code = code + 0
+                        out = out utf8(code)
+                    }
+                    rest = substr(rest, RSTART+RLENGTH)
+                }
+                return out rest
+            }
+            /<ChapterAtom>/ { inatom = 1; ts = ""; name = ""; grabname = 0; sawdisplay = 0; cdata = 0 }
             inatom && /<ChapterTimeStart>/ {
                 line = $0; sub(/.*<ChapterTimeStart>/, "", line); sub(/<\/ChapterTimeStart>.*/, "", line); ts = line
             }
-            inatom && /<ChapterString>/ && name == "" && !grabname {
-                # FIRST display wins (PS SelectSingleNode parity). Content
-                # may span lines: the sed tag-split puts CDATA sections on
-                # their own line, so accumulate until the closing tag.
-                line = $0; sub(/.*<ChapterString>/, "", line)
+            inatom && /<ChapterString[ >]/ && !sawdisplay && !grabname {
+                # FIRST display wins even when EMPTY (PS SelectSingleNode).
+                # Attributes tolerated; content may span lines (the sed
+                # tag-split puts CDATA on its own line) — accumulate with
+                # a separator until the closing tag.
+                line = $0; sub(/.*<ChapterString/, "", line); sub(/^[^>]*>/, "", line)
+                if (line ~ /^<!\[CDATA\[/) cdata = 1
                 if (line ~ /<\/ChapterString>/) {
-                    sub(/<\/ChapterString>.*/, "", line); name = line
+                    sub(/<\/ChapterString>.*/, "", line); name = line; sawdisplay = 1
                 } else {
                     name = line; grabname = 1
                 }
             }
-            grabname && !/<ChapterString>/ {
+            grabname && !/<ChapterString/ {
                 if ($0 ~ /<\/ChapterString>/) {
                     line = $0; sub(/<\/ChapterString>.*/, "", line)
-                    name = name line; grabname = 0
+                    name = name " " line; grabname = 0; sawdisplay = 1
+                } else if ($0 ~ /<\/ChapterAtom>/) {
+                    # Unclosed ChapterString (invalid XML): drop the atom
+                    # rather than accumulating raw markup into the name.
+                    grabname = 0; inatom = 0
                 } else {
-                    name = name $0
+                    name = name " " $0
                 }
             }
             /<\/ChapterAtom>/ {
-                if (inatom && ts != "") {
-                    # CDATA wrapper, then numeric entities, then named
-                    # entities with &amp; LAST (no double-unescape) —
-                    # matches PS InnerText semantics.
-                    sub(/^<!\[CDATA\[/, "", name); sub(/\]\]>$/, "", name)
-                    while (match(name, /&#([0-9]+);/)) {
-                        code = substr(name, RSTART+2, RLENGTH-3) + 0
-                        name = substr(name, 1, RSTART-1) sprintf("%c", code) substr(name, RSTART+RLENGTH)
+                if (inatom && ts != "" && !grabname && sawdisplay) {
+                    # Trim join spaces, then detect CDATA from the CONTENT
+                    # (the tag-split may put the wrapper on its own line).
+                    sub(/^ +/, "", name); sub(/ +$/, "", name)
+                    if (name ~ /^<!\[CDATA\[/) {
+                        # CDATA content is LITERAL (PS InnerText parity):
+                        # strip the wrapper, no entity decoding inside.
+                        sub(/^<!\[CDATA\[/, "", name); sub(/\]\]>$/, "", name)
+                    } else {
+                        name = decode(name)
                     }
-                    while (match(name, /&#[xX]([0-9a-fA-F]+);/)) {
-                        hex = substr(name, RSTART+3, RLENGTH-4)
-                        cmd = "printf \"%d\" 0x" hex
-                        cmd | getline code; close(cmd)
-                        name = substr(name, 1, RSTART-1) sprintf("%c", code) substr(name, RSTART+RLENGTH)
-                    }
-                    gsub(/&lt;/, "<", name); gsub(/&gt;/, ">", name)
-                    gsub(/&quot;/, "\"", name); gsub(/&apos;/, "\047", name)
-                    gsub(/&amp;/, "\\&", name)
-                    print ts "\t" name
+                    print ts "\t" sanitize(name)
                 }
-                inatom = 0
+                inatom = 0; grabname = 0
             }
         ') || ch_rows=''
         # Convert each atom to "seconds<TAB>name", validating the timestamp.
@@ -198,7 +249,7 @@ const bashSourceZoneBuild = `zone_build () {
             (( ef >= 10#$frames )) && ef=$(( 10#$frames - 1 ))
             if (( sf < ef )); then
                 local clean
-                clean=$(printf '%s' "${names[$i]}" | tr '\r\n"' '   ')
+                clean=$(printf '%s' "${names[$i]}" | tr '\r\n\t"' '    ')
                 zlines+="$sf	$ef	b	$op_ed_b	chapter:$clean"$'\n'
             fi
         done

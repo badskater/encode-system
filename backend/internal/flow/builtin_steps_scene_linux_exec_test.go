@@ -4,6 +4,7 @@ package flow
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -326,5 +327,24 @@ func TestSceneDetectBashFailClosed(t *testing.T) {
 			}
 			bdMustFail(t, bdRender(t, "scene_detect", tc.params, v), v, tc.wantMsg)
 		})
+	}
+}
+
+// Round-3 info: threshold precision parity with PS '0.###' formatting.
+func TestSceneDetectBashThresholdPrecisionParity(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"0.000001", "0"},
+		{"10.12345", "10.123"},
+	} {
+		v, epDir, _ := sceneTestEnv(t)
+		bdMustRun(t, bdRender(t, "scene_detect", map[string]string{"threshold": tc.in}, v), v)
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(bdRead(t, filepath.Join(epDir, "scenes.json"))), &probe); err != nil {
+			t.Fatalf("strict JSON: %v", err)
+		}
+		got := fmt.Sprintf("%v", probe["threshold"])
+		if got != tc.want {
+			t.Errorf("threshold %q: got %s, want %s (PS 0.### parity)", tc.in, got, tc.want)
+		}
 	}
 }

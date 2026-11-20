@@ -658,11 +658,17 @@ const bashSourceEncode = `encode () {
         # indent): an unanchored grep would pick a nested decoy "x265" key
         # inside a zone object and inject the wrong value. Non-contract
         # files fail closed here (PS reads the top-level key via JSON parse).
-        zstr=$(grep -m1 '^  "x265"' "$zones" | sed 's/^  "x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
-        if ! grep -q '^  "x265"' "$zones"; then
-            echo 'encode: zones.json has no top-level x265 key (regenerate via zone_build)'
+        # Exactly one such line: duplicate keys throw in the PS dialect's
+        # JSON parser, so bash refuses them too. JSON \uXXXX escapes in the
+        # value are NOT decoded — zone_build never emits them; hand-edited
+        # escaped values fail the shape regex (fail closed, documented).
+        local nkeys
+        nkeys=$(grep -c '^  "x265"' "$zones")
+        if (( nkeys != 1 )); then
+            echo 'encode: zones.json must have exactly one top-level x265 key (regenerate via zone_build)'
             echo 'ENCODE_STEP_FAILED encode'; exit 1
         fi
+        zstr=$(grep -m1 '^  "x265"' "$zones" | sed 's/^  "x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
         if [[ -n "$zstr" && ! "$zstr" =~ ^[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?)(/[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?))*$ ]]; then
             echo 'encode: zones.json x265 string is malformed'
             echo 'ENCODE_STEP_FAILED encode'; exit 1

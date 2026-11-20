@@ -50,8 +50,10 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'scene_detect: threshold must be 0..100'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
-    # Normalize (010 -> 10): the JSON artifact must be strict-JSON valid.
-    threshold=$(awk -v t="$threshold" 'BEGIN{printf "%g", t}')
+    # Normalize to the PS '0.###' format (3 decimals, trailing zeros
+    # stripped): 010 -> 10, 0.000001 -> 0, 10.12345 -> 10.123 — identical
+    # threshold reaches scdet and the JSON artifact in both dialects.
+    threshold=$(awk -v t="$threshold" 'BEGIN{s=sprintf("%.3f",t); sub(/0+$/,"",s); sub(/\.$/,"",s); print s}')
     if [[ ! "$min_len" =~ ^[0-9]{1,6}$ ]]; then
         echo "scene_detect: invalid min_scene_len '$(printf '%s' "$min_len" | tr '\r\n' '  ')'"
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1

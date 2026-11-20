@@ -122,6 +122,9 @@ func zoneBuildTemplate() *model.StepTemplate {
             $name = ''
             $dn = $a.SelectSingleNode('ChapterDisplay/ChapterString')
             if ($dn) { $name = [string]$dn.InnerText }
+            # Control chars -> space + trim (bash sanitize parity; keeps
+            # decoded entities like &#10; from breaking the TSV protocol).
+            $name = ($name -replace '[\x00-\x1F]', ' ').Trim()
             $chTimes += $secs; $chNames += $name
         }
         for ($i = 0; $i -lt $chTimes.Count; $i++) {
@@ -131,7 +134,7 @@ func zoneBuildTemplate() *model.StepTemplate {
             if ($sf -lt 0) { $sf = 0 }
             if ($ef -ge $frameCount) { $ef = $frameCount - 1 }
             if ($sf -lt $ef) {
-                $zones += [pscustomobject]@{ start = $sf; end = $ef; mode = 'b'; value = $opEdB; reason = ('chapter:' + ($chNames[$i] -replace '[\r\n"]', ' ')) }
+                $zones += [pscustomobject]@{ start = $sf; end = $ef; mode = 'b'; value = $opEdB; reason = ('chapter:' + ($chNames[$i] -replace '[\r\n\t"]', ' ')) }
             }
         }
     }

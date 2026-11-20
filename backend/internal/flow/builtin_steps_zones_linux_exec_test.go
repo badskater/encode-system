@@ -4,6 +4,7 @@ package flow
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -470,7 +471,7 @@ func TestEncodeZonesDecoyNestedKey(t *testing.T) {
 func TestEncodeZonesCompactFailsClosed(t *testing.T) {
 	v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":"0,71,b=0.6"}`)
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
-	if err == nil || !strings.Contains(out, "no top-level x265 key") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
+	if err == nil || !strings.Contains(out, "exactly one top-level x265 key") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
 		t.Fatalf("compact zones.json must fail closed:\n%s", out)
 	}
 }
@@ -503,4 +504,167 @@ func TestEncodeZonesFailClosed(t *testing.T) {
 			t.Fatalf("must fail closed:\n%s", out)
 		}
 	})
+}
+
+// --- Re-review round-3 regressions --------------------------------------
+
+// Helper: run zone_build with a custom chapters.xml over the standard
+// 3-scene fixture and return the zones.
+func zoneWithChapters(t *testing.T, xml string, params map[string]string) zoneDoc {
+	t.Helper()
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(xml), 0o644)
+	bdMustRun(t, bdRender(t, "zone_build", params, v), v)
+	return readZones(t, epDir)
+}
+
+const atomTpl = `<ChapterAtom><ChapterTimeStart>00:00:03.000000000</ChapterTimeStart><ChapterDisplay>%s</ChapterDisplay></ChapterAtom>`
+
+func chapterXML(displays string) string {
+	return `<Chapters><EditionEntry>` + fmt.Sprintf(atomTpl, displays) + `</EditionEntry></Chapters>`
+}
+
+// Round-3 medium: single-pass decode — '&#38;#79;P' decodes ONCE to
+// '&#79;P' (PS InnerText parity), never re-scanned into 'OP'.
+func TestZoneBuildBashNoDoubleDecode(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString>&#38;#79;P</ChapterString>`), nil)
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP" {
+			t.Fatalf("double-decode created a phantom OP zone: %+v", d.Zones)
+		}
+	}
+	d2 := zoneWithChapters(t, chapterXML(`<ChapterString>&#38;#79;P</ChapterString>`),
+		map[string]string{"name_patterns": "&#79;P"})
+	var found bool
+	for _, z := range d2.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("single-decoded name must match its literal pattern: %+v", d2.Zones)
+	}
+}
+
+// Round-3 medium: non-ASCII entities must produce VALID UTF-8 JSON
+// (mawk %c is byte-oriented — the utf8() helper emits proper sequences).
+func TestZoneBuildBashUtf8Entities(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString>&#233;OP</ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:éOP" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("é entity must decode to valid UTF-8: %+v", d.Zones)
+	}
+	// Emoji (>0xFFFF, 4-byte UTF-8) — no NUL truncation.
+	d2 := zoneWithChapters(t, chapterXML(`<ChapterString>&#x1F600;OP</ChapterString>`), nil)
+	found = false
+	for _, z := range d2.Zones {
+		if z.Reason == "chapter:\U0001F600OP" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("emoji entity must decode intact: %+v", d2.Zones)
+	}
+}
+
+// Round-3 low: empty FIRST display wins (PS SelectSingleNode parity).
+func TestZoneBuildBashEmptyFirstDisplay(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString></ChapterString><ChapterString>OP</ChapterString>`), nil)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("empty first display must win: %+v", d.Zones)
+		}
+	}
+}
+
+// Round-3 low: XML comments must not create phantom chapters.
+func TestZoneBuildBashCommentPhantom(t *testing.T) {
+	xml := `<Chapters><EditionEntry><!-- <ChapterAtom><ChapterTimeStart>00:00:03.000000000</ChapterTimeStart><ChapterDisplay><ChapterString>OP</ChapterString></ChapterDisplay></ChapterAtom> -->` +
+		fmt.Sprintf(atomTpl, `<ChapterString>Main</ChapterString>`) + `</EditionEntry></Chapters>`
+	d := zoneWithChapters(t, xml, nil)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("comment phantom leaked: %+v", d.Zones)
+		}
+	}
+}
+
+// Round-3 low: unclosed ChapterString drops the atom (no markup in name).
+func TestZoneBuildBashUnclosedChapterString(t *testing.T) {
+	xml := `<Chapters><EditionEntry><ChapterAtom><ChapterTimeStart>00:00:03.000000000</ChapterTimeStart><ChapterDisplay><ChapterString>OP<ChapterLanguage>eng</ChapterLanguage></ChapterDisplay></ChapterAtom></EditionEntry></Chapters>`
+	d := zoneWithChapters(t, xml, nil)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("unclosed tag must drop the atom: %+v", d.Zones)
+		}
+	}
+}
+
+// Round-3 low: attribute-bearing ChapterString is parsed.
+func TestZoneBuildBashChapterStringAttributes(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString lang="en">OP</ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("attributes must be tolerated: %+v", d.Zones)
+	}
+}
+
+// Round-3 low: decoded tab becomes a space in the reason (TSV safety).
+func TestZoneBuildBashTabInName(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString>OP&#9;ED</ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP ED" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("tab must sanitize to space: %+v", d.Zones)
+	}
+}
+
+// Round-3 low: multi-line CDATA joins with a separator; CDATA content is
+// literal (entities inside CDATA are NOT decoded).
+func TestZoneBuildBashMultilineCdata(t *testing.T) {
+	xml := "<Chapters><EditionEntry><ChapterAtom><ChapterTimeStart>00:00:03.000000000</ChapterTimeStart><ChapterDisplay><ChapterString><![CDATA[OP\nTitle]]></ChapterString></ChapterDisplay></ChapterAtom></EditionEntry></Chapters>"
+	d := zoneWithChapters(t, xml, map[string]string{"name_patterns": "OP Title"})
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP Title" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("multi-line CDATA must join with a space: %+v", d.Zones)
+	}
+	d2 := zoneWithChapters(t, chapterXML(`<ChapterString><![CDATA[&amp;]]></ChapterString>`),
+		map[string]string{"name_patterns": "&amp;"})
+	found = false
+	for _, z := range d2.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("CDATA content must stay literal: %+v", d2.Zones)
+	}
+}
+
+// Round-3 info: duplicate top-level x265 keys fail closed (PS throws).
+func TestEncodeZonesDuplicateKeysFailClosed(t *testing.T) {
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"x265\": \"0,999999,q=0\",\n  \"x265\": \"0,71,b=0.6\"\n}")
+	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
+	if err == nil || !strings.Contains(out, "exactly one top-level x265 key") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
+		t.Fatalf("duplicate keys must fail closed:\n%s", out)
+	}
 }

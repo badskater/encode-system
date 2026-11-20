@@ -125,34 +125,87 @@ func scanOnce(ctx context.Context, log *slog.Logger, st JobCreator, target Targe
 		if !sr.Enabled || sr.Paused {
 			continue // operator disabled/paused this series; folder stays unprocessed
 		}
-		exists, err := st.JobExistsForEpisode(ctx, c.EpisodeDir)
-		if err != nil {
-			log.Warn("dedupe check failed", "episode_dir", c.EpisodeDir, "err", err)
-			continue
-		}
-		if exists {
-			continue
-		}
-		fl, err := resolveSeriesFlow(ctx, st, sr, defaultFlow)
-		if err != nil {
-			log.Warn("flow resolution failed", "series", c.Series, "err", err)
-			continue
-		}
-		job, err := st.CreateJob(ctx, &model.Job{
-			Series:     c.Series,
-			Episode:    flow.EpisodeNumber(c.EpisodeDir),
-			EpisodeDir: c.EpisodeDir,
-			ScriptType: c.ScriptType,
-			ScriptFile: c.ScriptFile,
-			FlowID:     fl.ID,
-		})
-		if err != nil {
-			log.Warn("create job failed", "episode_dir", c.EpisodeDir, "err", err)
-			continue
-		}
-		log.Info("job created from scan", "job", job.ID, "episode_dir", c.EpisodeDir,
-			"script", c.ScriptFile, "flow", fl.Name)
+		createJobForCandidate(ctx, log, st, sr, c, defaultFlow)
 	}
+
+	// Source-only pass: episodes with a stable source but no filter script.
+	// Series with a script assignment get the template materialized into the
+	// episode dir, then a job exactly like the normal pass. Without an
+	// assignment these folders stay untouched (legacy behavior).
+	var sourceOnly []Candidate
+	switch {
+	case target.S3Bucket != "" && target.S3Store != nil:
+		scanned, err := ScanS3SourceOnly(ctx, target.S3Store, target.S3Bucket, SourceStableFor)
+		if err != nil {
+			log.Warn("s3 source-only scan failed", "bucket", target.S3Bucket, "err", err)
+			return
+		}
+		sourceOnly = scanned
+	case target.Root != "":
+		scanned, _, err := ScanSourceOnly(target.Root, SourceStableFor)
+		if err != nil {
+			log.Warn("source-only scan failed", "root", target.Root, "err", err)
+			return
+		}
+		sourceOnly = scanned
+	}
+	for _, c := range sourceOnly {
+		sr, err := st.UpsertSeriesByName(ctx, c.Series)
+		if err != nil {
+			log.Warn("series registration failed", "series", c.Series, "err", err)
+			continue
+		}
+		if !sr.Enabled || sr.Paused || sr.ScriptTemplate == "" {
+			continue
+		}
+		var m Candidate
+		if target.S3Bucket != "" && target.S3Store != nil {
+			m, err = MaterializeScriptS3(ctx, target.S3Store, target.S3Bucket, sr, c)
+		} else {
+			m, err = MaterializeScript(target.Root, sr, c)
+		}
+		if err != nil {
+			// Fail closed: no job with a missing/broken script. The next
+			// cycle retries (template may land later).
+			log.Warn("script materialization failed", "series", c.Series, "episode_dir", c.EpisodeDir, "err", err)
+			continue
+		}
+		log.Info("series script materialized", "series", c.Series, "episode_dir", c.EpisodeDir, "script", m.ScriptFile)
+		createJobForCandidate(ctx, log, st, sr, m, defaultFlow)
+	}
+}
+
+// createJobForCandidate is the shared job-creation tail: episode dedupe,
+// series flow resolution, CreateJob. Used by both the ready-candidate pass
+// and the template-materialization pass so their semantics cannot drift.
+func createJobForCandidate(ctx context.Context, log *slog.Logger, st JobCreator, sr *model.Series, c Candidate, defaultFlow string) {
+	exists, err := st.JobExistsForEpisode(ctx, c.EpisodeDir)
+	if err != nil {
+		log.Warn("dedupe check failed", "episode_dir", c.EpisodeDir, "err", err)
+		return
+	}
+	if exists {
+		return
+	}
+	fl, err := resolveSeriesFlow(ctx, st, sr, defaultFlow)
+	if err != nil {
+		log.Warn("flow resolution failed", "series", c.Series, "err", err)
+		return
+	}
+	job, err := st.CreateJob(ctx, &model.Job{
+		Series:     c.Series,
+		Episode:    flow.EpisodeNumber(c.EpisodeDir),
+		EpisodeDir: c.EpisodeDir,
+		ScriptType: c.ScriptType,
+		ScriptFile: c.ScriptFile,
+		FlowID:     fl.ID,
+	})
+	if err != nil {
+		log.Warn("create job failed", "episode_dir", c.EpisodeDir, "err", err)
+		return
+	}
+	log.Info("job created from scan", "job", job.ID, "episode_dir", c.EpisodeDir,
+		"script", c.ScriptFile, "flow", fl.Name)
 }
 
 // resolveSeriesFlow picks the series' explicit flow, else the flagged default

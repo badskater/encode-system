@@ -1,6 +1,12 @@
 // Package scanner walks the NFS-mounted scripts share and finds episode
 // folders ready to encode: a source media file plus a VapourSynth/AviSynth
 // filter script.
+//
+// Series can assign a default filter script (script_type/script_template).
+// The scan loop materializes _templates/<Series>/<template> into each
+// detected episode that lacks its own script (placeholder substitution;
+// an existing per-episode script always wins). _templates is a reserved
+// top-level folder, never scanned as a series.
 package scanner
 
 import (
@@ -39,6 +45,28 @@ type Candidate struct {
 // whose mtime is newer than minStableAge are considered still copying and are
 // likewise deferred (NFS copies of large .m2ts files take a while).
 func Scan(root string, minStableAge time.Duration) ([]Candidate, int, error) {
+	return scanFs(root, minStableAge, true)
+}
+
+// ScanSourceOnly returns episodes with a stable source but NO filter
+// script — the materialization candidates for series with a script
+// assignment. Episodes that already carry a script are excluded (the
+// normal Scan owns them). Same layout/stability rules as Scan.
+func ScanSourceOnly(root string, minStableAge time.Duration) ([]Candidate, int, error) {
+	cands, skipped, err := scanFs(root, minStableAge, false)
+	if err != nil {
+		return nil, skipped, err
+	}
+	var out []Candidate
+	for _, c := range cands {
+		if c.ScriptFile == "" {
+			out = append(out, c)
+		}
+	}
+	return out, skipped, nil
+}
+
+func scanFs(root string, minStableAge time.Duration, requireScript bool) ([]Candidate, int, error) {
 	fsys := os.DirFS(root)
 
 	seriesDirs, err := sortedDirs(fsys, ".")
@@ -49,13 +77,16 @@ func Scan(root string, minStableAge time.Duration) ([]Candidate, int, error) {
 	var out []Candidate
 	var skippedDirs int
 	for _, series := range seriesDirs {
+		if series == TemplateDirName {
+			continue // reserved: per-series script templates, not a series
+		}
 		epDirs, err := sortedDirs(fsys, series)
 		if err != nil {
 			skippedDirs++
 			continue // unreadable series dir: skip, keep scanning others
 		}
 		for _, ep := range epDirs {
-			c, ok, err := inspectEpisode(fsys, series, ep, minStableAge)
+			c, ok, err := inspectEpisodeOpts(fsys, series, ep, minStableAge, requireScript)
 			if err != nil {
 				skippedDirs++
 				continue
@@ -93,6 +124,14 @@ func sortedDirs(fsys fs.FS, dir string) ([]string, error) {
 // explicitly-authored 4K script wins over a legacy 1080 one, and VapourSynth
 // wins over AviSynth at the same resolution.
 func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (Candidate, bool, error) {
+	return inspectEpisodeOpts(fsys, series, ep, minStableAge, true)
+}
+
+// inspectEpisodeOpts is inspectEpisode with a script-requirement switch.
+// requireScript=false (ScanSourceOnly) accepts scriptless episodes and
+// lets the BDMV disc-layout fallback qualify without a script — the series
+// template materializes later, and bd_merge produces the flat source.
+func inspectEpisodeOpts(fsys fs.FS, series, ep string, minStableAge time.Duration, requireScript bool) (Candidate, bool, error) {
 	dir := path.Join(series, ep)
 	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
@@ -135,7 +174,7 @@ func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (
 	// actual playlist at runtime; SourceFile reports the first (sorted)
 	// playlist for display. A flat source always wins over the disc layout.
 	var bdmvNewest time.Time
-	if source == "" && script != "" {
+	if source == "" && (script != "" || !requireScript) {
 		pl, newest, ok, err := bdmvSource(fsys, dir)
 		if err != nil {
 			return Candidate{}, false, err
@@ -145,7 +184,7 @@ func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (
 			bdmvNewest = newest
 		}
 	}
-	if source == "" || script == "" {
+	if source == "" || (requireScript && script == "") {
 		return Candidate{}, false, nil
 	}
 	// Stability gate: a source still being copied over NFS has a fresh mtime.
@@ -166,10 +205,11 @@ func inspectEpisode(fsys fs.FS, series, ep string, minStableAge time.Duration) (
 			}
 		}
 	}
+	scriptType := strings.TrimPrefix(path.Ext(script), ".")
 	return Candidate{
 		Series:     series,
 		EpisodeDir: path.Join(series, ep),
-		ScriptType: strings.TrimPrefix(path.Ext(script), "."),
+		ScriptType: scriptType,
 		ScriptFile: script,
 		SourceFile: source,
 	}, true, nil

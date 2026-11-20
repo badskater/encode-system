@@ -47,6 +47,7 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		bdMergeTemplate(),
 		bdSplitTemplate(),
 		sceneDetectTemplate(),
+		zoneBuildTemplate(),
 	}
 }
 
@@ -248,6 +249,7 @@ func encodeTemplate() *model.StepTemplate {
 			{Key: "b_pyramid", Label: "B-pyramid", Type: "bool", Default: "true"},
 			{Key: "open_gop", Label: "Open GOP", Type: "bool", Default: "true"},
 			{Key: "x265_args", Label: "Raw x265 arguments (overrides everything above; blank = use the fields)"},
+			{Key: "use_zones", Label: "Apply zones.json from zone_build", Type: "bool", Default: "false"},
 		},
 		PowerShell: `function Invoke-VideoEncode {
     param(
@@ -307,6 +309,25 @@ func encodeTemplate() *model.StepTemplate {
         if ($Params.no_sao -ne 'false') { $argList += @('--no-sao', '--no-sao-non-deblock') }
         if ($Params.b_pyramid -ne 'false') { $argList += '--b-pyramid' }
         if ($Params.open_gop -ne 'false') { $argList += '--open-gop' }
+    }
+    # Zones (zone_build artifact): inject the validated --zones string.
+    # Applies in BOTH arg modes; input/output still come last.
+    if ($Params.use_zones -eq 'true') {
+        $zonesPath = Join-Path $Job.EpisodeDir 'zones.json'
+        if (-not (Test-Path -LiteralPath $zonesPath)) {
+            throw 'encode: use_zones is set but zones.json is missing - run zone_build first'
+        }
+        try { $zj = [System.IO.File]::ReadAllText($zonesPath) | ConvertFrom-Json } catch { throw 'encode: zones.json is not valid JSON' }
+        $zstr = [string]$zj.x265
+        if ($zstr -ne '' -and $zstr -notmatch '^[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?)(/[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?))*$') {
+            throw 'encode: zones.json x265 string is malformed'
+        }
+        if ($zstr -ne '') {
+            $argList += @('--zones', $zstr)
+            Write-Output "[x265] zones: $zstr"
+        } else {
+            Write-Output '[x265] zones.json empty - no zones applied'
+        }
     }
     # Input/output always appended last so flow params can never override them.
     $argList += @('--input', $Job.ScriptFile, '-o', $Job.HevcFile)

@@ -80,6 +80,7 @@ var builtinBashSources = map[string]string{
 	"bd_merge":         bashSourceBdMerge,
 	"bd_split":         bashSourceBdSplit,
 	"scene_detect":     bashSourceSceneDetect,
+	"zone_build":       bashSourceZoneBuild,
 }
 
 // builtinBashRefused lists built-in templates that genuinely have no Linux
@@ -642,6 +643,27 @@ const bashSourceEncode = `encode () {
         [[ "$no_sao" != "false" ]] && arg_list+=(--no-sao --no-sao-non-deblock)
         [[ "$b_pyramid" != "false" ]] && arg_list+=(--b-pyramid)
         [[ "$open_gop" != "false" ]] && arg_list+=(--open-gop)
+    fi
+    # Zones (zone_build artifact): inject the validated --zones string.
+    # Applies in BOTH arg modes; the y4m/input tail still comes last.
+    if [[ "$use_zones" == "true" ]]; then
+        local zones="$EpisodeDir/zones.json"
+        if [[ ! -f "$zones" ]]; then
+            echo 'encode: use_zones is set but zones.json is missing - run zone_build first'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
+        local zstr
+        zstr=$(grep -m1 '"x265"' "$zones" | sed 's/.*"x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
+        if [[ -n "$zstr" && ! "$zstr" =~ ^[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?)(/[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?))*$ ]]; then
+            echo 'encode: zones.json x265 string is malformed'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
+        if [[ -n "$zstr" ]]; then
+            arg_list+=(--zones "$zstr")
+            echo "[x265] zones: $zstr"
+        else
+            echo '[x265] zones.json empty - no zones applied'
+        fi
     fi
     # Linux: pipe the VapourSynth script through vspipe into x265 (y4m on stdin).
     arg_list+=(--y4m)

@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS series (
   paused INTEGER NOT NULL DEFAULT 0,
   node_group TEXT NOT NULL DEFAULT '',
   webhook_url TEXT NOT NULL DEFAULT '',
+  script_type TEXT NOT NULL DEFAULT '',
+  script_template TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT %s,
   updated_at TEXT NOT NULL DEFAULT %s
 );
@@ -270,6 +272,14 @@ func (s *Store) migratePG() error {
 	if _, err := s.db.ExecContext(context.Background(),
 		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TEXT`); err != nil {
 		return fmt.Errorf("migratePG jobs.last_progress_at: %w", err)
+	}
+	// Series script assignment for PG databases created by an older build
+	// (the fresh schema above carries the columns; these cover upgrades).
+	for _, col := range []string{"script_type", "script_template"} {
+		if _, err := s.db.ExecContext(context.Background(),
+			`ALTER TABLE series ADD COLUMN IF NOT EXISTS `+col+` TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migratePG series.%s: %w", col, err)
+		}
 	}
 	// SQLite compatibility functions: the stats queries use SQLite-specific
 	// functions (julianday, strftime, date, SUBSTR, json_extract, substr)

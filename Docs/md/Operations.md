@@ -427,6 +427,69 @@ DTS-HD MA / LPCM) works on it unchanged. Verified against tsMuxeR **v3.1.0**.
   go test ./internal/flow/ -run TestBdRealBinary -v
   ```
 
+## Series script templates
+
+Assign a filter script once per series instead of authoring it per episode:
+
+1. Create `_templates/<Series>/` at the scripts root and drop the template
+   file there (e.g. `1080.vpy`). Placeholders substituted at materialization:
+   `{{source}}` (detected source file name), `{{series}}`, `{{episode}}`
+   (episode folder name), `{{episode_dir}}` (relative dir). Unknown
+   `{{...}}` tokens are left intact. For BD flows, reference `src.m2ts`
+   directly — `bd_merge` produces it before the encode reads it.
+2. Assign via UI (Series → edit → Filter script) or API:
+   `PATCH /api/series/{id}` with `{"script_type":"vpy","script_template":"1080.vpy"}`
+   (both keys together; both `""` clears). The template must already exist —
+   assignment fails closed otherwise. `GET /api/series/{id}/templates` lists
+   the picker options.
+3. The scanner materializes the template into each detected episode that has
+   a stable source but no script, then queues the job as usual. An existing
+   per-episode script ALWAYS wins (hand-authored overrides stay in effect).
+   Missing/broken templates log a warning and retry next cycle — no job is
+   created with a missing script. `_templates` is reserved: never scanned as
+   a series, refused as a series name.
+
+## Scene detection + zones (scene_detect / zone_build / encode use_zones)
+
+Pre-encode analysis pipeline, composable with the BD steps:
+
+```text
+bd_merge → scene_detect → zone_build → encode(use_zones=true) → …
+```
+
+- `scene_detect` (ffmpeg + ffprobe required; Windows nodes get them via the
+  bin package, Linux nodes via provisioning): decode-only scdet pass over the
+  source → `scenes.json` (fps, frame_count, frame-accurate boundaries) +
+  `scdet.log` evidence. Params: `threshold` (default 10, 0–100),
+  `min_scene_len` (frames, 0 = off — merges short scenes into the previous).
+  Skips when `scenes.json` is newer than the source. m2ts sources lack
+  `nb_frames`; the frame count falls back to `round(duration*fps)` (±1 frame
+  at the tail — zones tolerate it).
+- `zone_build`: `scenes.json` + optional `chapters.xml` → `zones.json`.
+  Precedence (x265 applies the LAST matching zone; output is ordered
+  accordingly): credits heuristic (first/last scene ≤ `credits_max_seconds`,
+  default 90 s → `b=credits_b`, default 0.6) < chapter-name matches
+  (`name_patterns`, default `OP|Opening|ED|Ending|Credits|Preview`,
+  case-insensitive → `b=op_ed_b`, default 0.8, spanning the whole named
+  chapter) < manual `overrides` (`start,end,b=V/start,end,q=V`).
+  Single-scene sources get no heuristic zones. Tune factors per flow;
+  under CRF `b=` is a quantizer nudge (approximate), `q=` forces exact QP.
+- `encode` with `use_zones=true`: injects the validated `--zones` string
+  (works with raw `x265_args` too). Missing/malformed `zones.json` fails the
+  step; an empty zone set applies nothing. `encode_4k` does not consume
+  zones yet.
+- Failure classes: `scenes.json missing` (run scene_detect first),
+  `invalid override token` / `override frames outside` (fix the overrides
+  param), `zones.json x265 string is malformed` (regenerate via zone_build —
+  hand-edited zones.json is rejected by design).
+- Gated real-binary regression (synthetic hard-cut fixture, authored
+  chapters):
+
+  ```bash
+  ENCODE_TEST_FFMPEG=/path/ffmpeg ENCODE_TEST_FFPROBE=/path/ffprobe \
+  go test ./internal/flow/ -run 'TestSceneDetectRealBinary|TestZoneBuildRealBinary' -v
+  ```
+
 ## Notification channels
 
 Discord stays the default transport (unchanged). Three additive channels ship

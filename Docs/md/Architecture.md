@@ -49,7 +49,7 @@ the controller mounts nfs/smb (or lists s3), and nodes reach the same source.
 
 ### Controller (`backend/cmd/controller`)
 
-- **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. A Blu-ray disc layout also qualifies: `BDMV/PLAYLIST/*.mpls` **and** `BDMV/STREAM/*.m2ts` with no flat media file (the `bd_merge`/`bd_split` steps resolve the playlist at runtime; `SourceFile` reports the first sorted playlist; the stability gate uses the newest playlist/stream mtime — S3: `LastModified`). Flat sources keep priority over the disc layout. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
+- **Scanner** discovers episode folders on the configured storage sources. On a mounted share (nfs/smb) it polls `scripts/`; when an **enabled s3 share** serves the scripts role it switches to bucket listing (`scanner.ScanS3`: depth-2 `<series>/<episode>/` keys — no mount anywhere). An episode folder is "ready" when it contains a source video (`*.m2ts|*.ts|*.mkv`) plus at least one filter script. **Series script assignment**: a series may carry `script_type` (vpy/avs) + `script_template`; the scan loop then runs a second, source-only pass and materializes `_templates/<Series>/<template>` from the scripts root into each stable-source episode that lacks its own script (placeholders `{{source}}`, `{{series}}`, `{{episode}}`, `{{episode_dir}}`; atomic temp+rename on fs, Get/render/Put on S3; an existing per-episode script always wins; missing/invalid templates fail closed with a warn and retry next cycle). `_templates` is a reserved top-level folder (excluded from both scans, refused as a series name by the API). A Blu-ray disc layout also qualifies: `BDMV/PLAYLIST/*.mpls` **and** `BDMV/STREAM/*.m2ts` with no flat media file (the `bd_merge`/`bd_split` steps resolve the playlist at runtime; `SourceFile` reports the first sorted playlist; the stability gate uses the newest playlist/stream mtime — S3: `LastModified`). Flat sources keep priority over the disc layout. Script priority: `2160.vpy > 2160.avs > 1080.vpy > 1080.avs > any other .avs/.vpy` (VapourSynth wins at the same resolution). Ready-and-unseen folders become jobs. Sources younger than the stability window (2 min) are deferred — both for mid-copy share uploads and for S3 (`LastModified` gate).
 - **Queue** persists jobs in SQLite (default) or Postgres (`ENCODE_DATABASE_URL`; see the dialect layer below). Job lifecycle: `pending → assigned → running → muxing → done` (or `failed`/`cancelled`). Dispatch respects: per-node concurrency slots (`max_concurrent_jobs`, default 1, clamped 1–8), series pause (queued jobs of a paused series hold), node-group routing (series `node_group` → nodes with a matching `group`; empty group = wildcard), priority (`priority DESC, id ASC` FIFO within a tier), retry backoff (`next_retry_at`), and **retry steering** — a retried job prefers a node other than its `last_failed_node_id` within the same priority tier. Drain mode (live setting) halts assignment fleet-wide; per-node disk alerts soft-drain a single node.
 - **Flow renderer** turns a flow definition (ordered steps + params) plus job variables (series, episode, paths, output name) into a self-contained script — PowerShell (`.ps1`) for Windows nodes or bash (`.sh`) for Linux nodes, selected at dispatch time via `DialectForPlatform(node.Platform)`. PowerShell scripts call functions from `EncodeLib.ps1` (dot-sourced by the preamble); bash scripts are self-contained (the shared `find_source_file` helper is emitted into every render). For s3-backed roles, `$ScriptsDir`/`$ReleaseDir` point at a `{{JOBDIR}}` staging placeholder and the job payload carries an `S3Transfer` spec (bucket/keys) — the agent downloads `scripts/<episode_dir>` before the run and uploads outputs after success only.
 - **Agent API** under `/api/agent/*`: heartbeat + claim, step progress, log tail upload, job completion, update manifest + binary/script download. Token auth per node.
@@ -209,13 +209,14 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `EncodeLib.ps1`). User/custom templates using PowerShell-only cmdlets
   (Get-FileHash, pscustomobject, `@{}`, `$()`) are refused with a clear
   render error; `Write-Output` is the one translated cmdlet (→ `echo`).
-- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 22
-  of 23 built-in templates carry bash-native sources
+- **Built-in Linux mappings** (`internal/flow/builtin_steps_linux.go`): 24
+  of 25 built-in templates carry bash-native sources
   (`builtinBashSources`): `source_rename`, `media_probe`, `hdr_probe`,
   `audio`, `audio_branch`, `audio_lang`, `flac_audio`, `encode`,
   `encode_4k`, `mux`, `verify_output`, `quality_gate`, `subtitle_extract`,
   `font_extract`, `chapter_extract`, `mux_extras`, `crc32_rename`,
-  `release_copy`, `keyframes`, `discord_notify`, `bd_merge`, `bd_split`. Tool mappings: `vspipe -c y4m | x265`
+  `release_copy`, `keyframes`, `discord_notify`, `bd_merge`, `bd_split`,
+  `scene_detect`, `zone_build`. Tool mappings: `vspipe -c y4m | x265`
   (video, args mirrored verbatim from the PS template — ffmpeg never
   video-encodes), `ffmpeg` decode-only (`-c:a pcm_s24le`) → `opusenc`/`flac`
   (audio), `ffmpeg` libvmaf/ssim comparison (`quality_gate` — measurement,
@@ -227,7 +228,10 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   `sha256sum` hashing, `curl` notify, `tsMuxeR` Blu-ray playlist remux
   (`bd_merge`/`bd_split` — `command -v tsMuxeR` then `$BinDir/tsMuxeR`,
   with an optional `$BinDir/tsMuxeR-lib/` bundled-libs directory prepended
-  to `LD_LIBRARY_PATH` for tsMuxeR invocations only).
+  to `LD_LIBRARY_PATH` for tsMuxeR invocations only), `ffmpeg` scdet
+  analysis + `ffprobe` (`scene_detect` — awk parses the probe JSON and
+  generates `scenes.json`; no jq dependency), `awk` zone generation
+  (`zone_build`).
   1 template is refused (`builtinBashRefused`): `dgindex` (DGIndexNV is
   Windows/Nvidia-GPU only; Linux uses VapourSynth source filters — no `.dgi`
   index needed). `keyframes` is ported (P7): a generated `.vpy` loads the
@@ -239,13 +243,14 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   mirrors its `num_slices = num_threads`). Requires `pip install
   vapoursynth-scxvid` (provisioned by the linux-node ansible role).
 
-- **Built-in templates** (**23**, seeded at boot, editable, not deletable —
+- **Built-in templates** (**25**, seeded at boot, editable, not deletable —
   `flow.BuiltinStepTemplates()`):
   `source_rename`, `media_probe`, `dgindex`, `hdr_probe`, `audio`,
   `audio_branch`, `audio_lang`, `flac_audio`, `encode`, `encode_4k`, `mux`,
   `verify_output`, `quality_gate`, `subtitle_extract`, `font_extract`,
   `chapter_extract`, `mux_extras`, `crc32_rename`, `release_copy`,
-  `keyframes`, `discord_notify`, `bd_merge`, `bd_split`.
+  `keyframes`, `discord_notify`, `bd_merge`, `bd_split`, `scene_detect`,
+  `zone_build`.
 - **Blu-ray playlist pipeline** (`internal/flow/builtin_steps_bd.go` +
   `_linux.go`): `bd_merge` and `bd_split` remux Blu-ray playlists (MPLS)
   with **tsMuxeR** (teaching-droid/tsMuxer fork, v3.1.0 verified; lossless,
@@ -272,6 +277,32 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   episodes: `BDMV/PLAYLIST/*.mpls` + `BDMV/STREAM/*.m2ts` with no flat
   media file become candidates (fs `bdmvSource` + S3 `bdmvKey` parity;
   flat sources keep priority; stability gate on the newest BDMV file).
+- **Scene analysis + zones pipeline** (`internal/flow/builtin_steps_scene.go`
+  / `builtin_steps_zones.go` + `_linux.go` ports): `scene_detect` runs
+  ffmpeg `scdet=threshold=<T>,metadata=print:file=<ep>/scdet.log` over the
+  episode source (decode-only) and publishes `scenes.json` — fps from
+  ffprobe `r_frame_rate`, `frame_count` from `nb_frames` with a
+  `round(duration*fps)` fallback for containers lacking it (m2ts), scene
+  boundaries where `lavfi.scd.score >= threshold` (frame > 0),
+  `min_scene_len` merges shorter scenes into the previous one. The
+  metadata-log format is frozen against ffmpeg 9.x and covered by a gated
+  real-binary E2E (authored hard cuts). Skip when `scenes.json` is newer
+  than the source; zero boundaries = one scene (valid). `zone_build`
+  consumes `scenes.json` + optional `chapters.xml` and publishes
+  `zones.json` (structured zones + a ready x265 `--zones` string), ordered
+  low→high precedence because x265 applies the LAST matching zone:
+  credits heuristic (first/last scene ≤ `credits_max_seconds`, `b=credits_b`)
+  < chapter-name regex matches (`name_patterns`, case-insensitive,
+  `b=op_ed_b` over the whole named chapter span) < manual `overrides`
+  (x265-style `start,end,b=V/start,end,q=V` tokens). Validation is
+  fail-closed (frame ranges, b ∈ (0,10], q ∈ [0,51], regex check); both
+  steps skip-if-fresh and write atomically; the bash ports use awk only
+  (no jq). `encode` gains `use_zones` (default false): when true it reads
+  `zones.json`, shape-validates the x265 string and appends `--zones`
+  before the input/output tail in BOTH arg modes (named fields and raw
+  `x265_args`); missing/malformed fails closed, an empty string applies
+  nothing. Under CRF, `b=` nudges quantizers (approximate); `q=` forces an
+  exact QP. `encode_4k` does not consume zones yet (follow-up).
 - **Discord notification step**: `discord_notify` posts an episode-progress
   message to a Discord webhook when the flow reaches it (e.g. after mux or
   release copy). Webhook resolution: flow param first, then the controller's

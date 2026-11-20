@@ -525,9 +525,13 @@ function ScriptCell({
     );
   }
 
+  // Only templates whose extension matches the selected type are offered
+  // (the server lists .vpy AND .avs together; a cross-type pair would 400).
   // Keep the current assignment selectable even if its file vanished from
   // the share since it was assigned (re-saving it surfaces the 400 inline).
-  const names = templates.map((t) => t.name);
+  const names = templates
+    .map((t) => t.name)
+    .filter((n) => scriptType === '' || n.toLowerCase().endsWith('.' + scriptType));
   if (template && !names.includes(template)) names.unshift(template);
 
   return (

@@ -77,8 +77,11 @@ func scanFs(root string, minStableAge time.Duration, requireScript bool) ([]Cand
 	var out []Candidate
 	var skippedDirs int
 	for _, series := range seriesDirs {
-		if series == TemplateDirName {
+		if strings.EqualFold(series, TemplateDirName) {
 			continue // reserved: per-series script templates, not a series
+		}
+		if series == "." || series == ".." {
+			continue // dot segments can never be a series folder
 		}
 		epDirs, err := sortedDirs(fsys, series)
 		if err != nil {
@@ -86,6 +89,9 @@ func scanFs(root string, minStableAge time.Duration, requireScript bool) ([]Cand
 			continue // unreadable series dir: skip, keep scanning others
 		}
 		for _, ep := range epDirs {
+			if ep == "." || ep == ".." {
+				continue
+			}
 			c, ok, err := inspectEpisodeOpts(fsys, series, ep, minStableAge, requireScript)
 			if err != nil {
 				skippedDirs++

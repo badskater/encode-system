@@ -24,7 +24,9 @@ const bashSourceZoneBuild = `zone_build () {
         fi
     fi
     local fps frames
-    fps=$(grep -m1 '"fps"' "$scenes" | sed 's/.*"fps"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/') || fps=''
+    # Full-token extraction + strict validation: a truncated '1e9' -> '1'
+    # must fail closed, not silently change the frame math (PS parity).
+    fps=$(grep -m1 '"fps"' "$scenes" | sed 's/.*"fps"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/' | tr -d ' "') || fps=''
     frames=$(grep -m1 '"frame_count"' "$scenes" | sed 's/.*"frame_count"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/') || frames=''
     if [[ ! "$fps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v f="$fps" 'BEGIN{exit !(f>0)}'; then
         echo 'zone_build: scenes.json has unusable fps/frame_count'
@@ -34,10 +36,18 @@ const bashSourceZoneBuild = `zone_build () {
         echo 'zone_build: scenes.json has unusable fps/frame_count'
         echo 'ENCODE_STEP_FAILED zone_build'; exit 1
     fi
-    local nscenes
+    # Contract enforcement: scene_detect writes ONE scene object per line.
+    # Compact/non-contract files would mis-count scenes and mis-extract
+    # first/last — refuse them instead of degrading silently.
+    local nscenes nidx
     nscenes=$(grep -c '"index"' "$scenes")
+    nidx=$(grep -o '"index"' "$scenes" | wc -l)
     if (( nscenes < 1 )); then
         echo 'zone_build: scenes.json has no scenes'
+        echo 'ENCODE_STEP_FAILED zone_build'; exit 1
+    fi
+    if (( nscenes != nidx )); then
+        echo 'zone_build: scenes.json is not in the scene_detect one-scene-per-line contract'
         echo 'ENCODE_STEP_FAILED zone_build'; exit 1
     fi
 
@@ -97,23 +107,56 @@ const bashSourceZoneBuild = `zone_build () {
     # 2. Chapter-name matches: zone spans the whole named chapter.
     if [[ -f "$chapters" ]]; then
         local ch_rows
-        ch_rows=$(awk '
-            /<ChapterAtom>/ { inatom = 1; ts = ""; name = "" }
+        # Normalize compact XML to one tag per line first (greedy sub()
+        # would otherwise keep only the LAST atom on a multi-atom line).
+        ch_rows=$(sed 's/></>\n</g' "$chapters" | awk '
+            /<ChapterAtom>/ { inatom = 1; ts = ""; name = ""; grabname = 0 }
             inatom && /<ChapterTimeStart>/ {
                 line = $0; sub(/.*<ChapterTimeStart>/, "", line); sub(/<\/ChapterTimeStart>.*/, "", line); ts = line
             }
-            inatom && /<ChapterString>/ {
-                line = $0; sub(/.*<ChapterString>/, "", line); sub(/<\/ChapterString>.*/, "", line); name = line
+            inatom && /<ChapterString>/ && name == "" && !grabname {
+                # FIRST display wins (PS SelectSingleNode parity). Content
+                # may span lines: the sed tag-split puts CDATA sections on
+                # their own line, so accumulate until the closing tag.
+                line = $0; sub(/.*<ChapterString>/, "", line)
+                if (line ~ /<\/ChapterString>/) {
+                    sub(/<\/ChapterString>.*/, "", line); name = line
+                } else {
+                    name = line; grabname = 1
+                }
+            }
+            grabname && !/<ChapterString>/ {
+                if ($0 ~ /<\/ChapterString>/) {
+                    line = $0; sub(/<\/ChapterString>.*/, "", line)
+                    name = name line; grabname = 0
+                } else {
+                    name = name $0
+                }
             }
             /<\/ChapterAtom>/ {
                 if (inatom && ts != "") {
-                    gsub(/&amp;/, "\\&", name); gsub(/&lt;/, "<", name); gsub(/&gt;/, ">", name)
+                    # CDATA wrapper, then numeric entities, then named
+                    # entities with &amp; LAST (no double-unescape) —
+                    # matches PS InnerText semantics.
+                    sub(/^<!\[CDATA\[/, "", name); sub(/\]\]>$/, "", name)
+                    while (match(name, /&#([0-9]+);/)) {
+                        code = substr(name, RSTART+2, RLENGTH-3) + 0
+                        name = substr(name, 1, RSTART-1) sprintf("%c", code) substr(name, RSTART+RLENGTH)
+                    }
+                    while (match(name, /&#[xX]([0-9a-fA-F]+);/)) {
+                        hex = substr(name, RSTART+3, RLENGTH-4)
+                        cmd = "printf \"%d\" 0x" hex
+                        cmd | getline code; close(cmd)
+                        name = substr(name, 1, RSTART-1) sprintf("%c", code) substr(name, RSTART+RLENGTH)
+                    }
+                    gsub(/&lt;/, "<", name); gsub(/&gt;/, ">", name)
                     gsub(/&quot;/, "\"", name); gsub(/&apos;/, "\047", name)
+                    gsub(/&amp;/, "\\&", name)
                     print ts "\t" name
                 }
                 inatom = 0
             }
-        ' "$chapters") || ch_rows=''
+        ') || ch_rows=''
         # Convert each atom to "seconds<TAB>name", validating the timestamp.
         local ch_secs='' line ts name secs
         while IFS= read -r line; do
@@ -141,7 +184,10 @@ const bashSourceZoneBuild = `zone_build () {
             fi
             sf=$(awk -v s="${times[$i]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
             if (( i + 1 < ${#times[@]} )); then
-                ef=$(awk -v s="${times[$((i + 1))]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f - 1}')
+                # PS parity: Round(next*fps) THEN -1 (rounding the product
+                # minus one differs at exact .5 values).
+                ef=$(awk -v s="${times[$((i + 1))]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
+                ef=$(awk -v x="$ef" 'BEGIN{printf "%d", x - 1}')
             else
                 ef=$(( 10#$frames - 1 ))
             fi
@@ -175,6 +221,9 @@ const bashSourceZoneBuild = `zone_build () {
                 echo "zone_build: override frames outside 0..$(( 10#$frames - 1 )) or start >= end"
                 echo 'ENCODE_STEP_FAILED zone_build'; exit 1
             fi
+            # Normalize leading zeros (PS [int64] parity: 00,050 -> 0,50).
+            s=$(awk -v x="$s" 'BEGIN{printf "%d", x}')
+            e=$(awk -v x="$e" 'BEGIN{printf "%d", x}')
             if [[ -n "${BASH_REMATCH[4]}" ]]; then
                 local v="${BASH_REMATCH[4]}"
                 if ! awk -v v="$v" 'BEGIN{exit !(v>0 && v<=10)}'; then
@@ -204,6 +253,16 @@ const bashSourceZoneBuild = `zone_build () {
             sub(/0+$/, "", s); sub(/\.$/, "", s)
             return s
         }
+        function jesc(s,   i, ch, out) {
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                ch = substr(s, i, 1)
+                if (ch == "\\") out = out "\\\\"
+                else if (ch == "\"") out = out "\\\""
+                else out = out ch
+            }
+            return out
+        }
         BEGIN { n = 0 }
         NF >= 5 { s[n] = $1; e[n] = $2; m[n] = $3; v[n] = $4; r[n] = $5; n++ }
         END {
@@ -212,8 +271,7 @@ const bashSourceZoneBuild = `zone_build () {
             printf "  \"fps\": %s,\n", fps
             printf "  \"zones\": [\n"
             for (i = 0; i < n; i++) {
-                reason = r[i]
-                gsub(/\\/, "\\\\", reason); gsub(/"/, "\\\"", reason)
+                reason = jesc(r[i])
                 val = (m[i] == "q") ? sprintf("%d", v[i]) : fmtval(v[i])
                 tok[i] = s[i] "," e[i] "," m[i] "=" val
                 printf "    {\"start\": %d, \"end\": %d, \"mode\": \"%s\", \"value\": %s, \"reason\": \"%s\"}%s\n", s[i], e[i], m[i], val, reason, (i + 1 < n) ? "," : ""

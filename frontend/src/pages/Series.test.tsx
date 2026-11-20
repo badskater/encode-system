@@ -462,6 +462,31 @@ describe('Series page filter-script cell', () => {
     expect(picker.value).toBe('');
   });
 
+  it('offers only templates matching the selected type extension', async () => {
+    vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
+    mockEmpty();
+    vi.spyOn(api, 'seriesTemplates').mockResolvedValue({
+      templates: [templateFixture('1080.vpy'), templateFixture('2160.avs'), templateFixture('4K.VPY')],
+    });
+
+    render(<SeriesPage />);
+    await waitFor(() => expect(screen.getByText('—')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('—'));
+    const typeSelect = await screen.findByLabelText('Filter script type');
+    fireEvent.change(typeSelect, { target: { value: 'vpy' } });
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '1080.vpy' })).toBeInTheDocument(),
+    );
+    // Case-insensitive extension match; the .avs template is NOT offered.
+    expect(screen.getByRole('option', { name: '4K.VPY' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: '2160.avs' })).not.toBeInTheDocument();
+    fireEvent.change(typeSelect, { target: { value: 'avs' } });
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: '2160.avs' })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole('option', { name: '1080.vpy' })).not.toBeInTheDocument();
+  });
+
   it('PATCHes script_type and script_template together on save', async () => {
     vi.spyOn(api, 'series').mockResolvedValue([seriesFixture()]);
     mockEmpty();

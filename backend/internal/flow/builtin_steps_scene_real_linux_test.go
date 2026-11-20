@@ -79,3 +79,44 @@ func TestSceneDetectRealBinaryLinuxEndToEnd(t *testing.T) {
 		t.Fatalf("min_scene_len merge on real footage wrong: %+v", d2.Scenes)
 	}
 }
+
+// Review B-14: VFR source without nb_frames (m2ts) — the frame count must
+// be the ACTUAL decoded count, not duration*max_fps (which overcounts).
+func TestSceneDetectRealBinaryVFRCount(t *testing.T) {
+	ffmpeg := os.Getenv("ENCODE_TEST_FFMPEG")
+	ffprobe := os.Getenv("ENCODE_TEST_FFPROBE")
+	if ffmpeg == "" || ffprobe == "" {
+		t.Skip("ENCODE_TEST_FFMPEG / ENCODE_TEST_FFPROBE not set")
+	}
+	root := t.TempDir()
+	scriptsDir := filepath.Join(root, "scripts")
+	epDir := filepath.Join(scriptsDir, "Test Series", "Ep 01")
+	binDir := filepath.Join(root, "bin")
+	for _, d := range []string{epDir, binDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"ffmpeg": ffmpeg, "ffprobe": ffprobe} {
+		if err := os.Symlink(target, filepath.Join(binDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := filepath.Join(epDir, "vfr.m2ts")
+	// 3s @24fps (72 frames) + 3s @10fps (30 frames) = 102 decoded frames.
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24:duration=3",
+		"-f", "lavfi", "-i", "color=c=blue:size=320x240:rate=10:duration=3",
+		"-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0",
+		"-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts", src, "-y")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("author vfr fixture: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(epDir, "1080.vpy"), []byte("# stub"), 0o644)
+	v := Vars{BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: filepath.Join(root, "release"), Group: "TestGroup", Tag: "1080p"}
+	bdMustRun(t, bdRender(t, "scene_detect", nil, v), v)
+	d := readScenes(t, epDir)
+	if d.FrameCount < 101 || d.FrameCount > 103 {
+		t.Fatalf("VFR decoded count must be ~102 (not dur*fps=144): %d", d.FrameCount)
+	}
+}

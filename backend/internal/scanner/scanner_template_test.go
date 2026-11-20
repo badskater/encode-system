@@ -271,3 +271,97 @@ func TestScanOnceDisabledSeriesNoMaterialize(t *testing.T) {
 		t.Fatal("disabled series script was materialized")
 	}
 }
+
+// --- Review-round regressions -------------------------------------------
+
+// Review A-1: install must be no-replace — a target that exists at install
+// time is never clobbered (the ReadDir guard alone is a TOCTOU snapshot).
+func TestInstallNoReplaceRefusesExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, ".materialize-tmp")
+	target := filepath.Join(dir, "1080.vpy")
+	os.WriteFile(tmp, []byte("rendered template"), 0o644)
+	os.WriteFile(target, []byte("hand-authored"), 0o644)
+	if err := installNoReplace(tmp, target); err == nil {
+		t.Fatal("installNoReplace must refuse an existing target")
+	}
+	body, _ := os.ReadFile(target)
+	if string(body) != "hand-authored" {
+		t.Fatalf("target clobbered: %s", body)
+	}
+}
+
+// Review A-3: materialized scripts must be group/other-readable (0644) —
+// the encode agent reads them off the share as a different identity.
+func TestMaterializeScriptMode0644(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts")
+	writeTemplate(t, root, "S", "1080.vpy", "# template")
+	sr := &model.Series{Name: "S", ScriptType: "vpy", ScriptTemplate: "1080.vpy"}
+	if _, err := MaterializeScript(root, sr, Candidate{Series: "S", EpisodeDir: "S/Ep 01", SourceFile: "src.m2ts"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(root, "S", "Ep 01", "1080.vpy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("materialized script mode = %o, want 0644", info.Mode().Perm())
+	}
+}
+
+// Review A-7: control characters in placeholder values must be refused
+// (a newline source name would inject statements into the script).
+func TestMaterializeScriptRejectsControlChars(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts")
+	writeTemplate(t, root, "S", "1080.vpy", "# {{source}}")
+	sr := &model.Series{Name: "S", ScriptType: "vpy", ScriptTemplate: "1080.vpy"}
+	_, err := MaterializeScript(root, sr, Candidate{Series: "S", EpisodeDir: "S/Ep 01", SourceFile: "src\nimport os.m2ts"})
+	if err == nil {
+		t.Fatal("control-char source name must be refused")
+	}
+}
+
+// Review A-8: dot-segment EpisodeDir must be refused by the materializer.
+func TestMaterializeScriptRejectsDotSegments(t *testing.T) {
+	root := t.TempDir()
+	writeTemplate(t, root, "S", "1080.vpy", "# template")
+	sr := &model.Series{Name: "S", ScriptType: "vpy", ScriptTemplate: "1080.vpy"}
+	_, err := MaterializeScript(root, sr, Candidate{Series: "S", EpisodeDir: "S/..", SourceFile: "src.m2ts"})
+	if err == nil {
+		t.Fatal("dot-segment episode dir must be refused")
+	}
+	if _, err := os.Stat(filepath.Join(root, "1080.vpy")); !os.IsNotExist(err) {
+		t.Fatal("script escaped to the share root")
+	}
+}
+
+// Review A-9: the reserved-dir skip is case-insensitive (SMB parity).
+func TestScanReservedCaseVariant(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "_TEMPLATES", "Ep 01", "src.m2ts", "1080.vpy")
+	ageSource(t, filepath.Join(root, "_TEMPLATES", "Ep 01", "src.m2ts"))
+	cands, _, err := Scan(root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("_TEMPLATES variant must be reserved: %+v", cands)
+	}
+}
+
+// Review A-5: template extension matching is case-insensitive.
+func TestMaterializeScriptExtCaseInsensitive(t *testing.T) {
+	root := t.TempDir()
+	mkEp(t, root, "S", "Ep 01", "src.m2ts")
+	writeTemplate(t, root, "S", "1080.VPY", "# template")
+	sr := &model.Series{Name: "S", ScriptType: "vpy", ScriptTemplate: "1080.VPY"}
+	got, err := MaterializeScript(root, sr, Candidate{Series: "S", EpisodeDir: "S/Ep 01", SourceFile: "src.m2ts"})
+	if err != nil {
+		t.Fatalf("uppercase extension must be accepted: %v", err)
+	}
+	if got.ScriptFile != "1080.VPY" {
+		t.Fatalf("candidate wrong: %+v", got)
+	}
+}

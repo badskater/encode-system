@@ -62,8 +62,13 @@ func scanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableA
 		if name == "" {
 			continue
 		}
-		if strings.HasPrefix(o.Key, TemplateDirName+"/") {
+		if strings.HasPrefix(strings.ToLower(o.Key), TemplateDirName+"/") {
 			continue // reserved: per-series script templates, not a series
+		}
+		// S3 keys are literal: '..' segments pass the depth rule but would
+		// escape the episode prefix in path joins — refuse them.
+		if strings.Contains(o.Key, "/../") || strings.HasSuffix(o.Key, "/..") || strings.HasPrefix(o.Key, "../") {
+			continue
 		}
 		if strings.Count(trimmed, "/") == 1 {
 			byDir[trimmed] = append(byDir[trimmed], s3Entry{name: name, obj: o})

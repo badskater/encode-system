@@ -188,3 +188,61 @@ func TestSeriesTemplatesListing(t *testing.T) {
 		t.Fatalf("unknown series want 404, got %d", resp.StatusCode)
 	}
 }
+
+// --- Review-round regressions -------------------------------------------
+
+// Review A-4: a 400 on the script unit must NOT persist the other fields
+// sent in the same PATCH (validation runs before any setter).
+func TestPatchSeriesScriptFailureIsAtomic(t *testing.T) {
+	url, sr, root := scriptTestSetup(t)
+	writeSeriesTemplate(t, root, "Script Show", "1080.vpy", "# t\n")
+	resp, body := doJSON(t, "PATCH", url+"/api/series/"+itoa(sr.ID), adminTok,
+		map[string]any{"tag": "mutated", "enabled": false, "script_type": "vpy", "script_template": "missing.vpy"})
+	if resp.StatusCode != 400 {
+		t.Fatalf("want 400, got %d %s", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, "GET", url+"/api/series", adminTok, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("list: %d", resp.StatusCode)
+	}
+	var list []model.Series
+	json.Unmarshal(body, &list)
+	for _, s := range list {
+		if s.ID == sr.ID {
+			if s.Tag == "mutated" || !s.Enabled {
+				t.Fatalf("failed PATCH mutated other fields: %+v", s)
+			}
+		}
+	}
+}
+
+// Review A-2: a scanner-registered bogus name ('..') must not reach the
+// filesystem join in the templates listing or assignment validation.
+func TestSeriesTemplatesRejectsBogusName(t *testing.T) {
+	e := newTestEnv(t)
+	ts := e.serve(t)
+	sr, err := e.server.Store.UpsertSeriesByName(t.Context(), "..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := doJSON(t, "GET", ts.URL+"/api/series/"+itoa(sr.ID)+"/templates", adminTok, nil)
+	if resp.StatusCode != 400 {
+		t.Fatalf("bogus name must 400, got %d %s", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, "PATCH", ts.URL+"/api/series/"+itoa(sr.ID), adminTok,
+		map[string]any{"script_type": "vpy", "script_template": "secret.vpy"})
+	if resp.StatusCode != 400 {
+		t.Fatalf("assignment under bogus name must 400, got %d %s", resp.StatusCode, body)
+	}
+}
+
+// Review A-5: uppercase template extension is assignable (listing parity).
+func TestPatchSeriesScriptExtCase(t *testing.T) {
+	url, sr, root := scriptTestSetup(t)
+	writeSeriesTemplate(t, root, "Script Show", "4K.VPY", "# t\n")
+	resp, body := doJSON(t, "PATCH", url+"/api/series/"+itoa(sr.ID), adminTok,
+		map[string]any{"script_type": "vpy", "script_template": "4K.VPY"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("uppercase ext must assign: %d %s", resp.StatusCode, body)
+	}
+}

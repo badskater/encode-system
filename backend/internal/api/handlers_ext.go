@@ -162,6 +162,26 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "series not found")
 		return
 	}
+	// Script assignment is one unit and is validated FIRST: a 400 on the
+	// script pair must not leave earlier fields (tag/enabled/...) silently
+	// mutated by a request the caller sees as failed.
+	if req.ScriptType != nil || req.ScriptTemplate != nil {
+		if req.ScriptType == nil || req.ScriptTemplate == nil {
+			writeErr(w, http.StatusBadRequest, "script_type and script_template must be set together (or both empty to clear)")
+			return
+		}
+		stype := strings.TrimSpace(*req.ScriptType)
+		stmpl := strings.TrimSpace(*req.ScriptTemplate)
+		root := s.currentSettings(ctx).ScriptsRoot
+		if err := validateScriptAssignment(root, sr.Name, stype, stmpl); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.Store.SetSeriesScript(ctx, id, stype, stmpl); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series script")
+			return
+		}
+	}
 	// Field-scoped updates: each field is written by its own SQL statement,
 	// so two concurrent PATCHes touching different fields cannot lose writes.
 	if req.FlowID != nil {
@@ -222,26 +242,6 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if req.Notify != nil {
 		if err := s.Store.SetSeriesNotify(ctx, id, *req.Notify); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update series notify")
-			return
-		}
-	}
-	// Script assignment is one unit: when either key is present both must
-	// be (both empty clears). Validated against the _templates dir before
-	// writing so a typo fails at assignment time, not at scan time.
-	if req.ScriptType != nil || req.ScriptTemplate != nil {
-		if req.ScriptType == nil || req.ScriptTemplate == nil {
-			writeErr(w, http.StatusBadRequest, "script_type and script_template must be set together (or both empty to clear)")
-			return
-		}
-		stype := strings.TrimSpace(*req.ScriptType)
-		stmpl := strings.TrimSpace(*req.ScriptTemplate)
-		root := s.currentSettings(ctx).ScriptsRoot
-		if err := validateScriptAssignment(root, sr.Name, stype, stmpl); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.Store.SetSeriesScript(ctx, id, stype, stmpl); err != nil {
-			writeErr(w, http.StatusInternalServerError, "update series script")
 			return
 		}
 	}

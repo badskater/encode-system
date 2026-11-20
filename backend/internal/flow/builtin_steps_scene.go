@@ -47,10 +47,13 @@ func sceneDetectTemplate() *model.StepTemplate {
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $threshold = 10.0
     if ($Params.threshold) {
-        $t = 0.0
-        if (-not [double]::TryParse([string]$Params.threshold, [System.Globalization.NumberStyles]::Float, $inv, [ref]$t)) {
-            throw "scene_detect: invalid threshold '$($Params.threshold -replace '[\r\n]', ' ')'"
+        # Plain-decimal pre-validation (parity with bash: reject 1e1/10./
+        # padded forms BEFORE parsing) + trim.
+        $tt = ([string]$Params.threshold).Trim()
+        if ($tt -notmatch '^[0-9]{1,3}(\.[0-9]+)?$') {
+            throw "scene_detect: invalid threshold '$($tt -replace '[\r\n]', ' ')'"
         }
+        $t = [double]::Parse($tt, $inv)
         if ($t -lt 0 -or $t -gt 100) { throw 'scene_detect: threshold must be 0..100' }
         $threshold = $t
     }
@@ -84,16 +87,11 @@ func sceneDetectTemplate() *model.StepTemplate {
     if ("$($vs.duration)" -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$vs.duration }
     elseif ("$($j.format.duration)" -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$j.format.duration }
     if ($dur -le 0) { throw 'scene_detect: no usable duration from ffprobe' }
-    $frameCount = [int64]0
-    if ("$($vs.nb_frames)" -match '^[0-9]+$' -and [int64]$vs.nb_frames -gt 0) {
-        $frameCount = [int64]$vs.nb_frames
-    } else {
-        # m2ts and friends lack nb_frames: derive from duration*fps.
-        $frameCount = [int64][math]::Round($dur * $fps)
-    }
-    if ($frameCount -lt 1) { throw 'scene_detect: frame count must be >= 1' }
+    # nb_frames: digit cap before the cast (parity with bash fail-closed).
+    # The count is finalized after the scdet pass (decoded-frame fallback).
+    $nbOk = ("$($vs.nb_frames)" -match '^[0-9]{1,18}$' -and [int64]$vs.nb_frames -gt 0)
     Write-Output "ENCODE_STEP scene_detect 30"
-    Write-Output "[scene_detect] source=$(Split-Path $src -Leaf) fps=$($fps.ToString('0.######', $inv)) frames=$frameCount threshold=$($threshold.ToString('0.###', $inv))"
+    Write-Output "[scene_detect] source=$(Split-Path $src -Leaf) fps=$($fps.ToString('0.######', $inv)) threshold=$($threshold.ToString('0.###', $inv))"
 
     # --- scdet pass (decode-only; metadata log is the parse contract) ---
     $log = Join-Path $Job.EpisodeDir 'scdet.log'
@@ -107,11 +105,12 @@ func sceneDetectTemplate() *model.StepTemplate {
 
     # --- Parse boundaries: frame lines + score lines ---
     $bFrames = @(); $bTimes = @(); $bScores = @()
-    $curFrame = [int64]-1; $curTime = 0.0
+    $curFrame = [int64]-1; $curTime = 0.0; $maxFrame = [int64]-1
     foreach ($line in [System.IO.File]::ReadLines($log)) {
-        if ($line -match '^frame:([0-9]+)\s+pts:[0-9]+\s+pts_time:([0-9]+(\.[0-9]+)?)') {
+        if ($line -match '^frame:([0-9]{1,9})\s+pts:[0-9]+\s+pts_time:([0-9]+(\.[0-9]+)?)\s*$') {
             $curFrame = [int64]$Matches[1]
             $curTime = [double]::Parse($Matches[2], $inv)
+            if ($curFrame -gt $maxFrame) { $maxFrame = $curFrame }
         } elseif ($line -match '^lavfi\.scd\.score=([0-9]+(\.[0-9]+)?)\s*$') {
             if ($curFrame -lt 0) { throw 'scene_detect: scdet.log score line before any frame line' }
             $score = [double]::Parse($Matches[1], $inv)
@@ -121,6 +120,10 @@ func sceneDetectTemplate() *model.StepTemplate {
         }
     }
     if ($curFrame -lt 0) { throw 'scene_detect: scdet.log has no frame lines (unexpected ffmpeg output)' }
+    # Frame count: nb_frames when present, else the ACTUAL decoded count
+    # (last frame + 1) — exact for VFR too, unlike duration*fps.
+    $frameCount = if ($nbOk) { [int64]$vs.nb_frames } else { $maxFrame + 1 }
+    if ($frameCount -lt 1) { throw 'scene_detect: frame count must be >= 1' }
     # min_scene_len: drop boundaries closer than minLen frames to the
     # previous kept boundary (merges the short scene into its predecessor).
     if ($minLen -gt 0) {
@@ -159,7 +162,7 @@ func sceneDetectTemplate() *model.StepTemplate {
     $tmp = Join-Path $Job.EpisodeDir '.scenes.json.tmp'
     [System.IO.File]::WriteAllText($tmp, $sb.ToString(), [System.Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $tmp -Destination $out -Force
-    Write-Output "[scene_detect] wrote scenes.json: $($starts.Count) scene(s)"
+    Write-Output "[scene_detect] wrote scenes.json: $($starts.Count) scene(s), $frameCount frame(s)"
     Write-Output "ENCODE_STEP scene_detect 100"
 }`,
 	}

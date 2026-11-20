@@ -646,14 +646,23 @@ const bashSourceEncode = `encode () {
     fi
     # Zones (zone_build artifact): inject the validated --zones string.
     # Applies in BOTH arg modes; the y4m/input tail still comes last.
-    if [[ "$use_zones" == "true" ]]; then
+    # Case-insensitive bool (PS -eq parity: 'True' must apply too).
+    if [[ "${use_zones,,}" == "true" ]]; then
         local zones="$EpisodeDir/zones.json"
         if [[ ! -f "$zones" ]]; then
             echo 'encode: use_zones is set but zones.json is missing - run zone_build first'
             echo 'ENCODE_STEP_FAILED encode'; exit 1
         fi
         local zstr
-        zstr=$(grep -m1 '"x265"' "$zones" | sed 's/.*"x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
+        # Anchor to the TOP-LEVEL key line (zone_build writes it at two-space
+        # indent): an unanchored grep would pick a nested decoy "x265" key
+        # inside a zone object and inject the wrong value. Non-contract
+        # files fail closed here (PS reads the top-level key via JSON parse).
+        zstr=$(grep -m1 '^  "x265"' "$zones" | sed 's/^  "x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
+        if ! grep -q '^  "x265"' "$zones"; then
+            echo 'encode: zones.json has no top-level x265 key (regenerate via zone_build)'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
         if [[ -n "$zstr" && ! "$zstr" =~ ^[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?)(/[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?))*$ ]]; then
             echo 'encode: zones.json x265 string is malformed'
             echo 'ENCODE_STEP_FAILED encode'; exit 1

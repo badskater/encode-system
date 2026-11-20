@@ -191,6 +191,145 @@ func TestZoneBuildBashSkipIfFresh(t *testing.T) {
 	}
 }
 
+// Review B-2: multi-language chapters — the FIRST ChapterDisplay wins
+// (PS SelectSingleNode parity), not the last.
+func TestZoneBuildBashMultilangFirstDisplay(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Chapters>
+  <EditionEntry>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:00.000000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString>Main</ChapterString><ChapterLanguage>eng</ChapterLanguage></ChapterDisplay>
+      <ChapterDisplay><ChapterString>OP</ChapterString><ChapterLanguage>jpn</ChapterLanguage></ChapterDisplay>
+    </ChapterAtom>
+  </EditionEntry>
+</Chapters>`), 0o644)
+	bdMustRun(t, bdRender(t, "zone_build", nil, v), v)
+	d := readZones(t, epDir)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("first display 'Main' must win over 'OP': %+v", z)
+		}
+	}
+}
+
+// Review B-3: half-frame rounding parity — ef = Round(next*fps) - 1.
+// fps 25, chapters .02/.06: Round(0.5)=0 (ToEven), Round(1.5)=2 -> ef=1.
+func TestZoneBuildBashHalfFrameRounding(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "scenes.json"), []byte(`{
+  "fps": 25, "frame_count": 100,
+  "scenes": [
+    {"index": 1, "start_frame": 0, "end_frame": 99, "start_time": 0, "end_time": 4, "score": 0}
+  ]
+}`), 0o644)
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Chapters>
+  <EditionEntry>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:00.020000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString>OP</ChapterString></ChapterDisplay>
+    </ChapterAtom>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:00.060000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString>Main</ChapterString></ChapterDisplay>
+    </ChapterAtom>
+  </EditionEntry>
+</Chapters>`), 0o644)
+	bdMustRun(t, bdRender(t, "zone_build", nil, v), v)
+	d := readZones(t, epDir)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP" {
+			found = true
+			if z.Start != 0 || z.End != 1 {
+				t.Fatalf("half-frame parity: want [0,1], got %+v", z)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("OP zone missing (rounding parity): %+v", d.Zones)
+	}
+}
+
+// Review B-7: numeric entities decode; &amp; decodes LAST (no double
+// unescape); CDATA wrappers are stripped.
+func TestZoneBuildBashEntityDecoding(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Chapters>
+  <EditionEntry>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:00.000000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString>&#79;P</ChapterString></ChapterDisplay>
+    </ChapterAtom>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:03.000000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString><![CDATA[ED]]></ChapterString></ChapterDisplay>
+    </ChapterAtom>
+    <ChapterAtom>
+      <ChapterTimeStart>00:00:06.000000000</ChapterTimeStart>
+      <ChapterDisplay><ChapterString>&amp;lt;</ChapterString></ChapterDisplay>
+    </ChapterAtom>
+  </EditionEntry>
+</Chapters>`), 0o644)
+	bdMustRun(t, bdRender(t, "zone_build", map[string]string{"name_patterns": "OP|ED|&lt;"}, v), v)
+	d := readZones(t, epDir)
+	reasons := map[string]bool{}
+	for _, z := range d.Zones {
+		reasons[z.Reason] = true
+	}
+	if !reasons["chapter:OP"] || !reasons["chapter:ED"] || !reasons["chapter:&lt;"] {
+		t.Fatalf("entity/CDATA decoding wrong: %+v", d.Zones)
+	}
+}
+
+// Review B-9: compact one-line chapters.xml must parse ALL atoms.
+func TestZoneBuildBashCompactChapters(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(`<Chapters><EditionEntry><ChapterAtom><ChapterTimeStart>00:00:00.000000000</ChapterTimeStart><ChapterDisplay><ChapterString>OP</ChapterString></ChapterDisplay></ChapterAtom><ChapterAtom><ChapterTimeStart>00:00:03.000000000</ChapterTimeStart><ChapterDisplay><ChapterString>ED</ChapterString></ChapterDisplay></ChapterAtom><ChapterAtom><ChapterTimeStart>00:00:06.000000000</ChapterTimeStart><ChapterDisplay><ChapterString>Main</ChapterString></ChapterDisplay></ChapterAtom></EditionEntry></Chapters>`), 0o644)
+	bdMustRun(t, bdRender(t, "zone_build", nil, v), v)
+	d := readZones(t, epDir)
+	reasons := map[string]bool{}
+	for _, z := range d.Zones {
+		reasons[z.Reason] = true
+	}
+	if !reasons["chapter:OP"] || !reasons["chapter:ED"] {
+		t.Fatalf("compact XML must parse all atoms: %+v", d.Zones)
+	}
+}
+
+// Review B-8: compact scenes.json violates the one-scene-per-line contract
+// and must fail closed (not silently skip the heuristic).
+func TestZoneBuildBashCompactScenesFailsClosed(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "scenes.json"), []byte(`{"fps":24,"frame_count":216,"scenes":[{"index":1,"start_frame":0,"end_frame":71,"start_time":0,"end_time":3,"score":0},{"index":2,"start_frame":72,"end_frame":215,"start_time":3,"end_time":9,"score":25}]}`), 0o644)
+	bdMustFail(t, bdRender(t, "zone_build", nil, v), v, "one-scene-per-line contract")
+}
+
+// Review B-8: exponent fps must fail closed, not truncate to 1.
+func TestZoneBuildBashExponentFpsFailsClosed(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	os.WriteFile(filepath.Join(epDir, "scenes.json"), []byte(`{
+  "fps": 1e9, "frame_count": 216,
+  "scenes": [
+    {"index": 1, "start_frame": 0, "end_frame": 215, "start_time": 0, "end_time": 9, "score": 0}
+  ]
+}`), 0o644)
+	bdMustFail(t, bdRender(t, "zone_build", nil, v), v, "unusable fps")
+}
+
+// Review B-15: override leading zeros normalize (PS [int64] parity).
+func TestZoneBuildBashOverrideLeadingZeros(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	bdMustRun(t, bdRender(t, "zone_build", map[string]string{"overrides": "00,050,q=7"}, v), v)
+	d := readZones(t, epDir)
+	if !strings.HasSuffix(d.X265, "/0,50,q=7") {
+		t.Fatalf("leading zeros must normalize: %q", d.X265)
+	}
+}
+
 func TestZoneBuildBashFailClosed(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -257,7 +396,7 @@ func zoneEncodeRun(t *testing.T, script string, v Vars, binDir string) (string, 
 }
 
 func TestEncodeZonesInjection(t *testing.T) {
-	v, _, binDir := zoneEncodeEnv(t, `{"zones":[{"start":0,"end":71,"mode":"b","value":0.6,"reason":"credits:first-scene"}],"x265":"0,71,b=0.6"}`)
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"frame_count\": 216,\n  \"fps\": 24,\n  \"zones\": [\n    {\"start\": 0, \"end\": 71, \"mode\": \"b\", \"value\": 0.6, \"reason\": \"credits:first-scene\"}\n  ],\n  \"x265\": \"0,71,b=0.6\"\n}")
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
 	if err != nil {
 		t.Fatalf("encode with zones failed: %v\n%s", err, out)
@@ -275,7 +414,7 @@ func TestEncodeZonesInjection(t *testing.T) {
 }
 
 func TestEncodeZonesDefaultOff(t *testing.T) {
-	v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":"0,71,b=0.6"}`)
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [],\n  \"x265\": \"0,71,b=0.6\"\n}")
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", nil, v), v, binDir)
 	if err != nil {
 		t.Fatalf("encode failed: %v\n%s", err, out)
@@ -287,7 +426,7 @@ func TestEncodeZonesDefaultOff(t *testing.T) {
 }
 
 func TestEncodeZonesRawArgsMode(t *testing.T) {
-	v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":"10,20,q=18"}`)
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [],\n  \"x265\": \"10,20,q=18\"\n}")
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true", "x265_args": "--preset fast --crf 18"}, v), v, binDir)
 	if err != nil {
 		t.Fatalf("raw-mode encode failed: %v\n%s", err, out)
@@ -299,7 +438,7 @@ func TestEncodeZonesRawArgsMode(t *testing.T) {
 }
 
 func TestEncodeZonesEmptyString(t *testing.T) {
-	v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":""}`)
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [],\n  \"x265\": \"\"\n}")
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
 	if err != nil {
 		t.Fatalf("empty zones must succeed: %v\n%s", err, out)
@@ -313,6 +452,42 @@ func TestEncodeZonesEmptyString(t *testing.T) {
 	}
 }
 
+// Review B-1: a nested decoy "x265" key inside a zone object must NOT be
+// picked — only the anchored top-level key line is authoritative.
+func TestEncodeZonesDecoyNestedKey(t *testing.T) {
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [\n    {\"start\": 0, \"end\": 71, \"x265\": \"0,999999,q=0\"}\n  ],\n  \"x265\": \"0,71,b=0.6\"\n}")
+	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
+	if err != nil {
+		t.Fatalf("encode failed: %v\n%s", err, out)
+	}
+	args := bdRead(t, filepath.Join(binDir, "x265_args.txt"))
+	if !strings.Contains(args, "--zones\n0,71,b=0.6\n") || strings.Contains(args, "999999") {
+		t.Fatalf("decoy key leaked into args:\n%s", args)
+	}
+}
+
+// Review B-1: compact (non-contract) zones.json fails closed in bash.
+func TestEncodeZonesCompactFailsClosed(t *testing.T) {
+	v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":"0,71,b=0.6"}`)
+	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
+	if err == nil || !strings.Contains(out, "no top-level x265 key") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
+		t.Fatalf("compact zones.json must fail closed:\n%s", out)
+	}
+}
+
+// Review B-10: 'True' (capitalized) must apply zones — PS -eq parity.
+func TestEncodeZonesCapitalizedTrue(t *testing.T) {
+	v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [],\n  \"x265\": \"0,71,b=0.6\"\n}")
+	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "True"}, v), v, binDir)
+	if err != nil {
+		t.Fatalf("encode failed: %v\n%s", err, out)
+	}
+	args := bdRead(t, filepath.Join(binDir, "x265_args.txt"))
+	if !strings.Contains(args, "--zones\n0,71,b=0.6\n") {
+		t.Fatalf("capitalized True must apply zones:\n%s", args)
+	}
+}
+
 func TestEncodeZonesFailClosed(t *testing.T) {
 	t.Run("missing zones.json", func(t *testing.T) {
 		v, _, binDir := zoneEncodeEnv(t, "")
@@ -322,7 +497,7 @@ func TestEncodeZonesFailClosed(t *testing.T) {
 		}
 	})
 	t.Run("malformed string", func(t *testing.T) {
-		v, _, binDir := zoneEncodeEnv(t, `{"zones":[],"x265":"0,71;rm -rf"}`)
+		v, _, binDir := zoneEncodeEnv(t, "{\n  \"zones\": [],\n  \"x265\": \"0,71;rm -rf\"\n}")
 		out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
 		if err == nil || !strings.Contains(out, "malformed") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
 			t.Fatalf("must fail closed:\n%s", out)

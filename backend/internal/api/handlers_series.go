@@ -57,6 +57,11 @@ func validateSeriesName(name string) error {
 // _templates/<Series>/ on the scripts share (fail closed at assignment
 // time, not at scan time). Both empty = clearing the assignment (valid).
 func validateScriptAssignment(scriptsRoot, seriesName, scriptType, scriptTemplate string) error {
+	// Series names auto-registered by the scanner bypass validateSeriesName;
+	// re-validate here so a bogus DB name ('..') cannot escape _templates/.
+	if err := validateSeriesName(seriesName); err != nil {
+		return fmt.Errorf("invalid series name: %w", err)
+	}
 	if scriptType == "" && scriptTemplate == "" {
 		return nil
 	}
@@ -69,7 +74,7 @@ func validateScriptAssignment(scriptsRoot, seriesName, scriptType, scriptTemplat
 	if !scanner.ValidTemplateName(scriptTemplate) {
 		return fmt.Errorf("invalid template name")
 	}
-	if strings.TrimPrefix(filepath.Ext(scriptTemplate), ".") != scriptType {
+	if !strings.EqualFold(strings.TrimPrefix(filepath.Ext(scriptTemplate), "."), scriptType) {
 		return fmt.Errorf("template extension must match script_type")
 	}
 	if scriptsRoot == "" {
@@ -243,6 +248,12 @@ func (s *Server) handleSeriesTemplates(w http.ResponseWriter, r *http.Request) {
 	sr, err := s.Store.GetSeries(ctx, id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "series not found")
+		return
+	}
+	// Scanner-registered names bypass the create validator; refuse bogus
+	// names ('..') before they reach a filesystem join.
+	if err := validateSeriesName(sr.Name); err != nil {
+		writeErr(w, http.StatusBadRequest, "series name is not usable for templates: "+err.Error())
 		return
 	}
 	type tmplEntry struct {

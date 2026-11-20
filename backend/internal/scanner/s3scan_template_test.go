@@ -166,3 +166,37 @@ func TestScanOnceS3MaterializesSeriesTemplate(t *testing.T) {
 		t.Fatalf("bucket script wrong: %q", store.content["S/Ep 01/1080.vpy"])
 	}
 }
+
+// Review A-8: literal '..' segments in S3 keys must not become candidates.
+func TestScanS3RejectsDotDotKeys(t *testing.T) {
+	old := time.Now().Add(-1 * time.Hour)
+	store := &fakeS3Store{objects: map[string]model.S3Object{
+		"../Ep 01/src.m2ts": obj("../Ep 01/src.m2ts", old),
+		"S/../src.m2ts":     obj("S/../src.m2ts", old),
+	}}
+	cands, err := ScanS3(context.Background(), store, "bucket", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("dot-dot keys must be refused: %+v", cands)
+	}
+}
+
+// Review A-10: a NESTED script does not block materialization (the fs
+// guard only inspects direct children — S3 must match).
+func TestMaterializeScriptS3NestedScriptIgnored(t *testing.T) {
+	old := time.Now().Add(-1 * time.Hour)
+	store := &fakeS3IOStore{
+		objects: map[string]model.S3Object{
+			"S/Ep 01/src.m2ts":       obj("S/Ep 01/src.m2ts", old),
+			"S/Ep 01/sub/custom.vpy": obj("S/Ep 01/sub/custom.vpy", old),
+			"_templates/S/1080.vpy":  obj("_templates/S/1080.vpy", old),
+		},
+		content: map[string][]byte{"_templates/S/1080.vpy": []byte("# t\n")},
+	}
+	sr := &model.Series{Name: "S", ScriptType: "vpy", ScriptTemplate: "1080.vpy"}
+	if _, err := MaterializeScriptS3(context.Background(), store, "bucket", sr, Candidate{Series: "S", EpisodeDir: "S/Ep 01", SourceFile: "src.m2ts"}); err != nil {
+		t.Fatalf("nested script must not block: %v", err)
+	}
+}

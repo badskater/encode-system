@@ -2,11 +2,14 @@
 //
 // SEMANTIC PARITY with builtin_steps_scene.go: same markers (0/30/60/100),
 // same skip-if-fresh rule, same ffprobe contract (fps from r_frame_rate,
-// nb_frames with duration*fps fallback), same scdet metadata-log parse,
-// same min_scene_len merge, same scenes.json shape (atomic write).
+// nb_frames with a decoded-frame-count fallback), same STRICT scdet
+// metadata-log parse (single-dot numerics, digit caps), same min_scene_len
+// merge, same scenes.json shape (atomic write, normalized numbers).
 // Tools: ffmpeg/ffprobe via command -v then $BinDir; jq is NOT required —
-// awk parses the ffprobe JSON fields and generates scenes.json (the same
-// manual-JSON approach as the PS dialect, coreutils only).
+// awk parses the probe JSON fields and generates scenes.json (the same
+// manual-JSON approach as the PS dialect, coreutils only). JSON string
+// escaping uses a per-character loop (awk gsub replacement backslash
+// semantics differ between mawk and gawk).
 package flow
 
 const bashSourceSceneDetect = `scene_detect () {
@@ -35,8 +38,10 @@ const bashSourceSceneDetect = `scene_detect () {
         return 0
     fi
 
-    # --- Params (renderer passes step params as env vars) ---
+    # --- Params (renderer passes step params as env vars). Plain decimal
+    # only, trimmed — same acceptance as the PS pre-validation regex. ---
     local threshold="${threshold:-10}" min_len="${min_scene_len:-0}"
+    threshold=$(printf '%s' "$threshold" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     if [[ ! "$threshold" =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]]; then
         echo "scene_detect: invalid threshold '$(printf '%s' "$threshold" | tr '\r\n' '  ')'"
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
@@ -45,6 +50,8 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'scene_detect: threshold must be 0..100'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
+    # Normalize (010 -> 10): the JSON artifact must be strict-JSON valid.
+    threshold=$(awk -v t="$threshold" 'BEGIN{printf "%g", t}')
     if [[ ! "$min_len" =~ ^[0-9]{1,6}$ ]]; then
         echo "scene_detect: invalid min_scene_len '$(printf '%s' "$min_len" | tr '\r\n' '  ')'"
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
@@ -80,19 +87,13 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'scene_detect: no usable duration from ffprobe'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
-    local frames
-    if [[ "$nb" =~ ^[0-9]+$ ]] && (( 10#$nb > 0 )); then
-        frames=$((10#$nb))
-    else
-        # m2ts and friends lack nb_frames: derive from duration*fps.
-        frames=$(awk -v d="$dur" -v f="$fps" 'BEGIN{printf "%d", int(d*f+0.5)}')
-    fi
-    if [[ ! "$frames" =~ ^[0-9]+$ ]] || (( frames < 1 )); then
-        echo 'scene_detect: frame count must be >= 1'
-        echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
-    fi
+    # nb_frames: digit cap BEFORE arithmetic (bash wraps mod 2^64; the PS
+    # [int64] cast throws — parity is fail closed). The count itself is
+    # finalized after the scdet pass (decoded-frame fallback).
+    local nb_ok=0
+    if [[ "$nb" =~ ^[0-9]{1,18}$ ]] && (( 10#$nb > 0 )); then nb_ok=1; fi
     echo 'ENCODE_STEP scene_detect 30'
-    echo "[scene_detect] source=$(basename "$src") fps=$fps frames=$frames threshold=$threshold"
+    echo "[scene_detect] source=$(basename "$src") fps=$fps threshold=$threshold"
 
     # --- scdet pass (decode-only; metadata log is the parse contract) ---
     local log="$EpisodeDir/scdet.log"
@@ -111,22 +112,39 @@ const bashSourceSceneDetect = `scene_detect () {
     fi
     echo 'ENCODE_STEP scene_detect 60'
 
-    # --- Boundaries: frame lines + score lines (frozen ffmpeg format) ---
-    local bounds
-    if ! bounds=$(awk -v t="$threshold" '
-        /^frame:[0-9]+[[:space:]]+pts:[0-9]+[[:space:]]+pts_time:[0-9.]+/ {
+    # --- Boundaries: STRICT frame/score lines (single-dot numerics, digit
+    # caps — malformed values are ignored exactly like the PS regexes).
+    # Also reports the last decoded frame for the count fallback. ---
+    local parsed bounds last_frame
+    if ! parsed=$(awk -v t="$threshold" '
+        /^frame:[0-9]{1,9}[[:space:]]+pts:[0-9]+[[:space:]]+pts_time:[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
             split($1, a, ":"); frame = a[2] + 0
             split($3, b, ":"); ptime = b[2] + 0
+            if (frame > last) last = frame
             have = 1
         }
-        /^lavfi\.scd\.score=[0-9.]+[[:space:]]*$/ {
+        /^lavfi\.scd\.score=[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
             if (!have) exit 1
             split($0, c, "="); score = c[2] + 0
             if (frame > 0 && score >= t) printf "%d %.6f %.3f\n", frame, ptime, score
         }
-        END { if (!have) exit 1 }
+        END { if (!have) exit 1; printf "LAST %d\n", last }
     ' "$log"); then
         echo 'scene_detect: scdet.log has no valid frame lines (unexpected ffmpeg output)'
+        echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
+    fi
+    last_frame=$(printf '%s\n' "$parsed" | awk '/^LAST /{print $2}')
+    bounds=$(printf '%s\n' "$parsed" | grep -v '^LAST ')
+    if [[ ! "$last_frame" =~ ^[0-9]+$ ]]; then
+        echo 'scene_detect: scdet.log parse produced no frame count'
+        echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
+    fi
+    # Frame count: nb_frames when the container carries it, else the ACTUAL
+    # decoded count (last frame + 1) — exact for VFR too, unlike dur*fps.
+    local frames
+    if (( nb_ok == 1 )); then frames=$((10#$nb)); else frames=$(( last_frame + 1 )); fi
+    if (( frames < 1 )); then
+        echo 'scene_detect: frame count must be >= 1'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
 
@@ -141,15 +159,24 @@ const bashSourceSceneDetect = `scene_detect () {
     if ! scenes_json=$(printf '%s\n' "$bounds" | awk \
             -v ml="$min_len" -v src="$base" -v fps="$fps" -v frames="$frames" \
             -v dur="$dur" -v t="$threshold" '
+        function jesc(s,   i, ch, out) {
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                ch = substr(s, i, 1)
+                if (ch == "\\") out = out "\\\\"
+                else if (ch == "\"") out = out "\\\""
+                else out = out ch
+            }
+            return out
+        }
         BEGIN { prev = 0; n = 0 }
         NF == 3 {
             if (ml > 0 && $1 - prev < ml) next
             f[n] = $1 + 0; tm[n] = $2 + 0; sc[n] = $3 + 0; n++; prev = $1
         }
         END {
-            gsub(/\\/, "\\\\", src); gsub(/"/, "\\\"", src)
             printf "{\n"
-            printf "  \"source\": \"%s\",\n", src
+            printf "  \"source\": \"%s\",\n", jesc(src)
             printf "  \"fps\": %s,\n", fps
             printf "  \"frame_count\": %d,\n", frames
             printf "  \"duration\": %s,\n", dur
@@ -185,6 +212,6 @@ const bashSourceSceneDetect = `scene_detect () {
     fi
     local nscenes
     nscenes=$(grep -c '"index"' "$out")
-    echo "[scene_detect] wrote scenes.json: $nscenes scene(s)"
+    echo "[scene_detect] wrote scenes.json: $nscenes scene(s), $frames frame(s)"
     echo 'ENCODE_STEP scene_detect 100'
 }`

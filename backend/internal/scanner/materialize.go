@@ -46,7 +46,9 @@ func RenderTemplate(content []byte, seriesName, episodeDir, sourceFile string) [
 
 // validateAssignment checks the series' script assignment before any IO:
 // type must be vpy/avs, the template a safe base name whose extension
-// matches the type. Returns the template's base name for clarity.
+// matches the type (case-insensitive — shares may be case-insensitive and
+// the templates listing filters case-insensitively). Returns the template's
+// base name for clarity.
 func validateAssignment(sr *model.Series) error {
 	if sr.ScriptType != "vpy" && sr.ScriptType != "avs" {
 		return fmt.Errorf("invalid script type %q (want vpy or avs)", sr.ScriptType)
@@ -54,13 +56,57 @@ func validateAssignment(sr *model.Series) error {
 	if !ValidTemplateName(sr.ScriptTemplate) {
 		return fmt.Errorf("invalid template name %q", sr.ScriptTemplate)
 	}
-	if strings.TrimPrefix(path.Ext(sr.ScriptTemplate), ".") != sr.ScriptType {
+	if !strings.EqualFold(strings.TrimPrefix(path.Ext(sr.ScriptTemplate), "."), sr.ScriptType) {
 		return fmt.Errorf("template %q extension does not match script type %q", sr.ScriptTemplate, sr.ScriptType)
 	}
 	if !ValidTemplateName(sr.Name) {
 		return fmt.Errorf("invalid series name %q", sr.Name)
 	}
 	return nil
+}
+
+// validateCandidatePath rejects EpisodeDir/SourceFile values that could
+// escape the episode folder or inject code via placeholder substitution:
+// no '.'/'..' segments, no absolute paths or backslashes, no control
+// characters (a newline in a source name would inject live statements into
+// the materialized script).
+func validateCandidatePath(c Candidate) error {
+	for _, v := range []string{c.EpisodeDir, c.SourceFile} {
+		if strings.ContainsAny(v, "\\\x00") || strings.HasPrefix(v, "/") {
+			return fmt.Errorf("unsafe path value %q", v)
+		}
+		for _, r := range v {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("path value contains control characters")
+			}
+		}
+		for _, seg := range strings.Split(v, "/") {
+			if seg == "." || seg == ".." {
+				return fmt.Errorf("path value contains a dot segment")
+			}
+		}
+	}
+	return nil
+}
+
+// installNoReplace atomically installs tmp at target WITHOUT replacing an
+// existing file: hardlink+unlink is the POSIX renameat2(RENAME_NOREPLACE)
+// equivalent Go exposes portably (link fails EEXIST when target exists).
+// On filesystems without hardlink support it falls back to a re-check +
+// rename (residual race documented — the primary guard is the link).
+func installNoReplace(tmpName, target string) error {
+	err := os.Link(tmpName, target)
+	if err == nil {
+		return os.Remove(tmpName)
+	}
+	if os.IsExist(err) {
+		return fmt.Errorf("target %s appeared during materialization; per-episode scripts win", target)
+	}
+	// Hardlinks unsupported (some SMB/FUSE mounts): re-check then rename.
+	if _, statErr := os.Lstat(target); statErr == nil {
+		return fmt.Errorf("target %s appeared during materialization; per-episode scripts win", target)
+	}
+	return os.Rename(tmpName, target)
 }
 
 // episodeHasScript reports whether any .avs/.vpy file exists in the episode
@@ -84,6 +130,9 @@ func episodeHasScript(names []string) bool {
 // updated with the materialized script's name and type.
 func MaterializeScript(root string, sr *model.Series, c Candidate) (Candidate, error) {
 	if err := validateAssignment(sr); err != nil {
+		return Candidate{}, err
+	}
+	if err := validateCandidatePath(c); err != nil {
 		return Candidate{}, err
 	}
 	tmplPath := filepath.Join(root, TemplateDirName, sr.Name, sr.ScriptTemplate)
@@ -119,8 +168,13 @@ func MaterializeScript(root string, sr *model.Series, c Candidate) (Candidate, e
 	if err := tmp.Close(); err != nil {
 		return Candidate{}, fmt.Errorf("close temp script: %w", err)
 	}
+	// 0644: the encode agent reads the script off the share as its own
+	// identity — CreateTemp's 0600 breaks cross-identity NFS/SMB access.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return Candidate{}, fmt.Errorf("chmod temp script: %w", err)
+	}
 	target := filepath.Join(epDir, sr.ScriptTemplate)
-	if err := os.Rename(tmpName, target); err != nil {
+	if err := installNoReplace(tmpName, target); err != nil {
 		return Candidate{}, fmt.Errorf("install script %s: %w", target, err)
 	}
 	c.ScriptFile = sr.ScriptTemplate
@@ -136,15 +190,27 @@ func MaterializeScriptS3(ctx context.Context, store s3.ObjectStore, bucket strin
 	if err := validateAssignment(sr); err != nil {
 		return Candidate{}, err
 	}
+	if err := validateCandidatePath(c); err != nil {
+		return Candidate{}, err
+	}
+	// Direct children only: the real store lists recursively, so a nested
+	// .vpy must not count as the episode's script (fs guard parity).
+	directNames := func(objs []model.S3Object) []string {
+		var names []string
+		prefix := c.EpisodeDir + "/"
+		for _, o := range objs {
+			rel := strings.TrimPrefix(o.Key, prefix)
+			if rel != o.Key && !strings.Contains(rel, "/") {
+				names = append(names, rel)
+			}
+		}
+		return names
+	}
 	objs, err := store.List(ctx, bucket, c.EpisodeDir+"/")
 	if err != nil {
 		return Candidate{}, fmt.Errorf("list episode prefix: %w", err)
 	}
-	names := make([]string, 0, len(objs))
-	for _, o := range objs {
-		names = append(names, path.Base(o.Key))
-	}
-	if episodeHasScript(names) {
+	if episodeHasScript(directNames(objs)) {
 		return Candidate{}, fmt.Errorf("episode %s already has a filter script; per-episode scripts win", c.EpisodeDir)
 	}
 	tmplKey := TemplateDirName + "/" + sr.Name + "/" + sr.ScriptTemplate
@@ -165,6 +231,17 @@ func MaterializeScriptS3(ctx context.Context, store s3.ObjectStore, bucket strin
 	outFile := filepath.Join(tmpDir, "rendered")
 	if err := os.WriteFile(outFile, rendered, 0o644); err != nil {
 		return Candidate{}, fmt.Errorf("write rendered script: %w", err)
+	}
+	// Re-check immediately before the put: S3 has no atomic no-replace on
+	// the minimal ObjectStore interface, so this shrinks (not eliminates)
+	// the List->Put race; a hand-authored script landing in the window is
+	// still refused. Residual race documented for a future PutIfAbsent.
+	objs, err = store.List(ctx, bucket, c.EpisodeDir+"/")
+	if err != nil {
+		return Candidate{}, fmt.Errorf("re-list episode prefix: %w", err)
+	}
+	if episodeHasScript(directNames(objs)) {
+		return Candidate{}, fmt.Errorf("episode %s already has a filter script; per-episode scripts win", c.EpisodeDir)
 	}
 	destKey := c.EpisodeDir + "/" + sr.ScriptTemplate
 	if err := store.Put(ctx, bucket, destKey, outFile); err != nil {

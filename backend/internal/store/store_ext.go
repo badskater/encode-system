@@ -510,7 +510,9 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 }
 
 // UpdateSeries persists flow selection, enabled state, notify flag and the
-// script assignment.
+// script assignment. WHOLE-ROW semantics: callers must read-modify-write a
+// fresh row — a stale/zero struct clears live fields (the API uses the
+// field-scoped setters instead; this exists for test/import convenience).
 func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 	_, err := s.qExec(ctx,
 		`UPDATE series SET flow_id=?, tag=?, enabled=?, notify=?, script_type=?, script_template=?, updated_at=datetime('now') WHERE id=?`,

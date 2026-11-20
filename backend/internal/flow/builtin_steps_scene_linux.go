@@ -6,9 +6,9 @@
 // metadata-log parse (single-dot numerics, digit caps), same min_scene_len
 // merge, same scenes.json shape (atomic write, normalized numbers).
 // Tools: ffmpeg/ffprobe via command -v then $BinDir; jq is NOT required —
-// awk parses the probe JSON fields and generates scenes.json (the same
+// LC_ALL=C awk parses the probe JSON fields and generates scenes.json (the same
 // manual-JSON approach as the PS dialect, coreutils only). JSON string
-// escaping uses a per-character loop (awk gsub replacement backslash
+// escaping uses a per-character loop (LC_ALL=C awk gsub replacement backslash
 // semantics differ between mawk and gawk).
 package flow
 
@@ -46,14 +46,14 @@ const bashSourceSceneDetect = `scene_detect () {
         echo "scene_detect: invalid threshold '$(printf '%s' "$threshold" | tr '\r\n' '  ')'"
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
-    if ! awk -v t="$threshold" 'BEGIN{exit !(t>=0 && t<=100)}'; then
+    if ! LC_ALL=C awk -v t="$threshold" 'BEGIN{exit !(t>=0 && t<=100)}'; then
         echo 'scene_detect: threshold must be 0..100'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
     # Normalize to the PS '0.###' format (3 decimals, trailing zeros
     # stripped): 010 -> 10, 0.000001 -> 0, 10.12345 -> 10.123 — identical
     # threshold reaches scdet and the JSON artifact in both dialects.
-    threshold=$(awk -v t="$threshold" 'BEGIN{s=sprintf("%.3f",t); sub(/0+$/,"",s); sub(/\.$/,"",s); print s}')
+    threshold=$(LC_ALL=C awk -v t="$threshold" 'BEGIN{s=sprintf("%.3f",t); sub(/0+$/,"",s); sub(/\.$/,"",s); print s}')
     if [[ ! "$min_len" =~ ^[0-9]{1,6}$ ]]; then
         echo "scene_detect: invalid min_scene_len '$(printf '%s' "$min_len" | tr '\r\n' '  ')'"
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
@@ -75,7 +75,7 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
     local fps
-    fps=$(awk -F/ '{if ($1<=0 || $2<=0) exit 1; printf "%.6f", $1/$2}' <<< "$rate") || {
+    fps=$(LC_ALL=C awk -F/ '{if ($1<=0 || $2<=0) exit 1; printf "%.6f", $1/$2}' <<< "$rate") || {
         echo 'scene_detect: r_frame_rate must be positive'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     }
@@ -85,7 +85,7 @@ const bashSourceSceneDetect = `scene_detect () {
     local dur=''
     if [[ "$sdur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then dur="$sdur"
     elif [[ "$fdur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then dur="$fdur"; fi
-    if [[ -z "$dur" ]] || ! awk -v d="$dur" 'BEGIN{exit !(d>0)}'; then
+    if [[ -z "$dur" ]] || ! LC_ALL=C awk -v d="$dur" 'BEGIN{exit !(d>0)}'; then
         echo 'scene_detect: no usable duration from ffprobe'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
@@ -118,7 +118,7 @@ const bashSourceSceneDetect = `scene_detect () {
     # caps — malformed values are ignored exactly like the PS regexes).
     # Also reports the last decoded frame for the count fallback. ---
     local parsed bounds last_frame
-    if ! parsed=$(awk -v t="$threshold" '
+    if ! parsed=$(LC_ALL=C awk -v t="$threshold" '
         /^frame:[0-9]{1,9}[[:space:]]+pts:[0-9]+[[:space:]]+pts_time:[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
             split($1, a, ":"); frame = a[2] + 0
             split($3, b, ":"); ptime = b[2] + 0
@@ -135,7 +135,7 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'scene_detect: scdet.log has no valid frame lines (unexpected ffmpeg output)'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
-    last_frame=$(printf '%s\n' "$parsed" | awk '/^LAST /{print $2}')
+    last_frame=$(printf '%s\n' "$parsed" | LC_ALL=C awk '/^LAST /{print $2}')
     bounds=$(printf '%s\n' "$parsed" | grep -v '^LAST ')
     if [[ ! "$last_frame" =~ ^[0-9]+$ ]]; then
         echo 'scene_detect: scdet.log parse produced no frame count'
@@ -150,7 +150,7 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
 
-    # --- min_scene_len merge + scenes.json via awk (atomic write) ---
+    # --- min_scene_len merge + scenes.json via LC_ALL=C awk (atomic write) ---
     local base
     base=$(basename "$src")
     if [[ "$base" =~ [[:cntrl:]] ]]; then
@@ -158,7 +158,7 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     fi
     local scenes_json
-    if ! scenes_json=$(printf '%s\n' "$bounds" | awk \
+    if ! scenes_json=$(printf '%s\n' "$bounds" | LC_ALL=C awk \
             -v ml="$min_len" -v src="$base" -v fps="$fps" -v frames="$frames" \
             -v dur="$dur" -v t="$threshold" '
         function jesc(s,   i, ch, out) {

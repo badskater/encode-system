@@ -6,7 +6,7 @@
 // overrides, x265 later-wins), same validation ranges, same zones.json
 // shape + x265 string. scenes.json is parsed line-wise (the scene_detect
 // contract writes one scene object per line); chapters.xml via awk;
-// JSON generated with awk (no jq dependency).
+// JSON generated with LC_ALL=C awk (no jq dependency).
 package flow
 
 const bashSourceZoneBuild = `zone_build () {
@@ -28,7 +28,7 @@ const bashSourceZoneBuild = `zone_build () {
     # must fail closed, not silently change the frame math (PS parity).
     fps=$(grep -m1 '"fps"' "$scenes" | sed 's/.*"fps"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/' | tr -d ' "') || fps=''
     frames=$(grep -m1 '"frame_count"' "$scenes" | sed 's/.*"frame_count"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/') || frames=''
-    if [[ ! "$fps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v f="$fps" 'BEGIN{exit !(f>0)}'; then
+    if [[ ! "$fps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! LC_ALL=C awk -v f="$fps" 'BEGIN{exit !(f>0)}'; then
         echo 'zone_build: scenes.json has unusable fps/frame_count'
         echo 'ENCODE_STEP_FAILED zone_build'; exit 1
     fi
@@ -57,12 +57,12 @@ const bashSourceZoneBuild = `zone_build () {
     local overrides="${overrides:-}"
     local p
     for p in "$credits_b" "$op_ed_b"; do
-        if [[ ! "$p" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$p" 'BEGIN{exit !(v>0 && v<=10)}'; then
+        if [[ ! "$p" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! LC_ALL=C awk -v v="$p" 'BEGIN{exit !(v>0 && v<=10)}'; then
             echo 'zone_build: bitrate factors must be in (0, 10]'
             echo 'ENCODE_STEP_FAILED zone_build'; exit 1
         fi
     done
-    if [[ ! "$credits_max" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$credits_max" 'BEGIN{exit !(v>=0 && v<=36000)}'; then
+    if [[ ! "$credits_max" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! LC_ALL=C awk -v v="$credits_max" 'BEGIN{exit !(v>=0 && v<=36000)}'; then
         echo 'zone_build: credits_max_seconds must be 0..36000'
         echo 'ENCODE_STEP_FAILED zone_build'; exit 1
     fi
@@ -93,7 +93,7 @@ const bashSourceZoneBuild = `zone_build () {
             st=$(printf '%s' "$row" | sed 's/.*"start_time"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/')
             et=$(printf '%s' "$row" | sed 's/.*"end_time"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/')
             if [[ "$sf" =~ ^[0-9]+$ && "$ef" =~ ^[0-9]+$ && "$st" =~ ^[0-9.]+$ && "$et" =~ ^[0-9.]+$ ]]; then
-                if awk -v d="$et" -v s="$st" -v m="$credits_max" 'BEGIN{exit !(d-s<=m)}'; then
+                if LC_ALL=C awk -v d="$et" -v s="$st" -v m="$credits_max" 'BEGIN{exit !(d-s<=m)}'; then
                     if (( 10#$sf < 10#$ef )) && (( 10#$ef < 10#$frames )); then
                         local reason='credits:last-scene'
                         [[ "$row" == "$first" ]] && reason='credits:first-scene'
@@ -111,7 +111,7 @@ const bashSourceZoneBuild = `zone_build () {
         # chapter markup would otherwise create phantom zones), then
         # normalize compact XML to one tag per line (greedy sub() would
         # keep only the LAST atom on a multi-atom line).
-        ch_rows=$(awk 'BEGIN{RS="<!--"} {if (NR>1) {p=index($0,"-->"); if (p==0) exit 1; $0=substr($0,p+3)} printf "%s",$0}' "$chapters" | sed 's/></>\n</g' | awk '
+        ch_rows=$(LC_ALL=C awk 'BEGIN{RS="<!--"} {if (NR>1) {p=index($0,"-->"); if (p==0) exit 1; $0=substr($0,p+3)} printf "%s",$0}' "$chapters" | sed 's/></>\n</g' | LC_ALL=C awk '
             function hex2dec(h,   i, c, v) {
                 v = 0; h = tolower(h)
                 for (i = 1; i <= length(h); i++) {
@@ -122,8 +122,10 @@ const bashSourceZoneBuild = `zone_build () {
                 return v
             }
             function utf8(c) {
-                # mawk sprintf %c is BYTE-oriented: emit the UTF-8 bytes
-                # explicitly so legal entities (é, emoji) stay valid UTF-8.
+                # Emit UTF-8 bytes explicitly. LC_ALL=C is REQUIRED on the
+                # invocation: gawk in a UTF-8 locale treats %c as a codepoint
+                # and re-encodes it (double-encoding), mawk is byte-oriented;
+                # the C locale makes both emit raw bytes.
                 if (c <= 0) return " "
                 if (c <= 127) return sprintf("%c", c)
                 if (c <= 2047) return sprintf("%c%c", 192 + int(c/64), 128 + (c%64))
@@ -218,7 +220,7 @@ const bashSourceZoneBuild = `zone_build () {
                 echo "zone_build: bad ChapterTimeStart '$(printf '%s' "$ts" | tr '\r\n' '  ')'"
                 echo 'ENCODE_STEP_FAILED zone_build'; exit 1
             fi
-            secs=$(awk -v t="$ts" 'BEGIN{split(t,a,":"); printf "%.9f", a[1]*3600 + a[2]*60 + a[3]}')
+            secs=$(LC_ALL=C awk -v t="$ts" 'BEGIN{split(t,a,":"); printf "%.9f", a[1]*3600 + a[2]*60 + a[3]}')
             ch_secs+="$secs	$name"$'\n'
         done <<< "$ch_rows"
         # Walk the chapters; a matching name zones [start, next start-1].
@@ -233,18 +235,18 @@ const bashSourceZoneBuild = `zone_build () {
             if ! printf '%s' "${names[$i]}" | grep -Eiq -- "$patterns"; then
                 continue
             fi
-            sf=$(awk -v s="${times[$i]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
+            sf=$(LC_ALL=C awk -v s="${times[$i]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
             if (( i + 1 < ${#times[@]} )); then
                 # PS parity: Round(next*fps) THEN -1 (rounding the product
                 # minus one differs at exact .5 values).
-                ef=$(awk -v s="${times[$((i + 1))]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
-                ef=$(awk -v x="$ef" 'BEGIN{printf "%d", x - 1}')
+                ef=$(LC_ALL=C awk -v s="${times[$((i + 1))]}" -v f="$fps" 'BEGIN{printf "%.0f", s*f}')
+                ef=$(LC_ALL=C awk -v x="$ef" 'BEGIN{printf "%d", x - 1}')
             else
                 ef=$(( 10#$frames - 1 ))
             fi
-            # Normalize (awk %d kills "-0"/leading-zero octal hazards).
-            sf=$(awk -v x="$sf" 'BEGIN{printf "%d", x}')
-            ef=$(awk -v x="$ef" 'BEGIN{printf "%d", x}')
+            # Normalize (LC_ALL=C awk %d kills "-0"/leading-zero octal hazards).
+            sf=$(LC_ALL=C awk -v x="$sf" 'BEGIN{printf "%d", x}')
+            ef=$(LC_ALL=C awk -v x="$ef" 'BEGIN{printf "%d", x}')
             (( sf < 0 )) && sf=0
             (( ef >= 10#$frames )) && ef=$(( 10#$frames - 1 ))
             if (( sf < ef )); then
@@ -273,11 +275,11 @@ const bashSourceZoneBuild = `zone_build () {
                 echo 'ENCODE_STEP_FAILED zone_build'; exit 1
             fi
             # Normalize leading zeros (PS [int64] parity: 00,050 -> 0,50).
-            s=$(awk -v x="$s" 'BEGIN{printf "%d", x}')
-            e=$(awk -v x="$e" 'BEGIN{printf "%d", x}')
+            s=$(LC_ALL=C awk -v x="$s" 'BEGIN{printf "%d", x}')
+            e=$(LC_ALL=C awk -v x="$e" 'BEGIN{printf "%d", x}')
             if [[ -n "${BASH_REMATCH[4]}" ]]; then
                 local v="${BASH_REMATCH[4]}"
-                if ! awk -v v="$v" 'BEGIN{exit !(v>0 && v<=10)}'; then
+                if ! LC_ALL=C awk -v v="$v" 'BEGIN{exit !(v>0 && v<=10)}'; then
                     echo 'zone_build: override b must be in (0, 10]'
                     echo 'ENCODE_STEP_FAILED zone_build'; exit 1
                 fi
@@ -298,7 +300,7 @@ const bashSourceZoneBuild = `zone_build () {
 
     # --- zones.json + x265 string (awk, atomic write) ---
     local zones_json
-    if ! zones_json=$(printf '%s' "$zlines" | awk -F'\t' -v frames="$frames" -v fps="$fps" '
+    if ! zones_json=$(printf '%s' "$zlines" | LC_ALL=C awk -F'\t' -v frames="$frames" -v fps="$fps" '
         function fmtval(v,   s) {
             s = sprintf("%.3f", v)
             sub(/0+$/, "", s); sub(/\.$/, "", s)

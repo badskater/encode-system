@@ -46,6 +46,7 @@ func BuiltinStepTemplates() []*model.StepTemplate {
 		discordNotifyTemplate(),
 		bdMergeTemplate(),
 		bdSplitTemplate(),
+		sceneDetectTemplate(),
 	}
 }
 

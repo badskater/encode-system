@@ -79,6 +79,7 @@ var builtinBashSources = map[string]string{
 	"discord_notify":   bashSourceDiscordNotify,
 	"bd_merge":         bashSourceBdMerge,
 	"bd_split":         bashSourceBdSplit,
+	"scene_detect":     bashSourceSceneDetect,
 }
 
 // builtinBashRefused lists built-in templates that genuinely have no Linux

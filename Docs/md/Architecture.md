@@ -281,14 +281,21 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   / `builtin_steps_zones.go` + `_linux.go` ports): `scene_detect` runs
   ffmpeg `scdet=threshold=<T>,metadata=print:file=<ep>/scdet.log` over the
   episode source (decode-only) and publishes `scenes.json` — fps from
-  ffprobe `r_frame_rate`, `frame_count` from `nb_frames` with a
-  `round(duration*fps)` fallback for containers lacking it (m2ts), scene
-  boundaries where `lavfi.scd.score >= threshold` (frame > 0),
+  ffprobe `r_frame_rate`, `frame_count` from `nb_frames` (digit-capped)
+  with an ACTUAL-decoded-count fallback (last scdet frame + 1 — exact for
+  VFR and m2ts, which lack `nb_frames`), scene boundaries where
+  `lavfi.scd.score >= threshold` (frame > 0; STRICT single-dot numerics +
+  digit caps, malformed lines ignored identically in both dialects),
   `min_scene_len` merges shorter scenes into the previous one. The
-  metadata-log format is frozen against ffmpeg 9.x and covered by a gated
-  real-binary E2E (authored hard cuts). Skip when `scenes.json` is newer
-  than the source; zero boundaries = one scene (valid). `zone_build`
-  consumes `scenes.json` + optional `chapters.xml` and publishes
+  metadata-log format is frozen against ffmpeg 9.x and covered by gated
+  real-binary E2E (authored hard cuts + a VFR fixture). Skip when
+  `scenes.json` is newer than the source; zero boundaries = one scene
+  (valid); the threshold is normalized (leading zeros stripped) so the
+  artifact is always strict JSON. `zone_build`
+  consumes `scenes.json` (one-scene-per-line contract ENFORCED — compact
+  or exponent-fps files fail closed) + optional `chapters.xml` (compact
+  XML normalized; FIRST ChapterDisplay wins; CDATA + numeric entities
+  decoded, `&amp;` last) and publishes
   `zones.json` (structured zones + a ready x265 `--zones` string), ordered
   low→high precedence because x265 applies the LAST matching zone:
   credits heuristic (first/last scene ≤ `credits_max_seconds`, `b=credits_b`)
@@ -297,10 +304,14 @@ to the pre-refactor renderer (the dialect methods reproduce the exact lines).
   (x265-style `start,end,b=V/start,end,q=V` tokens). Validation is
   fail-closed (frame ranges, b ∈ (0,10], q ∈ [0,51], regex check); both
   steps skip-if-fresh and write atomically; the bash ports use awk only
-  (no jq). `encode` gains `use_zones` (default false): when true it reads
+  (no jq; JSON string escaping is a per-character loop — mawk/gawk gsub
+  replacement semantics differ). `encode` gains `use_zones` (default false,
+  case-insensitive): when true it reads
   `zones.json`, shape-validates the x265 string and appends `--zones`
   before the input/output tail in BOTH arg modes (named fields and raw
-  `x265_args`); missing/malformed fails closed, an empty string applies
+  `x265_args`); the bash extraction is anchored to the top-level `"x265"`
+  key line (nested decoy keys cannot inject a value; non-contract files
+  fail closed); missing/malformed fails closed, an empty string applies
   nothing. Under CRF, `b=` nudges quantizers (approximate); `q=` forces an
   exact QP. `encode_4k` does not consume zones yet (follow-up).
 - **Discord notification step**: `discord_notify` posts an episode-progress

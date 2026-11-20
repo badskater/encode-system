@@ -462,10 +462,13 @@ bd_merge → scene_detect → zone_build → encode(use_zones=true) → …
   source → `scenes.json` (fps, frame_count, frame-accurate boundaries) +
   `scdet.log` evidence. Params: `threshold` (default 10, 0–100),
   `min_scene_len` (frames, 0 = off — merges short scenes into the previous).
-  Skips when `scenes.json` is newer than the source. m2ts sources lack
-  `nb_frames`; the frame count falls back to `round(duration*fps)` (±1 frame
-  at the tail — zones tolerate it).
+  Skips when `scenes.json` is newer than the source. m2ts/VFR sources lack
+  `nb_frames`; the frame count falls back to the ACTUAL decoded count
+  (last scdet frame + 1 — exact, not an estimate).
 - `zone_build`: `scenes.json` + optional `chapters.xml` → `zones.json`.
+  `scenes.json` must be zone/scene_detect-produced (one scene per line —
+  compact files fail closed); `chapters.xml` may be compact or pretty,
+  multi-language (first display wins) or CDATA/entity-laden.
   Precedence (x265 applies the LAST matching zone; output is ordered
   accordingly): credits heuristic (first/last scene ≤ `credits_max_seconds`,
   default 90 s → `b=credits_b`, default 0.6) < chapter-name matches

@@ -52,6 +52,38 @@ Mirror of the session task list. Move cards through columns as work lands.
   Linux-only by build tag, matching the agent-never-imports-flow design).
   Frontend: 311 vitest tests / 25 files, lint/tsc/build green.
 
+## Done (Series script templates + scene detection/zones, phases 1–3, 2026-11-20)
+
+- Scope: per-series AviSynth/VapourSynth script assignment materialized at
+  scan time (`_templates/<Series>/` reserved folder, fs + S3 parity;
+  per-episode scripts always win; atomic no-replace install, 0644 for
+  cross-identity agent reads; placeholder render `{{source}}/{{series}}/
+  {{episode}}/{{episode_dir}}`). Series API/UI: script type+template as one
+  validated unit (atomic PATCH), template listing endpoint, extension-
+  filtered picker. `scene_detect` builtin (ffmpeg scdet, PS + bash parity):
+  publishes `scenes.json` (strict numerics, digit caps, VFR-exact decoded
+  frame-count fallback, threshold normalized to PS `0.###`). `zone_build`
+  builtin: scenes + optional chapters.xml → `zones.json` + x265 zone string
+  (credits heuristic < chapter-name matches < manual overrides; later zone
+  wins in x265). Chapter XML parser hardened across 4 adversarial review
+  rounds: single-pass entity decode, explicit UTF-8 emission under
+  `LC_ALL=C` (gawk %c locale trap), CDATA-aware comment stripping, literal
+  CDATA content, first-display-wins, quote-aware attributes, control-char
+  sanitization. `encode use_zones` injects validated `--zones` in both arg
+  modes (anchored top-level extraction, duplicate keys fail closed).
+- Deferred (phase 4): per-scene filter chains (needs rules-format design);
+  `encode_4k` zone consumption.
+- Delivery: PR #61 squash-merged (79902b1), released **v1.25.0**. Review:
+  4 rounds (24 + 10 findings FIX-VERIFIED via preserved probes at
+  scratch/p61-review-{a,b}/, p61-rereview/, p61-rereview4/; 35 reviewer
+  fixtures re-run green on the final decoder). Gates: backend 16/16 pkgs
+  (+ PG-gated store/api), real-binary ffmpeg E2E incl. VFR, frontend
+  320 vitest / lint / tsc / build, GOOS=windows build, gofmt, CI green.
+- Known documented residuals: PS 5.1 rounds exact dyadic threshold
+  midpoints AwayFromZero (bash ToEven); malformed XML entities degrade
+  gracefully in bash where PS fails closed; hardlink-less materialize
+  fallback keeps a documented Lstat→Rename window.
+
 ## Done (BD playlist steps — MPLS → M2TS split/merge, 2026-11-18)
 
 - Scope: `bd_merge` / `bd_split` builtins (PS + bash parity) remux Blu-ray

@@ -79,6 +79,16 @@ Mirror of the session task list. Move cards through columns as work lands.
   fixtures re-run green on the final decoder). Gates: backend 16/16 pkgs
   (+ PG-gated store/api), real-binary ffmpeg E2E incl. VFR, frontend
   320 vitest / lint / tsc / build, GOOS=windows build, gofmt, CI green.
+- Live-smoke hotfixes (farm jobs 30–35): **v1.25.1** (PR #62) PS
+  StrictMode-safe ffprobe access (m2ts omits nb_frames); **v1.25.2**
+  (PR #63) filtergraph path escaping + the guarded factory upgrade chain
+  (builtins seed insert-if-absent — a fixed builtin MUST carry prior
+  factory snapshots or upgraded installs keep the buggy DB row);
+  **v1.25.3** (PR #64) escaping needs TWO levels (graph splitter +
+  option parser; proven with exact-file-placement probes on colon paths).
+  Final live state: Windows job 35 DONE (30s BD m2ts, 720 decoded frames,
+  StrictMode + two-level escaping), Linux job 33 DONE (9s m2ts, 3 scenes,
+  2 zones); self-heal chain verified on every upgrade since 1.25.2.
 - Known documented residuals: PS 5.1 rounds exact dyadic threshold
   midpoints AwayFromZero (bash ToEven); malformed XML entities degrade
   gracefully in bash where PS fails closed; hardlink-less materialize

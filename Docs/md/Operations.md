@@ -469,6 +469,15 @@ bd_merge → scene_detect → zone_build → encode(use_zones=true) → …
   `scenes.json` must be zone/scene_detect-produced (one scene per line —
   compact files fail closed); `chapters.xml` may be compact or pretty,
   multi-language (first display wins) or CDATA/entity-laden.
+- **Maintainer rule (v1.25.1–3 hotfixes):** builtin templates seed
+  insert-if-absent so UI edits survive restarts — a release that CHANGES
+  a builtin must add a guarded factory upgrade chain in
+  `api.seedStepTemplates` (byte-exact prior-factory snapshots, mux
+  precedent) or upgraded installs keep rendering the old DB row.
+  Emergency restore for untouched copies: `POST /api/step-templates/{id}/reset`.
+  The scdet metadata-log path is filtergraph-escaped at TWO levels in both
+  dialects (graph splitter + option parser); one level fails on Windows
+  drive-letter paths.
   Precedence (x265 applies the LAST matching zone; output is ordered
   accordingly): credits heuristic (first/last scene ≤ `credits_max_seconds`,
   default 90 s → `b=credits_b`, default 0.6) < chapter-name matches

@@ -97,3 +97,46 @@ func TestSceneDetectPSNullSafeProbeAccess(t *testing.T) {
 		t.Error("frame count must use the captured nb_frames value")
 	}
 }
+
+// Live-farm regression (v1.25.0 job 32): the ffmpeg filtergraph parser treats
+// \ : ' [ ] , ; and space as special — the metadata log path MUST be escaped
+// at the option-value level in BOTH dialects (Windows C:\ paths with spaces).
+func TestSceneDetectFiltergraphEscaping(t *testing.T) {
+	ps := sceneDetectTemplate().PowerShell
+	if !strings.Contains(ps, `.Replace('\', '\\')`) || !strings.Contains(ps, `.Replace(':', '\:')`) || !strings.Contains(ps, `.Replace(' ', '\ ')`) {
+		t.Error("PS template must escape backslash/colon/space in the filtergraph log path")
+	}
+	if !strings.Contains(ps, "metadata=print:file=' + $lf") {
+		t.Error("PS vf must use the escaped path variable")
+	}
+	bash := bashSourceSceneDetect
+	if !strings.Contains(bash, `s/\\/\\\\/g`) || !strings.Contains(bash, `s/:/\\:/g`) || !strings.Contains(bash, `s/ /\\ /g`) {
+		t.Error("bash template must escape backslash/colon/space in the filtergraph log path")
+	}
+	if !strings.Contains(bash, "metadata=print:file=$lf") {
+		t.Error("bash vf must use the escaped path variable")
+	}
+}
+
+// The factory snapshots must stay byte-exact copies of the shipped versions
+// (the upgrade chain matches byte-for-byte; a drifted snapshot silently
+// stops upgrading untouched installs).
+func TestSceneDetectFactorySnapshots(t *testing.T) {
+	if !strings.HasPrefix(SceneDetectFactoryV1, "function Invoke-SceneDetect {") ||
+		!strings.HasPrefix(SceneDetectFactoryV1a, "function Invoke-SceneDetect {") {
+		t.Fatal("factory snapshots must be complete Invoke-SceneDetect scripts")
+	}
+	if strings.Contains(SceneDetectFactoryV1, "PSObject.Properties['nb_frames']") {
+		t.Error("V1 snapshot must be the PRE-StrictMode-fix script")
+	}
+	if !strings.Contains(SceneDetectFactoryV1a, "PSObject.Properties['nb_frames']") {
+		t.Error("V1a snapshot must be the StrictMode-fixed script")
+	}
+	if strings.Contains(SceneDetectFactoryV1a, ".Replace(") {
+		t.Error("V1a snapshot must be PRE-filtergraph-escaping")
+	}
+	cur := sceneDetectTemplate().PowerShell
+	if cur == SceneDetectFactoryV1 || cur == SceneDetectFactoryV1a {
+		t.Error("current factory must differ from both snapshots")
+	}
+}

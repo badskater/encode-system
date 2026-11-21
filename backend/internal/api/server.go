@@ -413,6 +413,22 @@ func (s *Server) seedStepTemplates() error {
 	} else if upgraded {
 		s.Log.Info("upgraded hdr_probe step template to the CLI-MediaInfo-compatible factory version")
 	}
+	// Guarded scene_detect upgrades (live v1.25.0 smoke findings):
+	// V1 (v1.25.0): StrictMode-unsafe ffprobe property access — m2ts sources
+	//   (no nb_frames key) failed on Windows nodes.
+	// V1a (v1.25.1): probe access fixed, but the filtergraph log path was
+	//   unescaped — Windows paths (backslashes/colon/spaces) failed the
+	//   ffmpeg graph parser. Current factory escapes both dialects.
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "scene_detect", flow.SceneDetectFactoryV1, flow.SceneDetectTemplate()); err != nil {
+		return fmt.Errorf("upgrade scene_detect template (V1): %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded scene_detect step template to the StrictMode-safe factory version")
+	}
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "scene_detect", flow.SceneDetectFactoryV1a, flow.SceneDetectTemplate()); err != nil {
+		return fmt.Errorf("upgrade scene_detect template (V1a): %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded scene_detect step template to the filtergraph-escaped factory version")
+	}
 	return nil
 }
 

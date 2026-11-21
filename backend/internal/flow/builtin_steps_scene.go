@@ -78,21 +78,33 @@ func sceneDetectTemplate() *model.StepTemplate {
         throw "scene_detect: ffprobe failed (exit $LASTEXITCODE): $(($probeRaw -join ' ') -replace '[\r\n]', ' ')"
     }
     try { $j = [string]::Join([Environment]::NewLine, $probeRaw) | ConvertFrom-Json } catch { throw "scene_detect: ffprobe output is not JSON" }
-    $vs = @($j.streams) | Select-Object -First 1
+    # Null-safe property access (StrictMode Latest throws on missing keys):
+    # m2ts and other containers omit nb_frames and often stream duration.
+    $streams = $null
+    if ($null -ne $j.PSObject.Properties['streams']) { $streams = @($j.streams) }
+    $vs = @($streams) | Select-Object -First 1
     if (-not $vs) { throw 'scene_detect: ffprobe found no video stream' }
-    if ("$($vs.r_frame_rate)" -notmatch '^([0-9]+)/([0-9]+)$') {
-        throw "scene_detect: unusable r_frame_rate '$($vs.r_frame_rate)'"
+    $rfr = ''
+    if ($null -ne $vs.PSObject.Properties['r_frame_rate']) { $rfr = [string]$vs.r_frame_rate }
+    if ($rfr -notmatch '^([0-9]+)/([0-9]+)$') {
+        throw "scene_detect: unusable r_frame_rate '$rfr'"
     }
     $num = [double]$Matches[1]; $den = [double]$Matches[2]
     if ($num -le 0 -or $den -le 0) { throw 'scene_detect: r_frame_rate must be positive' }
     $fps = $num / $den
     $dur = 0.0
-    if ("$($vs.duration)" -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$vs.duration }
-    elseif ("$($j.format.duration)" -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$j.format.duration }
+    $sd = ''
+    if ($null -ne $vs.PSObject.Properties['duration']) { $sd = [string]$vs.duration }
+    $fd = ''
+    if ($null -ne $j.PSObject.Properties['format'] -and $null -ne $j.format -and $null -ne $j.format.PSObject.Properties['duration']) { $fd = [string]$j.format.duration }
+    if ($sd -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$sd }
+    elseif ($fd -match '^[0-9]+(\.[0-9]+)?$') { $dur = [double]$fd }
     if ($dur -le 0) { throw 'scene_detect: no usable duration from ffprobe' }
     # nb_frames: digit cap before the cast (parity with bash fail-closed).
-    # The count is finalized after the scdet pass (decoded-frame fallback).
-    $nbOk = ("$($vs.nb_frames)" -match '^[0-9]{1,18}$' -and [int64]$vs.nb_frames -gt 0)
+    # Absent key (m2ts) -> decoded-frame fallback after the scdet pass.
+    $nbRaw = ''
+    if ($null -ne $vs.PSObject.Properties['nb_frames']) { $nbRaw = [string]$vs.nb_frames }
+    $nbOk = ($nbRaw -match '^[0-9]{1,18}$' -and [int64]$nbRaw -gt 0)
     Write-Output "ENCODE_STEP scene_detect 30"
     Write-Output "[scene_detect] source=$(Split-Path $src -Leaf) fps=$($fps.ToString('0.######', $inv)) threshold=$($threshold.ToString('0.###', $inv))"
 
@@ -125,7 +137,7 @@ func sceneDetectTemplate() *model.StepTemplate {
     if ($curFrame -lt 0) { throw 'scene_detect: scdet.log has no frame lines (unexpected ffmpeg output)' }
     # Frame count: nb_frames when present, else the ACTUAL decoded count
     # (last frame + 1) — exact for VFR too, unlike duration*fps.
-    $frameCount = if ($nbOk) { [int64]$vs.nb_frames } else { $maxFrame + 1 }
+    $frameCount = if ($nbOk) { [int64]$nbRaw } else { $maxFrame + 1 }
     if ($frameCount -lt 1) { throw 'scene_detect: frame count must be >= 1' }
     # min_scene_len: drop boundaries closer than minLen frames to the
     # previous kept boundary (merges the short scene into its predecessor).

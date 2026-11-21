@@ -124,7 +124,8 @@ func zoneBuildTemplate() *model.StepTemplate {
             if ($dn) { $name = [string]$dn.InnerText }
             # Control chars -> space + trim (bash sanitize parity; keeps
             # decoded entities like &#10; from breaking the TSV protocol).
-            $name = ($name -replace '[\x00-\x1F]', ' ').Trim()
+            # Includes DEL (0x7F) to match bash [[:cntrl:]] in the C locale.
+            $name = ($name -replace '[\x00-\x1F\x7F]', ' ').Trim()
             $chTimes += $secs; $chNames += $name
         }
         for ($i = 0; $i -lt $chTimes.Count; $i++) {

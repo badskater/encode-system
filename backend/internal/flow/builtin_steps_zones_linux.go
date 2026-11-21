@@ -107,11 +107,36 @@ const bashSourceZoneBuild = `zone_build () {
     # 2. Chapter-name matches: zone spans the whole named chapter.
     if [[ -f "$chapters" ]]; then
         local ch_rows
-        # Strip XML comments (PS [xml] ignores them; a comment containing
-        # chapter markup would otherwise create phantom zones), then
-        # normalize compact XML to one tag per line (greedy sub() would
-        # keep only the LAST atom on a multi-atom line).
-        ch_rows=$(LC_ALL=C awk 'BEGIN{RS="<!--"} {if (NR>1) {p=index($0,"-->"); if (p==0) exit 1; $0=substr($0,p+3)} printf "%s",$0}' "$chapters" | sed 's/></>\n</g' | LC_ALL=C awk '
+        # Strip XML comments CDATA-AWARE (PS [xml] ignores comments but
+        # treats CDATA as literal — a '<!--' inside CDATA must survive),
+        # then normalize compact XML to one tag per line (greedy sub()
+        # would keep only the LAST atom on a multi-atom line).
+        local stripped
+        if ! stripped=$(LC_ALL=C awk '
+            { doc = doc $0 "\n" }
+            END {
+                out = ""; rest = doc
+                while (1) {
+                    c = index(rest, "<![CDATA["); m = index(rest, "<!--")
+                    if (c == 0 && m == 0) { out = out rest; break }
+                    if (c > 0 && (m == 0 || c < m)) {
+                        e = index(substr(rest, c+9), "]]>")
+                        if (e == 0) { out = out rest; break }
+                        out = out substr(rest, 1, c+9+e+1)
+                        rest = substr(rest, c+9+e+2)
+                    } else {
+                        out = out substr(rest, 1, m-1)
+                        e = index(substr(rest, m+4), "-->")
+                        if (e == 0) exit 1
+                        rest = substr(rest, m+4+e+2)
+                    }
+                }
+                printf "%s", out
+            }' "$chapters"); then
+            echo 'zone_build: chapters.xml has an unclosed comment; chapter zones skipped'
+            stripped=''
+        fi
+        ch_rows=$(printf '%s' "$stripped" | sed 's/></>\n</g' | LC_ALL=C awk '
             function hex2dec(h,   i, c, v) {
                 v = 0; h = tolower(h)
                 for (i = 1; i <= length(h); i++) {
@@ -125,8 +150,12 @@ const bashSourceZoneBuild = `zone_build () {
                 # Emit UTF-8 bytes explicitly. LC_ALL=C is REQUIRED on the
                 # invocation: gawk in a UTF-8 locale treats %c as a codepoint
                 # and re-encodes it (double-encoding), mawk is byte-oriented;
-                # the C locale makes both emit raw bytes.
+                # the C locale makes both emit raw bytes. Illegal character
+                # references (surrogates, >0x10FFFF — PS [xml] throws) map to
+                # a space so the artifact stays valid UTF-8.
                 if (c <= 0) return " "
+                if (c >= 55296 && c <= 57343) return " "
+                if (c > 1114111) return " "
                 if (c <= 127) return sprintf("%c", c)
                 if (c <= 2047) return sprintf("%c%c", 192 + int(c/64), 128 + (c%64))
                 if (c <= 65535) return sprintf("%c%c%c", 224 + int(c/4096), 128 + (int(c/64)%64), 128 + (c%64))
@@ -164,50 +193,111 @@ const bashSourceZoneBuild = `zone_build () {
                 }
                 return out rest
             }
-            /<ChapterAtom>/ { inatom = 1; ts = ""; name = ""; grabname = 0; sawdisplay = 0; cdata = 0 }
+            function stripattrs(s,   i, ch, q) {
+                # Quote-aware: a ">" inside an attribute value is legal XML
+                # and must not terminate the tag.
+                q = ""
+                for (i = 1; i <= length(s); i++) {
+                    ch = substr(s, i, 1)
+                    if (q != "") { if (ch == q) q = "" }
+                    else if (ch == "\"" || ch == "\047") q = ch
+                    else if (ch == ">") return substr(s, i+1)
+                }
+                return s
+            }
+            /<ChapterAtom>/ { inatom = 1; ts = ""; name = ""; grabname = 0; sawdisplay = 0; cdopen = 0; cdliteral = 0 }
             inatom && /<ChapterTimeStart>/ {
                 line = $0; sub(/.*<ChapterTimeStart>/, "", line); sub(/<\/ChapterTimeStart>.*/, "", line); ts = line
             }
+            inatom && /<ChapterString[[:space:]]*\/>/ && !sawdisplay && !grabname {
+                # Self-closing EMPTY first display wins (PS SelectSingleNode).
+                sawdisplay = 1; next
+            }
             inatom && /<ChapterString[ >]/ && !sawdisplay && !grabname {
                 # FIRST display wins even when EMPTY (PS SelectSingleNode).
-                # Attributes tolerated; content may span lines (the sed
-                # tag-split puts CDATA on its own line) — accumulate with
-                # a separator until the closing tag.
-                line = $0; sub(/.*<ChapterString/, "", line); sub(/^[^>]*>/, "", line)
-                if (line ~ /^<!\[CDATA\[/) cdata = 1
-                if (line ~ /<\/ChapterString>/) {
+                # Attributes stripped quote-aware; content may span lines
+                # (the sed tag-split puts CDATA on its own line) — accumulate
+                # with a separator until the closing tag.
+                line = $0; sub(/.*<ChapterString/, "", line); line = stripattrs(line)
+                if (line ~ /^<!\[CDATA\[/) {
+                    # CDATA content is LITERAL: closing/opening ChapterString
+                    # markup inside it is text, not tags (PS InnerText parity).
+                    cdliteral = 1
+                    if (line ~ /\]\]>/) {
+                        sub(/^<!\[CDATA\[/, "", line)
+                        p = index(line, "]]>")
+                        name = substr(line, 1, p-1)
+                        line = substr(line, p+3)
+                        if (line ~ /<\/ChapterString>/) { sawdisplay = 1 } else { grabname = 1 }
+                    } else {
+                        name = line; grabname = 1; cdopen = 1
+                    }
+                } else if (line ~ /<\/ChapterString>/) {
                     sub(/<\/ChapterString>.*/, "", line); name = line; sawdisplay = 1
                 } else {
                     name = line; grabname = 1
                 }
+                next
+            }
+            grabname && cdopen {
+                # Inside CDATA: literal content until the terminator (which
+                # may share its line with trailing content).
+                if ($0 ~ /\]\]>/) {
+                    line = $0; sub(/\]\]>.*/, "", line)
+                    if (line != "") name = name " " line
+                    cdopen = 0
+                } else if ($0 != "") {
+                    name = name " " $0
+                }
+                next
+            }
+            grabname && /<!\[CDATA\[/ && !/\]\]>/ {
+                # CDATA opens on a continuation line: literal until ]]>.
+                cdopen = 1; cdliteral = 1
+                name = name " " $0
+                next
+            }
+            grabname && /<!\[CDATA\[/ && /\]\]>/ {
+                # CDATA opens AND closes on a continuation line: the content
+                # between the wrappers is literal (may contain tag markup).
+                line = $0; sub(/^<!\[CDATA\[/, "", line)
+                p = index(line, "]]>")
+                line = substr(line, 1, p-1)
+                if (line != "") name = name " " line
+                cdliteral = 1
+                line = substr($0, index($0, "]]>") + 3)
+                if (line ~ /<\/ChapterString>/) { grabname = 0; sawdisplay = 1 }
+                next
             }
             grabname && !/<ChapterString/ {
                 if ($0 ~ /<\/ChapterString>/) {
                     line = $0; sub(/<\/ChapterString>.*/, "", line)
-                    name = name " " line; grabname = 0; sawdisplay = 1
+                    if (line != "") name = name " " line
+                    grabname = 0; sawdisplay = 1
                 } else if ($0 ~ /<\/ChapterAtom>/) {
                     # Unclosed ChapterString (invalid XML): drop the atom
                     # rather than accumulating raw markup into the name.
                     grabname = 0; inatom = 0
-                } else {
+                } else if ($0 != "") {
                     name = name " " $0
                 }
+                next
             }
             /<\/ChapterAtom>/ {
                 if (inatom && ts != "" && !grabname && sawdisplay) {
                     # Trim join spaces, then detect CDATA from the CONTENT
                     # (the tag-split may put the wrapper on its own line).
                     sub(/^ +/, "", name); sub(/ +$/, "", name)
-                    if (name ~ /^<!\[CDATA\[/) {
+                    if (cdliteral || name ~ /^<!\[CDATA\[/) {
                         # CDATA content is LITERAL (PS InnerText parity):
-                        # strip the wrapper, no entity decoding inside.
+                        # strip any remaining wrapper, no entity decoding.
                         sub(/^<!\[CDATA\[/, "", name); sub(/\]\]>$/, "", name)
                     } else {
                         name = decode(name)
                     }
                     print ts "\t" sanitize(name)
                 }
-                inatom = 0; grabname = 0
+                inatom = 0; grabname = 0; cdopen = 0; cdliteral = 0
             }
         ') || ch_rows=''
         # Convert each atom to "seconds<TAB>name", validating the timestamp.

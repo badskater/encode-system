@@ -55,7 +55,10 @@ func sceneDetectTemplate() *model.StepTemplate {
         }
         $t = [double]::Parse($tt, $inv)
         if ($t -lt 0 -or $t -gt 100) { throw 'scene_detect: threshold must be 0..100' }
-        $threshold = $t
+        # Compare against the SAME rounded value the scdet filter receives
+        # (bash normalizes before both uses; full-precision comparison would
+        # select different boundaries for scores in [rounded, original)).
+        $threshold = [double]$t.ToString('0.###', $inv)
     }
     $minLen = 0
     if ($Params.min_scene_len) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Execution tests for zone_build (bash) and the encode use_zones injection.
@@ -666,5 +667,107 @@ func TestEncodeZonesDuplicateKeysFailClosed(t *testing.T) {
 	out, err := zoneEncodeRun(t, bdRender(t, "encode", map[string]string{"use_zones": "true"}, v), v, binDir)
 	if err == nil || !strings.Contains(out, "exactly one top-level x265 key") || !strings.Contains(out, "ENCODE_STEP_FAILED") {
 		t.Fatalf("duplicate keys must fail closed:\n%s", out)
+	}
+}
+
+// --- Round-4 hardening regressions --------------------------------------
+
+// Illegal character references (surrogates, >0x10FFFF) must not emit
+// invalid UTF-8 — they map to spaces (PS [xml] throws on such XML).
+func TestZoneBuildBashIllegalCharRefs(t *testing.T) {
+	for _, ent := range []string{"&#xD800;", "&#xD83D;&#xDE00;", "&#999999999;", "&#x110000;"} {
+		d := zoneWithChapters(t, chapterXML(`<ChapterString>`+ent+`OP</ChapterString>`), nil)
+		for _, z := range d.Zones {
+			if z.Reason == "chapter:OP" {
+				continue // illegal ref mapped to space, trimmed — valid
+			}
+			if strings.HasPrefix(z.Reason, "chapter:") && !utf8.ValidString(z.Reason) {
+				t.Fatalf("%s produced invalid UTF-8: %q", ent, z.Reason)
+			}
+		}
+	}
+}
+
+// A literal '<!--' inside CDATA is content, not a comment: chapter zones
+// must survive (the old comment pre-pass dropped ALL chapters).
+func TestZoneBuildBashCdataLiteralComment(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString><![CDATA[OP <!-- literal]]></ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP <!-- literal" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("CDATA literal comment must survive: %+v", d.Zones)
+	}
+}
+
+// Literal '<ChapterString>' markup inside CDATA is content, not a tag.
+func TestZoneBuildBashCdataLiteralMarkup(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString><![CDATA[OP <ChapterString> tag]]></ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP <ChapterString> tag" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("CDATA literal markup must survive: %+v", d.Zones)
+	}
+}
+
+// Self-closing empty FIRST display wins over a later named display.
+func TestZoneBuildBashSelfClosingFirstDisplay(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString/><ChapterString>OP</ChapterString>`), nil)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("self-closing first display must win: %+v", d.Zones)
+		}
+	}
+}
+
+// '>' inside an attribute value is legal XML and must not corrupt the name.
+func TestZoneBuildBashAttributeGt(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString lang="a>b">OP</ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("quote-aware attribute strip required: %+v", d.Zones)
+	}
+}
+
+// DEL (0x7F) sanitizes to space (bash cntrl class parity with PS).
+func TestZoneBuildBashDelSanitized(t *testing.T) {
+	d := zoneWithChapters(t, chapterXML(`<ChapterString>&#127;OP</ChapterString>`), nil)
+	var found bool
+	for _, z := range d.Zones {
+		if z.Reason == "chapter:OP" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("DEL must sanitize: %+v", d.Zones)
+	}
+}
+
+// Unclosed comment: chapter zones skipped WITH a diagnostic (not silent).
+func TestZoneBuildBashUnclosedCommentDiagnostic(t *testing.T) {
+	v, epDir := zoneTestEnv(t, false)
+	xml := chapterXML(`<ChapterString>OP</ChapterString>`) + "<!-- trailing"
+	os.WriteFile(filepath.Join(epDir, "chapters.xml"), []byte(xml), 0o644)
+	out, _ := bdRun(t, bdRender(t, "zone_build", nil, v), v)
+	if !strings.Contains(out, "unclosed comment") {
+		t.Fatalf("unclosed comment must log a diagnostic:\n%s", out)
+	}
+	d := readZones(t, epDir)
+	for _, z := range d.Zones {
+		if strings.HasPrefix(z.Reason, "chapter:") {
+			t.Fatalf("unclosed comment must skip chapter zones: %+v", d.Zones)
+		}
 	}
 }

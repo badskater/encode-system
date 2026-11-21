@@ -429,6 +429,13 @@ func (s *Server) seedStepTemplates() error {
 	} else if upgraded {
 		s.Log.Info("upgraded scene_detect step template to the filtergraph-escaped factory version")
 	}
+	// V2 (v1.25.2): single-level escaping — colon-bearing paths (Windows
+	// drive letters) still failed; current factory escapes two levels.
+	if upgraded, err := s.Store.UpgradeStepTemplateIfFactory(ctx, "scene_detect", flow.SceneDetectFactoryV2, flow.SceneDetectTemplate()); err != nil {
+		return fmt.Errorf("upgrade scene_detect template (V2): %w", err)
+	} else if upgraded {
+		s.Log.Info("upgraded scene_detect step template to the two-level filtergraph-escaped factory version")
+	}
 	return nil
 }
 

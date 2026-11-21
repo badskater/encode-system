@@ -81,3 +81,19 @@ func TestSceneDetectBashRegistered(t *testing.T) {
 		t.Errorf("scene_detect primary tool must be ffmpeg, got %q", tools)
 	}
 }
+
+// Live-farm regression (v1.25.0 job 30): PS 5.1 under Set-StrictMode Latest
+// THROWS on missing JSON properties — m2ts ffprobe output has no nb_frames
+// key (and often no stream duration). The template must use null-safe
+// PSObject.Properties guards, matching the bash absent-key fallback.
+func TestSceneDetectPSNullSafeProbeAccess(t *testing.T) {
+	tpl := sceneDetectTemplate().PowerShell
+	for _, key := range []string{"nb_frames", "r_frame_rate", "duration", "streams", "format"} {
+		if !strings.Contains(tpl, "PSObject.Properties['"+key+"']") {
+			t.Errorf("PS template must null-guard %q (StrictMode throws on missing keys)", key)
+		}
+	}
+	if strings.Contains(tpl, "$vs.nb_frames") && !strings.Contains(tpl, "$nbRaw") {
+		t.Error("frame count must use the captured nb_frames value")
+	}
+}

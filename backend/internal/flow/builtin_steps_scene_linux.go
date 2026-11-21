@@ -103,7 +103,11 @@ const bashSourceSceneDetect = `scene_detect () {
         echo 'scene_detect: cannot remove stale scdet.log'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1
     }
-    "$ffmpeg" -hide_banner -nostdin -i "$src" -an -vf "scdet=threshold=$threshold,metadata=print:file=$log" -f null - 2>&1 | sed 's/^/[ffmpeg] /'
+    # Filtergraph option-value escaping (PS parity): \ : ' [ ] , ; and space
+    # are special to the ffmpeg graph parser; backslashes FIRST.
+    local lf
+    lf=$(printf '%s' "$log" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g' -e 's/ /\\ /g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/,/\\,/g' -e 's/;/\\;/g' -e "s/'/\\\\'/g")
+    "$ffmpeg" -hide_banner -nostdin -i "$src" -an -vf "scdet=threshold=$threshold,metadata=print:file=$lf" -f null - 2>&1 | sed 's/^/[ffmpeg] /'
     if (( ${PIPESTATUS[0]} != 0 )); then
         echo 'scene_detect: ffmpeg scdet pass failed'
         echo 'ENCODE_STEP_FAILED scene_detect'; exit 1

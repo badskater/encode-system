@@ -75,7 +75,7 @@ printf '%s\n' "$@" > "$dir/ffmpeg_args.txt"
 log=''
 prev=''
 for a in "$@"; do
-  case "$prev" in -vf) log="${a#*metadata=print:file=}";; esac
+  case "$prev" in -vf) log="${a#*metadata=print:file=}"; log=$(printf '%s' "$log" | sed 's/\\\(.\)/\1/g');; esac
   prev="$a"
 done
 if [ -f "$dir/ffmpeg_fail" ]; then echo "stub: ffmpeg failure" >&2; exit 1; fi

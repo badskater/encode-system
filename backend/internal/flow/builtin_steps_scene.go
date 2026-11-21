@@ -19,6 +19,10 @@ package flow
 
 import "github.com/badskater/encode-system/backend/internal/model"
 
+// SceneDetectTemplate returns the current factory scene_detect template
+// (exported for the guarded upgrade chain in api.seedStepTemplates).
+func SceneDetectTemplate() *model.StepTemplate { return sceneDetectTemplate() }
+
 func sceneDetectTemplate() *model.StepTemplate {
 	return &model.StepTemplate{
 		Key:         "scene_detect",
@@ -111,7 +115,11 @@ func sceneDetectTemplate() *model.StepTemplate {
     # --- scdet pass (decode-only; metadata log is the parse contract) ---
     $log = Join-Path $Job.EpisodeDir 'scdet.log'
     if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
-    $vf = 'scdet=threshold=' + $threshold.ToString('0.###', $inv) + ',metadata=print:file=' + $log
+    # Filtergraph option-value escaping: \ : ' [ ] , ; and space are special
+    # to the ffmpeg graph parser — an unescaped Windows path (C:\..., spaces)
+    # fails with 'No option name near ...'. Backslashes FIRST, then the rest.
+    $lf = $log.Replace('\', '\\').Replace(':', '\:').Replace(' ', '\ ').Replace("'", "\'").Replace('[', '\[').Replace(']', '\]').Replace(',', '\,').Replace(';', '\;')
+    $vf = 'scdet=threshold=' + $threshold.ToString('0.###', $inv) + ',metadata=print:file=' + $lf
     Invoke-Tool -ExePath $ffmpeg -Arguments @('-hide_banner', '-nostdin', '-i', $src, '-an', '-vf', $vf, '-f', 'null', '-') -Label 'ffmpeg'
     if (-not (Test-Path -LiteralPath $log) -or (Get-Item -LiteralPath $log).Length -lt 10) {
         throw 'scene_detect: scdet.log missing or empty after the ffmpeg pass'

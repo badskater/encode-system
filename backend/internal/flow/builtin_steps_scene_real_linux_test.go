@@ -120,3 +120,53 @@ func TestSceneDetectRealBinaryVFRCount(t *testing.T) {
 		t.Fatalf("VFR decoded count must be ~102 (not dur*fps=144): %d", d.FrameCount)
 	}
 }
+
+// Live-farm regression (v1.25.2 job 34): filtergraph escaping needs TWO
+// levels — a single pass fails on colon-bearing paths (Windows C:\ drive
+// letters). The colon sits AFTER the first slash so Linux avio treats the
+// path as a file (a colon before any slash parses as a URL protocol).
+func TestSceneDetectRealBinaryColonPath(t *testing.T) {
+	ffmpeg := os.Getenv("ENCODE_TEST_FFMPEG")
+	ffprobe := os.Getenv("ENCODE_TEST_FFPROBE")
+	if ffmpeg == "" || ffprobe == "" {
+		t.Skip("ENCODE_TEST_FFMPEG / ENCODE_TEST_FFPROBE not set")
+	}
+	root := t.TempDir()
+	scriptsDir := filepath.Join(root, "scripts")
+	epDir := filepath.Join(scriptsDir, "sub", "Series: X", "Ep 01")
+	binDir := filepath.Join(root, "bin")
+	for _, d := range []string{epDir, binDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"ffmpeg": ffmpeg, "ffprobe": ffprobe} {
+		if err := os.Symlink(target, filepath.Join(binDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := filepath.Join(epDir, "cuts.mp4")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24:duration=3",
+		"-f", "lavfi", "-i", "color=c=red:size=320x240:rate=24:duration=3",
+		"-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", src, "-y")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("author fixture: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(epDir, "1080.vpy"), []byte("# stub"), 0o644)
+	v := Vars{BinDir: binDir, ScriptsDir: scriptsDir, ReleaseDir: filepath.Join(root, "release"), Group: "TestGroup", Tag: "1080p"}
+	job := linuxTestJob()
+	job.Series = "Series: X"
+	job.EpisodeDir = "sub/Series: X/Ep 01"
+	f := singleStepFlow("scene_detect")
+	script, err := RenderDialect(f, job, v, BuiltinResolver(), BashDialect{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdMustRun(t, script, v)
+	d := readScenes(t, epDir)
+	if d.FPS != 24 || d.FrameCount != 144 || len(d.Scenes) != 2 {
+		t.Fatalf("colon+space path must produce correct scenes: fps=%v frames=%d scenes=%+v", d.FPS, d.FrameCount, d.Scenes)
+	}
+}

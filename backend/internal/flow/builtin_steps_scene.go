@@ -115,10 +115,12 @@ func sceneDetectTemplate() *model.StepTemplate {
     # --- scdet pass (decode-only; metadata log is the parse contract) ---
     $log = Join-Path $Job.EpisodeDir 'scdet.log'
     if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
-    # Filtergraph option-value escaping: \ : ' [ ] , ; and space are special
-    # to the ffmpeg graph parser — an unescaped Windows path (C:\..., spaces)
-    # fails with 'No option name near ...'. Backslashes FIRST, then the rest.
+    # Filtergraph escaping is TWO levels (graph splitter + option parser):
+    # empirically verified against ffmpeg 9 — a single pass fails on paths
+    # with colons (Windows drive letters). Escape the full special set,
+    # then escape the RESULT again. Backslashes first in each pass.
     $lf = $log.Replace('\', '\\').Replace(':', '\:').Replace(' ', '\ ').Replace("'", "\'").Replace('[', '\[').Replace(']', '\]').Replace(',', '\,').Replace(';', '\;')
+    $lf = $lf.Replace('\', '\\').Replace(':', '\:').Replace(' ', '\ ').Replace("'", "\'").Replace('[', '\[').Replace(']', '\]').Replace(',', '\,').Replace(';', '\;')
     $vf = 'scdet=threshold=' + $threshold.ToString('0.###', $inv) + ',metadata=print:file=' + $lf
     Invoke-Tool -ExePath $ffmpeg -Arguments @('-hide_banner', '-nostdin', '-i', $src, '-an', '-vf', $vf, '-f', 'null', '-') -Label 'ffmpeg'
     if (-not (Test-Path -LiteralPath $log) -or (Get-Item -LiteralPath $log).Length -lt 10) {

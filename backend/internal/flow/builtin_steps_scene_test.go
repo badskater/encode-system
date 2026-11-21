@@ -109,12 +109,18 @@ func TestSceneDetectFiltergraphEscaping(t *testing.T) {
 	if !strings.Contains(ps, "metadata=print:file=' + $lf") {
 		t.Error("PS vf must use the escaped path variable")
 	}
+	if strings.Count(ps, `.Replace('\', '\\')`) != 2 {
+		t.Error("PS must escape TWO levels (graph splitter + option parser)")
+	}
 	bash := bashSourceSceneDetect
 	if !strings.Contains(bash, `s/\\/\\\\/g`) || !strings.Contains(bash, `s/:/\\:/g`) || !strings.Contains(bash, `s/ /\\ /g`) {
 		t.Error("bash template must escape backslash/colon/space in the filtergraph log path")
 	}
 	if !strings.Contains(bash, "metadata=print:file=$lf") {
 		t.Error("bash vf must use the escaped path variable")
+	}
+	if strings.Count(bash, `s/\\/\\\\/g`) != 2 {
+		t.Error("bash must escape TWO levels (graph splitter + option parser)")
 	}
 }
 

@@ -23,6 +23,7 @@ func TestSeedUpgradesSceneDetectFactoryCopies(t *testing.T) {
 	}{
 		{"v1.25.0 factory (StrictMode-unsafe)", flow.SceneDetectFactoryV1},
 		{"v1.25.1 factory (unescaped filtergraph)", flow.SceneDetectFactoryV1a},
+		{"v1.25.2 factory (single-level escaping)", flow.SceneDetectFactoryV2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

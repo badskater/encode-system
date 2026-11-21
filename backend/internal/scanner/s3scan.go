@@ -22,6 +22,26 @@ import (
 // source is still uploading — deferred to the next scan, exactly like a
 // fresh mtime on NFS. minStableAge <= 0 disables the gate.
 func ScanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableAge time.Duration) ([]Candidate, error) {
+	return scanS3(ctx, store, bucket, minStableAge, true)
+}
+
+// ScanS3SourceOnly is the bucket parity of ScanSourceOnly: stable-source
+// episodes without a filter script (materialization candidates).
+func ScanS3SourceOnly(ctx context.Context, store s3.ObjectStore, bucket string, minStableAge time.Duration) ([]Candidate, error) {
+	cands, err := scanS3(ctx, store, bucket, minStableAge, false)
+	if err != nil {
+		return nil, err
+	}
+	var out []Candidate
+	for _, c := range cands {
+		if c.ScriptFile == "" {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func scanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableAge time.Duration, requireScript bool) ([]Candidate, error) {
 	objs, err := store.List(ctx, bucket, "")
 	if err != nil {
 		return nil, err
@@ -40,6 +60,14 @@ func ScanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableA
 		// one slash. Root/top-level files and deeper nesting are ignored,
 		// mirroring the filesystem scan's depth rule.
 		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(o.Key), TemplateDirName+"/") {
+			continue // reserved: per-series script templates, not a series
+		}
+		// S3 keys are literal: '..' segments pass the depth rule but would
+		// escape the episode prefix in path joins — refuse them.
+		if strings.Contains(o.Key, "/../") || strings.HasSuffix(o.Key, "/..") || strings.HasPrefix(o.Key, "../") {
 			continue
 		}
 		if strings.Count(trimmed, "/") == 1 {
@@ -66,7 +94,7 @@ func ScanS3(ctx context.Context, store s3.ObjectStore, bucket string, minStableA
 
 	var out []Candidate
 	for _, d := range dirs {
-		c, ok := inspectS3Episode(d, byDir[d], bdmvByDir[d], minStableAge, time.Now())
+		c, ok := inspectS3Episode(d, byDir[d], bdmvByDir[d], minStableAge, time.Now(), requireScript)
 		if ok {
 			out = append(out, c)
 		}
@@ -104,7 +132,7 @@ type s3Entry struct {
 // rules as inspectEpisode to one episode's object listing. bdmvEntries
 // carries the disc-layout evidence (BDMV/PLAYLIST + BDMV/STREAM objects)
 // used when no flat source exists — parity with the filesystem fallback.
-func inspectS3Episode(epDir string, entries, bdmvEntries []s3Entry, minStableAge time.Duration, now time.Time) (Candidate, bool) {
+func inspectS3Episode(epDir string, entries, bdmvEntries []s3Entry, minStableAge time.Duration, now time.Time, requireScript bool) (Candidate, bool) {
 	var source, script string
 	var mkvFallback string
 	var sourceMtime time.Time
@@ -160,15 +188,18 @@ func inspectS3Episode(epDir string, entries, bdmvEntries []s3Entry, minStableAge
 			sourceMtime = newest
 		}
 	}
-	if source == "" || script == "" {
+	if source == "" || (requireScript && script == "") {
 		return Candidate{}, false
 	}
 	if minStableAge > 0 && !sourceMtime.IsZero() && now.Sub(sourceMtime) < minStableAge {
 		return Candidate{}, false // still uploading
 	}
-	scriptType := "avs"
-	if strings.HasSuffix(strings.ToLower(script), ".vpy") {
-		scriptType = "vpy"
+	scriptType := ""
+	if script != "" {
+		scriptType = "avs"
+		if strings.HasSuffix(strings.ToLower(script), ".vpy") {
+			scriptType = "vpy"
+		}
 	}
 	parts := strings.SplitN(epDir, "/", 2)
 	return Candidate{

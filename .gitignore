@@ -40,3 +40,6 @@ coverage/
 core
 core.*
 *.core
+
+# Hermes agent workspace (plans, scratch state — local only)
+.hermes/

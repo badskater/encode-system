@@ -37,6 +37,8 @@ Distributed anime encoding farm. Terminology used everywhere:
 - Mux: `mkvmerge` with the standard track language/default flags from the
   legacy batch script; audio language comes from `audio.json` when present.
 - Keyframes: `ffmpeg` → y4m pipe → `SCXvid` → `<Series> - NN Keyframes.txt`, only when the flow includes the keyframes step. The artifact is an xvid first-pass stats log; on Linux the same file is produced by `vapoursynth-scxvid` via `vspipe` (log-format parity, no conversion).
+- Series scripts: a series may assign `script_type` + `script_template`; the scanner materializes `_templates/<Series>/<template>` into scriptless episodes (placeholders `{{source}}`/`{{series}}`/`{{episode}}`/`{{episode_dir}}`; per-episode scripts always win; `_templates` is reserved).
+- Scene/zones: `scene_detect` → `scenes.json` (ffmpeg scdet metadata-log contract, frame-accurate boundaries); `zone_build` → `zones.json` (credits heuristic < chapter-name matches < manual overrides, x265 later-wins ordering); `encode` `use_zones=true` injects the validated `--zones` string.
 - Binaries live in `C:\bin` on nodes (moved from `E:\Encodes\bin`). Encode
   working dirs: `C:\Encodes\scripts` and `C:\Encodes\ReleaseFolders` — both
   NFS shares mounted by the Windows NFS client. Series folders are created

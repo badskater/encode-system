@@ -277,6 +277,19 @@ func (s *Store) migrateV2() error {
 			return fmt.Errorf("migrate series.webhook_url: %w", err)
 		}
 	}
+	// series.script_type/script_template: per-series filter script assignment
+	// (scanner materializes the template into detected episodes). '' = legacy
+	// per-episode scripts only.
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN script_type TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate series.script_type: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE series ADD COLUMN script_template TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("migrate series.script_template: %w", err)
+		}
+	}
 	// nodes.platform: the agent's OS ("windows" | "linux"), reported via
 	// heartbeat so later tasks can select the script dialect per node.
 	// Default 'windows' so legacy rows and old agents (which never report

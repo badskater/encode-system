@@ -576,6 +576,14 @@ type Series struct {
 	// jobs only dispatch to nodes whose Group matches; nodes with an empty
 	// Group (wildcard) still accept them. Set via PATCH /api/series/{id}.
 	NodeGroup string `json:"node_group"`
+	// ScriptType + ScriptTemplate assign the series' filter script once:
+	// the scanner materializes _templates/<Series>/<ScriptTemplate> into
+	// each detected episode that lacks its own script (placeholder
+	// substitution; an existing per-episode script always wins).
+	// ScriptType is "vpy" or "avs"; both empty = unassigned (legacy
+	// behavior: episodes must carry their own script).
+	ScriptType     string `json:"script_type"`
+	ScriptTemplate string `json:"script_template"`
 	// Notify controls whether job outcomes for this series emit Discord
 	// alerts. Defaults true (matches pre-v2 behavior where every job
 	// alerted) so a silent series is an opt-in, not an opt-out.

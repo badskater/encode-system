@@ -79,6 +79,8 @@ var builtinBashSources = map[string]string{
 	"discord_notify":   bashSourceDiscordNotify,
 	"bd_merge":         bashSourceBdMerge,
 	"bd_split":         bashSourceBdSplit,
+	"scene_detect":     bashSourceSceneDetect,
+	"zone_build":       bashSourceZoneBuild,
 }
 
 // builtinBashRefused lists built-in templates that genuinely have no Linux
@@ -641,6 +643,42 @@ const bashSourceEncode = `encode () {
         [[ "$no_sao" != "false" ]] && arg_list+=(--no-sao --no-sao-non-deblock)
         [[ "$b_pyramid" != "false" ]] && arg_list+=(--b-pyramid)
         [[ "$open_gop" != "false" ]] && arg_list+=(--open-gop)
+    fi
+    # Zones (zone_build artifact): inject the validated --zones string.
+    # Applies in BOTH arg modes; the y4m/input tail still comes last.
+    # Case-insensitive bool (PS -eq parity: 'True' must apply too).
+    if [[ "${use_zones,,}" == "true" ]]; then
+        local zones="$EpisodeDir/zones.json"
+        if [[ ! -f "$zones" ]]; then
+            echo 'encode: use_zones is set but zones.json is missing - run zone_build first'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
+        local zstr
+        # Anchor to the TOP-LEVEL key line (zone_build writes it at two-space
+        # indent): an unanchored grep would pick a nested decoy "x265" key
+        # inside a zone object and inject the wrong value. Non-contract
+        # files fail closed here (PS reads the top-level key via JSON parse).
+        # Exactly one such line: duplicate keys throw in the PS dialect's
+        # JSON parser, so bash refuses them too. JSON \uXXXX escapes in the
+        # value are NOT decoded — zone_build never emits them; hand-edited
+        # escaped values fail the shape regex (fail closed, documented).
+        local nkeys
+        nkeys=$(grep -c '^  "x265"' "$zones")
+        if (( nkeys != 1 )); then
+            echo 'encode: zones.json must have exactly one top-level x265 key (regenerate via zone_build)'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
+        zstr=$(grep -m1 '^  "x265"' "$zones" | sed 's/^  "x265"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || zstr=''
+        if [[ -n "$zstr" && ! "$zstr" =~ ^[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?)(/[0-9]+,[0-9]+,(q=[0-9]+|b=[0-9]+(\.[0-9]+)?))*$ ]]; then
+            echo 'encode: zones.json x265 string is malformed'
+            echo 'ENCODE_STEP_FAILED encode'; exit 1
+        fi
+        if [[ -n "$zstr" ]]; then
+            arg_list+=(--zones "$zstr")
+            echo "[x265] zones: $zstr"
+        else
+            echo '[x265] zones.json empty - no zones applied'
+        fi
     fi
     # Linux: pipe the VapourSynth script through vspipe into x265 (y4m on stdin).
     arg_list+=(--y4m)

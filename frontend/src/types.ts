@@ -67,8 +67,24 @@ export interface Series {
   // Routing label: non-empty restricts this series' jobs to nodes with a
   // matching group (wildcard nodes still accept them). '' = any node.
   node_group?: string;
+  // Per-series filter-script assignment: the scanner materializes this
+  // template (from _templates/<Series>/ on the scripts share) into each
+  // detected episode. script_type ''/absent = unassigned. Both fields are
+  // always set or cleared TOGETHER via PATCH /api/series/{id} — the server
+  // rejects half assignments with 400.
+  script_type?: string; // '' | 'vpy' | 'avs'
+  script_template?: string; // template file name, '' when unassigned
   created_at: string;
   updated_at: string;
+}
+
+// SeriesTemplate is one filter-script template file under
+// _templates/<Series>/ on the scripts share, as listed by
+// GET /api/series/{id}/templates (sorted by name server-side).
+export interface SeriesTemplate {
+  name: string;
+  size: number;
+  mtime: string;
 }
 
 // Response of POST /api/series (create series with folder scaffolding).

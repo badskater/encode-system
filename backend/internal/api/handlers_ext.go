@@ -142,13 +142,15 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FlowID     *int64  `json:"flow_id"`
-		Enabled    *bool   `json:"enabled"`
-		Notify     *bool   `json:"notify"`
-		Paused     *bool   `json:"paused"`
-		NodeGroup  *string `json:"node_group"`
-		Tag        *string `json:"tag"`
-		WebhookURL *string `json:"webhook_url"`
+		FlowID         *int64  `json:"flow_id"`
+		Enabled        *bool   `json:"enabled"`
+		Notify         *bool   `json:"notify"`
+		Paused         *bool   `json:"paused"`
+		NodeGroup      *string `json:"node_group"`
+		Tag            *string `json:"tag"`
+		WebhookURL     *string `json:"webhook_url"`
+		ScriptType     *string `json:"script_type"`
+		ScriptTemplate *string `json:"script_template"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid patch")
@@ -159,6 +161,26 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "series not found")
 		return
+	}
+	// Script assignment is one unit and is validated FIRST: a 400 on the
+	// script pair must not leave earlier fields (tag/enabled/...) silently
+	// mutated by a request the caller sees as failed.
+	if req.ScriptType != nil || req.ScriptTemplate != nil {
+		if req.ScriptType == nil || req.ScriptTemplate == nil {
+			writeErr(w, http.StatusBadRequest, "script_type and script_template must be set together (or both empty to clear)")
+			return
+		}
+		stype := strings.TrimSpace(*req.ScriptType)
+		stmpl := strings.TrimSpace(*req.ScriptTemplate)
+		root := s.currentSettings(ctx).ScriptsRoot
+		if err := validateScriptAssignment(root, sr.Name, stype, stmpl); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.Store.SetSeriesScript(ctx, id, stype, stmpl); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update series script")
+			return
+		}
 	}
 	// Field-scoped updates: each field is written by its own SQL statement,
 	// so two concurrent PATCHes touching different fields cannot lose writes.
@@ -232,6 +254,7 @@ func (s *Server) handlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		"name": sr.Name, "flow_id": req.FlowID, "enabled": req.Enabled,
 		"notify": req.Notify, "paused": req.Paused, "node_group": req.NodeGroup,
 		"tag": req.Tag, "webhook_set": req.WebhookURL != nil && *req.WebhookURL != "",
+		"script_type": req.ScriptType, "script_template": req.ScriptTemplate,
 	})
 	writeJSON(w, http.StatusOK, sr)
 }

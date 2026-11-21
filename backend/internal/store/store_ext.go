@@ -457,14 +457,14 @@ func (s *Store) UpsertSeriesByName(ctx context.Context, name string) (*model.Ser
 // SeriesByName loads a series by exact folder name.
 func (s *Store) SeriesByName(ctx context.Context, name string) (*model.Series, error) {
 	row := s.qRow(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE name = ?`, name)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, script_type, script_template, created_at, updated_at FROM series WHERE name = ?`, name)
 	return scanSeries(row)
 }
 
 // GetSeries loads a series by ID.
 func (s *Store) GetSeries(ctx context.Context, id int64) (*model.Series, error) {
 	row := s.qRow(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series WHERE id = ?`, id)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, script_type, script_template, created_at, updated_at FROM series WHERE id = ?`, id)
 	return scanSeries(row)
 }
 
@@ -472,7 +472,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 	var sr model.Series
 	var enabled, notify, paused int
 	var createdAt, updatedAt string
-	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &sr.ScriptType, &sr.ScriptTemplate, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	sr.Enabled = enabled == 1
@@ -486,7 +486,7 @@ func scanSeries(row *sql.Row) (*model.Series, error) {
 // ListSeries returns all series ordered by name.
 func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	rows, err := s.qQuery(ctx,
-		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, created_at, updated_at FROM series ORDER BY name`)
+		`SELECT id, name, flow_id, tag, enabled, notify, paused, node_group, webhook_url, script_type, script_template, created_at, updated_at FROM series ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +496,7 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 		var sr model.Series
 		var enabled, notify, paused int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&sr.ID, &sr.Name, &sr.FlowID, &sr.Tag, &enabled, &notify, &paused, &sr.NodeGroup, &sr.WebhookURL, &sr.ScriptType, &sr.ScriptTemplate, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		sr.Enabled = enabled == 1
@@ -509,11 +509,14 @@ func (s *Store) ListSeries(ctx context.Context) ([]*model.Series, error) {
 	return out, rows.Err()
 }
 
-// UpdateSeries persists flow selection, enabled state, and notify flag.
+// UpdateSeries persists flow selection, enabled state, notify flag and the
+// script assignment. WHOLE-ROW semantics: callers must read-modify-write a
+// fresh row — a stale/zero struct clears live fields (the API uses the
+// field-scoped setters instead; this exists for test/import convenience).
 func (s *Store) UpdateSeries(ctx context.Context, sr *model.Series) error {
 	_, err := s.qExec(ctx,
-		`UPDATE series SET flow_id=?, tag=?, enabled=?, notify=?, updated_at=datetime('now') WHERE id=?`,
-		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), boolToInt(sr.Notify), sr.ID)
+		`UPDATE series SET flow_id=?, tag=?, enabled=?, notify=?, script_type=?, script_template=?, updated_at=datetime('now') WHERE id=?`,
+		sr.FlowID, sr.Tag, boolToInt(sr.Enabled), boolToInt(sr.Notify), sr.ScriptType, sr.ScriptTemplate, sr.ID)
 	return err
 }
 
@@ -573,6 +576,16 @@ func (s *Store) SetSeriesWebhook(ctx context.Context, id int64, webhookURL strin
 func (s *Store) SetSeriesNodeGroup(ctx context.Context, id int64, group string) error {
 	_, err := s.qExec(ctx,
 		`UPDATE series SET node_group=?, updated_at=datetime('now') WHERE id=?`, group, id)
+	return err
+}
+
+// SetSeriesScript updates ONLY the script assignment (type + template are
+// one unit: a template without a type is meaningless). Field-scoped like
+// the other setters so a concurrent flow/tag patch cannot be clobbered.
+// Both empty clears the assignment (legacy per-episode scripts only).
+func (s *Store) SetSeriesScript(ctx context.Context, id int64, scriptType, scriptTemplate string) error {
+	_, err := s.qExec(ctx,
+		`UPDATE series SET script_type=?, script_template=?, updated_at=datetime('now') WHERE id=?`, scriptType, scriptTemplate, id)
 	return err
 }
 

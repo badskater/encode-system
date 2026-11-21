@@ -172,6 +172,8 @@ var builtinLinuxToolMap = map[string]string{
 	"discord_notify":   "curl",       // curl replaces WebClient
 	"bd_merge":         "tsMuxeR",    // tsMuxeR remuxes the playlist to one m2ts
 	"bd_split":         "tsMuxeR",    // tsMuxeR splits the playlist at chapter marks
+	"scene_detect":     "ffmpeg",     // ffmpeg scdet analysis (ffprobe + jq assist)
+	"zone_build":       "awk",        // awk parses scenes/chapters and emits zones.json
 }
 
 // TestBuiltinBashAllTemplatesResolveOrRefuse: every built-in template must
